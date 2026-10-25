@@ -38,6 +38,11 @@ static constexpr int BOOKMARK_BUTTON_TEXT_ELISION_PADDING = 2;
 static constexpr char const* BOOKMARK_ITEM_PROPERTY = "bookmark_item";
 static constexpr char const* BOOKMARK_CONTEXT_MENU_OPEN_PROPERTY = "bookmark_context_menu_open";
 
+static int bookmark_button_height(QFontMetrics const& font_metrics, int icon_height)
+{
+    return max(BOOKMARK_BUTTON_MIN_HEIGHT, max(font_metrics.height(), icon_height) + BOOKMARK_BUTTON_VERTICAL_PADDING);
+}
+
 static QStyleOptionToolButton bookmark_button_style_option(QToolButton const& button)
 {
     QStyleOptionToolButton option;
@@ -176,7 +181,7 @@ BookmarksBar::BookmarksBar(Tab* parent)
 {
     setObjectName("LadybirdBookmarksBar");
     setIconSize({ BOOKMARK_BUTTON_ICON_SIZE, BOOKMARK_BUTTON_ICON_SIZE });
-    setVisible(WebView::Application::settings().appearance().show_bookmarks_bar);
+    setVisible(false);
     setMovable(false);
     setFloatable(false);
     update_chrome_style();
@@ -186,22 +191,11 @@ BookmarksBar::BookmarksBar(Tab* parent)
     rebuild();
 }
 
-bool BookmarksBar::event(QEvent* event)
-{
-    if (event->type() == QEvent::PaletteChange)
-        update_chrome_style();
-
-    return QToolBar::event(event);
-}
-
 void BookmarksBar::update_chrome_style()
 {
-    if (m_is_updating_chrome_style)
-        return;
-
-    m_is_updating_chrome_style = true;
-    setStyleSheet(ChromeStyle::bookmarks_bar_style_sheet(palette()));
-    m_is_updating_chrome_style = false;
+    // Bookmark items are pills, like the tabs.
+    auto corner_radius = bookmark_button_height(fontMetrics(), iconSize().height()) / 2;
+    setStyleSheet(ChromeStyle::bookmarks_bar_style_sheet(m_tab->palette(), corner_radius));
 }
 
 void BookmarksBar::rebuild()
@@ -220,8 +214,8 @@ void BookmarksBar::rebuild()
 
         auto option = bookmark_button_style_option(*button);
 
-        auto bookmark_button_height = max(BOOKMARK_BUTTON_MIN_HEIGHT, max(button->fontMetrics().height(), button->iconSize().height()) + BOOKMARK_BUTTON_VERTICAL_PADDING);
-        auto max_size_rect = QRect { 0, 0, BOOKMARK_BUTTON_MAX_WIDTH, bookmark_button_height };
+        auto height = bookmark_button_height(button->fontMetrics(), button->iconSize().height());
+        auto max_size_rect = QRect { 0, 0, BOOKMARK_BUTTON_MAX_WIDTH, height };
 
         auto layout = bookmark_button_layout(*button, option, title, max_size_rect);
 
@@ -233,7 +227,7 @@ void BookmarksBar::rebuild()
 
         button->setFixedWidth(layout.preferred_width);
         button->setMaximumWidth(BOOKMARK_BUTTON_MAX_WIDTH);
-        button->setFixedHeight(bookmark_button_height);
+        button->setFixedHeight(height);
 
         button->installEventFilter(this);
     };
@@ -251,6 +245,9 @@ void BookmarksBar::rebuild()
                     set_button_properties(button, qstring_from_ak_string(bookmark->text()));
             },
             [&](NonnullRefPtr<WebView::Menu> const& folder) {
+                if (folder->properties().get("type"sv) != "folder"sv)
+                    return;
+
                 auto title = qstring_from_ak_string(folder->title());
 
                 auto* submenu = create_application_menu(*this, *folder);
@@ -261,6 +258,7 @@ void BookmarksBar::rebuild()
                 action->setProperty("id", submenu->property("id"));
                 action->setProperty("type", submenu->property("type"));
                 action->setProperty("target_folder_id", submenu->property("target_folder_id"));
+                action->setProperty("parent_folder_id", submenu->property("parent_folder_id"));
                 action->setMenu(submenu);
                 addAction(action);
 
@@ -274,21 +272,23 @@ void BookmarksBar::rebuild()
     }
 }
 
-void BookmarksBar::show_context_menu(QPoint position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id)
+void BookmarksBar::show_context_menu(QPoint position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
 {
     if (item.has_value()) {
         m_selected_bookmark_menu_item_id = item->id;
         m_selected_bookmark_menu_target_folder_id = target_folder_id.copy();
+        m_selected_bookmark_menu_parent_folder_id = parent_folder_id.copy();
 
         if (item->is_bookmark())
-            bookmark_context_menu().exec(position);
+            execute_context_menu(bookmark_context_menu(), position);
         else if (item->is_folder())
-            bookmark_folder_context_menu().exec(position);
+            execute_context_menu(bookmark_folder_context_menu(), position);
     } else {
         m_selected_bookmark_menu_item_id = {};
         m_selected_bookmark_menu_target_folder_id = {};
+        m_selected_bookmark_menu_parent_folder_id = {};
 
-        bookmarks_bar_context_menu().exec(position);
+        execute_context_menu(bookmarks_bar_context_menu(), position);
     }
 }
 
@@ -346,9 +346,14 @@ bool BookmarksBar::handle_middle_mouse_click(QMouseEvent* event, QObject* item)
 
 bool BookmarksBar::handle_right_mouse_click(QMouseEvent* event, QObject* item)
 {
+    // FIXME: The exec() calls below should use execute_context_menu() instead to use native context menus on macOS.
+    //        However, more work is needed to ensure that opened bookmark folders do not disappear when the native menu
+    //        is shown.
+
     if (is<BookmarksBar>(item)) {
         m_selected_bookmark_menu_item_id = {};
         m_selected_bookmark_menu_target_folder_id = {};
+        m_selected_bookmark_menu_parent_folder_id = {};
 
         bookmarks_bar_context_menu().exec(event->globalPosition().toPoint());
     } else if (auto* button = as_if<QToolButton>(item)) {
@@ -400,8 +405,13 @@ void BookmarksBar::extract_item_properties(QObject* item)
     m_selected_bookmark_menu_item_id = ak_string_from_qstring(item->property("id").toString());
     m_selected_bookmark_menu_item_type = item->property("type").toString();
 
+    m_selected_bookmark_menu_target_folder_id = {};
     if (auto value = ak_string_from_qstring(item->property("target_folder_id").toString()); !value.is_empty())
         m_selected_bookmark_menu_target_folder_id = AK::move(value);
+
+    m_selected_bookmark_menu_parent_folder_id = {};
+    if (auto value = ak_string_from_qstring(item->property("parent_folder_id").toString()); !value.is_empty())
+        m_selected_bookmark_menu_parent_folder_id = AK::move(value);
 }
 
 QMenu& BookmarksBar::bookmarks_bar_context_menu()

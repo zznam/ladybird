@@ -10,35 +10,33 @@
 #include <AK/Mutex.h>
 #include <LibMedia/Sinks/RemoteVideoSink.h>
 #include <LibMedia/VideoEdgeQueue.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoPresentation/PresentedFramePage.h>
-#include <LibMedia/VideoSurface.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoSurface.h>
 #include <LibThreading/Thread.h>
 
 namespace Media {
 
 class RemoteVideoSink::ThreadData : public AtomicRefCounted<RemoteVideoSink::ThreadData> {
 public:
-    ThreadData(VideoEdgeQueue, Delegates, PresentedFramePage);
+    ThreadData(VideoEdgeQueue, Delegates);
+    ~ThreadData();
 
     VideoEdgeQueue const& edge() const { return m_edge; }
-    PresentedFramePage const& presented_frame_page() const { return m_presented_frame_page; }
-
-    RefPtr<VideoFrame> current_frame();
-
     ErrorOr<void> connect_input(NonnullRefPtr<VideoProducer> const&);
     void disconnect_input(NonnullRefPtr<VideoProducer> const&);
-    void transmit_seek() const;
+    void ring_data_available() const;
+    void transmit_seek(InvalidateHeldData) const;
     void transmit_time_reader(MediaTimeReader const&) const;
-    void seek_upstream(AK::Duration timestamp);
+    void seek_upstream(AK::Duration timestamp, InvalidateHeldData);
+    void seek_input_directly(AK::Duration timestamp);
     void start_input();
     void notify_space_available();
     void release_slot(VideoFramePoolID, u32 slot_index);
-    Optional<SlotStorage> lent_slot_storage(VideoFramePoolID, u32 slot_index);
-    void set_pool_retired_observer(Function<void(VideoFramePoolID)>);
 
     void pump_thread_loop();
     void request_exit();
+    void stop_and_reclaim_unconsumed_frames();
+    bool has_lent_slots() const;
     void release_all_lends();
 
 private:
@@ -49,8 +47,23 @@ private:
         u64 outstanding_lend_count { 0 };
     };
 
+    struct LentSlot {
+        VideoFramePoolID pool_id;
+        u32 slot_index { 0 };
+
+        bool operator==(LentSlot const&) const = default;
+    };
+    struct LentSlotTraits : public DefaultTraits<LentSlot> {
+        static unsigned hash(LentSlot const& slot) { return pair_int_hash(u64_hash(slot.pool_id.value()), slot.slot_index); }
+    };
+    struct LentFrameRange {
+        AK::Duration timestamp;
+        AK::Duration conservative_end;
+    };
+
     void enqueue_frame(VideoFrame const&, u32 seek_id);
-    void lend_slot(PooledVideoFrameSlot const&);
+    void lend_slot(VideoFrame const&);
+    bool consumer_may_satisfy_seek_locally(AK::Duration timestamp) const;
     void wait_on_pump_thread(MutexLocker<Mutex>&);
 
     VideoEdgeQueue m_edge;
@@ -60,13 +73,17 @@ private:
     ConditionVariable m_wait_condition { m_mutex };
     RefPtr<VideoProducer> m_input;
     bool m_exit_requested { false };
+    bool m_pump_thread_exited { false };
     bool m_wake_pending { false };
     u32 m_actual_seek_id { 0 };
+    // A seek the input was given directly, whose request from the consumer has yet to arrive.
+    Optional<AK::Duration> m_direct_seek_timestamp;
+    // The frame the pump has taken from the input and has yet to lend.
+    Optional<LentFrameRange> m_peeked_frame_range;
 
-    Mutex m_lent_pools_mutex;
+    mutable Mutex m_lent_pools_mutex;
     HashMap<VideoFramePoolID, LentPool> m_lent_pools;
-    Function<void(VideoFramePoolID)> m_pool_retired_observer;
-    PresentedFramePage m_presented_frame_page;
+    HashMap<LentSlot, LentFrameRange, LentSlotTraits> m_lent_frame_ranges;
 };
 
 ErrorOr<NonnullRefPtr<RemoteVideoSink>> RemoteVideoSink::create(Delegates delegates)
@@ -77,8 +94,7 @@ ErrorOr<NonnullRefPtr<RemoteVideoSink>> RemoteVideoSink::create(Delegates delega
     VERIFY(delegates.announce_slot);
     VERIFY(delegates.retire_pool);
     auto edge = TRY(VideoEdgeQueue::create());
-    auto presented_frame_page = TRY(PresentedFramePage::create());
-    auto thread_data = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) ThreadData(move(edge), move(delegates), move(presented_frame_page))));
+    auto thread_data = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) ThreadData(move(edge), move(delegates))));
     auto sink = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) RemoteVideoSink(thread_data)));
     auto thread = Threading::Thread::construct("Video Pump"sv, [thread_data]() -> intptr_t {
         thread_data->pump_thread_loop();
@@ -100,14 +116,18 @@ RemoteVideoSink::~RemoteVideoSink()
 }
 
 VideoEdgeQueue const& RemoteVideoSink::edge() const { return m_thread_data->edge(); }
-PresentedFramePage const& RemoteVideoSink::presented_frame_page() const { return m_thread_data->presented_frame_page(); }
-RefPtr<VideoFrame> RemoteVideoSink::current_frame() const { return m_thread_data->current_frame(); }
 
 ErrorOr<void> RemoteVideoSink::connect_input(NonnullRefPtr<VideoProducer> const& producer) { return m_thread_data->connect_input(producer); }
 void RemoteVideoSink::disconnect_input(NonnullRefPtr<VideoProducer> const& producer) { m_thread_data->disconnect_input(producer); }
 
-void RemoteVideoSink::seek(AK::Duration) { m_thread_data->transmit_seek(); }
-void RemoteVideoSink::seek_upstream(AK::Duration timestamp) { m_thread_data->seek_upstream(timestamp); }
+void RemoteVideoSink::seek(AK::Duration timestamp, InvalidateHeldData invalidate_held_data)
+{
+    if (invalidate_held_data == InvalidateHeldData::No)
+        m_thread_data->seek_input_directly(timestamp);
+    m_thread_data->transmit_seek(invalidate_held_data);
+}
+void RemoteVideoSink::notify_clock_resumed() { m_thread_data->ring_data_available(); }
+void RemoteVideoSink::seek_upstream(AK::Duration timestamp, InvalidateHeldData invalidate_held_data) { m_thread_data->seek_upstream(timestamp, invalidate_held_data); }
 
 void RemoteVideoSink::set_time_reader(MediaTimeReader time_reader)
 {
@@ -139,14 +159,18 @@ void RemoteVideoSink::report_remote_resize(Gfx::Size<u32> size)
 void RemoteVideoSink::start_input() { m_thread_data->start_input(); }
 void RemoteVideoSink::notify_space_available() { m_thread_data->notify_space_available(); }
 void RemoteVideoSink::release_slot(VideoFramePoolID pool_id, u32 slot_index) { m_thread_data->release_slot(pool_id, slot_index); }
-Optional<RemoteVideoSink::SlotStorage> RemoteVideoSink::lent_slot_storage(VideoFramePoolID pool_id, u32 slot_index) { return m_thread_data->lent_slot_storage(pool_id, slot_index); }
-void RemoteVideoSink::set_pool_retired_observer(Function<void(VideoFramePoolID)> observer) { m_thread_data->set_pool_retired_observer(move(observer)); }
+void RemoteVideoSink::stop_and_reclaim_unconsumed_frames() { m_thread_data->stop_and_reclaim_unconsumed_frames(); }
+bool RemoteVideoSink::has_lent_slots() const { return m_thread_data->has_lent_slots(); }
 
-RemoteVideoSink::ThreadData::ThreadData(VideoEdgeQueue edge, Delegates delegates, PresentedFramePage presented_frame_page)
+RemoteVideoSink::ThreadData::ThreadData(VideoEdgeQueue edge, Delegates delegates)
     : m_edge(move(edge))
     , m_delegates(move(delegates))
-    , m_presented_frame_page(move(presented_frame_page))
 {
+}
+
+RemoteVideoSink::ThreadData::~ThreadData()
+{
+    release_all_lends();
 }
 
 ErrorOr<void> RemoteVideoSink::ThreadData::connect_input(NonnullRefPtr<VideoProducer> const& producer)
@@ -170,11 +194,17 @@ void RemoteVideoSink::ThreadData::disconnect_input(NonnullRefPtr<VideoProducer> 
     MutexLocker locker { m_mutex };
     VERIFY(m_input == producer.ptr());
     m_input = nullptr;
+    m_direct_seek_timestamp = {};
 }
 
-void RemoteVideoSink::ThreadData::transmit_seek() const
+void RemoteVideoSink::ThreadData::ring_data_available() const
 {
-    m_delegates.transmit_seek();
+    m_delegates.ring_data_available();
+}
+
+void RemoteVideoSink::ThreadData::transmit_seek(InvalidateHeldData invalidate_held_data) const
+{
+    m_delegates.transmit_seek(invalidate_held_data);
 }
 
 void RemoteVideoSink::ThreadData::transmit_time_reader(MediaTimeReader const& time_reader) const
@@ -182,14 +212,58 @@ void RemoteVideoSink::ThreadData::transmit_time_reader(MediaTimeReader const& ti
     m_delegates.transmit_time_reader(time_reader);
 }
 
-void RemoteVideoSink::ThreadData::seek_upstream(AK::Duration timestamp)
+void RemoteVideoSink::ThreadData::seek_upstream(AK::Duration timestamp, InvalidateHeldData invalidate_held_data)
 {
     MutexLocker locker { m_mutex };
-    if (m_input)
-        m_input->seek(timestamp);
+    auto direct_seek_timestamp = m_direct_seek_timestamp;
+    m_direct_seek_timestamp = {};
+    auto seek_was_given_directly = direct_seek_timestamp == timestamp && invalidate_held_data == InvalidateHeldData::No;
+    if (m_input && !seek_was_given_directly)
+        m_input->seek(timestamp, invalidate_held_data);
     m_actual_seek_id++;
     m_wake_pending = true;
     m_wait_condition.broadcast();
+}
+
+bool RemoteVideoSink::ThreadData::consumer_may_satisfy_seek_locally(AK::Duration timestamp) const
+{
+    // Everything the consumer could resolve the seek from is lent across the edge: the frames it shows and the ring,
+    // and the frame on its way into the ring.
+    Optional<AK::Duration> earliest_timestamp;
+    Optional<AK::Duration> latest_end;
+    auto include_range = [&](LentFrameRange const& range) {
+        if (!earliest_timestamp.has_value() || range.timestamp < *earliest_timestamp)
+            earliest_timestamp = range.timestamp;
+        if (!latest_end.has_value() || range.conservative_end > *latest_end)
+            latest_end = range.conservative_end;
+    };
+    {
+        MutexLocker locker { m_lent_pools_mutex };
+        for (auto const& [slot, range] : m_lent_frame_ranges)
+            include_range(range);
+    }
+    if (m_peeked_frame_range.has_value())
+        include_range(*m_peeked_frame_range);
+    if (!earliest_timestamp.has_value() || timestamp < *earliest_timestamp)
+        return false;
+    if (timestamp < *latest_end)
+        return true;
+    auto status = m_edge.status();
+    return status.has_value() && status->seek_id == m_actual_seek_id && status->status == PipelineStatus::EndOfStream;
+}
+
+void RemoteVideoSink::ThreadData::seek_input_directly(AK::Duration timestamp)
+{
+    MutexLocker locker { m_mutex };
+    if (m_input == nullptr || m_direct_seek_timestamp.has_value() || consumer_may_satisfy_seek_locally(timestamp))
+        return;
+    // A request already on its way will seek the input to its own target, undoing this one.
+    if (m_edge.requested_seek_id() != m_actual_seek_id)
+        return;
+    // Pumping stops until the consumer's request for this seek arrives, so that no frame of the new position is
+    // stamped with the seek before it.
+    m_direct_seek_timestamp = timestamp;
+    m_input->seek(timestamp, InvalidateHeldData::No);
 }
 
 void RemoteVideoSink::ThreadData::start_input()
@@ -224,6 +298,27 @@ void RemoteVideoSink::ThreadData::request_exit()
         input->set_wake_handler(nullptr);
 }
 
+void RemoteVideoSink::ThreadData::stop_and_reclaim_unconsumed_frames()
+{
+    request_exit();
+    {
+        MutexLocker locker { m_mutex };
+        while (!m_pump_thread_exited)
+            m_wait_condition.wait();
+    }
+
+    for (auto item = m_edge.peek(); item.has_value(); item = m_edge.peek()) {
+        release_slot(item->handle.pool_id, item->handle.slot_index);
+        m_edge.consume();
+    }
+}
+
+bool RemoteVideoSink::ThreadData::has_lent_slots() const
+{
+    MutexLocker locker { m_lent_pools_mutex };
+    return !m_lent_pools.is_empty();
+}
+
 void RemoteVideoSink::ThreadData::wait_on_pump_thread(MutexLocker<Mutex>&)
 {
     while (!m_wake_pending && !m_exit_requested)
@@ -249,6 +344,7 @@ void RemoteVideoSink::ThreadData::pump_thread_loop()
         if (enqueued_frame_seek_id.has_value()) {
             {
                 MutexLocker locker { m_mutex };
+                m_peeked_frame_range = {};
                 if (m_exit_requested)
                     break;
                 // Paired with the fence in RemoteVideoProducer::seek(): either that seek's look at the ring saw this
@@ -260,7 +356,7 @@ void RemoteVideoSink::ThreadData::pump_thread_loop()
                     enqueued_frame_seek_id = {};
                     continue;
                 }
-                if (m_edge.requested_seek_id() != m_actual_seek_id) {
+                if (m_edge.requested_seek_id() != m_actual_seek_id || m_direct_seek_timestamp.has_value()) {
                     wait_on_pump_thread(locker);
                     continue;
                 }
@@ -279,13 +375,15 @@ void RemoteVideoSink::ThreadData::pump_thread_loop()
             MutexLocker locker { m_mutex };
             if (m_exit_requested)
                 break;
-            auto seek_request_is_pending = m_edge.requested_seek_id() != m_actual_seek_id;
+            auto seek_request_is_pending = m_edge.requested_seek_id() != m_actual_seek_id || m_direct_seek_timestamp.has_value();
             if (m_input == nullptr || !m_edge.can_enqueue() || seek_request_is_pending) {
                 wait_on_pump_thread(locker);
                 continue;
             }
             seek_id = m_actual_seek_id;
             output = m_input->peek();
+            if (output.status == PipelineStatus::HaveData)
+                m_peeked_frame_range = LentFrameRange { output.frame->timestamp(), output.frame->conservative_end() };
         }
 
         if (output.status == PipelineStatus::HaveData) {
@@ -301,32 +399,35 @@ void RemoteVideoSink::ThreadData::pump_thread_loop()
         wait_on_pump_thread(locker);
     }
 
-    release_all_lends();
+    MutexLocker locker { m_mutex };
+    m_pump_thread_exited = true;
+    m_wait_condition.broadcast();
 }
 
 void RemoteVideoSink::ThreadData::enqueue_frame(VideoFrame const& frame, u32 seek_id)
 {
-    auto const* pool_slot = frame.pool_slot();
-    VERIFY(pool_slot != nullptr);
-    lend_slot(*pool_slot);
+    lend_slot(frame);
     MUST(m_edge.enqueue(VideoFrameHandle::for_frame(frame), seek_id));
 }
 
-void RemoteVideoSink::ThreadData::lend_slot(PooledVideoFrameSlot const& pool_slot)
+void RemoteVideoSink::ThreadData::lend_slot(VideoFrame const& frame)
 {
-    auto& ledger = pool_slot.ledger();
-    auto slot_index = pool_slot.slot_index();
+    auto const* pool_slot = frame.pool_slot();
+    VERIFY(pool_slot != nullptr);
+    auto& ledger = pool_slot->ledger();
+    auto slot_index = pool_slot->slot_index();
     ledger.add_hold(slot_index);
     MutexLocker locker { m_lent_pools_mutex };
+    m_lent_frame_ranges.set({ ledger.id(), slot_index }, { frame.timestamp(), frame.conservative_end() });
     auto& lent_pool = m_lent_pools.ensure(ledger.id(), [&] {
         return LentPool { .ledger = ledger, .lend_counts_by_slot_index = {}, .announced_allocated_buffer_ids_by_slot_index = {}, .outstanding_lend_count = 0 };
     });
 
     // Each new buffer backing the slot is announced exactly once, before the first handle that refers to it.
     auto announced_buffer_id = lent_pool.announced_allocated_buffer_ids_by_slot_index.get(slot_index);
-    if (!announced_buffer_id.has_value() || *announced_buffer_id != pool_slot.allocated_buffer_id()) {
+    if (!announced_buffer_id.has_value() || *announced_buffer_id != pool_slot->allocated_buffer_id()) {
         m_delegates.announce_slot(ledger.id(), slot_index, ledger.slot_buffer(slot_index), ledger.slot_surface(slot_index));
-        lent_pool.announced_allocated_buffer_ids_by_slot_index.set(slot_index, pool_slot.allocated_buffer_id());
+        lent_pool.announced_allocated_buffer_ids_by_slot_index.set(slot_index, pool_slot->allocated_buffer_id());
     }
 
     lent_pool.lend_counts_by_slot_index.ensure(slot_index, [] { return 0u; })++;
@@ -345,35 +446,16 @@ void RemoteVideoSink::ThreadData::release_slot(VideoFramePoolID pool_id, u32 slo
         if (!count.has_value() || *count == 0)
             return;
         ledger = lent_pool->ledger;
-        if (--*count == 0)
+        if (--*count == 0) {
             lent_pool->lend_counts_by_slot_index.remove(slot_index);
+            m_lent_frame_ranges.remove({ pool_id, slot_index });
+        }
         if (--lent_pool->outstanding_lend_count == 0) {
             m_lent_pools.remove(pool_id);
             m_delegates.retire_pool(pool_id);
-            if (m_pool_retired_observer)
-                m_pool_retired_observer(pool_id);
         }
     }
     ledger->release_hold(slot_index);
-}
-
-Optional<RemoteVideoSink::SlotStorage> RemoteVideoSink::ThreadData::lent_slot_storage(VideoFramePoolID pool_id, u32 slot_index)
-{
-    MutexLocker locker { m_lent_pools_mutex };
-    auto lent_pool = m_lent_pools.get(pool_id);
-    if (!lent_pool.has_value())
-        return {};
-    auto count = lent_pool->lend_counts_by_slot_index.get(slot_index);
-    if (!count.has_value() || *count == 0)
-        return {};
-    auto const& ledger = lent_pool->ledger;
-    return SlotStorage { ledger->slot_buffer(slot_index), ledger->slot_surface(slot_index) };
-}
-
-void RemoteVideoSink::ThreadData::set_pool_retired_observer(Function<void(VideoFramePoolID)> observer)
-{
-    MutexLocker locker { m_lent_pools_mutex };
-    m_pool_retired_observer = move(observer);
 }
 
 void RemoteVideoSink::ThreadData::release_all_lends()
@@ -382,6 +464,7 @@ void RemoteVideoSink::ThreadData::release_all_lends()
     {
         MutexLocker locker { m_lent_pools_mutex };
         lent_pools = move(m_lent_pools);
+        m_lent_frame_ranges.clear();
     }
     for (auto& entry : lent_pools) {
         for (auto& [slot_index, lend_count] : entry.value.lend_counts_by_slot_index) {
@@ -389,43 +472,6 @@ void RemoteVideoSink::ThreadData::release_all_lends()
                 entry.value.ledger->release_hold(slot_index);
         }
     }
-}
-
-RefPtr<VideoFrame> RemoteVideoSink::ThreadData::current_frame()
-{
-    auto handle = m_presented_frame_page.read();
-    while (handle.has_value()) {
-        {
-            MutexLocker locker { m_lent_pools_mutex };
-            auto lent_pool = m_lent_pools.get(handle->pool_id);
-            if (lent_pool.has_value() && lent_pool->lend_counts_by_slot_index.contains(handle->slot_index)) {
-                auto ledger = lent_pool->ledger;
-
-                // Hold the slot across the synchronous read so it cannot be recycled mid-use; the resolved frame's
-                // release callback drops the hold.
-                ledger->add_hold(handle->slot_index);
-                auto frame_or_error = resolve_frame_from_slot(ledger->slot_buffer(handle->slot_index), ledger->slot_surface(handle->slot_index), *handle, [ledger, slot_index = handle->slot_index] {
-                    ledger->release_hold(slot_index);
-                });
-                if (frame_or_error.is_error()) {
-                    ledger->release_hold(handle->slot_index);
-                    return nullptr;
-                }
-                return frame_or_error.release_value();
-            }
-        }
-
-        // The handle's lend was already released, so a newer presented frame may have superseded it.
-        auto updated_handle = m_presented_frame_page.read();
-        auto handle_is_unchanged = updated_handle.has_value()
-            && updated_handle->pool_id == handle->pool_id
-            && updated_handle->slot_index == handle->slot_index
-            && updated_handle->slot_acquisition_id == handle->slot_acquisition_id;
-        if (handle_is_unchanged)
-            return nullptr;
-        handle = updated_handle;
-    }
-    return nullptr;
 }
 
 }

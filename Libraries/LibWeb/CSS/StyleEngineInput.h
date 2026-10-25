@@ -15,6 +15,7 @@
 namespace Web::CSS::StyleEngineFFI {
 
 struct FfiAppliedAnimationDefinition;
+enum class FfiElementDeclarationKind : u8;
 
 }
 
@@ -38,17 +39,45 @@ WEB_API void flush_deferred_style_change_events_for_rule(CSSRule&);
 // the document's style node identity, which is the parent every top-level child names.
 WEB_API void record_document_tree_tracked(DOM::Document&);
 
-// Called once a subtree has been linked into a connected tree. Allocates a style node identity for
-// every element and shadow root in it that has none yet, and records the arrival of each element.
+// The hover moves to the element `node` is, or is inside of, or off the document for none.
+void move_style_hover(DOM::Document&, GC::Ptr<DOM::Node> node);
+
+// Called once a subtree has been linked into a connected tree. Marks it as waiting to arrive: the
+// elements, text nodes and shadow roots in it that have no style node identity yet take one, and
+// the elements record their arrival, only once something observes the style engine.
 WEB_API void record_subtree_connecting(DOM::Node& root);
 
-// Called once a node has been linked into a connected tree. Allocates the element's style node
-// identity if it does not have one yet.
+// Called once a node has been linked into a connected tree. Marks the element as waiting to arrive
+// if it has no style node identity yet and no subtree waiting to arrive covers it.
 WEB_API void record_element_connected(DOM::Element&);
 
-// Called once a text node has been linked into a connected tree that no subtree arrival covered.
-// Allocates the text node's style node identity if it does not have one yet.
+// Called once a text node has been linked into a connected tree. Marks it as waiting to arrive if it
+// has no style node identity yet and no subtree waiting to arrive covers it.
 WEB_API void record_text_connected(DOM::Text&);
+
+// Gives every node waiting to arrive its style node identity and records its arrival, in tree
+// order. Whatever reads the style engine, or a connected node's identity, calls this first.
+//
+// The children of an element in a display:none subtree have no boxes, and their styles serve only a
+// read of them or the subtree's reveal. Where nothing outside the subtree can observe them either,
+// the element may arrive alone and leave its children waiting, until the subtree is revealed, a
+// `:has()` argument could reach them, or the caller is one that names them.
+enum class HiddenChildArrivals {
+    TakeIn,
+    MayWait,
+};
+WEB_API void take_in_pending_style_arrivals(DOM::Document&, HiddenChildArrivals = HiddenChildArrivals::TakeIn);
+
+// Called once an element whose children, or some descendant's, wait to arrive in a display:none
+// subtree takes a style that is not display:none, or an animation, either of which may reveal them.
+WEB_API void record_waiting_children_may_be_revealed(DOM::Element&);
+
+// Called once an element is associated with an animation, which can hold a display:none element visible and keeps the
+// style of an element even while it is hidden.
+WEB_API void record_element_associated_with_animation(DOM::Element&);
+
+// Called once the classes of a connected element without a style node identity change.
+WEB_API void record_waiting_element_classes_changed(DOM::Element&);
 
 // Called whenever a text node's data is replaced. The mirror carries the characters, which the layout tree build
 // renders, and whether they are nothing but ASCII whitespace.
@@ -105,72 +134,10 @@ WEB_API void record_element_custom_states_changed(DOM::Element&);
 WEB_API void record_element_language_and_directionality(DOM::Element&);
 WEB_API void record_element_directionality(DOM::Element&);
 
-// The element facts the style computation's box-type transformation and element style adjustments
-// read of the DOM. Mirrors Rust `element_adjustment_fact`.
-enum ElementStyleAdjustmentFact : u32 {
-    IsBr = 1 << 0,
-    IsWbr = 1 << 1,
-    DisallowDisplayContents = 1 << 2,
-    RewriteInlineFlow = 1 << 3,
-    IsButton = 1 << 4,
-    ForceLineHeightNormal = 1 << 5,
-    CheckInputLineHeight = 1 << 6,
-    HideAudioWithoutControls = 1 << 7,
-    IsTable = 1 << 8,
-    ForcePositionStatic = 1 << 9,
-    ForceSymbolDisplayInline = 1 << 10,
-    IsMathML = 1 << 11,
-    IsMathMLMtable = 1 << 12,
-    IsMathMLMtr = 1 << 13,
-    IsMathMLMtd = 1 << 14,
-    IsTh = 1 << 15,
-    IsDocumentElement = 1 << 16,
-    HasAnimations = 1 << 17,
-    // An SVG graphics element folds its own transform into its SVG container's layout, which the
-    // style engine's damage for the element's record moves reads.
-    IsSvgGraphicsElement = 1 << 18,
-    // The element stands for an element-reference pseudo-element of its shadow host, whose style
-    // it takes.
-    IsShadowHostPseudoElement = 1 << 19,
-    // An HTML <body>. The first one among an HTML <html> root's children propagates its style to the
-    // viewport, which layout and the style engine's damage for the element's record moves read.
-    IsHtmlBodyElement = 1 << 20,
-    // The element types layout tree construction branches on. An element's type is fixed when it is
-    // created, so the store holds these rather than the tree builder asking the DOM for them.
-    IsSvgElement = 1 << 21,
-    IsSvgSwitchElement = 1 << 22,
-    IsSvgContainer = 1 << 23,
-    RequiresSvgContainer = 1 << 24,
-    IsSvgForeignObjectElement = 1 << 25,
-    IsSvgMaskElement = 1 << 26,
-    IsSvgClipPathElement = 1 << 27,
-    IsSvgPatternElement = 1 << 28,
-    // Whether the element is rendered in the top layer. Unlike the type facts above it moves during
-    // the element's lifetime, and every move is recorded where the element's flag is set.
-    RenderedInTopLayer = 1 << 29,
-    // An HTML <html>, whose first <body> child propagates its overflow to the viewport when it is
-    // the root.
-    IsHtmlHtmlElement = 1 << 30,
-    // An HTML <frameset>, which is the document's body in place of a <body>.
-    IsHtmlFramesetElement = 1u << 31,
-};
-// What a layout row records about the element it is built for at the moment it is allocated, published so that the
-// tree build can read it out of the mirror rather than off the DOM node. Mirrors Rust `element_construction_fact`.
-enum ElementConstructionFact : u32 {
-    IsHtmlInputElement = 1 << 0,
-    // This and ConstructedAsDocumentElement are also ElementStyleAdjustmentFacts. A row is built out of this word
-    // alone, so they are published into both rather than read across two.
-    ConstructedAsHtmlHtmlElement = 1 << 1,
-    IsInUserAgentShadowTree = 1 << 2,
-    UsesButtonLayout = 1 << 3,
-    IsEditingHost = 1 << 4,
-    IsBody = 1 << 5,
-    ConstructedAsDocumentElement = 1 << 6,
-};
-WEB_API u32 element_construction_facts(DOM::Element const&);
-WEB_API u32 element_style_adjustment_facts(DOM::Element const&);
 WEB_API u32 element_box_type_adjustment_facts(DOM::Element const&);
 WEB_API void record_element_adjustment_facts(DOM::Element&);
+// The element's animations changed: an element with animations has its style composed by the host.
+void record_element_animations_changed(DOM::Element&);
 WEB_API void record_element_construction_facts(DOM::Element&);
 // Called where which box an element asks for may have moved without its type or an attribute's presence moving.
 WEB_API void record_element_box_kind(DOM::Element&);
@@ -182,7 +149,6 @@ WEB_API void republish_presentational_hints(DOM::Element&);
 WEB_API void record_element_animation_names(DOM::Element&, ReadonlySpan<Utf16FlyString>);
 WEB_API void record_element_css_defined_animations(DOM::Element&, u8 slot, ReadonlySpan<Utf16FlyString> names, ReadonlySpan<StyleEngineFFI::FfiAppliedAnimationDefinition> definitions);
 WEB_API void record_element_animation_effect_descriptions(DOM::Element&, u8 slot, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>);
-WEB_API void record_element_custom_property_names(DOM::Element&, ReadonlySpan<Utf16FlyString>, bool uses_unnamed, bool uses_custom_functions);
 
 // The same index, from the environments the element and its pseudo-elements resolved to, plus
 // names read outside substitution (for example by style queries). The names each environment
@@ -242,11 +208,7 @@ WEB_API void record_element_attribute_changed(DOM::Element&, Utf16FlyString cons
 // Called when a declaration block the element itself sources has changed: its inline style, its
 // presentational hints, or its SVG presentation attributes. What that changes is which declaration
 // wins on this element, never which elements match, so it reaches the element and nothing else.
-enum class ElementDeclarationKind : u8 {
-    InlineStyle,
-    PresentationalHint,
-    SvgPresentationAttribute,
-};
+using ElementDeclarationKind = StyleEngineFFI::FfiElementDeclarationKind;
 WEB_API void record_element_declarations_changed(DOM::Element&, ElementDeclarationKind, bool had_declarations, bool has_declarations);
 
 }

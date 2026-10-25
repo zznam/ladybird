@@ -239,7 +239,6 @@ public:
         i64 seconds = sane_mod(milliseconds, 1'000);
         return Duration(seconds, milliseconds * 1'000'000);
     }
-    [[nodiscard]] static Duration from_ticks(clock_t, time_t);
     [[nodiscard]] static Duration from_timespec(const struct timespec&);
     [[nodiscard]] static Duration from_timeval(const struct timeval&);
     [[nodiscard]] static Duration from_time_units(i64 units, u32 numerator, u32 denominator);
@@ -250,15 +249,17 @@ public:
     [[nodiscard]] constexpr static Duration max() { return Duration(__INT64_MAX__, 999'999'999); }
 
     // Truncates towards zero (2.8s to 2s, -2.8s to -2s).
-    [[nodiscard]] i64 to_truncated_seconds() const;
-    [[nodiscard]] i64 to_truncated_milliseconds() const;
-    [[nodiscard]] i64 to_truncated_microseconds() const;
-    // Rounds away from zero (2.3s to 3s, -2.3s to -3s).
     [[nodiscard]] i64 to_seconds() const;
-    [[nodiscard]] f64 to_seconds_f64() const;
     [[nodiscard]] i64 to_milliseconds() const;
     [[nodiscard]] i64 to_microseconds() const;
     [[nodiscard]] i64 to_nanoseconds() const;
+    // Rounds towards -inf (2.8s to 2s, -2.3s to -3s).
+    [[nodiscard]] i64 to_floored_seconds() const;
+    [[nodiscard]] i64 to_floored_milliseconds() const;
+    // Rounds towards +inf (2.3s to 3s, -2.8s to -2s).
+    [[nodiscard]] i64 to_ceiled_milliseconds() const;
+
+    [[nodiscard]] f64 to_seconds_f64() const;
     [[nodiscard]] timespec to_timespec() const;
     // Rounds towards -inf (it was the easiest to implement).
     [[nodiscard]] timeval to_timeval() const;
@@ -467,12 +468,11 @@ public:
     [[nodiscard]] constexpr static UnixDateTime latest() { return UnixDateTime { Duration::max() }; }
 
     [[nodiscard]] constexpr Duration offset_to_epoch() const { return m_offset; }
-    // May return an epoch offset *after* what this UnixDateTime contains, because rounding to seconds occurs.
-    [[nodiscard]] i64 seconds_since_epoch() const { return m_offset.to_seconds(); }
-    [[nodiscard]] i64 milliseconds_since_epoch() const { return m_offset.to_milliseconds(); }
+    // Never returns a point after this UnixDateTime, since fractions are rounded towards -inf.
+    [[nodiscard]] i64 seconds_since_epoch() const { return m_offset.to_floored_seconds(); }
+    [[nodiscard]] i64 milliseconds_since_epoch() const { return m_offset.to_floored_milliseconds(); }
     [[nodiscard]] i64 nanoseconds_since_epoch() const { return m_offset.to_nanoseconds(); }
-    // Never returns a point after this UnixDateTime, since fractional seconds are cut off.
-    [[nodiscard]] i64 truncated_seconds_since_epoch() const { return m_offset.to_truncated_seconds(); }
+    [[nodiscard]] f64 to_seconds_f64() const { return m_offset.to_seconds_f64(); }
 
     enum class LocalTime {
         Yes,
@@ -552,9 +552,10 @@ private:
 // Monotonic time represents time returned from the CLOCK_MONOTONIC clock, which has an arbitrary fixed reference point.
 class MonotonicTime : private Detail::UnawareTime {
 public:
-    // Monotonic time does not have a defined reference point.
-    // A MonotonicTime at the reference point is therefore meaningless.
-    MonotonicTime() = delete;
+    constexpr MonotonicTime()
+        : Detail::UnawareTime(Duration::zero())
+    {
+    }
     constexpr MonotonicTime(MonotonicTime const&) = default;
     constexpr MonotonicTime(MonotonicTime&&) = default;
     constexpr MonotonicTime& operator=(MonotonicTime const&) = default;
@@ -563,12 +564,12 @@ public:
     [[nodiscard]] static MonotonicTime now();
     [[nodiscard]] static MonotonicTime now_coarse();
 
-    [[nodiscard]] i64 seconds() const { return m_offset.to_seconds(); }
-    [[nodiscard]] i64 milliseconds() const { return m_offset.to_milliseconds(); }
+    // Never returns a point in the future, since fractions are rounded towards -inf.
+    [[nodiscard]] i64 seconds() const { return m_offset.to_floored_seconds(); }
+    [[nodiscard]] i64 milliseconds() const { return m_offset.to_floored_milliseconds(); }
     [[nodiscard]] i64 nanoseconds() const { return m_offset.to_nanoseconds(); }
-    // Never returns a point in the future, since fractional seconds are cut off.
-    [[nodiscard]] i64 truncated_seconds() const { return m_offset.to_truncated_seconds(); }
     [[nodiscard]] i64 nanoseconds_within_second() const { return to_timespec().tv_nsec; }
+    [[nodiscard]] f64 to_seconds_f64() const { return m_offset.to_seconds_f64(); }
 
     constexpr bool operator==(MonotonicTime const& other) const { return this->m_offset == other.m_offset; }
     constexpr int operator<=>(MonotonicTime const& other) const { return this->m_offset <=> other.m_offset; }

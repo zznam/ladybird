@@ -14,6 +14,7 @@
 
 use crate::cow_column::ColumnSnapshot;
 use crate::css::css_pixels::CssPixelPoint;
+use crate::css::style::StyleRecordLease;
 use crate::layout::LayoutNodeArena;
 use crate::layout::PublishedTextSlot;
 use crate::layout::SLOTS_PER_CHUNK;
@@ -26,7 +27,9 @@ use crate::painting::paintable_data::{CommittedSideData, PaintableData};
 use crate::painting::paintable_rows::{CommittedFragmentLinkSlot, PAINTABLE_SLOTS_PER_CHUNK};
 use crate::painting::record::damage::FrameDamage;
 use crate::painting::replaced_paint_facts::ReplacedPaintFactsTable;
-use crate::painting::selection::SelectionRange;
+use crate::painting::selection::{
+    HighlightPseudoElement, SearchTextHighlights, SelectionRange, SpellingErrorHighlights,
+};
 use crate::painting::stacking_context::entries::StackingContextEntries;
 use crate::painting::svg_paint_resources::SvgPaintResourceRows;
 use crate::painting::visual_context::VisualContextTree;
@@ -106,11 +109,10 @@ impl PublishedRows {
         id: NodeSlotId,
         read: impl FnOnce(Option<&FragmentLink>) -> R,
     ) -> R {
-        debug_assert!(self.paintable_row_is_populated(id));
         read(
             self.fragment_links
                 .get(id.slot_index() as usize)
-                .and_then(CommittedFragmentLinkSlot::link),
+                .and_then(|slot| slot.link_for(id.generation())),
         )
     }
 
@@ -147,12 +149,26 @@ pub(crate) struct PublishedPaintState {
     pub(crate) has_non_viewport_wheel_scroll_target_candidate: bool,
     pub(crate) selection: Option<Arc<SelectionRange>>,
     pub(crate) selection_pseudo_styles: Arc<SelectionPseudoStyles>,
+    pub(crate) search_text: Arc<SearchTextHighlights>,
+    pub(crate) search_text_pseudo_styles: Arc<SelectionPseudoStyles>,
+    pub(crate) search_text_current_pseudo_styles: Arc<SelectionPseudoStyles>,
+    pub(crate) spelling_errors: Arc<SpellingErrorHighlights>,
+    pub(crate) spelling_error_pseudo_styles: Arc<SelectionPseudoStyles>,
     pub(crate) hit_test_list_generation: u64,
     /// How many items the document's hit-test list held, which the recording's list reserves.
     pub(crate) hit_test_item_capacity_hint: usize,
 }
 
 impl PublishedPaintState {
+    pub(crate) fn highlight_pseudo_styles(&self, highlight: HighlightPseudoElement) -> &SelectionPseudoStyles {
+        match highlight {
+            HighlightPseudoElement::Selection => &self.selection_pseudo_styles,
+            HighlightPseudoElement::SearchText => &self.search_text_pseudo_styles,
+            HighlightPseudoElement::SearchTextCurrent => &self.search_text_current_pseudo_styles,
+            HighlightPseudoElement::SpellingError => &self.spelling_error_pseudo_styles,
+        }
+    }
+
     fn new(paint_state: &PaintState, hit_test_item_capacity_hint: usize) -> Self {
         let visual_context = &paint_state.visual_context;
         Self {
@@ -163,6 +179,11 @@ impl PublishedPaintState {
                 .has_non_viewport_wheel_scroll_target_candidate,
             selection: paint_state.selection.clone(),
             selection_pseudo_styles: paint_state.selection_pseudo_styles.clone(),
+            search_text: paint_state.search_text.clone(),
+            search_text_pseudo_styles: paint_state.search_text_pseudo_styles.clone(),
+            search_text_current_pseudo_styles: paint_state.search_text_current_pseudo_styles.clone(),
+            spelling_errors: paint_state.spelling_errors.clone(),
+            spelling_error_pseudo_styles: paint_state.spelling_error_pseudo_styles.clone(),
             hit_test_list_generation: paint_state.hit_test_list_generation,
             hit_test_item_capacity_hint,
         }
@@ -182,19 +203,20 @@ impl PublishedPaintState {
 }
 
 /// What a document published for one recording to read: its rows, its paint damage and the paint
-/// state the recording reads. [`LayoutNodeArena::freeze_frame`] is its only constructor and it has
-/// no `Clone`: a recording takes a frame and drops it before it returns, and nothing keeps one past
-/// the next write to the arena.
+/// state the recording reads, with a lease on the style records its rows name. [`LayoutNodeArena::freeze_frame`] is
+/// its only constructor and it has no `Clone`: a recording takes a frame and drops it before it returns, and nothing
+/// keeps one past the next write to the arena.
 pub(crate) struct PublishedFrame {
     pub(super) rows: PublishedRows,
     damage: FrameDamage,
     paint_state: PublishedPaintState,
+    _style_records: StyleRecordLease,
 }
 
 // A frame is read on whichever thread paints it while the document writes its live columns: it
 // holds no cell and no borrow of the document, and owns everything it reads but its nodes' styles.
-// Those are `HostShared` pointers to style records, which stay valid only because no style record
-// is released while a recording runs.
+// Those are `HostShared` pointers to style records, which stay valid because the engine frees no
+// record's payloads while the frame holds its lease, even after the document has replaced them.
 const _: () = {
     const fn assert_published<T: Send + Sync + 'static>() {}
     assert_published::<PublishedFrame>();
@@ -209,6 +231,7 @@ impl LayoutNodeArena {
             rows,
             damage: self.paint_damage_for_frame(),
             paint_state: PublishedPaintState::new(&self.paint_state().borrow(), hit_test_item_capacity_hint),
+            _style_records: self.with_style_engine(|engine| engine.lease_style_records()),
         }
     }
 }
@@ -242,7 +265,7 @@ mod tests {
     use crate::layout::LayoutNodeArena;
     use crate::layout::fragment_tree;
     use crate::layout::node_data::{NodeFlag, NodeKind};
-    use crate::painting::paint_read::{GeometryRead, PaintRead, PaintSource};
+    use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow, PaintSource};
     use crate::painting::record::recorder_state::AbsoluteRectMemo;
     use std::cell::RefCell;
 
@@ -253,13 +276,13 @@ mod tests {
         arena.populate_paintable_row(node);
         let mut link = fragment_tree::FragmentLink::for_test(node);
         link.inset_left = CssPixels::from_integer(10);
-        arena.set_committed_fragment_link(arena.data(node), link.clone(), None);
+        arena.set_committed_fragment_link(node, link.clone(), None);
         arena.paintable_rows_mut().paintable_data_mut(node).offset.x = CssPixels::from_integer(10).into();
         arena.committed_side_data_mut(node).piece_indices = Some([0].into());
 
         let published = arena.publish_rows();
         link.inset_left = CssPixels::from_integer(20);
-        arena.set_committed_fragment_link(arena.data(node), link, None);
+        arena.set_committed_fragment_link(node, link, None);
         arena.paintable_rows_mut().paintable_data_mut(node).offset.x = CssPixels::from_integer(20).into();
         arena.committed_side_data_mut(node).piece_indices = None;
 
@@ -283,9 +306,23 @@ mod tests {
         assert!(arena.committed_side_data(node).piece_indices().is_empty());
     }
 
+    fn derived_facts<'a>(row: Option<impl PaintRow<'a>>) -> Option<[bool; 5]> {
+        row.map(|row| {
+            [
+                row.is_fragmented_inline(),
+                row.is_out_of_flow(),
+                row.is_atomic_inline(),
+                row.is_positioned(),
+                row.is_floating(),
+            ]
+        })
+    }
+
     #[test]
     fn published_rows_answer_every_row_read_as_the_arena_does() {
+        let mut engine = crate::css::style::StyleEngine::new();
         let mut arena = LayoutNodeArena::new();
+        arena.set_style_engine(crate::css::style::StyleEngineHandle::from_raw(&raw mut engine));
         let mut slots = Vec::new();
         for index in 0..PAINTABLE_SLOTS_PER_CHUNK + 3 {
             let node = arena.allocate_for_test().slot;
@@ -298,7 +335,7 @@ mod tests {
             if index % 2 == 0 {
                 let mut link = fragment_tree::FragmentLink::for_test(node);
                 link.inset_top = CssPixels::from_integer(index as i64);
-                arena.set_committed_fragment_link(arena.data(node), link, None);
+                arena.set_committed_fragment_link(node, link, None);
                 arena.committed_side_data_mut(node).overflow_valid_across_recommits = true;
             }
         }
@@ -330,17 +367,7 @@ mod tests {
             );
             assert_eq!(source.node_generated_for(node), arena.node_generated_for(node));
             assert_eq!(source.node_is_dom_backed(node), arena.node_is_dom_backed(node));
-            assert_eq!(
-                source.node_is_fragmented_inline(node),
-                arena.node_is_fragmented_inline(node)
-            );
-            assert_eq!(
-                source.node_is_out_of_flow_if_live(node),
-                arena.node_is_out_of_flow_if_live(node)
-            );
-            assert_eq!(source.node_is_atomic_inline(node), arena.node_is_atomic_inline(node));
-            assert_eq!(source.node_is_positioned(node), arena.node_is_positioned(node));
-            assert_eq!(source.node_is_floating(node), arena.node_is_floating(node));
+            assert_eq!(derived_facts(source.node(node)), derived_facts(arena.node(node)));
             assert_eq!(
                 source.node_style_if_live(node).is_some(),
                 arena.node_style_if_live(node).is_some()

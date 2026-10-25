@@ -52,6 +52,15 @@ extern "C" fn ladybird_gfx_system_fallback_font(
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_measure_text_width(
+    _font: *const c_void,
+    _text_utf16: *const u16,
+    _length_in_code_units: usize,
+) -> f32 {
+    unreachable!("no unit test reads a font");
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_process_note_wanted_pending_face(_face_id: u64) {
     unreachable!("no unit test reads a font");
 }
@@ -83,41 +92,45 @@ extern "C" fn ladybird_gfx_glyph_run_bounding_box(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_create_from_ops(_kinds: *const u8, _values: *const f32, _count: usize) -> *mut c_void {
-    unreachable!("no unit test builds a path");
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ladybird_gfx_glyph_run_glyph_intercepts(
+    _font: *const c_void,
+    _glyphs: *const DrawGlyph,
+    _glyph_count: usize,
+    _scale: f32,
+    _y_top: f32,
+    _y_bottom: f32,
+    _sink: *mut c_void,
+    _push: unsafe extern "C" fn(*mut c_void, f32),
+) {
+    unreachable!("no unit test shapes text");
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_create_from_glyph_runs(_runs: *const c_void, _run_count: usize) -> *mut c_void {
-    unreachable!("no unit test builds a path");
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_copy_transformed(_path: *const c_void, _affine_values: *const f32) -> *mut c_void {
-    unreachable!("no unit test builds a path");
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_length(_path: *const c_void) -> f32 {
-    unreachable!("no unit test builds a path");
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_place_glyph_runs_along(
-    _path: *const c_void,
-    _runs: *const c_void,
-    _run_count: usize,
-    _offset: f32,
-) -> *mut c_void {
-    unreachable!("no unit test builds a path");
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_gfx_path_set_fill_type(_path: *mut c_void, _winding_rule: i32) {
-    unreachable!("no unit test builds a path");
+extern "C" fn ladybird_gfx_font_glyph_outlines(
+    _font: *const c_void,
+    _glyphs: *const DrawGlyph,
+    _glyph_count: usize,
+    _visit: unsafe extern "C" fn(*mut c_void, usize, *const c_void),
+    _context: *mut c_void,
+) {
+    unreachable!("no unit test reads a font");
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_process_next_path_identity() -> u64 {
-    unreachable!("no unit test builds a path");
+    unreachable!("no unit test reads the identity of a path");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn web_render_clock_hand_pointer_move(
+    _context: u64,
+    _has_position: bool,
+    _x: f32,
+    _y: f32,
+    _buttons: u32,
+    _scrolled_since_frame: bool,
+    _input_event_id: u64,
+) {
+    unreachable!("no unit test hands a render clock a pointer move");
 }

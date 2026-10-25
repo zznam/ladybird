@@ -339,7 +339,7 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Scheduling remote autocomplete suggestions from {} for '{}'", engine->name, m_query);
 
     static constexpr auto remote_query_debounce_delay_ms = 100;
-    m_remote_query_timer = Core::Timer::create_single_shot(remote_query_debounce_delay_ms, [this, query_id, engine = engine.release_value(), query = m_query] {
+    m_remote_query_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(remote_query_debounce_delay_ms), [this, query_id, engine = engine.release_value(), query = m_query] {
         if (m_query_id != query_id)
             return;
         start_remote_query(query_id, engine, move(query));
@@ -360,7 +360,14 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, SearchEngine
         return;
     }
 
-    m_request = Application::request_server_client(m_is_private).start_request("GET"sv, *url);
+    auto client = Application::request_server_client(m_is_private);
+    if (client.is_error()) {
+        warnln("Unable to fetch autocomplete suggestions: {}", client.error());
+        m_remote_query_complete = true;
+        deliver_current_result();
+        return;
+    }
+    m_request = client.value()->start_request("GET"sv, *url);
 
     m_request->set_buffered_request_finished_callback(
         [this, query_id, engine, query = move(query)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState, Core::ImmutableBytes payload) {
@@ -531,7 +538,7 @@ static ErrorOr<Vector<String>> parse_yahoo_autocomplete(JsonValue const& json)
 
 ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(SearchSuggestions const& provider, Optional<ByteString const&> content_type, StringView response)
 {
-    auto decoder = [&]() -> Optional<TextCodec::Decoder&> {
+    auto decoder = [&]() -> Optional<TextCodec::Decoder> {
         if (!content_type.has_value())
             return {};
 
@@ -543,13 +550,13 @@ ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(SearchSugge
         if (!charset.has_value())
             return {};
 
-        return TextCodec::decoder_for_exact_name(*charset);
+        return TextCodec::decoder_for(*charset);
     }();
 
     if (!decoder.has_value())
-        decoder = TextCodec::decoder_for_exact_name("UTF-8"sv);
+        decoder = TextCodec::decoder_for("UTF-8"sv);
 
-    auto decoded_response = TRY(decoder->to_utf8(response, TextCodec::IgnoreBOM::No, TextCodec::ErrorMode::Replacement));
+    auto decoded_response = TRY(TextCodec::decode_to_utf8(response.bytes(), *decoder));
     auto json = TRY(JsonValue::from_string(decoded_response));
 
     switch (provider.response_format) {

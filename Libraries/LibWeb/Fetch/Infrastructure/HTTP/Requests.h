@@ -28,6 +28,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Forward.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
@@ -260,8 +261,16 @@ public:
     [[nodiscard]] bool user_activation() const { return m_user_activation; }
     void set_user_activation(bool user_activation) { m_user_activation = user_activation; }
 
+    [[nodiscard]] bool text_directive_user_activation() const { return m_text_directive_user_activation; }
+    void set_text_directive_user_activation(bool value) { m_text_directive_user_activation = value; }
+    [[nodiscard]] bool browsing_context_group_has_multiple_contexts() const { return m_browsing_context_group_has_multiple_contexts; }
+    void set_browsing_context_group_has_multiple_contexts(bool value) { m_browsing_context_group_has_multiple_contexts = value; }
+
     [[nodiscard]] bool user_agent_initiated() const { return m_user_agent_initiated; }
     void set_user_agent_initiated(bool user_agent_initiated) { m_user_agent_initiated = user_agent_initiated; }
+
+    [[nodiscard]] bool is_form_submission() const { return m_form_submission; }
+    void set_form_submission(bool form_submission) { m_form_submission = form_submission; }
 
     [[nodiscard]] bool render_blocking() const { return m_render_blocking; }
     void set_render_blocking(bool render_blocking) { m_render_blocking = render_blocking; }
@@ -303,8 +312,8 @@ public:
     [[nodiscard]] bool destination_is_script_like() const;
 
     [[nodiscard]] bool is_subresource_request() const;
-    [[nodiscard]] bool is_non_subresource_request() const;
     [[nodiscard]] bool is_navigation_request() const;
+    [[nodiscard]] GC::Ptr<HTML::BrowsingContext> target_browsing_context() const;
 
     [[nodiscard]] RedirectTaint redirect_taint() const;
 
@@ -492,9 +501,18 @@ private:
     // A request has an associated boolean user-activation. Unless stated otherwise, it is false.
     bool m_user_activation { false };
 
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
+    // The one-shot authorization to scroll to a text directive, propagated through navigation requests.
+    bool m_text_directive_user_activation { false };
+    bool m_browsing_context_group_has_multiple_contexts { false };
+
     // NB: Not a Fetch concept. Fetch Metadata's "set site" sends Sec-Fetch-Site:none for a navigation whose URL
     //     the user agent itself supplied, and populating a history entry sets this from the entry's document state.
     bool m_user_agent_initiated { false };
+
+    // NB: Not a Fetch concept. Upgrade Insecure Requests asks whether a navigation request is a form submission, and
+    //     creating navigation params by fetching sets this from the navigation's CSP navigation type.
+    bool m_form_submission { false };
 
     // https://fetch.spec.whatwg.org/#request-render-blocking
     // A request has an associated boolean render-blocking. Unless stated otherwise, it is false.

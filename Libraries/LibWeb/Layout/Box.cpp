@@ -24,43 +24,47 @@ Box::~Box()
 {
 }
 
-static ImageProvider const& image_provider_for_element(DOM::Element const& element)
+static ImageProvider const* image_provider_for_element(DOM::Element const& element)
 {
     if (auto const* image = as_if<HTML::HTMLImageElement>(element))
-        return *image;
+        return image;
     if (auto const* input = as_if<HTML::HTMLInputElement>(element))
-        return *input;
+        return input;
     if (auto const* object = as_if<HTML::HTMLObjectElement>(element))
-        return *object;
-
-    VERIFY_NOT_REACHED();
+        return object;
+    return nullptr;
 }
 
 ImageProvider* Box::owned_image_provider() const
 {
-    return static_cast<ImageProvider*>(RustFFI::layout_arena_owned_image_provider(arena_handle(), Node::slot_id(this)));
+    return static_cast<ImageProvider*>(RustFFI::document_host_owned_image_provider(document_host(), Node::slot_id(this)));
+}
+
+ImageProvider const* Box::image_provider_if_any() const
+{
+    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
+    if (auto const* owned = owned_image_provider())
+        return owned;
+    auto const* element = as_if<DOM::Element>(dom_node());
+    return element ? image_provider_for_element(*element) : nullptr;
 }
 
 ImageProvider const& Box::image_provider() const
 {
-    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
-    if (auto const* owned = owned_image_provider())
-        return *owned;
-
-    auto const* element = dom_node();
-    VERIFY(element);
-    return image_provider_for_element(as<DOM::Element>(*element));
+    auto const* image_provider = image_provider_if_any();
+    VERIFY(image_provider);
+    return *image_provider;
 }
 
 void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
 {
     VERIFY(kind() == RustFFI::NodeKind::ImageBox);
-    RustFFI::layout_arena_set_owned_image_provider(arena_handle(), Node::slot_id(this), image_provider.leak_ptr());
+    RustFFI::document_host_set_owned_image_provider(document_host(), Node::slot_id(this), image_provider.leak_ptr());
 }
 
 bool Box::is_partial_relayout_boundary() const
 {
-    return RustFFI::layout_arena_node_is_partial_relayout_boundary(arena_handle(), Node::slot_id(this));
+    return RustFFI::render_state_node_is_partial_relayout_boundary(document_host(), Node::slot_id(this));
 }
 
 }

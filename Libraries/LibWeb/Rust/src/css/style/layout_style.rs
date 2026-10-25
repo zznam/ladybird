@@ -40,6 +40,7 @@ pub(crate) struct AnonymousStyleOverrides {
     pub inline_block_wrapper: bool,
     pub overflow_x: u8,
     pub overflow_y: u8,
+    pub columns_from_parent: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -117,7 +118,7 @@ impl LayoutStyle {
             .expect("layout styles have every computed group");
         let mut style = Self {
             payloads,
-            longhand_table: view.longhand_table,
+            longhand_table: HostShared::from_option(view.longhand_table),
             changed: false,
         };
         for (index, payload) in style.payloads.iter().copied().enumerate() {
@@ -216,6 +217,13 @@ impl LayoutStyle {
         self.edit::<MiscResetValues>(|values| values.scrollbar_width = width);
     }
 
+    pub(crate) fn set_overscroll_behavior(&mut self, x: u8, y: u8) {
+        self.edit::<MiscResetValues>(|values| {
+            values.overscroll_behavior_x = x;
+            values.overscroll_behavior_y = y;
+        });
+    }
+
     // CSS table wrappers carry positioning and margins, and act as the table's grid item.
     // z-index and vertical-align also follow the wrapper for interoperable painting and
     // inline alignment; clip only applies on the wrapper that receives position.
@@ -238,7 +246,32 @@ impl LayoutStyle {
             target.z_index = box_values.z_index;
             target.vertical_align = box_values.vertical_align.clone();
         });
+        let misc_reset = source.group::<MiscResetValues>();
+        self.edit::<MiscResetValues>(|target| {
+            target.column_span = misc_reset.column_span;
+            target.break_before = misc_reset.break_before;
+            target.break_after = misc_reset.break_after;
+            target.break_inside = misc_reset.break_inside;
+        });
         self.copy_table_properties(source);
+    }
+
+    pub(crate) fn copy_column_properties(&mut self, source: &Self) {
+        let box_values = source.group::<BoxValues>();
+        self.edit::<BoxValues>(|target| {
+            target.column_count = box_values.column_count;
+            target.column_count_has_value = box_values.column_count_has_value;
+            target.column_width = box_values.column_width.clone();
+        });
+        let misc_reset = source.group::<MiscResetValues>();
+        self.edit::<MiscResetValues>(|target| {
+            target.column_fill = misc_reset.column_fill;
+            target.column_rule_style = misc_reset.column_rule_style;
+            target.column_rule_width = misc_reset.column_rule_width;
+            target.column_rule_color = misc_reset.column_rule_color;
+        });
+        let alignment = source.group::<AlignmentValues>();
+        self.edit::<AlignmentValues>(|target| target.column_gap = alignment.column_gap.clone());
     }
 
     fn copy_table_properties(&mut self, source: &Self) {
@@ -257,6 +290,8 @@ impl LayoutStyle {
         self.edit::<AlignmentValues>(|target| {
             target.align_self = alignment.align_self;
             target.justify_self = alignment.justify_self;
+            target.align_self_overflow = alignment.align_self_overflow;
+            target.justify_self_overflow = alignment.justify_self_overflow;
             target.order = alignment.order;
         });
         self.edit::<GridValues>(|target| {
@@ -385,6 +420,9 @@ impl LayoutStyle {
                 }
             });
         }
+        if overrides.columns_from_parent {
+            style.copy_column_properties(&Self::from_record(engine, parent));
+        }
         if kind == AnonymousStyleKind::ButtonContentBox {
             style.edit::<SizingValues>(|values| {
                 values.min_height = ComputedSize {
@@ -422,15 +460,9 @@ impl LayoutStyle {
 impl StyleEngine {
     pub(crate) fn pin_layout_style_record(&mut self, record: u64) {
         self.pin_style_record(record);
-        self.record_boundary_call(super::record_replay::EventKind::PinStyleRecord, |payload| {
-            payload.write_u64(record);
-        });
     }
 
     pub(crate) fn unpin_layout_style_record(&mut self, record: u64) {
         self.unpin_style_record(record);
-        self.record_boundary_call(super::record_replay::EventKind::UnpinStyleRecord, |payload| {
-            payload.write_u64(record);
-        });
     }
 }

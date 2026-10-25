@@ -9,13 +9,12 @@
 #include <LibGC/Heap.h>
 #include <LibGC/Root.h>
 #include <LibGC/WeakInlines.h>
-#include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Environment.h>
-#include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibWeb/Bindings/HostDefined.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/WebAssembly/BindingsGlue.h>
@@ -24,6 +23,7 @@
 #include <LibWeb/WebAssembly/Memory.h>
 #include <LibWeb/WebAssembly/Module.h>
 #include <LibWeb/WebAssembly/Table.h>
+#include <LibWeb/WebAssembly/Tag.h>
 #include <LibWeb/WebAssembly/WebAssembly.h>
 
 namespace Web::WebAssembly {
@@ -32,54 +32,49 @@ GC_DEFINE_ALLOCATOR(Instance);
 
 WebIDL::ExceptionOr<GC::Ref<Instance>> Instance::create(JS::Realm& realm, Module& module, GC::Ptr<JS::Object> import_object)
 {
-    auto module_instance = TRY(Detail::instantiate_module(realm, module.compiled_module()->module, import_object));
-    return Instance::create(Detail::get_cache(realm), move(module_instance));
+    auto instance = TRY(Detail::instantiate_module(realm.vm(), *module.compiled_module()->module, import_object));
+    return Instance::create(realm, instance);
 }
 
-GC::Ref<Instance> Instance::create(NonnullRefPtr<Detail::WebAssemblyCache> cache, NonnullRefPtr<Wasm::ModuleInstance> module_instance)
+GC::Ref<Instance> Instance::create(JS::Realm& realm, Wasm::Runtime::Entity instance)
 {
-    return GC::Heap::the().allocate<Instance>(move(cache), move(module_instance));
+    return GC::Heap::the().allocate<Instance>(Bindings::host_defined_wrapper_world(realm), instance);
 }
 
-Instance::Instance(NonnullRefPtr<Detail::WebAssemblyCache> cache, NonnullRefPtr<Wasm::ModuleInstance> module_instance)
-    : m_cache(move(cache))
-    , m_module_instance(move(module_instance))
+Instance::Instance(Bindings::WrapperWorld& wrapper_world, Wasm::Runtime::Entity instance)
+    : m_instance(instance)
+    , m_wrapper_world(wrapper_world)
 {
 }
 
-GC::Ref<Global> Instance::global_instance(Wasm::GlobalAddress address)
+GC::Ref<Global> Instance::global_instance(Wasm::Runtime::Entity global)
 {
-    Optional<GC::Ptr<Global>> object = cache().get_global_instance(address);
-    if (!object.has_value())
-        object = Global::create(m_cache, address);
-    return GC::Ref { **object };
+    if (auto object = Detail::WebAssemblyCache::the().global_object(global))
+        return *object;
+    return Global::create(global);
 }
 
-GC::Ref<Memory> Instance::memory_instance(Wasm::MemoryAddress address)
+GC::Ref<Memory> Instance::memory_instance(Wasm::Runtime::Entity memory)
 {
-    Optional<GC::Ptr<Memory>> object = cache().get_memory_instance(address);
-    if (!object.has_value()) {
-        // FIXME: Once LibWasm implements the threads/atomics proposal, the shared-ness should be
-        //        obtained from the Wasm::MemoryInstance's type.
-        object = Memory::create(m_cache, address, Memory::Shared::No);
-    }
-    return GC::Ref { **object };
+    auto& cache = Detail::WebAssemblyCache::the();
+    if (auto object = cache.memory_object(memory))
+        return *object;
+    auto shared = cache.store().memory_limits(memory).shared ? Memory::Shared::Yes : Memory::Shared::No;
+    return Memory::create(memory, shared);
 }
 
-GC::Ref<Table> Instance::table_instance(Wasm::TableAddress address)
+GC::Ref<Table> Instance::table_instance(Wasm::Runtime::Entity table)
 {
-    Optional<GC::Ptr<Table>> object = cache().get_table_instance(address);
-    if (!object.has_value())
-        object = GC::Heap::the().allocate<Table>(m_cache, address);
-    return GC::Ref { **object };
+    if (auto object = Detail::WebAssemblyCache::the().table_object(table))
+        return *object;
+    return Table::create(table);
 }
 
 void Instance::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-
-    // NOTE: m_cache is already visited by the realm's HostDefined, which owns it.
-    visitor.ignore(m_cache);
+    visitor.visit(m_instance);
+    visitor.visit(m_wrapper_world);
 }
 
 }
@@ -93,20 +88,13 @@ WebIDL::ExceptionOr<GC::Ref<WebAssembly::Instance>> construct_instance(JS::Realm
 
 struct InstanceExportsCache {
     GC::Weak<WebAssembly::Instance> instance;
-    GC::Weak<JS::Object> primary_exports;
-    Vector<GC::Weak<JS::Object>> live_export_objects;
-    HashMap<Wasm::FunctionAddress, GC::Weak<JS::FunctionObject>> function_instances;
+    GC::Weak<JS::Object> exports;
 };
 
 static Vector<InstanceExportsCache>& instance_exports_caches()
 {
     static NeverDestroyed<Vector<InstanceExportsCache>> caches;
     return *caches;
-}
-
-static void prune_instance_exports_cache(InstanceExportsCache& cache)
-{
-    cache.live_export_objects.remove_all_matching([](auto const& exports) { return !exports; });
 }
 
 static void prune_instance_exports_caches()
@@ -126,92 +114,38 @@ static InstanceExportsCache& instance_exports_cache_for(WebAssembly::Instance& i
             return cache;
     }
 
-    caches.append(InstanceExportsCache { instance, {}, {}, {} });
+    caches.append(InstanceExportsCache { instance, {} });
     return caches.last();
 }
 
-static GC::Ref<JS::FunctionObject> create_native_function_for_instance_realm(JS::Realm& realm, Wasm::FunctionAddress address, GC::Ref<WebAssembly::Instance> instance)
-{
-    Optional<Wasm::FunctionType> type;
-    auto* function = instance->cache().abstract_machine().store().get(address);
-    VERIFY(function);
-    function->visit([&](auto const& value) { type = value.type(); });
-
-    return WebAssembly::Detail::ExportedWasmFunction::create(
-        realm,
-        WebAssembly::Detail::name_of_webassembly_function(instance->cache().abstract_machine().store(), address),
-        type->parameters().size(),
-        [address, type = type.release_value(), instance, realm = GC::Ref(realm)](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
-            Vector<Wasm::Value, Wasm::ArgumentsStaticSize> values;
-            values.ensure_capacity(type.parameters().size());
-
-            size_t index = 0;
-            for (auto& type : type.parameters())
-                values.append(TRY(WebAssembly::Detail::to_webassembly_value(realm, vm.argument(index++), type)));
-
-            auto result = instance->cache().abstract_machine().invoke(address, move(values));
-            if (result.is_trap()) {
-                if (auto ptr = result.trap().data.get_pointer<Wasm::ExternallyManagedTrap>())
-                    return ptr->unsafe_external_object_as<JS::Completion>();
-                auto& trap = result.trap().data.get<ByteString>();
-                if (trap.ends_with(Wasm::Constants::stack_exhaustion_message))
-                    return vm.throw_completion<JS::InternalError>(JS::ErrorType::CallStackSizeExceeded);
-                return vm.throw_completion<WebAssembly::RuntimeError>(TRY_OR_THROW_OOM(vm, String::formatted("Wasm execution trapped (WIP): {}", trap)));
-            }
-
-            if (result.values().is_empty())
-                return JS::js_undefined();
-
-            if (result.values().size() == 1)
-                return WebAssembly::Detail::to_js_value(realm, result.values().first(), type.results().first());
-
-            GC::RootVector<JS::Value> js_result_values;
-            js_result_values.ensure_capacity(result.values().size());
-
-            for (size_t i = result.values().size(); i > 0; i--)
-                js_result_values.unchecked_append(WebAssembly::Detail::to_js_value(realm, result.values().at(i - 1), type.results().at(i - 1)));
-
-            return JS::Value(JS::Array::create_from(realm, js_result_values));
-        },
-        address);
-}
-
-static GC::Ref<JS::Object> create_exports_object(JS::Realm& realm, WebAssembly::Instance& instance, bool cache_function_exports)
+static GC::Ref<JS::Object> create_exports_object(JS::Realm& realm, WebAssembly::Instance& instance)
 {
     auto exports = GC::make_root(JS::Object::create(realm, nullptr));
 
     // https://webassembly.github.io/spec/js-api/#create-an-exports-object
-    for (auto& export_ : instance.module_instance()->exports()) {
-        auto name = Utf16FlyString::from_utf8(export_.name());
+    for (auto& export_ : WebAssembly::Detail::WebAssemblyCache::the().store().instance_exports(instance.instance_address())) {
+        auto name = Utf16FlyString::from_utf8(export_.name);
+        auto address = export_.value.entity.ptr();
 
-        export_.value().visit(
-            [&](Wasm::FunctionAddress const& address) {
-                GC::Ptr<JS::FunctionObject> object;
-                if (cache_function_exports) {
-                    auto& cache = instance_exports_cache_for(instance);
-                    if (auto cached_object = cache.function_instances.get(address); cached_object.has_value())
-                        object = cached_object->ptr();
-                    if (!object) {
-                        object = WebAssembly::Detail::create_native_function(realm, address, name, &instance);
-                        cache.function_instances.set(address, *object);
-                    }
-                } else {
-                    object = create_native_function_for_instance_realm(realm, address, GC::Ref { instance });
-                }
-
-                auto object_root = GC::make_root(*object);
-                exports->define_direct_property(name, object_root.ptr(), JS::default_attributes);
-            },
-            [&](Wasm::GlobalAddress const& address) {
-                exports->define_direct_property(name, wrap(host_defined_wrapper_world(realm), realm, instance.global_instance(address)), JS::default_attributes);
-            },
-            [&](Wasm::MemoryAddress const& address) {
-                exports->define_direct_property(name, wrap(host_defined_wrapper_world(realm), realm, instance.memory_instance(address)), JS::default_attributes);
-            },
-            [&](Wasm::TableAddress const& address) {
-                exports->define_direct_property(name, table(realm, instance.table_instance(address)), JS::default_attributes);
-            },
-            [&](Wasm::TagAddress const&) { dbgln("Not yet implemented: tags"); });
+        switch (export_.value.kind) {
+        case Wasm::Runtime::ExternKind::Function: {
+            auto object = WebAssembly::Detail::create_native_function(realm, address);
+            exports->define_direct_property(name, object, JS::default_attributes);
+            break;
+        }
+        case Wasm::Runtime::ExternKind::Global:
+            exports->define_direct_property(name, wrap(host_defined_wrapper_world(realm), realm, instance.global_instance(address)), JS::default_attributes);
+            break;
+        case Wasm::Runtime::ExternKind::Memory:
+            exports->define_direct_property(name, wrap(host_defined_wrapper_world(realm), realm, instance.memory_instance(address)), JS::default_attributes);
+            break;
+        case Wasm::Runtime::ExternKind::Table:
+            exports->define_direct_property(name, table(realm, instance.table_instance(address)), JS::default_attributes);
+            break;
+        case Wasm::Runtime::ExternKind::Tag:
+            exports->define_direct_property(name, wrap(host_defined_wrapper_world(realm), realm, WebAssembly::Tag::from_address(realm, address)), JS::default_attributes);
+            break;
+        }
     }
 
     MUST(exports->set_integrity_level(JS::Object::IntegrityLevel::Frozen));
@@ -220,25 +154,15 @@ static GC::Ref<JS::Object> create_exports_object(JS::Realm& realm, WebAssembly::
 
 GC::Ref<JS::Object const> exports(JS::Realm& realm, GC::Ref<WebAssembly::Instance> instance)
 {
+    // NB: An instance's exports, like its memories and tables, belong to the world it was created in.
+    VERIFY(&host_defined_wrapper_world(realm) == &instance->wrapper_world());
+
     auto& cache = instance_exports_cache_for(instance);
+    if (cache.exports)
+        return cache.exports.ptr().as_nonnull();
 
-    if (!cache.primary_exports) {
-        auto exports = create_exports_object(realm, instance, true);
-        cache.primary_exports = exports;
-        return exports;
-    }
-
-    if (&realm == &cache.primary_exports->shape().realm())
-        return cache.primary_exports.ptr().as_nonnull();
-
-    prune_instance_exports_cache(cache);
-    for (auto const& exports : cache.live_export_objects) {
-        if (&exports->shape().realm() == &realm)
-            return exports.ptr().as_nonnull();
-    }
-
-    auto exports = create_exports_object(realm, instance, false);
-    cache.live_export_objects.append(exports);
+    auto exports = create_exports_object(realm, instance);
+    cache.exports = exports;
     return exports;
 }
 

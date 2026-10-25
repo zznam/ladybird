@@ -8,6 +8,7 @@
 
 #include <AK/kmalloc.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Promise.h>
 #include <LibURL/URL.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
@@ -20,22 +21,27 @@
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/ContentBlockingButton.h>
+#include <UI/Qt/ContentBlockingPopover.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/JavaScriptDialog.h>
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/Popover.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WindowControlButton.h>
 
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <QApplication>
 #include <QColorDialog>
+#include <QCursor>
+#include <QDynamicPropertyChangeEvent>
 #include <QFileDialog>
 #include <QFont>
 #include <QFontMetrics>
 #include <QFrame>
-#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QMenu>
@@ -46,23 +52,26 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QResizeEvent>
-#include <QScreen>
 #include <QScrollArea>
 #include <QStyleOptionToolButton>
 #include <QStylePainter>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVariantAnimation>
 #include <UI/Qt/PerformanceMonitorWidget.h>
 
 namespace Ladybird {
 
 static constexpr auto WINDOW_DRAG_REGION_PROPERTY = "LadybirdWindowDragRegion";
+static constexpr int BOOKMARKS_BAR_HOVER_COLLAPSE_POLL_INTERVAL_MS = 250;
 
 class ToolbarButton : public QToolButton {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
     using QToolButton::QToolButton;
+
+    Function<void()> on_middle_click;
 
 protected:
     virtual void paintEvent(QPaintEvent*) override
@@ -75,6 +84,130 @@ protected:
 
         painter.drawComplexControl(QStyle::CC_ToolButton, option);
     }
+
+    virtual void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::MiddleButton && on_middle_click)
+            event->accept();
+        else
+            QToolButton::mousePressEvent(event);
+    }
+
+    virtual void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::MiddleButton && on_middle_click) {
+            if (rect().contains(event->position().toPoint()))
+                on_middle_click();
+            event->accept();
+        } else {
+            QToolButton::mouseReleaseEvent(event);
+        }
+    }
+};
+
+// The reload button becomes a stop button while the page loads. So that one click does not do what the user did not aim
+// at, the button does not change at the wrong moment while under the pointer: a stop button stays until the pointer
+// leaves or a short delay passes, and a reload click does not become a stop button until the double-click interval
+// passes, so a double-click does not stop the reload it started. The reload action stays attached to the button while
+// it shows stop, so its shortcuts still work during a load.
+class ReloadButton final : public ToolbarButton {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    explicit ReloadButton(QWidget* parent)
+        : ToolbarButton(parent)
+    {
+        m_double_click_timer.setSingleShot(true);
+        m_double_click_timer.setInterval(QApplication::doubleClickInterval());
+        QObject::connect(&m_double_click_timer, &QTimer::timeout, this, [this] {
+            change_mode(m_intended_mode, ForceChange::No);
+        });
+
+        m_stop_to_reload_timer.setSingleShot(true);
+        m_stop_to_reload_timer.setInterval(STOP_TO_RELOAD_DELAY_MS);
+        QObject::connect(&m_stop_to_reload_timer, &QTimer::timeout, this, [this] {
+            change_mode(m_intended_mode, ForceChange::Yes);
+        });
+
+        QObject::connect(this, &QToolButton::pressed, this, [this] {
+            if (m_visible_mode == Mode::Reload)
+                m_double_click_timer.start();
+        });
+
+        // NB: A stop click that arrives after the load ended has nothing to stop, so show the reload button right away.
+        QObject::connect(this, &QToolButton::clicked, this, [this] {
+            if (m_visible_mode == Mode::Stop)
+                change_mode(m_intended_mode, ForceChange::Yes);
+        });
+    }
+
+    void set_actions(QAction& reload_action, QAction& reload_bypassing_cache_action, QAction& stop_action)
+    {
+        m_reload_action = &reload_action;
+        m_reload_bypassing_cache_action = &reload_bypassing_cache_action;
+        m_stop_action = &stop_action;
+    }
+
+    void set_loading(bool is_loading)
+    {
+        change_mode(is_loading ? Mode::Stop : Mode::Reload, ForceChange::No);
+    }
+
+protected:
+    virtual void leaveEvent(QEvent* event) override
+    {
+        ToolbarButton::leaveEvent(event);
+        change_mode(m_intended_mode, ForceChange::Yes);
+    }
+
+    // A Shift-click on the reload button reloads bypassing the HTTP cache, and one on the stop button stops the load as
+    // any other click there does. QToolButton triggers its default action from here, once a click has completed.
+    virtual void nextCheckState() override
+    {
+        if (m_visible_mode == Mode::Reload && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
+            m_reload_bypassing_cache_action->trigger();
+            return;
+        }
+        ToolbarButton::nextCheckState();
+    }
+
+private:
+    static constexpr int STOP_TO_RELOAD_DELAY_MS = 1000;
+
+    enum class Mode {
+        Reload,
+        Stop,
+    };
+
+    enum class ForceChange {
+        No,
+        Yes,
+    };
+
+    void change_mode(Mode mode, ForceChange force_change)
+    {
+        m_intended_mode = mode;
+
+        auto change_is_safe = mode == Mode::Stop ? !m_double_click_timer.isActive() : m_visible_mode != Mode::Stop;
+        if (force_change == ForceChange::Yes || !underMouse() || change_is_safe) {
+            m_double_click_timer.stop();
+            m_stop_to_reload_timer.stop();
+            m_visible_mode = mode;
+            setDefaultAction(mode == Mode::Stop ? m_stop_action : m_reload_action);
+            return;
+        }
+
+        if (m_visible_mode == Mode::Stop && !m_stop_to_reload_timer.isActive())
+            m_stop_to_reload_timer.start();
+    }
+
+    QAction* m_reload_action { nullptr };
+    QAction* m_reload_bypassing_cache_action { nullptr };
+    QAction* m_stop_action { nullptr };
+    Mode m_visible_mode { Mode::Reload };
+    Mode m_intended_mode { Mode::Reload };
+    QTimer m_double_click_timer;
+    QTimer m_stop_to_reload_timer;
 };
 
 class HamburgerButton final : public ToolbarButton {
@@ -187,9 +320,10 @@ private:
 
 static constexpr int TOOLBAR_BUTTON_SIZE = 34;
 
-static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
+template<typename ButtonType = ToolbarButton>
+static ButtonType* create_toolbar_button(QWidget& parent, QAction& action)
 {
-    auto* button = new ToolbarButton(&parent);
+    auto* button = new ButtonType(&parent);
     button->setDefaultAction(&action);
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
@@ -203,9 +337,13 @@ static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
     return button;
 }
 
-static QToolButton* create_navigation_history_toolbar_button(QWidget& parent, QAction& action, WebContentView& view, int direction)
+QToolButton* Tab::create_navigation_history_toolbar_button(QWidget& parent, QAction& action, int direction)
 {
+    auto& view = this->view();
     auto* button = create_toolbar_button(parent, action);
+    button->on_middle_click = [this, direction] {
+        m_window->open_history_entry_in_new_tab(*this, direction);
+    };
     auto* menu = new QMenu(button);
     QObject::connect(menu, &QMenu::aboutToShow, button, [menu, &view, direction] {
         populate_session_history_traversal_menu(*menu, view, direction);
@@ -222,9 +360,11 @@ static QToolButton* create_navigation_history_toolbar_button(QWidget& parent, QA
 }
 
 static constexpr int TOOLBAR_HORIZONTAL_MARGIN = 12;
+#ifdef AK_OS_MACOS
+static constexpr int WEB_VIEW_INSET = 6;
+#endif
 static constexpr int TOOLBAR_VERTICAL_MARGIN = 2;
 static constexpr int TOOLBAR_SIDEBAR_TOGGLE_NAVIGATION_GAP = 8;
-static constexpr int TOOLBAR_LOCATION_EDIT_SIDE_GAP = 32;
 static constexpr int TOOLBAR_WINDOW_CONTROLS_RIGHT_MARGIN = 4;
 static constexpr int DOWNLOADS_POPOVER_WIDTH = 380;
 static constexpr int DOWNLOADS_POPOVER_MAX_HEIGHT = 360;
@@ -383,23 +523,17 @@ private:
     QPushButton* m_cancel_button { nullptr };
 };
 
-class DownloadsPopover final : public QFrame {
+class DownloadsPopover final : public Popover {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit DownloadsPopover(QWidget* parent)
-        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
+        : Popover(parent)
     {
-        setObjectName("LadybirdDownloadsPopover");
-#if defined(AK_OS_MACOS)
-        setAttribute(Qt::WA_NativeWindow);
-#endif
-        setFrameShape(QFrame::StyledPanel);
-        setFrameShadow(QFrame::Raised);
-        setAutoFillBackground(true);
-        setFixedWidth(DOWNLOADS_POPOVER_WIDTH);
+        card().setObjectName("LadybirdDownloadsPopover");
+        card().setFixedWidth(DOWNLOADS_POPOVER_WIDTH);
 
-        auto* layout = new QVBoxLayout(this);
+        auto* layout = new QVBoxLayout(&card());
         layout->setContentsMargins(12, 10, 12, 12);
         layout->setSpacing(8);
 
@@ -533,96 +667,60 @@ private:
     Vector<DownloadRow*> m_download_rows;
 };
 
-class PrivateSessionPopover final : public QFrame {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit PrivateSessionPopover(QWidget* parent)
-        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
-    {
-        setObjectName("LadybirdPrivateSessionPopover");
-#if defined(AK_OS_MACOS)
-        setAttribute(Qt::WA_NativeWindow);
-#endif
-        setFrameShape(QFrame::StyledPanel);
-        setFrameShadow(QFrame::Raised);
-        setAutoFillBackground(true);
-        setFixedWidth(PRIVATE_SESSION_POPOVER_WIDTH);
-
-        auto* layout = new QVBoxLayout(this);
-        layout->setContentsMargins(16, 14, 16, 14);
-        layout->setSpacing(10);
-
-        auto* title = new QLabel("Start a fresh private session?", this);
-        title->setObjectName("LadybirdPrivateSessionPopoverTitle");
-        title->setWordWrap(true);
-        layout->addWidget(title);
-
-        auto* body = new QLabel("This closes all private windows and deletes history and other site data from the current private browsing session.", this);
-        body->setObjectName("LadybirdPrivateSessionPopoverBody");
-        body->setWordWrap(true);
-        layout->addWidget(body);
-
-        auto* button_row = new QWidget(this);
-        auto* button_layout = new QHBoxLayout(button_row);
-        button_layout->setContentsMargins(0, 0, 0, 0);
-        button_layout->setSpacing(8);
-        button_layout->addStretch();
-
-        auto* cancel_button = new QPushButton("Cancel", button_row);
-        cancel_button->setObjectName("LadybirdPrivateSessionCancelButton");
-        cancel_button->setFocusPolicy(Qt::NoFocus);
-        QObject::connect(cancel_button, &QPushButton::clicked, this, [this] {
-            close();
-        });
-        button_layout->addWidget(cancel_button);
-
-        auto* restart_button = new QPushButton("Restart Private Session", button_row);
-        restart_button->setObjectName("LadybirdPrivateSessionRestartButton");
-        restart_button->setDefault(true);
-        QObject::connect(restart_button, &QPushButton::clicked, this, [this] {
-            close();
-            if (on_confirm)
-                on_confirm();
-        });
-        button_layout->addWidget(restart_button);
-
-        layout->addWidget(button_row);
-    }
-
-    void update_chrome_style(QPalette const& palette)
-    {
-        setPalette(palette);
-        setStyleSheet(ChromeStyle::private_session_popover_style_sheet(palette));
-    }
-
-    Function<void()> on_confirm;
-};
-
-Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client, Web::PageId page_index)
+Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable)
     : QWidget(window)
     , m_window(window)
 {
-    auto& application = WebView::Application::the();
+    create_tab_shell();
+    initialize(traversable);
+}
 
+Tab::Tab(BrowserWindow* window, DeferredTab deferred_tab)
+    : QWidget(window)
+    , m_window(window)
+    , m_title(deferred_tab.title)
+    , m_favicon(deferred_tab.favicon)
+    , m_session_tab_id(deferred_tab.session_tab_id)
+    , m_deferred_tab(AK::move(deferred_tab))
+{
+    create_tab_shell();
+}
+
+void Tab::create_tab_shell()
+{
     auto* tab_layout = new QBoxLayout(QBoxLayout::Direction::TopToBottom, this);
     tab_layout->setSpacing(0);
     tab_layout->setContentsMargins(0, 0, 0, 0);
 
-    auto view_initial_state = WebContentViewInitialState {
-        .is_private = window->is_private(),
-        .maximum_frames_per_second = window->refresh_rate(),
-        .display_id = window->display_id(),
-    };
-
-    m_view = new WebContentView(this, parent_client, page_index, AK::move(view_initial_state));
-    m_javascript_dialog = new JavaScriptDialog(m_view);
-    m_find_in_page = new FindInPageWidget(this, m_view);
-    m_find_in_page->setVisible(false);
-
+    // TabWidget keeps every tab's toolbar container in a stack beside its pages, so even a tab that hasn't loaded needs
+    // one. initialize() fills it.
     m_toolbar_container = new QWidget(this);
     m_toolbar_container->setObjectName("LadybirdToolbarContainer");
     m_toolbar_container->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+
+    create_tab_context_menu();
+}
+
+void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
+{
+    auto& application = WebView::Application::the();
+    auto* tab_layout = static_cast<QBoxLayout*>(layout());
+
+    auto view_initial_state = WebContentViewInitialState {
+        .is_private = m_window->is_private(),
+        .maximum_frames_per_second = m_window->refresh_rate(),
+        .display_id = m_window->display_id(),
+        .owner_view = nullptr,
+    };
+
+    m_view = new WebContentView(this, traversable, AK::move(view_initial_state));
+    // The window reports its geometry to its tabs as it is moved and resized, so a tab opened later has to be told
+    // where the window stands now.
+    m_view->set_window_position({ m_window->x(), m_window->y() });
+    m_view->set_window_size({ m_window->width(), m_window->height() });
+    m_javascript_dialog = new JavaScriptDialog(m_view);
+    m_find_in_page = new FindInPageWidget(this, m_view);
+    m_find_in_page->setVisible(false);
 
     m_toolbar = new QWidget(this);
     m_toolbar->setObjectName("LadybirdNavigationToolbar");
@@ -638,9 +736,47 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     toolbar_layout->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN, TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN);
 
     m_location_edit = new LocationEdit(this, m_window->is_private());
-    m_bookmarks_bar = new BookmarksBar(this);
     m_loading_animation_timer = new QTimer(this);
     m_loading_animation_timer->setInterval(80);
+
+    m_bookmarks_bar = new BookmarksBar(this);
+    m_bookmarks_bar_container = new QWidget(this);
+    m_bookmarks_bar_container->setObjectName("LadybirdBookmarksBarContainer");
+    m_bookmarks_bar_container->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+#if defined(AK_OS_MACOS) || defined(LADYBIRD_QT_USE_RHI_WIDGET)
+    // The web view is native on these presentation paths, so its sibling overlay must also be native.
+    m_bookmarks_bar_container->setAttribute(Qt::WA_DontCreateNativeAncestors);
+    m_bookmarks_bar_container->setAttribute(Qt::WA_NativeWindow);
+#endif
+    m_bookmarks_bar->setParent(m_bookmarks_bar_container);
+    m_bookmarks_bar->show();
+
+    m_bookmarks_bar_hover_expand_timer = new QTimer(this);
+    m_bookmarks_bar_hover_expand_timer->setSingleShot(true);
+    m_bookmarks_bar_hover_expand_timer->setTimerType(Qt::PreciseTimer);
+    connect(m_bookmarks_bar_hover_expand_timer, &QTimer::timeout, this, [this] {
+        if (cursor_is_over_bookmarks_bar_hover_region())
+            set_bookmarks_bar_hover_expanded(true);
+    });
+
+    m_bookmarks_bar_hover_expand_animation = new QVariantAnimation(this);
+    m_bookmarks_bar_hover_expand_animation->setEasingCurve(QEasingCurve::OutCubic);
+    m_bookmarks_bar_hover_expand_animation->setStartValue(0.0);
+    m_bookmarks_bar_hover_expand_animation->setEndValue(1.0);
+    connect(m_bookmarks_bar_hover_expand_animation, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
+        m_bookmarks_bar_hover_expand_progress = value.toReal();
+        update_bookmarks_bar_geometry();
+    });
+
+    m_bookmarks_bar_hover_collapse_timer = new QTimer(this);
+    m_bookmarks_bar_hover_collapse_timer->setInterval(BOOKMARKS_BAR_HOVER_COLLAPSE_POLL_INTERVAL_MS);
+    connect(m_bookmarks_bar_hover_collapse_timer, &QTimer::timeout, this, &Tab::update_bookmarks_bar_hover);
+
+    m_toolbar->installEventFilter(this);
+    m_bookmarks_bar_container->installEventFilter(this);
+    m_bookmarks_bar->installEventFilter(this);
+    m_view->installEventFilter(this);
+    m_location_edit->installEventFilter(this);
 
     m_hover_label = new HyperlinkLabel(this);
     m_hover_label->hide();
@@ -660,13 +796,28 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     addAction(focus_location_editor_action);
 
     toolbar_container_layout->addWidget(m_toolbar);
-    toolbar_container_layout->addWidget(m_bookmarks_bar);
+    toolbar_container_layout->addWidget(m_bookmarks_bar_container);
+#ifdef AK_OS_MACOS
+    m_view_layout = new QHBoxLayout;
+    m_view_layout->addWidget(m_view);
+    update_web_view_frame(m_web_view_chrome_visible, m_web_view_sidebar_position);
+    tab_layout->addLayout(m_view_layout);
+#else
     tab_layout->addWidget(m_view);
+#endif
     tab_layout->addWidget(m_find_in_page);
+    update_bookmarks_bar_visibility();
 
     m_navigate_back_action = create_application_action(*this, view().navigate_back_action());
     m_navigate_forward_action = create_application_action(*this, view().navigate_forward_action());
     m_reload_action = create_application_action(*this, application.reload_action());
+    m_reload_bypassing_cache_action = create_application_action(*this, application.reload_bypassing_cache_action());
+    addAction(m_reload_bypassing_cache_action);
+    m_stop_action = new QAction("Stop", this);
+    m_stop_action->setToolTip("Stop loading this page");
+    QObject::connect(m_stop_action, &QAction::triggered, this, [this] {
+        view().stop_loading();
+    });
     m_toggle_vertical_tabs_expanded_action = create_application_action(*this, application.toggle_vertical_tabs_expanded_action());
     m_open_downloads_page_action = create_application_action(*this, application.open_downloads_page_action());
 
@@ -691,6 +842,13 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     QObject::connect(m_private_badge, &QPushButton::clicked, this, [this] {
         show_private_session_popover();
     });
+
+    m_content_blocking_button = new ContentBlockingButton(m_toolbar);
+    m_content_blocking_button->setToolTip("Ad Block");
+    QObject::connect(m_content_blocking_button, &QToolButton::clicked, this, [this] { show_content_blocking_popover(); });
+    view().on_content_blocking_change = [this](auto const& snapshot) { update_content_blocking_controls(snapshot); };
+    update_content_blocking_controls(view().content_blocking_snapshot());
+    content_blocker_count_visibility_changed();
 
     m_hamburger_button = new HamburgerButton(m_toolbar);
     m_hamburger_button->setObjectName("LadybirdHamburgerButton");
@@ -746,40 +904,46 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     auto* navigation_button_layout = new QHBoxLayout(navigation_button_cluster);
     navigation_button_layout->setSpacing(2);
     navigation_button_layout->setContentsMargins(0, 0, 0, 0);
-    m_left_toggle_vertical_tabs_expanded_button = create_toolbar_button(*navigation_button_cluster, *m_toggle_vertical_tabs_expanded_action);
-    navigation_button_layout->addWidget(m_left_toggle_vertical_tabs_expanded_button);
-    m_sidebar_toggle_navigation_spacer = new QSpacerItem(0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
-    navigation_button_layout->addItem(m_sidebar_toggle_navigation_spacer);
-    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_back_action, view(), -1));
-    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action, view(), 1));
-    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_reload_action));
 
-    if constexpr (use_native_macos_window_controls())
-        toolbar_layout->addWidget(m_toolbar_window_controls, 0, Qt::AlignVCenter);
+    m_left_toggle_vertical_tabs_expanded_button = create_toolbar_button(*navigation_button_cluster, *m_toggle_vertical_tabs_expanded_action);
+    m_right_toggle_vertical_tabs_expanded_button = create_toolbar_button(*m_toolbar, *m_toggle_vertical_tabs_expanded_action);
+    m_sidebar_toggle_navigation_spacer = new QSpacerItem(0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
+
+    navigation_button_layout->addWidget(m_left_toggle_vertical_tabs_expanded_button);
+    navigation_button_layout->addItem(m_sidebar_toggle_navigation_spacer);
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_back_action, -1));
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action, 1));
+    m_reload_button = create_toolbar_button<ReloadButton>(*navigation_button_cluster, *m_reload_action);
+    m_reload_button->set_actions(*m_reload_action, *m_reload_bypassing_cache_action, *m_stop_action);
+    navigation_button_layout->addWidget(m_reload_button);
 
     auto* location_edit_container = new QWidget(m_toolbar);
     location_edit_container->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
     auto* location_edit_layout = new QHBoxLayout(location_edit_container);
     location_edit_layout->setSpacing(0);
-    location_edit_layout->setContentsMargins(TOOLBAR_LOCATION_EDIT_SIDE_GAP, 0, TOOLBAR_LOCATION_EDIT_SIDE_GAP, 0);
+    location_edit_layout->setContentsMargins(0, 0, 0, 0);
 
-    toolbar_layout->addWidget(navigation_button_cluster, 0, Qt::AlignVCenter);
     m_location_edit->set_trailing_action(create_application_action(*m_location_edit, view().toggle_bookmark_action()));
     m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
     location_edit_layout->addWidget(m_location_edit);
-    toolbar_layout->addWidget(location_edit_container, 1);
-    m_right_toggle_vertical_tabs_expanded_button = create_toolbar_button(*m_toolbar, *m_toggle_vertical_tabs_expanded_action);
-    toolbar_layout->addWidget(m_right_toggle_vertical_tabs_expanded_button, 0, Qt::AlignVCenter);
 
-    toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
-    toolbar_layout->addWidget(m_private_badge, 0, Qt::AlignVCenter);
     m_performance_monitor = new PerformanceMonitorWidget(m_toolbar);
-    toolbar_layout->addWidget(m_performance_monitor, 0, Qt::AlignVCenter);
     (void)WebView::TabPerformanceMonitor::the();
     m_performance_monitor->setVisible(WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowTabPerformanceMonitor));
     view().on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
         static_cast<PerformanceMonitorWidget*>(m_performance_monitor)->set_stats(stats);
     };
+
+    if constexpr (use_native_macos_window_controls())
+        toolbar_layout->addWidget(m_toolbar_window_controls, 0, Qt::AlignVCenter);
+
+    toolbar_layout->addWidget(navigation_button_cluster, 0, Qt::AlignVCenter);
+    toolbar_layout->addWidget(location_edit_container, 1);
+    toolbar_layout->addWidget(m_performance_monitor, 0, Qt::AlignVCenter);
+    toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
+    toolbar_layout->addWidget(m_private_badge, 0, Qt::AlignVCenter);
+    toolbar_layout->addWidget(m_content_blocking_button, 0, Qt::AlignVCenter);
+    toolbar_layout->addWidget(m_right_toggle_vertical_tabs_expanded_button, 0, Qt::AlignVCenter);
     toolbar_layout->addWidget(m_hamburger_button, 0, Qt::AlignVCenter);
 
     if constexpr (!use_native_macos_window_controls()) {
@@ -796,7 +960,19 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
 
     view().on_close = [this] {
-        m_window->definitely_close_tab(tab_index());
+        auto index = tab_index();
+        if (m_tab_to_activate_on_close) {
+            if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
+                m_window->activate_tab(index_to_activate);
+        }
+        if (!m_window_is_closing)
+            m_window->definitely_close_tab(index);
+    };
+
+    view().on_request_web_compat_report_review = [this](WebCompatReportCapture capture) {
+        auto& tab = m_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
+        tab.view().review_web_compat_report(AK::move(capture));
+        tab.enter_report_review(this, tr("Report Website Issue"));
     };
 
     view().on_link_hover = [this](auto const& url) {
@@ -811,7 +987,14 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
 
     view().on_loading_state_change = [this](bool is_loading) {
+        if (!is_loading)
+            m_content_blocking_popover_reload_site.clear();
         set_loading(is_loading);
+    };
+    view().on_load_start = [this] {
+        m_window->on_tab_load_start(*this);
+        if (m_content_blocking_popover && !m_content_blocking_popover_reload_site.has_value())
+            m_content_blocking_popover->close();
     };
     set_loading(view().is_loading());
 
@@ -820,6 +1003,15 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
 
     view().on_top_level_navigation_commit = [this] {
+        if (m_content_blocking_popover) {
+            auto snapshot = view().content_blocking_snapshot();
+            if (!m_content_blocking_popover_reload_site.has_value() || snapshot.site != m_content_blocking_popover_reload_site) {
+                m_content_blocking_popover->close();
+            } else {
+                m_content_blocking_popover_reload_site.clear();
+                update_content_blocking_controls(snapshot);
+            }
+        }
         m_suppress_javascript_dialogs_until_navigation = false;
     };
 
@@ -846,6 +1038,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     view().on_favicon_change = [this](auto const& bitmap) {
         if (!bitmap.has_value()) {
             m_favicon = {};
+            if (m_content_blocking_popover)
+                m_content_blocking_popover->set_favicon(m_favicon);
             update_tab_icon();
             return;
         }
@@ -858,6 +1052,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             return;
 
         m_favicon = qpixmap;
+        if (m_content_blocking_popover)
+            m_content_blocking_popover->set_favicon(m_favicon);
         update_tab_icon();
     };
 
@@ -873,7 +1069,15 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             view().alert_closed();
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_alert(javascript_dialog_title(), qstring_from_utf16_string(message));
+    };
+
+    view().on_request_before_unload = [this](auto const& source, auto on_complete) {
+        hide_hover_label();
+        m_before_unload_completion = AK::move(on_complete);
+        m_window->raise_for_close_prompt();
+        m_javascript_dialog->show_before_unload(qstring_from_ak_string(source));
     };
 
     view().on_request_confirm = [this, javascript_dialog_title](auto const& message) {
@@ -881,6 +1085,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             view().confirm_closed(false);
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_confirm(javascript_dialog_title(), qstring_from_utf16_string(message));
     };
 
@@ -889,6 +1094,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             view().prompt_closed({});
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_prompt(javascript_dialog_title(), qstring_from_utf16_string(message), qstring_from_utf16_string(default_));
     };
 
@@ -901,6 +1107,17 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         case JavaScriptDialog::Type::Alert:
             view().alert_closed();
             break;
+        case JavaScriptDialog::Type::BeforeUnload: {
+            auto on_complete = AK::move(m_before_unload_completion);
+            VERIFY(on_complete);
+            on_complete(accepted);
+            if (!accepted) {
+                if (!m_preserve_close_retry_state_on_dialog_dismissal)
+                    m_already_requested_close = false;
+                m_suppress_javascript_dialogs_until_navigation = false;
+            }
+            break;
+        }
         case JavaScriptDialog::Type::Confirm:
             view().confirm_closed(accepted);
             break;
@@ -939,6 +1156,11 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         }
         if (m_external_url_confirmation_dialog)
             m_external_url_confirmation_dialog->close();
+        auto pending_permission_requests = AK::move(m_pending_permission_requests);
+        for (auto& it : pending_permission_requests) {
+            if (it.value.dialog)
+                it.value.dialog->close();
+        }
     };
 
     view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, auto const& handler, auto on_complete) {
@@ -946,6 +1168,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             on_complete(false);
             return;
         }
+
+        hide_hover_label();
 
         auto initiator = initiator_origin.is_opaque() ? "This page"_string : initiator_origin.serialize();
         auto application_name = handler.application_name().is_empty() ? "another application"sv : handler.application_name().bytes_as_string_view();
@@ -971,6 +1195,40 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
             if (m_external_url_confirmation_dialog == dialog)
                 m_external_url_confirmation_dialog = nullptr;
             on_complete(accepted);
+        });
+
+        dialog->open();
+    };
+
+    view().on_request_permission = [this](auto const& name, auto const& origin, auto on_decided) {
+        auto requester = origin.is_opaque() ? "this page"_string : origin.serialize();
+        auto question = MUST(String::formatted("Allow {} to use your {}?", requester, name));
+        if (auto pending = m_pending_permission_requests.get(question); pending.has_value()) {
+            pending.value().on_decided.append(AK::move(on_decided));
+            return;
+        }
+
+        auto* dialog = new QMessageBox(&view());
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setIcon(QMessageBox::Icon::Question);
+        dialog->setWindowTitle("Ladybird");
+        dialog->setTextFormat(Qt::PlainText);
+        dialog->setText(qstring_from_ak_string(question));
+        auto* allow_button = dialog->addButton("Allow", QMessageBox::ButtonRole::AcceptRole);
+        auto* block_button = dialog->addButton("Block", QMessageBox::ButtonRole::RejectRole);
+        dialog->setDefaultButton(block_button);
+
+        PendingPermissionRequests pending { .dialog = dialog, .on_decided = {} };
+        pending.on_decided.append(AK::move(on_decided));
+        m_pending_permission_requests.set(question, AK::move(pending));
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QMessageBox> { dialog }, allow_button, question](auto) {
+            auto pending = m_pending_permission_requests.take(question);
+            if (!pending.has_value())
+                return;
+            auto granted = dialog && dialog->clickedButton() == allow_button;
+            for (auto& on_decided : pending.value().on_decided)
+                on_decided(granted);
         });
 
         dialog->open();
@@ -1123,10 +1381,23 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     view().on_screen_wake_lock_state_changed = [this](auto wake_lock_state) {
         set_screen_wake_lock_state(wake_lock_state);
     };
+}
+
+void Tab::create_tab_context_menu()
+{
+    auto& application = WebView::Application::the();
 
     auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
     QObject::connect(duplicate_tab_action, &QAction::triggered, this, [this]() {
         m_window->duplicate_tab(*this);
+    });
+
+    m_pin_tab_action = new QAction("&Pin Tab", this);
+    QObject::connect(m_pin_tab_action, &QAction::triggered, this, [this]() {
+        if (m_is_pinned)
+            m_window->unpin_tab(*this);
+        else
+            m_window->pin_tab(*this);
     });
 
     auto* move_to_start_action = new QAction("Move to &Start", this);
@@ -1147,21 +1418,30 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     auto* close_tabs_to_left_action = new QAction("C&lose Tabs to Left", this);
     QObject::connect(close_tabs_to_left_action, &QAction::triggered, this, [this]() {
         for (auto i = tab_index() - 1; i >= 0; i--) {
-            m_window->request_to_close_tab(i);
+            if (!m_window->tab_at(i)->is_pinned())
+                m_window->request_to_close_tab(i);
         }
     });
 
     auto* close_tabs_to_right_action = new QAction("Close Tabs to R&ight", this);
     QObject::connect(close_tabs_to_right_action, &QAction::triggered, this, [this]() {
+        // Closing the current tab selects a neighbor, which may be a tab about to close too, and selecting a tab that
+        // hasn't loaded loads it. So, this tab, which stays open, becomes the current tab first.
+        if (auto* current = m_window->current_tab(); current && m_window->tab_index(current) > tab_index() && !current->is_pinned())
+            m_window->activate_tab(tab_index());
         for (auto i = m_window->tab_count() - 1; i > tab_index(); i--) {
-            m_window->request_to_close_tab(i);
+            if (!m_window->tab_at(i)->is_pinned())
+                m_window->request_to_close_tab(i);
         }
     });
 
     auto* close_other_tabs_action = new QAction("Cl&ose Other Tabs", this);
     QObject::connect(close_other_tabs_action, &QAction::triggered, this, [this]() {
+        // As in Close Tabs to Right, this tab becomes the current tab first if the current tab is among those closing.
+        if (auto* current = m_window->current_tab(); current && current != this && !current->is_pinned())
+            m_window->activate_tab(tab_index());
         for (auto i = m_window->tab_count() - 1; i >= 0; i--) {
-            if (i == tab_index())
+            if (i == tab_index() || m_window->tab_at(i)->is_pinned())
                 continue;
 
             m_window->request_to_close_tab(i);
@@ -1171,6 +1451,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     m_context_menu = new QMenu("Context menu", this);
     m_context_menu->addAction(create_application_action(*this, application.reload_action(), IncludeActionIcon::No));
     m_context_menu->addAction(duplicate_tab_action);
+    m_context_menu->addAction(m_pin_tab_action);
     m_context_menu->addSeparator();
     auto* move_tab_menu = m_context_menu->addMenu("Mo&ve Tab");
     move_tab_menu->addAction(move_to_start_action);
@@ -1185,8 +1466,77 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
 Tab::~Tab() = default;
 
+void Tab::park_location_editing()
+{
+    // A tab that hasn't loaded has no omnibox yet, so it has no editing session to park.
+    if (!is_loaded())
+        return;
+    m_location_edit->park_editing_session();
+}
+
+void Tab::ensure_loaded()
+{
+    if (is_loaded())
+        return;
+
+    // Until initialize() has built the view, url() reads the deferred tab's URL, so the deferred tab stays until then.
+    auto deferred_url = m_deferred_tab->url;
+    // initialize() hides the toolbar's window controls, which overwrites the visibility TabWidget last asked for.
+    auto toolbar_window_controls_visible = m_toolbar_window_controls_visible;
+    initialize({});
+    m_deferred_tab.clear();
+
+    // TabWidget pushed these while the tab had no toolbar to apply them to.
+    set_vertical_tabs_enabled(m_vertical_tabs_enabled);
+    recreate_toolbar_icons();
+    update_vertical_tabs_toolbar_button_placement();
+    set_toolbar_window_controls_visible(toolbar_window_controls_visible);
+
+    if (m_session_tab_id.has_value())
+        view().set_session_tab_id(*m_session_tab_id);
+    emit loaded();
+
+    Optional<WebView::SessionHistorySnapshot> history;
+    if (m_session_tab_id.has_value())
+        history = m_window->session().session_store->load_tab_history(*m_session_tab_id);
+    if (!history.has_value() || view().restore_session_history_from_snapshot(history.release_value()).is_error())
+        navigate(deferred_url);
+}
+
+URL::URL Tab::url() const
+{
+    if (!is_loaded())
+        return m_deferred_tab->url;
+    return view().url();
+}
+
+Optional<WebView::SessionTabId> Tab::session_tab_id() const
+{
+    // A loaded tab's view holds the ID it reports its state under.
+    if (is_loaded())
+        return view().session_tab_id();
+    return m_session_tab_id;
+}
+
+void Tab::set_session_tab_id(WebView::SessionTabId session_tab_id)
+{
+    m_session_tab_id = session_tab_id;
+    if (is_loaded())
+        view().set_session_tab_id(session_tab_id);
+}
+
+void Tab::clear_session_tab_id()
+{
+    m_session_tab_id.clear();
+    if (is_loaded())
+        view().clear_session_tab_id();
+}
+
 void Tab::focus_location_editor()
 {
+    if (!is_loaded())
+        return;
+
 #if defined(AK_OS_MACOS)
     make_appkit_window_first_responder(*m_location_edit);
 #endif
@@ -1200,21 +1550,40 @@ void Tab::set_window(BrowserWindow& window)
     if (&window == m_window)
         return;
 
+    if (!is_loaded()) {
+        m_window = &window;
+        return;
+    }
+
     QObject::disconnect(&m_window->hamburger_menu(), nullptr, m_hamburger_button, nullptr);
 
     m_window = &window;
     m_hamburger_button->setMenu(&m_window->hamburger_menu());
     connect_hamburger_menu();
     recreate_toolbar_icons();
+
+    // The tab's pages hold the geometry of the window that hosted them until now.
+    m_view->set_window_position({ window.x(), window.y() });
+    m_view->set_window_size({ window.width(), window.height() });
+}
+
+void Tab::set_pinned(bool pinned)
+{
+    m_is_pinned = pinned;
+    m_pin_tab_action->setText(pinned ? "Un&pin Tab" : "&Pin Tab");
 }
 
 void Tab::set_vertical_tabs_enabled(bool enabled)
 {
     m_vertical_tabs_enabled = enabled;
+    if (!is_loaded())
+        return;
+
     m_toolbar->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
     if (m_sidebar_toggle_navigation_spacer)
         m_sidebar_toggle_navigation_spacer->changeSize(enabled ? TOOLBAR_SIDEBAR_TOGGLE_NAVIGATION_GAP : 0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
     update_vertical_tabs_toolbar_button_placement();
+    update_bookmarks_bar_visibility();
     m_toolbar->layout()->invalidate();
 }
 
@@ -1224,10 +1593,36 @@ void Tab::set_vertical_tabs_position(WebView::VerticalTabsPosition position)
         return;
 
     m_vertical_tabs_position = position;
+    if (!is_loaded())
+        return;
+
     recreate_toolbar_icons();
     update_vertical_tabs_toolbar_button_placement();
     m_toolbar->layout()->invalidate();
 }
+
+#ifdef AK_OS_MACOS
+void Tab::update_web_view_frame(bool chrome_visible, Optional<WebView::VerticalTabsPosition> sidebar_position)
+{
+    m_web_view_chrome_visible = chrome_visible;
+    m_web_view_sidebar_position = sidebar_position;
+    if (!is_loaded())
+        return;
+
+    // With the browser chrome hidden, the page fills the window edge to edge.
+    if (!chrome_visible) {
+        m_view_layout->setContentsMargins(0, 0, 0, 0);
+        m_view->set_has_rounded_corners(false);
+        return;
+    }
+
+    // Keep the web view's rounded corners clear of the window edges. The sidebar has its own padding.
+    auto left = sidebar_position == WebView::VerticalTabsPosition::Left ? 0 : WEB_VIEW_INSET;
+    auto right = sidebar_position == WebView::VerticalTabsPosition::Right ? 0 : WEB_VIEW_INSET;
+    m_view_layout->setContentsMargins(left, 0, right, WEB_VIEW_INSET);
+    m_view->set_has_rounded_corners(true);
+}
+#endif
 
 void Tab::set_toolbar_container_in_tab_layout(bool in_tab_layout)
 {
@@ -1251,12 +1646,23 @@ void Tab::set_toolbar_container_in_tab_layout(bool in_tab_layout)
 
 void Tab::set_toolbar_window_controls_visible(bool visible)
 {
+    m_toolbar_window_controls_visible = visible;
+    if (!is_loaded())
+        return;
+
     auto const has_native_window_controls = use_native_macos_window_controls() && visible;
     auto const has_custom_window_controls = !use_native_macos_window_controls() && visible;
 
     m_toolbar_window_controls_separator->setVisible(has_custom_window_controls);
     m_toolbar_window_controls->setVisible(has_native_window_controls || has_custom_window_controls);
-    m_toolbar->layout()->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN, has_custom_window_controls ? TOOLBAR_WINDOW_CONTROLS_RIGHT_MARGIN : TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN);
+    auto top_margin = TOOLBAR_VERTICAL_MARGIN;
+#ifdef AK_OS_MACOS
+    // NB: A toolbar holding the window controls is the top of the window, whose outline covers its first point.
+    auto window_outline_width = visible ? 1 : 0;
+    top_margin += window_outline_width;
+    m_toolbar->setFixedHeight(browser_chrome_layout_policy().toolbar_height + window_outline_width);
+#endif
+    m_toolbar->layout()->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, top_margin, has_custom_window_controls ? TOOLBAR_WINDOW_CONTROLS_RIGHT_MARGIN : TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN);
     m_toolbar->layout()->invalidate();
 }
 
@@ -1310,7 +1716,7 @@ void Tab::location_edit_return_pressed(String input, Optional<URL::URL> fallback
     auto is_external_url = destination_kind == WebView::OmniboxDestinationKind::URL
         && WebView::classify_user_input(input).classification == WebView::UserInputClassification::ExternalURL;
     if (is_external_url)
-        m_location_edit->set_url(view().url());
+        m_location_edit->set_url(view().displayed_url());
 
     view().setFocus();
 }
@@ -1324,10 +1730,47 @@ QIcon Tab::tab_icon() const
 
 QString Tab::title() const
 {
-    if (!WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
-        return m_title;
+    auto title = m_fixed_title.value_or(m_title);
+    if (!is_loaded() || !WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
+        return title;
 
-    return QString("%1 [%2]").arg(m_title).arg(view().client().pid());
+    return QString("%1 [%2]").arg(title).arg(view().web_content_pid());
+}
+
+// A tab opened only for a review shows it over a blank page, under the review's own title if it has one, and closing it
+// goes back to the tab it was opened from. That lasts until the user takes the tab somewhere else. The tab starts out
+// loading about:blank, which is not somewhere else, but any page loaded after that is, about:blank included.
+void Tab::enter_report_review(Tab* tab_to_activate_on_close, Optional<QString> title)
+{
+    VERIFY(!m_report_review_navigation_listener.has_value());
+    m_tab_to_activate_on_close = tab_to_activate_on_close;
+    m_fixed_title = AK::move(title);
+    update_tab_title();
+
+    WebView::ViewImplementation::NavigationListener listener;
+    listener.on_load_start = [this](URL::URL const& url) {
+        if (m_has_loaded_report_review_page || url != URL::about_blank())
+            leave_report_review();
+    };
+    listener.on_load_finish = [this](URL::URL const&) { m_has_loaded_report_review_page = true; };
+    m_report_review_navigation_listener = view().add_navigation_listener(AK::move(listener));
+}
+
+// A report on its way keeps being sent, as it does when the tab closes.
+void Tab::leave_report_review()
+{
+    if (!m_report_review_navigation_listener.has_value())
+        return;
+
+    view().leave_report_review();
+    m_tab_to_activate_on_close = nullptr;
+    m_fixed_title.clear();
+    update_tab_title();
+
+    // The view is still telling its listeners about this navigation, so the listener goes once it is done.
+    QTimer::singleShot(0, this, [this, listener = m_report_review_navigation_listener.release_value()] {
+        view().remove_navigation_listener(listener);
+    });
 }
 
 void Tab::update_tab_title()
@@ -1337,6 +1780,9 @@ void Tab::update_tab_title()
 
 void Tab::tab_settings_changed()
 {
+    if (!is_loaded())
+        return;
+
     auto const& tab_settings = WebView::Application::settings().tab_settings();
     m_vertical_tabs_enabled = tab_settings.vertical_tabs_enabled;
     m_vertical_tabs_position = tab_settings.vertical_tabs_position;
@@ -1344,15 +1790,27 @@ void Tab::tab_settings_changed()
         m_sidebar_toggle_navigation_spacer->changeSize(m_vertical_tabs_enabled ? TOOLBAR_SIDEBAR_TOGGLE_NAVIGATION_GAP : 0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
     recreate_toolbar_icons();
     update_vertical_tabs_toolbar_button_placement();
+    update_bookmarks_bar_visibility();
     m_toolbar->layout()->invalidate();
 }
 
 void Tab::config_variable_changed(WebView::ConfigVariableID variable)
 {
+    if (!is_loaded())
+        return;
+
     if (variable == WebView::ConfigVariableID::ShowTabPerformanceMonitor)
         m_performance_monitor->setVisible(WebView::Application::settings().config_variable_as_bool(variable));
     if (variable == WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle)
         update_tab_title();
+}
+
+void Tab::content_blocker_count_visibility_changed()
+{
+    if (!is_loaded())
+        return;
+
+    m_content_blocking_button->set_show_count_badge(WebView::Application::settings().show_content_blocker_count());
 }
 
 void Tab::set_loading(bool is_loading)
@@ -1362,6 +1820,7 @@ void Tab::set_loading(bool is_loading)
 
     m_is_loading = is_loading;
     m_loading_animation_frame = 0;
+    emit loading_changed();
 
     if (m_is_loading)
         m_loading_animation_timer->start();
@@ -1369,6 +1828,13 @@ void Tab::set_loading(bool is_loading)
         m_loading_animation_timer->stop();
 
     update_tab_icon();
+
+    m_reload_button->set_loading(m_is_loading);
+
+    // Only mark the end of loads that finished, rather than being stopped. The browser's own about: pages are not
+    // marked.
+    if (!m_is_loading && view().last_load_finished() && view().url().scheme() != "about"sv)
+        emit loading_finished();
 }
 
 void Tab::update_tab_icon()
@@ -1407,9 +1873,23 @@ void Tab::set_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
     }
 }
 
+#ifdef AK_OS_MACOS
+void Tab::paintEvent(QPaintEvent*)
+{
+    // The inset around the web view should match the chrome surrounding it.
+    QPainter painter(this);
+    painter.fillRect(rect(), ChromeStyle::chrome_background(window()->palette()));
+}
+#endif
+
 void Tab::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
+    if (isVisible())
+        did_get_real_size();
+    if (!is_loaded())
+        return;
+
     if (m_hover_label->isVisible())
         update_hover_label();
 }
@@ -1417,8 +1897,13 @@ void Tab::resizeEvent(QResizeEvent* event)
 void Tab::hideEvent(QHideEvent* event)
 {
     QWidget::hideEvent(event);
+    if (!is_loaded())
+        return;
 
+    set_bookmarks_bar_hover_expanded(false);
     m_hover_label->hide();
+    if (m_content_blocking_popover)
+        m_content_blocking_popover->close();
 }
 
 void Tab::update_hover_label()
@@ -1440,9 +1925,14 @@ void Tab::update_hover_label()
     m_hover_label->raise();
 }
 
+void Tab::hide_hover_label()
+{
+    m_hover_label->hide();
+}
+
 bool Tab::event(QEvent* event)
 {
-    if (event->type() == QEvent::PaletteChange) {
+    if (event->type() == QEvent::PaletteChange && is_loaded()) {
         update_chrome_style();
         recreate_toolbar_icons();
         if (m_is_loading)
@@ -1453,12 +1943,39 @@ bool Tab::event(QEvent* event)
     return QWidget::event(event);
 }
 
+bool Tab::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == m_location_edit && event->type() == QEvent::DynamicPropertyChange) {
+        if (static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
+            update_bookmarks_bar_hover();
+    }
+    if (watched == m_view && (event->type() == QEvent::Resize || event->type() == QEvent::Move))
+        update_bookmarks_bar_geometry();
+    if (watched == m_bookmarks_bar_container && event->type() == QEvent::Resize)
+        update_bookmarks_bar_geometry();
+    if (watched == m_bookmarks_bar && event->type() == QEvent::LayoutRequest)
+        update_bookmarks_bar_geometry();
+
+    if (watched == m_toolbar || watched == m_bookmarks_bar_container) {
+        if (event->type() == QEvent::Enter || event->type() == QEvent::Show) {
+            update_bookmarks_bar_hover();
+        } else if (event->type() == QEvent::Leave) {
+            QTimer::singleShot(0, this, &Tab::update_bookmarks_bar_hover);
+        } else if (event->type() == QEvent::Hide && watched == m_toolbar) {
+            set_bookmarks_bar_hover_expanded(false);
+        }
+    }
+
+    return QWidget::eventFilter(watched, event);
+}
+
 void Tab::update_chrome_style()
 {
     if (m_is_updating_chrome_style)
         return;
     m_is_updating_chrome_style = true;
     m_toolbar_container->setStyleSheet(ChromeStyle::toolbar_container_style_sheet(palette()));
+    m_bookmarks_bar->update_chrome_style();
     auto hover_surface = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(palette()));
     auto hover_border = ChromeStyle::style_sheet_color(ChromeStyle::chrome_border(palette()));
     auto hover_text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(palette()));
@@ -1466,6 +1983,8 @@ void Tab::update_chrome_style()
         hover_surface, hover_text, hover_border));
     if (m_downloads_popover)
         m_downloads_popover->update_chrome_style(palette());
+    if (m_content_blocking_popover)
+        m_content_blocking_popover->update_chrome_style(palette());
     m_is_updating_chrome_style = false;
 }
 
@@ -1479,6 +1998,7 @@ void Tab::recreate_toolbar_icons()
     m_navigate_back_action->setIcon(create_chrome_icon(ChromeIcon::Back, palette()));
     m_navigate_forward_action->setIcon(create_chrome_icon(ChromeIcon::Forward, palette()));
     m_reload_action->setIcon(create_chrome_icon(ChromeIcon::Reload, palette()));
+    m_stop_action->setIcon(create_chrome_icon(ChromeIcon::Stop, palette()));
     m_downloads_button_icon = {};
     update_downloads_button();
     m_hamburger_button->setIcon(create_chrome_icon(ChromeIcon::Menu, palette()));
@@ -1495,7 +2015,7 @@ void Tab::update_downloads_button()
     if (!m_downloads_button)
         return;
 
-    auto downloads = WebView::Application::the().file_downloader().downloads();
+    auto downloads = WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private());
     auto button_state = WebView::downloads_button_state(downloads);
 
     m_downloads_button->setVisible(button_state.has_downloads);
@@ -1529,7 +2049,7 @@ void Tab::update_downloads_popover()
     if (!m_downloads_popover || !m_downloads_popover->isVisible())
         return;
 
-    if (m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads()))
+    if (m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private())))
         position_downloads_popover();
 }
 
@@ -1540,6 +2060,10 @@ void Tab::show_downloads_popover()
 
     if (!m_downloads_popover) {
         m_downloads_popover = new DownloadsPopover(this);
+        m_downloads_popover->on_visibility_change = [button = QPointer(m_downloads_button)](bool visible) {
+            if (button)
+                button->setDown(visible);
+        };
         m_downloads_popover->on_cancel_download = [this](u64 id) {
             auto& file_downloader = WebView::Application::the().file_downloader();
             if (auto download = file_downloader.download(id); download.has_value() && WebView::FileDownloader::status_is_active(download->status))
@@ -1562,7 +2086,7 @@ void Tab::show_downloads_popover()
     }
 
     m_downloads_popover->update_chrome_style(palette());
-    (void)m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads());
+    (void)m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private()));
     position_downloads_popover();
     m_downloads_popover->show();
     position_downloads_popover();
@@ -1575,30 +2099,25 @@ void Tab::position_downloads_popover()
         return;
 
     m_downloads_popover->adjustSize();
-    auto size = m_downloads_popover->sizeHint();
+    auto& card = m_downloads_popover->card();
+    auto size = card.sizeHint();
     size.setWidth(DOWNLOADS_POPOVER_WIDTH);
     if (size.height() > DOWNLOADS_POPOVER_MAX_HEIGHT)
         size.setHeight(DOWNLOADS_POPOVER_MAX_HEIGHT);
-    m_downloads_popover->setFixedSize(size);
+    card.setFixedSize(size);
+    m_downloads_popover->adjustSize();
 
-    auto anchor_position = m_downloads_button->mapToGlobal(m_downloads_button->rect().bottomRight());
-    auto popup_position = QPoint(anchor_position.x() - m_downloads_popover->width(), anchor_position.y() + 4);
-
-    if (auto* screen = QGuiApplication::screenAt(anchor_position)) {
-        auto available_geometry = screen->availableGeometry();
-        if (popup_position.x() < available_geometry.left())
-            popup_position.setX(available_geometry.left());
-        if (popup_position.x() + m_downloads_popover->width() > available_geometry.right())
-            popup_position.setX(available_geometry.right() - m_downloads_popover->width() + 1);
-        if (popup_position.y() + m_downloads_popover->height() > available_geometry.bottom())
-            popup_position.setY(m_downloads_button->mapToGlobal(m_downloads_button->rect().topRight()).y() - m_downloads_popover->height() - 4);
-    }
-
-    m_downloads_popover->move(popup_position);
+    move_popover_below(*m_downloads_popover, *m_downloads_button);
 }
 
-void Tab::download_added(WebView::FileDownloader::Download const&)
+void Tab::download_added(WebView::FileDownloader::Download const& download)
 {
+    if (!is_loaded())
+        return;
+
+    // NB: A window lists the downloads of its own browsing session only.
+    if (download.is_private != m_window->is_private())
+        return;
     update_downloads_button();
     if (Application::the().active_tab() == this && m_window->isActiveWindow()) {
         show_downloads_popover();
@@ -1607,16 +2126,96 @@ void Tab::download_added(WebView::FileDownloader::Download const&)
     update_downloads_popover();
 }
 
-void Tab::download_updated(WebView::FileDownloader::Download const&)
+void Tab::download_updated(WebView::FileDownloader::Download const& download)
 {
+    if (!is_loaded())
+        return;
+
+    if (download.is_private != m_window->is_private())
+        return;
     update_downloads_button();
     update_downloads_popover();
 }
 
-void Tab::download_removed(u64)
+void Tab::download_removed(u64, WebView::IsPrivate is_private)
 {
+    if (!is_loaded())
+        return;
+
+    if (is_private != m_window->is_private())
+        return;
     update_downloads_button();
     update_downloads_popover();
+}
+
+void Tab::update_content_blocking_controls(WebView::ContentBlockingSnapshot const& snapshot)
+{
+    m_content_blocking_button->set_snapshot(snapshot);
+    if (!m_content_blocking_popover || !m_content_blocking_popover->isVisible())
+        return;
+
+    if (snapshot.state == WebView::ContentBlockingState::Unavailable
+        || (m_content_blocking_popover_reload_site.has_value() && snapshot.site != m_content_blocking_popover_reload_site)) {
+        m_content_blocking_popover->close();
+        return;
+    }
+
+    m_content_blocking_popover->set_snapshot(snapshot);
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+}
+
+void Tab::show_content_blocking_popover()
+{
+    if (m_content_blocking_popover && m_content_blocking_popover->isVisible()) {
+        m_content_blocking_popover->close();
+        m_content_blocking_button->setFocus(Qt::PopupFocusReason);
+        return;
+    }
+
+    auto snapshot = view().content_blocking_snapshot();
+    if (snapshot.state == WebView::ContentBlockingState::Unavailable)
+        return;
+
+    if (!m_content_blocking_popover) {
+        m_content_blocking_popover = new ContentBlockingPopover(this);
+        m_content_blocking_popover->on_visibility_change = [this, button = QPointer(m_content_blocking_button)](bool visible) {
+            if (button)
+                button->setDown(visible);
+            if (!visible)
+                m_content_blocking_popover_reload_site.clear();
+        };
+        m_content_blocking_popover->on_keyboard_dismiss = [button = QPointer(m_content_blocking_button)] {
+            if (button && button->isVisible())
+                button->setFocus(Qt::PopupFocusReason);
+        };
+    }
+
+    m_content_blocking_popover->on_toggle = [this, site = snapshot.site](bool enabled) {
+        auto current = view().content_blocking_snapshot();
+        if (!site.has_value() || current.site != site || !current.can_toggle()) {
+            m_content_blocking_popover->close();
+            return;
+        }
+
+        if (auto result = WebView::Application::settings().set_content_blocker_enabled_for_site(*site, enabled); result.is_error()) {
+            m_content_blocking_popover->set_snapshot(view().content_blocking_snapshot());
+            m_content_blocking_popover->show_error("Unable to save the site preference.");
+            move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+            return;
+        }
+
+        m_content_blocking_popover_reload_site = site;
+        view().reload();
+    };
+
+    m_content_blocking_popover->update_chrome_style(palette());
+    m_content_blocking_popover->set_favicon(m_favicon);
+    m_content_blocking_popover->set_snapshot(snapshot);
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+    m_content_blocking_popover->show();
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+    m_content_blocking_popover->raise();
+    m_content_blocking_popover->focus_switch();
 }
 
 void Tab::update_vertical_tabs_toolbar_button_placement()
@@ -1636,8 +2235,10 @@ void Tab::show_private_session_popover()
         return;
 
     if (!m_private_session_popover) {
-        m_private_session_popover = new PrivateSessionPopover(this);
-        m_private_session_popover->on_confirm = [] {
+        m_private_session_popover = new MessagePopover(this, PRIVATE_SESSION_POPOVER_WIDTH, "Start a fresh private session?",
+            "This closes all private windows and deletes history and other site data from the current private browsing session.",
+            "Cancel", "Restart Private Session");
+        m_private_session_popover->on_accept = [] {
             Application::the().restart_private_browsing_session();
         };
     }
@@ -1656,20 +2257,7 @@ void Tab::position_private_session_popover()
 
     m_private_session_popover->adjustSize();
 
-    auto anchor_position = m_private_badge->mapToGlobal(m_private_badge->rect().bottomRight());
-    auto popup_position = QPoint(anchor_position.x() - m_private_session_popover->width(), anchor_position.y() + 4);
-
-    if (auto* screen = QGuiApplication::screenAt(anchor_position)) {
-        auto available_geometry = screen->availableGeometry();
-        if (popup_position.x() < available_geometry.left())
-            popup_position.setX(available_geometry.left());
-        if (popup_position.x() + m_private_session_popover->width() > available_geometry.right())
-            popup_position.setX(available_geometry.right() - m_private_session_popover->width() + 1);
-        if (popup_position.y() + m_private_session_popover->height() > available_geometry.bottom())
-            popup_position.setY(m_private_badge->mapToGlobal(m_private_badge->rect().topRight()).y() - m_private_session_popover->height() - 4);
-    }
-
-    m_private_session_popover->move(popup_position);
+    move_popover_below(*m_private_session_popover, *m_private_badge);
 }
 
 void Tab::show_find_in_page()
@@ -1688,10 +2276,150 @@ void Tab::find_next()
     m_find_in_page->find_next();
 }
 
+void Tab::update_bookmarks_bar_visibility()
+{
+    auto show_bookmarks_bar = Application::settings().appearance().show_bookmarks_bar;
+    auto* toolbar_layout = static_cast<QBoxLayout*>(m_toolbar_container->layout());
+
+    if (show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover) {
+        // Hovering must not resize the page or move the sidebar. Keep the bar out of both layouts and overlay the view.
+        toolbar_layout->removeWidget(m_bookmarks_bar_container);
+        static_cast<QBoxLayout*>(layout())->removeWidget(m_bookmarks_bar_container);
+        if (m_bookmarks_bar_container->parentWidget() != this)
+            m_bookmarks_bar_container->setParent(this);
+    } else if (toolbar_layout->indexOf(m_bookmarks_bar_container) == -1) {
+        // An always-visible bar remains in the full-width toolbar above the vertical tabs.
+        toolbar_layout->addWidget(m_bookmarks_bar_container);
+    }
+
+    update_bookmarks_bar_hover();
+    update_bookmarks_bar_geometry();
+}
+
+bool Tab::has_bookmarks_bar_in_page() const
+{
+    // A tab that hasn't loaded has no bookmarks bar yet.
+    if (!is_loaded())
+        return false;
+    return m_bookmarks_bar_container->parentWidget() == this && !m_bookmarks_bar_container->isHidden();
+}
+
+bool Tab::can_expand_bookmarks_bar_on_hover() const
+{
+    return Application::settings().appearance().show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover
+        && isVisible() && m_toolbar->isVisible() && !m_window->isFullScreen()
+        && !m_location_edit->property("autocompleteOpen").toBool();
+}
+
+bool Tab::cursor_is_over_bookmarks_bar_hover_region() const
+{
+    // Menus are separate windows, so QWidget::isAncestorOf() does not follow them back to the toolbar.
+    for (auto* popup = QApplication::activePopupWidget(); popup; popup = popup->parentWidget()) {
+        if (popup == m_bookmarks_bar)
+            return true;
+    }
+
+    if (!m_window->underMouse())
+        return false;
+
+    auto cursor_position = QCursor::pos();
+    auto contains_cursor = [&](QWidget const& widget) {
+        return widget.isVisible() && QRect { widget.mapToGlobal(QPoint {}), widget.size() }.contains(cursor_position);
+    };
+    return contains_cursor(*m_toolbar) || contains_cursor(*m_bookmarks_bar_container);
+}
+
+void Tab::update_bookmarks_bar_hover()
+{
+    if (!can_expand_bookmarks_bar_on_hover() || !cursor_is_over_bookmarks_bar_hover_region()) {
+        set_bookmarks_bar_hover_expanded(false);
+        return;
+    }
+
+    if (!m_bookmarks_bar_hover_expanded && !m_bookmarks_bar_hover_expand_timer->isActive()) {
+        auto delay = Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandDelay);
+        m_bookmarks_bar_hover_expand_timer->start(delay);
+    }
+}
+
+void Tab::set_bookmarks_bar_hover_expanded(bool expanded)
+{
+    m_bookmarks_bar_hover_expand_timer->stop();
+    expanded &= can_expand_bookmarks_bar_on_hover();
+    if (m_bookmarks_bar_hover_expanded == expanded)
+        return;
+
+    m_bookmarks_bar_hover_expanded = expanded;
+    m_bookmarks_bar_hover_expand_animation->stop();
+
+    auto duration = expanded
+        ? Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
+        : 0;
+    m_bookmarks_bar_hover_expand_progress = expanded && duration == 0 ? 1.0 : 0.0;
+
+    if (expanded)
+        m_bookmarks_bar_hover_collapse_timer->start();
+    else
+        m_bookmarks_bar_hover_collapse_timer->stop();
+
+    update_bookmarks_bar_geometry();
+
+    if (expanded && duration > 0) {
+        m_bookmarks_bar_hover_expand_animation->setDuration(duration);
+        m_bookmarks_bar_hover_expand_animation->start();
+    }
+}
+
+void Tab::update_bookmarks_bar_geometry()
+{
+    auto show_bookmarks_bar = Application::settings().appearance().show_bookmarks_bar;
+    auto on_hover = show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
+    auto visible = !m_window->isFullScreen()
+        && (show_bookmarks_bar == WebView::ShowBookmarksBar::Always
+            || (show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover && m_bookmarks_bar_hover_expanded));
+
+    auto full_height = m_bookmarks_bar->sizeHint().height();
+    auto height = on_hover
+        ? min(qRound(full_height * m_bookmarks_bar_hover_expand_progress), m_view->height())
+        : full_height;
+
+    // Clip the full-height toolbar as it slides down, keeping its buttons at their normal size throughout the reveal.
+    m_bookmarks_bar_container->setFixedHeight(height);
+    if (on_hover)
+        m_bookmarks_bar_container->setGeometry(m_view->x(), m_view->y(), m_view->width(), height);
+    m_bookmarks_bar->setGeometry(0, height - full_height, m_bookmarks_bar_container->width(), full_height);
+    m_view->set_bookmarks_bar_overlay_height(on_hover && visible ? height : 0);
+    m_bookmarks_bar_container->setVisible(visible);
+    if (on_hover && visible)
+        m_bookmarks_bar_container->raise();
+
+#if defined(AK_OS_MACOS)
+    ensure_appkit_window_is_exposed(*m_bookmarks_bar_container);
+#endif
+
+    auto hover_bookmarks_visible = on_hover && visible;
+    if (m_toolbar_container->property("hoverBookmarksVisible").toBool() != hover_bookmarks_visible) {
+        m_toolbar_container->setProperty("hoverBookmarksVisible", hover_bookmarks_visible);
+        m_toolbar_container->style()->unpolish(m_toolbar_container);
+        m_toolbar_container->style()->polish(m_toolbar_container);
+        m_toolbar_container->update();
+    }
+}
+
 void Tab::request_close()
 {
+    m_window->cancel_window_close_preflight();
+
+    // A tab that hasn't loaded has no page to ask, so it closes at once.
+    if (!is_loaded()) {
+        m_window->definitely_close_tab(tab_index());
+        return;
+    }
+
     m_suppress_javascript_dialogs_until_navigation = true;
+    m_preserve_close_retry_state_on_dialog_dismissal = m_already_requested_close;
     m_javascript_dialog->dismiss();
+    m_preserve_close_retry_state_on_dialog_dismissal = false;
 
     if (!view().needs_beforeunload_check()) {
         auto request_close = view().prepare_for_immediate_close();
@@ -1711,6 +2439,55 @@ void Tab::request_close()
     // If the user has already requested a close, then respect the user's request and just close the tab.
     // For example, the WebContent process may not be responding.
     m_window->definitely_close_tab(tab_index());
+}
+
+void Tab::request_window_close_preflight(Function<void(bool)> on_complete)
+{
+    if (!is_loaded()) {
+        on_complete(true);
+        return;
+    }
+
+    m_suppress_javascript_dialogs_until_navigation = true;
+
+    if (m_javascript_dialog->type() != JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+
+    if (!view().needs_beforeunload_check()) {
+        on_complete(true);
+        return;
+    }
+
+    auto weak_this = QPointer<Tab>(this);
+    view().request_close_preflight([weak_this, on_complete = AK::move(on_complete)](bool approved) mutable {
+        if (!weak_this) {
+            on_complete(true);
+            return;
+        }
+        on_complete(approved);
+    });
+}
+
+void Tab::cancel_window_close_preflight()
+{
+    if (!is_loaded())
+        return;
+
+    if (m_javascript_dialog->type() == JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+    m_already_requested_close = false;
+    m_suppress_javascript_dialogs_until_navigation = false;
+}
+
+Function<void()> Tab::prepare_for_window_close()
+{
+    if (!is_loaded())
+        return [] { };
+
+    m_window_is_closing = true;
+    m_suppress_javascript_dialogs_until_navigation = true;
+    m_javascript_dialog->dismiss();
+    return view().prepare_for_close_without_prompting();
 }
 
 }

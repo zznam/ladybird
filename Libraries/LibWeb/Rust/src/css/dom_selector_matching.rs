@@ -12,6 +12,7 @@
 //! it and the style engine is not consulted. Every fact a selector tests is asked of the DOM through the callbacks the
 //! host passes in.
 
+use crate::css::ffi_support::OwnedBox;
 use std::convert::Infallible;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
@@ -59,11 +60,11 @@ pub struct FfiDomElement {
 /// One attribute of an element, borrowed from the DOM until it next changes.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct FfiDomAttribute {
+pub struct FfiDomAttribute<'a> {
     pub local_name: usize,
     /// Zero for the null namespace.
     pub namespace_uri: usize,
-    pub value: FfiUtf16View,
+    pub value: FfiUtf16View<'a>,
 }
 
 /// Which of an element's child indices a child-indexed pseudo-class counts with.
@@ -124,8 +125,9 @@ pub struct FfiDomSelectorCallbacks {
         unsafe extern "C" fn(element: *const c_void, is_class: bool, name: usize) -> bool,
     /// Whether the element is in a state, by the state's `StateFact` value.
     pub matches_state: unsafe extern "C" fn(element: *const c_void, state: u8) -> bool,
-    /// The element's resolved language tag, or an empty view when it has none. Only valid until the next callback.
-    pub language: unsafe extern "C" fn(element: *const c_void) -> FfiUtf16View,
+    /// The element's resolved language tag, or an empty view when it has none. Only valid until the next callback, which
+    /// the caller ensures, as no Rust lifetime names that.
+    pub language: unsafe extern "C" fn(element: *const c_void) -> FfiUtf16View<'static>,
     /// The interned identity of the element's directionality: `ltr` or `rtl`.
     pub directionality: unsafe extern "C" fn(element: *const c_void) -> usize,
     /// The element's heading level, or zero when it is not a heading.
@@ -222,7 +224,7 @@ pub unsafe extern "C" fn rust_dom_selector_program_create(
 ) -> *mut DomSelectorProgram {
     let selectors = match count {
         0 => &[][..],
-        _ => unsafe { std::slice::from_raw_parts(selectors, count) },
+        _ => unsafe { ak::slice_from_raw_parts(selectors, count) },
     };
     let mut names = QueryNames::default();
     let program = {
@@ -317,13 +319,9 @@ pub unsafe extern "C" fn rust_dom_selector_program_create(
     }))
 }
 
-/// # Safety
-/// `program` must be null or a program `rust_dom_selector_program_create` returned, which is not used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_dom_selector_program_destroy(program: *mut DomSelectorProgram) {
-    if !program.is_null() {
-        drop(unsafe { Box::from_raw(program) });
-    }
+pub extern "C" fn rust_dom_selector_program_destroy(program: OwnedBox<DomSelectorProgram>) {
+    drop(program);
 }
 
 /// The DOM, as the callbacks show it.
@@ -386,8 +384,8 @@ struct DomSubject<'q> {
     /// are read field by field where they lie. Nothing is written to the buffers until an element has such attributes.
     current: Option<DomNode>,
     element: FfiDomElement,
-    attributes: [MaybeUninit<FfiDomAttribute>; 4],
-    spilled_attributes: Vec<FfiDomAttribute>,
+    attributes: [MaybeUninit<FfiDomAttribute<'q>>; 4],
+    spilled_attributes: Vec<FfiDomAttribute<'q>>,
     /// Whether the query remembers answers, which a query matching one element does only if it can ask a question
     /// twice.
     remembers_answers: bool,
@@ -446,23 +444,23 @@ impl<'q> DomSubject<'q> {
 
     /// The attributes the program names of the element read last.
     #[inline]
-    fn attributes(&self) -> &[FfiDomAttribute] {
+    fn attributes(&self) -> &[FfiDomAttribute<'q>] {
         let count = self.element.attribute_count;
         match count <= self.attributes.len() {
             // SAFETY: The host wrote this many attributes to the buffer when it read the element.
-            true => unsafe { std::slice::from_raw_parts(self.attributes.as_ptr().cast(), count) },
+            true => unsafe { ak::slice_from_raw_parts(self.attributes.as_ptr().cast(), count) },
             false => &self.spilled_attributes,
         }
     }
 }
 
 /// An element, with the subject whose names its atoms are and which holds its facts.
-struct DomFeatures<'s> {
-    subject: &'s DomSubject<'s>,
+struct DomFeatures<'s, 'q> {
+    subject: &'s DomSubject<'q>,
     node: DomNode,
 }
 
-impl DomFeatures<'_> {
+impl DomFeatures<'_, '_> {
     /// The subject holds the facts of the element read last, which is this one: an element's features are asked of as
     /// soon as it is read.
     #[inline]
@@ -472,8 +470,8 @@ impl DomFeatures<'_> {
     }
 }
 
-impl ElementFeatures for DomFeatures<'_> {
-    type Attribute = FfiDomAttribute;
+impl<'q> ElementFeatures for DomFeatures<'_, 'q> {
+    type Attribute = FfiDomAttribute<'q>;
 
     #[inline]
     fn local_name_is(&self, name: StyleAtomID) -> bool {
@@ -506,12 +504,16 @@ impl ElementFeatures for DomFeatures<'_> {
         }
         match self.subject.ids_and_classes_ignore_case {
             true => unsafe { (self.subject.dom.id_or_class_equals_ignoring_ascii_case)(self.node, true, class) },
-            false => unsafe { std::slice::from_raw_parts(element.classes, element.class_count) }.contains(&class),
+            false => unsafe { ak::slice_from_raw_parts(element.classes, element.class_count) }.contains(&class),
         }
     }
 
     #[inline]
-    fn attributes_named(&self, name: StyleAtomID, any_namespace: bool) -> impl Iterator<Item = FfiDomAttribute> + '_ {
+    fn attributes_named(
+        &self,
+        name: StyleAtomID,
+        any_namespace: bool,
+    ) -> impl Iterator<Item = FfiDomAttribute<'q>> + '_ {
         let name = self.subject.names().raw(name);
         debug_assert!(self.subject.current == Some(self.node));
         self.subject
@@ -528,9 +530,9 @@ impl<'q> SelectorSubject for DomSubject<'q> {
     type Tree = DomTree<'q>;
     /// An element's facts are read into the subject, where they stay until another element is read.
     type Row = DomNode;
-    type Attribute = FfiDomAttribute;
+    type Attribute = FfiDomAttribute<'q>;
     type Features<'s>
-        = DomFeatures<'s>
+        = DomFeatures<'s, 'q>
     where
         Self: 's;
     type Incomplete = Infallible;
@@ -558,7 +560,7 @@ impl<'q> SelectorSubject for DomSubject<'q> {
     }
 
     #[inline]
-    fn features(&self, node: DomNode) -> DomFeatures<'_> {
+    fn features(&self, node: DomNode) -> DomFeatures<'_, 'q> {
         DomFeatures { subject: self, node }
     }
 
@@ -568,14 +570,14 @@ impl<'q> SelectorSubject for DomSubject<'q> {
     }
 
     #[inline]
-    fn attribute_value_atom(&self, _attribute: FfiDomAttribute) -> StyleAtomID {
+    fn attribute_value_atom(&self, _attribute: FfiDomAttribute<'q>) -> StyleAtomID {
         StyleAtomID::NONE
     }
 
     #[inline]
-    fn attribute_value_text(&self, attribute: FfiDomAttribute) -> Option<TokenizerInput<'_>> {
+    fn attribute_value_text(&self, attribute: FfiDomAttribute<'q>) -> Option<TokenizerInput<'_>> {
         // An empty value crosses as an empty view.
-        Some(unsafe { attribute.value.units() }.unwrap_or(TokenizerInput::Utf16(&[])))
+        Some(attribute.value.units().unwrap_or(TokenizerInput::Utf16(&[])))
     }
 
     #[inline]
@@ -680,9 +682,12 @@ impl<'q> SelectorSubject for DomSubject<'q> {
 
     #[inline]
     fn sibling_index(&mut self, position: NthPosition, node: DomNode) -> Result<Option<i64>, Infallible> {
-        // A fixed position, such as `:last-child` or `:nth-child(3)`, is found by a scan of at most that many siblings
-        // from the near end. An index could cost a walk over the whole child list after it changes.
-        if position.step == 0 {
+        // A fixed position near the end it counts from, such as `:last-child` or `:nth-child(3)`, is found by a scan of
+        // at most that many siblings. An index could cost a walk over the whole child list after it changes. A scan to a
+        // far position costs as much as that walk, though, and one per candidate makes asking for every position of a
+        // list quadratic, while the element keeps its index once it is counted.
+        const NEAR_POSITION_SCAN_LIMIT: i32 = 8;
+        if position.step == 0 && position.offset <= NEAR_POSITION_SCAN_LIMIT {
             return Ok(None);
         }
         let which = match (position.of_type, position.from_end) {
@@ -782,7 +787,7 @@ impl<'q> DomQuery<'q> {
     fn matches(&mut self, element: DomNode) -> bool {
         let query = self.query;
         query.subjects.iter().any(|&subject| {
-            let Ok(matches) = self.evaluator.matches_node(&query.program, subject, element, &mut ());
+            let Ok(matches) = self.evaluator.matches_node(&query.program, subject, element, &());
             matches
         })
     }

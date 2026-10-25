@@ -6,12 +6,10 @@
 
 pub mod hit_test;
 pub mod paint;
-pub use libcompositing_rust::host::replay;
 pub mod visual_context;
 
 pub use hit_test::*;
 pub use paint::*;
-pub use replay::*;
 pub use visual_context::*;
 
 /// The boxes the canvas background is painted from, and whether it takes over the body's.
@@ -34,31 +32,30 @@ impl Default for RootBackgroundSource {
 
 /// What geometry tells the document. The fields are private, so the callbacks are reached only
 /// through the methods below, which take the main thread token.
+///
+/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export
+///     whose safety contract keeps them callable, and the private fields let nothing else call them.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiGeometryHostCallbacks {
     context: *mut std::ffi::c_void,
-    set_scroll_offset: unsafe extern "C" fn(
+    set_scroll_offset: extern "C" fn(
         *mut std::ffi::c_void,
+        &crate::render_state::BegunRead,
         crate::layout::node_data::NodeSlotId,
         crate::layout::used_values::FfiCssPixelPoint,
     ),
 }
 
 impl FfiGeometryHostCallbacks {
-    /// Stores a scroll offset the overflow pass settled on, after the pass.
-    ///
-    /// # Safety
-    ///
-    /// `slot` must name a live row. The host re-enters geometry queries and writes the store the
-    /// offset lives in, so no mutable arena or cache borrow may be held across this call.
-    pub(crate) unsafe fn set_scroll_offset(
+    /// Stores a scroll offset the overflow pass settled on, after the pass, in `read`.
+    pub(crate) fn set_scroll_offset(
         &self,
         _: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
         slot: crate::layout::node_data::NodeSlotId,
         offset: crate::layout::used_values::FfiCssPixelPoint,
     ) {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { (self.set_scroll_offset)(self.context, slot, offset) };
+        (self.set_scroll_offset)(self.context, read, slot, offset);
     }
 }

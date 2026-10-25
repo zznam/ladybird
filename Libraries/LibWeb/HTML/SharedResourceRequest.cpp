@@ -22,6 +22,7 @@
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
@@ -56,20 +57,20 @@ SharedResourceRequest::~SharedResourceRequest() = default;
 
 void SharedResourceRequest::finalize()
 {
+    end_rendering_pending_operation(this);
     Base::finalize();
 
-    m_callbacks.clear();
-    m_load_event_delayer.clear();
-    m_image_data = nullptr;
-    m_fetch_controller = nullptr;
+    // Don't release m_load_event_delayer or touch m_document here. While we're in our document's shared resource
+    // requests, the document keeps us alive, so if we're being finalized, it is dying in this same collection and may
+    // already have been finalized itself. The delayer is released by our destructor, after the GC has cleared its weak
+    // pointer to a dead document.
+}
 
-    if (m_document) {
-        auto& shared_resource_requests = m_document->shared_resource_requests();
-        if (auto it = shared_resource_requests.find(m_url);
-            it != shared_resource_requests.end() && it->value.ptr() == this)
-            shared_resource_requests.remove(it);
-        m_document = nullptr;
-    }
+void SharedResourceRequest::remove_from_document()
+{
+    auto& shared_resource_requests = m_document->shared_resource_requests();
+    if (auto it = shared_resource_requests.find(m_url); it != shared_resource_requests.end() && it->value.ptr() == this)
+        shared_resource_requests.remove(it);
 }
 
 void SharedResourceRequest::visit_edges(JS::Cell::Visitor& visitor)
@@ -81,6 +82,7 @@ void SharedResourceRequest::visit_edges(JS::Cell::Visitor& visitor)
     for (auto& callback : m_callbacks) {
         visitor.visit(callback.on_finish);
         visitor.visit(callback.on_fail);
+        visitor.visit(callback.on_stop);
     }
     visitor.visit(m_image_data);
 }
@@ -156,7 +158,18 @@ void SharedResourceRequest::fetch_resource(GC::Ref<Fetch::Infrastructure::Reques
         });
 
         // Check for failed fetch response
-        if (!Fetch::Infrastructure::is_ok_status(response->status()) || !response->body()) {
+        if (!response->body()) {
+            self->handle_failed_fetch();
+            return;
+        }
+
+        if (!Fetch::Infrastructure::is_ok_status(response->status())) {
+            // NB: Fetch only reports the response's timing once its body has been fully read, so read it without
+            //     holding back the failure.
+            auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
+            auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
+            auto ignore_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
+            (void)response->body()->incrementally_read(realm, ignore_chunk, ignore_end_of_body, ignore_body_error, GC::Ref { realm.global_object() });
             self->handle_failed_fetch();
             return;
         }
@@ -172,10 +185,14 @@ void SharedResourceRequest::fetch_resource(GC::Ref<Fetch::Infrastructure::Reques
         request,
         Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 
+    fetch_controller->set_stop_steps(GC::create_function(GC::Heap::the(), [weak_this] {
+        if (auto self = weak_this.ptr())
+            self->handle_stopped_fetch();
+    }));
     set_fetch_controller(fetch_controller);
 }
 
-void SharedResourceRequest::add_callbacks(Function<void()> on_finish, Function<void()> on_fail)
+void SharedResourceRequest::add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop)
 {
     if (m_state == State::Finished) {
         if (on_finish)
@@ -189,29 +206,39 @@ void SharedResourceRequest::add_callbacks(Function<void()> on_finish, Function<v
         return;
     }
 
+    if (m_state == State::Stopped) {
+        if (on_stop)
+            on_stop();
+        return;
+    }
+
     Callbacks callbacks;
     if (on_finish)
         callbacks.on_finish = GC::create_function(GC::Heap::the(), move(on_finish));
     if (on_fail)
         callbacks.on_fail = GC::create_function(GC::Heap::the(), move(on_fail));
+    if (on_stop)
+        callbacks.on_stop = GC::create_function(GC::Heap::the(), move(on_stop));
 
     m_callbacks.append(move(callbacks));
 }
 
 void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, IsSVGImage is_svg_image, ByteBuffer data, bool image_data_is_cors_cross_origin)
 {
+    begin_rendering_pending_operation(this, *m_document, RenderingPendingReason::ImageDecodes);
     // AD-HOC: At this point, things gets very ad-hoc.
     // FIXME: Bring this closer to spec.
 
     if (is_svg_image == IsSVGImage::Yes) {
-        auto result = SVG::SVGDecodedImageData::create(m_page, url_string, data);
-        if (result.is_error()) {
-            handle_failed_fetch();
-        } else {
-            m_image_data = result.release_value();
-            m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
-            handle_successful_resource_load();
-        }
+        SVG::SVGDecodedImageData::decode(m_page, url_string, data)
+            ->when_resolved([self = GC::Root { *this }, image_data_is_cors_cross_origin](auto& image_data) {
+                self->m_image_data = image_data.ptr();
+                self->m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
+                self->handle_successful_resource_load();
+            })
+            .when_rejected([self = GC::Root { *this }](Error&) {
+                self->handle_failed_fetch();
+            });
         return;
     }
 
@@ -260,6 +287,7 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
 
 void SharedResourceRequest::handle_failed_fetch()
 {
+    end_rendering_pending_operation(this);
     m_state = State::Failed;
     m_load_event_delayer.clear();
     m_fetch_controller = nullptr;
@@ -270,8 +298,28 @@ void SharedResourceRequest::handle_failed_fetch()
     m_callbacks.clear();
 }
 
+// NB: A stopped fetch never responds, so nothing waits on it anymore, and a later request for the URL
+//     fetches it again.
+void SharedResourceRequest::handle_stopped_fetch()
+{
+    if (m_state != State::Fetching)
+        return;
+
+    end_rendering_pending_operation(this);
+    m_state = State::Stopped;
+    remove_from_document();
+    m_load_event_delayer.clear();
+    m_fetch_controller = nullptr;
+    for (auto& callback : m_callbacks) {
+        if (callback.on_stop)
+            callback.on_stop->function()();
+    }
+    m_callbacks.clear();
+}
+
 void SharedResourceRequest::handle_successful_resource_load()
 {
+    end_rendering_pending_operation(this);
     m_state = State::Finished;
     m_load_event_delayer.clear();
     m_fetch_controller = nullptr;

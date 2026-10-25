@@ -14,6 +14,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibURL/Parser.h>
 #include <LibURL/PublicSuffixData.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Autocomplete.h>
 #include <LibWebView/ExternalURLHandler.h>
@@ -23,7 +24,7 @@ namespace WebView {
 
 bool is_url_handled_internally(URL::URL const& url)
 {
-    return url.scheme().is_one_of("about"sv, "blob"sv, "data"sv, "file"sv, "http"sv, "https"sv, "resource"sv);
+    return Web::Fetch::Infrastructure::is_fetch_scheme(url.scheme());
 }
 
 static bool has_valid_explicit_port(StringView input)
@@ -235,7 +236,7 @@ bool autocomplete_urls_match(StringView left, StringView right)
     if (!left_url.has_value() || !right_url.has_value())
         return false;
 
-    return left_url->equals(*right_url, URL::ExcludeFragment::Yes);
+    return left_url->equals(*right_url);
 }
 
 bool autocomplete_url_can_complete(StringView query, StringView suggestion)
@@ -251,7 +252,7 @@ bool autocomplete_url_can_complete(StringView query, StringView suggestion)
             && form.starts_with(query, CaseSensitivity::CaseInsensitive);
     };
 
-    auto serialized_suggestion = suggestion_url->serialize(URL::ExcludeFragment::Yes);
+    auto serialized_suggestion = suggestion_url->serialize();
     if (can_complete_form(serialized_suggestion))
         return true;
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/ParkedRandomBaseValues.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Element.h>
@@ -62,14 +63,7 @@ struct Element::RareData
     // the computedStyleMap() method when it is first called.
     GC::Ptr<CSS::StylePropertyMapReadOnly> computed_style_map_cache;
 
-    // https://drafts.csswg.org/css-values-5/#random-caching
-    // The random base values of the keys that name the element, kept while it has no style node to keep them under.
-    struct RandomBaseValues {
-        Vector<u32> name_lengths;
-        Vector<u16> name_units;
-        Vector<u64> value_bits;
-    };
-    RandomBaseValues random_base_values_without_style_node;
+    CSS::ParkedRandomBaseValues random_base_values_without_style_node;
 
     // https://dom.spec.whatwg.org/#concept-element-custom-element-definition
     GC::Ptr<HTML::CustomElementDefinition> custom_element_definition;
@@ -98,6 +92,10 @@ struct Element::RareData
     //         then passed down to here. This is used by Content Security Policy to disable the nonce attribute if this
     //         flag is set.
     bool had_duplicate_attribute_during_tokenization { false };
+
+    // Whether the style attribute was set while the element was not connected, so that whether Content Security
+    // Policy blocks it is decided when the element is inserted.
+    bool style_attribute_awaits_content_security_policy_check { false };
 
     // https://drafts.csswg.org/css-contain/#proximity-to-the-viewport
     ProximityToTheViewport proximity_to_the_viewport { ProximityToTheViewport::NotDetermined };

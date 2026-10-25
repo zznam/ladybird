@@ -10,9 +10,12 @@ use super::node_facts::{kind_is_box, kind_is_text, node_style_view};
 use super::rendered_text::{FfiTextSourceRange, RenderedTextBoundary, ensure_text_content};
 use crate::css::css_enums::{visibility, white_space_collapse};
 use crate::css::style::tree::StyleNodeID;
+use crate::painting::paint_read::PaintRead;
 use std::ops::Range;
 
 use RenderedTextBoundary::{End, Start};
+
+crate::render_state::held_node_entries!();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TextPosition {
@@ -22,6 +25,7 @@ struct TextPosition {
 
 // A run normally maps linearly into one rendered snapshot. A collapsed space
 // instead covers the entire whitespace range, which can cross text nodes.
+#[derive(Clone)]
 struct TextRun {
     text: Range<usize>,
     start: TextPosition,
@@ -36,7 +40,7 @@ impl TextRun {
 
 /// Text assembled from rendered snapshots. Runs retain rendered offsets, so
 /// all DOM conversion continues to use the snapshots' transform edit maps.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct MappedText {
     text: Vec<u16>,
     runs: Vec<TextRun>,
@@ -113,10 +117,11 @@ impl MappedText {
     }
 }
 
-fn collapses_whitespace(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
-    let parent = arena.data(node).parent.get();
+fn collapses_whitespace(rows: &impl PaintRead, node: NodeSlotId) -> bool {
+    let parent = rows.node_parent_if_live(node);
     matches!(
-        node_style_view(arena.data(parent))
+        parent
+            .and_then(|parent| rows.node_style_if_live(parent))
             .expect("text parent has style")
             .inherited_text()
             .white_space_collapse,
@@ -124,37 +129,74 @@ fn collapses_whitespace(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
     )
 }
 
-unsafe fn ensure_text_fragments(arena: *mut LayoutNodeArena, primary: NodeSlotId) {
-    // SAFETY: The caller lends the live arena; the IDs do not borrow it.
-    let fragments = unsafe { &*arena }.text_fragments(primary);
-    for &node in fragments.as_slice() {
-        // SAFETY: No arena borrow crosses the refresh's source callback.
-        unsafe { ensure_text_content(arena, node) };
+fn ensure_text_fragments(arena: &mut LayoutNodeArena, primary: NodeSlotId) {
+    for &node in arena.text_fragments(primary).as_slice() {
+        ensure_text_content(arena, node);
     }
 }
 
-/// The text the rows of the text node whose primary row is `primary` render, with whitespace
-/// collapsed where their style collapses it if `collapse_whitespace`.
-pub(crate) fn rendered_text(arena: &mut LayoutNodeArena, primary: NodeSlotId, collapse_whitespace: bool) -> Vec<u16> {
-    // SAFETY: The arena is borrowed exclusively.
-    unsafe { ensure_text_fragments(arena, primary) };
+/// The text the rows of the text node whose primary row is `primary` render.
+pub(crate) fn rendered_text(arena: &mut LayoutNodeArena, primary: NodeSlotId) -> Vec<u16> {
+    ensure_text_fragments(arena, primary);
     let mut text = Vec::new();
     for &node in arena.text_fragments(primary).as_slice() {
         let content = arena.text_content(node).expect("fragment was refreshed");
-        if !collapse_whitespace || !collapses_whitespace(arena, node) {
-            text.extend_from_slice(&content.text);
-            continue;
-        }
-        let mut previous_is_space = false;
-        for &unit in &content.text {
-            let is_space = matches!(unit, 0x09..=0x0d | 0x20);
-            if !is_space || !previous_is_space {
-                text.push(unit);
-            }
-            previous_is_space = is_space;
-        }
+        text.extend_from_slice(&content.text);
     }
     text
+}
+
+/// The rendered text of a text row, with each UTF-16 code unit mapped back to the DOM offsets that produced it.
+pub(crate) fn rendered_text_with_dom_offsets(
+    arena: &mut LayoutNodeArena,
+    primary: NodeSlotId,
+) -> (Vec<u16>, Vec<(usize, usize)>) {
+    ensure_text_fragments(arena, primary);
+    let mut text = MappedText::default();
+    for &node in arena.text_fragments(primary).as_slice() {
+        let content = arena.text_content(node).expect("fragment was refreshed");
+        text.append(
+            &content.text,
+            TextPosition { node, offset: 0 },
+            TextPosition {
+                node,
+                offset: content.text.len(),
+            },
+        );
+    }
+
+    let mut offsets = Vec::with_capacity(text.text.len());
+    for offset in 0..text.text.len() {
+        let start = text
+            .dom_position(arena, offset, Start)
+            .expect("rendered code unit has a start");
+        let end = text
+            .dom_position(arena, offset + 1, End)
+            .expect("rendered code unit has an end");
+        offsets.push((start.offset, end.offset));
+    }
+    (text.text, offsets)
+}
+
+/// [`rendered_text`] as `rows` carry it, where they carry the rendered text of each of the text node's rows: a text row
+/// carries what [`rendered_text`] answers unless it is among `awaiting_render`, the rows that wait for their text to be
+/// rendered again, by slot index.
+pub(crate) fn rendered_text_of_rows(
+    rows: &impl PaintRead,
+    awaiting_render: &[NodeSlotId],
+    primary: NodeSlotId,
+) -> Option<Vec<u16>> {
+    let mut text = Vec::new();
+    for &node in rows.text_fragments(primary).as_slice() {
+        if awaiting_render
+            .binary_search_by_key(&node.index, |row| row.index)
+            .is_ok()
+        {
+            return None;
+        }
+        text.extend_from_slice(&rows.rendered_text(node)?.text);
+    }
+    Some(text)
 }
 
 fn word_range(
@@ -204,8 +246,7 @@ pub(crate) fn text_word_range(
     primary: NodeSlotId,
     dom_offset: usize,
 ) -> FfiTextSourceRange {
-    // SAFETY: The arena is borrowed exclusively.
-    unsafe { ensure_text_fragments(arena, primary) };
+    ensure_text_fragments(arena, primary);
     let range = word_range(arena, primary, dom_offset, super::text_chunker::word_boundaries);
     FfiTextSourceRange {
         start: range.start,
@@ -324,8 +365,7 @@ fn ensure_searchable_text(
                 if !is_searchable(text) {
                     continue;
                 }
-                // SAFETY: The arena is borrowed exclusively.
-                unsafe { ensure_text_content(arena, node) };
+                ensure_text_content(arena, node);
                 let content = arena.text_content(node).expect("search text was refreshed");
                 builder.append(node, &content.text, collapses_whitespace(arena, node));
             }
@@ -391,10 +431,12 @@ pub(crate) fn find_matching_text(
     for block in arena.searchable_text.as_ref().expect("search cache was prepared") {
         let mut offset = 0;
         while let Some(index) = find_text(&block.text, query, offset, case_sensitive) {
-            if let Some(range) = block.dom_range(arena, index..index + query.len()) {
+            if let Some(range) = block.dom_range(arena, index..index + query.len())
+                && matches.last() != Some(&range)
+            {
                 matches.push(range);
             }
-            offset = index + query.len() + 1;
+            offset = index + query.len();
             if offset >= block.text.len() {
                 break;
             }
@@ -403,36 +445,17 @@ pub(crate) fn find_matching_text(
     matches
 }
 
-/// The reason the host waits for its document's render state as input selects the word at a point.
-pub(crate) struct InputSelectsByWord {
-    _private: (),
-}
-
-const INPUT_SELECTS_BY_WORD: InputSelectsByWord = InputSelectsByWord { _private: () };
-
 /// The DOM range of the word at `dom_offset` in the text the rows of the text node whose primary row is `primary`
-/// render.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and the primary and its fragments live text rows
-/// with styled parents.
+/// render, which input reads in `read` as it selects the word at a point.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_text_word_range(
-    host: *mut crate::render_state::DocumentHost,
+pub extern "C" fn layout_text_word_range(
+    host: &crate::render_state::DocumentHost,
     primary: NodeSlotId,
     dom_offset: usize,
 ) -> FfiTextSourceRange {
-    use crate::render_state::{Answer, ArenaAnswer, ArenaQuery, LockstepProof, Query, ask};
-    assert!(!host.is_null(), "document host is null");
-    let query = Query::Arena(ArenaQuery::WordRange { primary, dom_offset });
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
-    let Answer::Arena(ArenaAnswer::Range(range)) = ask(LockstepProof::for_reason(&INPUT_SELECTS_BY_WORD), host, query)
-    else {
-        unreachable!("a word range is answered with a range");
-    };
-    range
+    host.ask(node_read(), |state| {
+        text_word_range(state.arena_mut(), primary, dom_offset)
+    })
 }
 
 #[cfg(test)]
@@ -552,6 +575,22 @@ mod tests {
             .free_subtree(text)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert!(arena.searchable_text.is_none());
+    }
+
+    #[test]
+    fn search_finds_a_match_that_starts_where_the_previous_match_ends() {
+        let mut arena = LayoutNodeArena::new();
+        let text = node(&mut arena, "foofoo", 0, 6, Vec::new());
+        let mut builder = SearchTextBuilder::default();
+        builder.append(text, &arena.text_content(text).unwrap().text, false);
+        builder.flush();
+        arena.searchable_text = Some(builder.blocks);
+        let query: Vec<u16> = "foo".encode_utf16().collect();
+        let offsets: Vec<_> = find_matching_text(&mut arena, text, &query, true, &[])
+            .iter()
+            .map(|range| (range.start_offset, range.end_offset))
+            .collect();
+        assert_eq!(offsets, [(0, 3), (3, 6)]);
     }
 
     #[test]

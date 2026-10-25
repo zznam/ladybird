@@ -11,9 +11,13 @@
 
 class QAbstractButton;
 class QPainter;
+class QPainterPath;
 class QPalette;
 
 namespace Ladybird::ChromeStyle {
+
+constexpr inline int LOCATION_EDIT_CORNER_RADIUS = 16;
+constexpr inline int LOADING_SWIRL_PERIOD_MS = 2000;
 
 bool is_dark(QPalette const&);
 QColor mix(QColor const& from, QColor const& to, double amount);
@@ -25,11 +29,12 @@ QColor chrome_surface_recessed(QPalette const&);
 QColor chrome_surface_hover(QPalette const&);
 QColor chrome_surface_pressed(QPalette const&);
 QColor chrome_control_border(QPalette const&);
-QColor chrome_active_tab_surface_top(QPalette const&);
-QColor chrome_active_tab_surface_bottom(QPalette const&);
+QColor chrome_active_tab_surface(QPalette const&);
 QColor chrome_border(QPalette const&);
+QColor location_edit_border(QPalette const&);
+QColor chrome_separator(QPalette const&);
 QColor chrome_window_outline(QPalette const&);
-QColor chrome_accent(QPalette const&);
+QColor chrome_accent();
 QColor chrome_muted_text(QPalette const&);
 
 QString style_sheet_color(QColor const&);
@@ -38,21 +43,27 @@ QString toolbar_container_style_sheet(QPalette const&);
 QString menu_bar_style_sheet(QPalette const&);
 QString hamburger_style_sheet(QPalette const&);
 QString location_edit_style_sheet(QPalette const&);
-QString bookmarks_bar_style_sheet(QPalette const&);
+QString bookmarks_bar_style_sheet(QPalette const&, int corner_radius);
 QString find_in_page_style_sheet(QPalette const&);
 QString javascript_dialog_style_sheet(QPalette const&);
-QString crash_report_review_style_sheet(QPalette const&);
-QColor crash_report_review_placeholder_text(QPalette const&);
+QString bookmark_dialog_style_sheet(QPalette const&);
+QString report_review_style_sheet(QPalette const&);
+QColor report_review_placeholder_text(QPalette const&);
 QString devtools_banner_style_sheet(QPalette const&);
 QString tab_widget_style_sheet(QPalette const&);
 QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
-QString private_session_popover_style_sheet(QPalette const&);
+QString message_popover_style_sheet(QPalette const&);
+QString content_blocking_popover_style_sheet(QPalette const&);
+QString screenshot_selection_style_sheet(QPalette const&);
+QString screenshot_viewer_style_sheet();
 
 enum class CircularControlFrameStyle {
     InteractionOnly,
     ActiveTabOverlay,
 };
 void paint_circular_control_frame(QPainter&, QAbstractButton const&, CircularControlFrameStyle = CircularControlFrameStyle::InteractionOnly);
+
+void paint_loading_swirl(QPainter&, QPainterPath const& border);
 
 }

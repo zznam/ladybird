@@ -20,7 +20,8 @@ pub(in crate::css::style) enum Unanswered {
     Suspended(Suspension),
     Refused,
     /// The row inherits from a parent that holds no record yet: one the host styles in the same
-    /// update. The host retries the row once it has applied the rows before it.
+    /// update. The style pass settles the row in its next wave, once the host installed the rows
+    /// before it.
     AwaitsParent,
 }
 
@@ -93,7 +94,7 @@ pub(super) enum FullDrive {
     AwaitsRegisteredContext(custom_property_cascade::RegisteredValueContext),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::css::style) struct FontDriveScratch {
     request: Option<font_resolution::FontRequest>,
     pending: Option<PendingFontDrive>,
@@ -128,18 +129,12 @@ impl FontDriveScratch {
             .take()
             .expect("a drive suspended on a font names its request")
     }
-
-    pub(in crate::css::style) fn capacity_bytes(&self) -> u64 {
-        self.pending
-            .as_ref()
-            .and_then(|pending| pending.progress.as_ref())
-            .map_or(0, |progress| progress.table.owned_capacity_bytes())
-    }
 }
 
 /// An element's record, computed while one of its pseudo-elements waits for a font, held for the
 /// element's own row to resume. Its fields are private to the drive, so the record can only be
 /// taken back by naming the node it was computed for.
+#[derive(Clone)]
 pub(super) struct PendingElement {
     node: StyleNodeID,
     delta: RecordDelta,
@@ -161,6 +156,7 @@ impl PendingElement {
 
 /// A drive left for its target's retry. No parent/context borrow survives refill; the caller
 /// resumes the same subject before evaluating any later canonical element.
+#[derive(Clone)]
 struct PendingFontDrive {
     /// What the suspended drive belongs to. The record loop can settle that element another way
     /// before the retry comes, which leaves the drive behind; whoever is driven next must not
@@ -172,6 +168,7 @@ struct PendingFontDrive {
 }
 
 /// The completed font phase owns its table.
+#[derive(Clone)]
 struct DriveProgress {
     root_font_complete: bool,
     /// Whether the color-scheme phase ran too, as it has for a drive awaiting its registered
@@ -223,8 +220,8 @@ impl RetainedState {
             views[index]
                 .1
                 .as_ref()
-                .and_then(|view| unsafe { view.longhand_table.as_ref() })
-                .map_or(std::ptr::null(), ComputedLonghandTable::raw_cascaded_font_size)
+                .and_then(|view| view.longhand_table)
+                .and_then(ComputedLonghandTable::raw_cascaded_font_size_value)
         };
         let default_size = CssPixels::from_integer(13).raw_value();
         let document_inputs = FfiFontSizeRecascadeDocumentInputs::from_document(inputs);
@@ -236,7 +233,7 @@ impl RetainedState {
             false,
             default_size,
             document_inputs,
-            std::ptr::null(),
+            None,
         );
         while batch.status != FontSizeRecascadeStatus::Complete {
             let index = batch.next_index;
@@ -251,6 +248,9 @@ impl RetainedState {
                 font_weight: 400.0,
                 font_width: 100.0,
                 font_optical_sizing: 0,
+                font_size_adjust: bridge::FontSizeAdjustKind::None,
+                font_size_adjust_metric: 0,
+                font_size_adjust_value: 0.0,
                 font_feature_values_scope: TreeScopeID::DOCUMENT.0,
                 font_environment_generation: inputs.font_environment_generation,
             };
@@ -325,7 +325,7 @@ impl RetainedState {
                 batch.depends_on_viewport_metrics,
                 default_size,
                 document_inputs,
-                &raw const context,
+                Some(&context),
             );
             // The context resolves every length a cascaded font-size holds.
             if batch.status == FontSizeRecascadeStatus::NeedsCppLengthResolution {
@@ -342,7 +342,7 @@ impl RetainedState {
     /// The tree scope whose `@font-feature-values` an element's `font-variant-alternates` names
     /// features through: the nearest around it, through the trees its hosts are in, that declares
     /// some, or the document's. Those of the trees between add nothing.
-    fn font_feature_values_scope(&self, node: StyleNodeID) -> TreeScopeID {
+    pub(in crate::css::style) fn font_feature_values_scope(&self, node: StyleNodeID) -> TreeScopeID {
         let declaring = self
             .font_resolution
             .as_ref()
@@ -370,13 +370,11 @@ impl RetainedState {
         store: &WinnerStore,
         selected: &[u64],
         inputs: &bridge::FfiDocumentStyleComputationInputs,
-        installed_ancestors: Option<&InstalledAncestors>,
-        counters: &mut Counters,
     ) -> Drive<PartialDrive> {
         let random_base_values = store
             .drive_random_base_values(self, node)
             .or_refused()
-            .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailValue))?;
+            .inspect_err(|_| self.counters.bump(Counter::EngineComputedRecordBailValue))?;
         let resource_contexts = store.drive_resource_contexts(self);
         let reads_container_units = store.reads_container_units(self);
         let document_base_url = &self.document_resource_contexts.document_base_url;
@@ -394,33 +392,34 @@ impl RetainedState {
             debug_assert!(false, "the record being driven again has a view");
             return Ok(PartialDrive::DriverInputMoved);
         };
-        if !view.animated_overlay.is_null() {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+        if view.animated_overlay.is_some() {
+            self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return Err(Unanswered::Refused);
         }
         // A record holding no table has no slots to copy the unselected properties from, and one
         // under display:none may have kept values its moved ancestors no longer pass on: the caller
         // drives either in full.
-        let Some(old_table) =
-            (unsafe { view.longhand_table.as_ref() }).filter(|_| view.dependency_flags & IN_DISPLAY_NONE_SUBTREE == 0)
+        let Some(old_table) = (view.longhand_table).filter(|_| view.dependency_flags & IN_DISPLAY_NONE_SUBTREE == 0)
         else {
             return Ok(PartialDrive::DriverInputMoved);
         };
         let parent = self
-            .record_inheritance_parent(node, installed_ancestors)
-            .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
+            .record_inheritance_parent(node)
+            .inspect_err(|_| self.counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
         let snapshot = match parent.and_then(|parent| self.computed_group_sets.assigned_style_record(parent)) {
             None => None,
             Some(record) => {
                 let Some(view) = self.computed_group_sets.style_record_view(record.raw()) else {
                     debug_assert!(false, "an assigned parent record has a view");
-                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return Err(Unanswered::Refused);
                 };
                 // A child inherits what the parent's animations sampled over its record.
-                Some(parent_snapshot_for_style_record(self, record.raw(), unsafe {
-                    view.animated_overlay.as_ref()
-                }))
+                Some(parent_snapshot_for_style_record(
+                    self,
+                    record.raw(),
+                    view.animated_overlay,
+                ))
             }
         };
         let font = unsafe {
@@ -468,16 +467,15 @@ impl RetainedState {
         if reads_container_units {
             self.container_unit_bases(node).apply_to(&mut length);
         }
-        // No element fact reaches the remaining phase through this environment but the element's
-        // place among its siblings: the moved properties were checked not to need one, and the
-        // required driver inputs are compared against the record below.
+        // NB: Remaining-phase computation uses the current box-type inputs and compares its
+        //     required driver outputs with the retained record below. Font-phase and line-height
+        //     changes still take the full path.
         let sibling_position = self.sibling_position(node);
         let environment = FfiStyleComputationEnvironment {
-            box_type_input: crate::css::style_compute::rust_box_type_transformation_input(
-                0,
+            box_type_input: self.box_type_transformation_input(
+                self.computed_group_sets.adjustment_facts(node),
                 crate::css::style_compute::FfiStyleAdjustmentTarget::Element,
-                false,
-                crate::css::display::FfiDisplay::block(),
+                parent,
             ),
             color_scheme_input: FfiEffectiveColorSchemeInput {
                 preferred_color_scheme: 0,
@@ -503,43 +501,46 @@ impl RetainedState {
         let mut table = view.longhand_table_for_partial_drive();
         let mut results = empty_longhand_driver_results();
         let mut effective_color_scheme = old_table.effective_color_scheme();
+        let input_line_height_metrics = crate::css::style_compute::FfiInputLineHeightMetrics {
+            current_line_height: 0.0,
+            minimum_line_height: 0.0,
+        };
         unsafe {
             drive_property_computation(
-                &raw mut table,
-                std::ptr::null_mut(),
+                &mut table,
                 &store,
                 snapshot.as_ref(),
                 None,
-                &raw const environment,
-                u32::MAX,
-                selected.as_ptr(),
+                &environment,
+                Some(selected),
                 LONGHAND_DRIVE_PHASE_REMAINING,
-                &raw const length,
-                std::ptr::null(),
-                std::ptr::null(),
-                &raw mut results,
+                Some(&length),
+                Some(&input_line_height_metrics),
+                &mut results,
                 &mut effective_color_scheme,
                 true,
             );
         }
-        counters.bump(Counter::EnginePartialDrivesStarted);
+        self.counters.bump(Counter::EnginePartialDrivesStarted);
 
-        counters.add(
+        self.counters.add(
             Counter::EnginePhysicalLonghandEvaluations,
             u64::from(results.longhand_evaluations),
         );
-        counters.add(
+        self.counters.add(
             Counter::EnginePartialLonghandEvaluations,
             u64::from(results.longhand_evaluations),
         );
         // A tree-counting value is admitted only where the retained tree places the element.
         if results.uses_tree_counting_function && sibling_position.is_none() {
-            counters.bump(Counter::EngineComputedRecordBailDrive);
+            self.counters.bump(Counter::EngineComputedRecordBailDrive);
             return Err(Unanswered::Refused);
         }
         // An input the drive reads for properties it did not select moved with the selection: the
         // caller drives the record in full instead.
-        if table.display_before_box_type_transformation() != old_table.display_before_box_type_transformation() {
+        if results.post_adjusted_longhands & crate::css::style_compute::POST_ADJUSTED_LINE_HEIGHT != 0
+            || table.display_before_box_type_transformation() != old_table.display_before_box_type_transformation()
+        {
             return Ok(PartialDrive::DriverInputMoved);
         }
         let old_values = old_table.value_pointers();
@@ -598,15 +599,17 @@ impl RetainedState {
         use crate::css::style_compute::effective_display;
 
         let mut parent_display = None;
+        let mut parent_writing_mode = crate::css::css_enums::writing_mode::HORIZONTAL_TB;
         let mut ancestor = parent;
         while let Some(current) = ancestor
             && let Some(record) = self.computed_group_sets.assigned_style_record(current)
             && let Some(view) = self.computed_group_sets.style_record_view(record.raw())
-            && let Some(table) = unsafe { view.longhand_table.as_ref() }
+            && let Some(table) = view.longhand_table
         {
-            let display = effective_display(table, unsafe { view.animated_overlay.as_ref() });
+            let display = effective_display(table, view.animated_overlay);
             if !display.is_contents() {
                 parent_display = Some(display);
+                parent_writing_mode = crate::css::style_compute::effective_writing_mode(table, view.animated_overlay);
                 break;
             }
             ancestor = self.tree.inheritance_parent(current);
@@ -616,6 +619,7 @@ impl RetainedState {
             target,
             parent_display.is_some(),
             parent_display.unwrap_or_else(crate::css::display::FfiDisplay::block),
+            parent_writing_mode,
         )
     }
 
@@ -658,12 +662,11 @@ impl RetainedState {
         font_scratch: &mut FontDriveScratch,
         goal: FontDriveGoal,
         awaits_registered_context: bool,
-        counters: &mut Counters,
     ) -> Drive<FullDrive> {
         let random_base_values = store
             .drive_random_base_values(self, subject.target.node())
             .or_refused()
-            .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailValue))?;
+            .inspect_err(|_| self.counters.bump(Counter::EngineComputedRecordBailValue))?;
         let resource_contexts = store.drive_resource_contexts(self);
         // A pseudo-element's container-relative lengths resolve against its originating
         // element's query containers.
@@ -687,7 +690,7 @@ impl RetainedState {
         let has = |bit: u32| facts & bit != 0;
         let is_document_element = has(fact::IS_DOCUMENT_ELEMENT);
         if !self.computes_records() {
-            counters.bump(Counter::EngineComputedRecordBailUnhosted);
+            self.counters.bump(Counter::EngineComputedRecordBailUnhosted);
             return Err(Unanswered::Refused);
         }
         // HACK: A cascade that ends in `font-family: monospace` re-runs the font-size cascade over
@@ -704,7 +707,7 @@ impl RetainedState {
             progress.recascaded_font_size
         } else if store
             .winning_declaration(prop::FONT_FAMILY)
-            .is_some_and(|(value, ..)| font_family_is_monospace(unsafe { &*value.cast::<StyleValueData>() }))
+            .is_some_and(|(value, ..)| font_family_is_monospace(value.data()))
         {
             match self.monospace_recascaded_font_size(target, inputs) {
                 Some(MonospaceRecascade::Size(recascaded, reads_viewport)) => {
@@ -715,7 +718,7 @@ impl RetainedState {
                     return Err(font_scratch.suspend(target, request, None));
                 }
                 None => {
-                    counters.bump(Counter::EngineComputedRecordBailMonospaceQuirk);
+                    self.counters.bump(Counter::EngineComputedRecordBailMonospaceQuirk);
                     return Err(Unanswered::Refused);
                 }
             }
@@ -731,24 +734,24 @@ impl RetainedState {
         });
         let old_table = match &old_view {
             Some(view) => {
-                if !view.animated_overlay.is_null() {
-                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                if view.animated_overlay.is_some() {
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return Err(Unanswered::Refused);
                 }
                 // A record holding no table is driven from a fresh one, like a first record.
-                unsafe { view.longhand_table.as_ref() }
+                view.longhand_table
             }
             None => None,
         };
         let parent_view = match parent {
             Some(parent) => {
                 let Some(parent_record) = self.computed_group_sets.assigned_style_record(parent) else {
-                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return Err(Unanswered::AwaitsParent);
                 };
                 let Some(parent_view) = self.computed_group_sets.style_record_view(parent_record.raw()) else {
                     debug_assert!(false, "an assigned parent record has a view");
-                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return Err(Unanswered::Refused);
                 };
                 Some(parent_view)
@@ -788,34 +791,35 @@ impl RetainedState {
             };
         let snapshot = match &parent_view {
             Some(parent_view) => {
-                let Some(parent_table) = (unsafe { parent_view.longhand_table.as_ref() }) else {
+                let Some(parent_table) = parent_view.longhand_table else {
                     debug_assert!(false, "an assigned parent record has a longhand table");
-                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return Err(Unanswered::Refused);
                 };
                 Some(crate::css::style_compute::ParentSnapshot::new(
                     parent_table,
-                    unsafe { parent_view.animated_overlay.as_ref() },
+                    parent_view.animated_overlay,
                     parent_font_metrics_depend_on_viewport_metrics,
                 ))
             }
             None => None,
         };
-        // A ::selection inherits its applicable properties from the nearest ancestor's ::selection.
-        let highlight = (target.pseudo_kind() == pseudo_kind::SELECTION).then(|| {
+        // A highlight pseudo-element inherits its applicable properties from the same
+        // pseudo-element of the nearest ancestor.
+        let highlight = pseudo_kind::is_highlight(target.pseudo_kind()).then(|| {
             let snapshot = self
-                .retained_highlight_inheritance_parent_style_record(target.node(), pseudo_kind::SELECTION)
+                .retained_highlight_inheritance_parent_style_record(target.node(), target.pseudo_kind())
                 .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
                 .and_then(|view| {
-                    let table = unsafe { view.longhand_table.as_ref() }?;
+                    let table = view.longhand_table?;
                     Some(crate::css::style_compute::ParentSnapshot::new(
                         table,
-                        unsafe { view.animated_overlay.as_ref() },
+                        view.animated_overlay,
                         view.dependency_flags & (1 << 1) != 0,
                     ))
                 });
             crate::css::style_compute::HighlightInheritance {
-                pseudo_kind: pseudo_kind::SELECTION,
+                pseudo_kind: target.pseudo_kind(),
                 snapshot,
             }
         });
@@ -910,14 +914,14 @@ impl RetainedState {
         let root_font_complete = resumed.as_ref().is_some_and(|pending| pending.root_font_complete);
         let color_scheme_complete = resumed.as_ref().is_some_and(|pending| pending.color_scheme_complete);
         if !resuming {
-            counters.bump(Counter::EngineFullDrivesStarted);
+            self.counters.bump(Counter::EngineFullDrivesStarted);
         }
         let (mut table, mut results, mut effective_color_scheme) = match resumed {
             Some(pending) => {
                 resolved_viewport_relative_length = pending.resolved_viewport_relative_length;
                 if !pending.root_font_complete {
-                    counters.bump(Counter::FontRefillResumedDrives);
-                    counters.add(
+                    self.counters.bump(Counter::FontRefillResumedDrives);
+                    self.counters.add(
                         Counter::FontRefillPreservedLonghands,
                         u64::from(pending.results.longhand_evaluations),
                     );
@@ -930,29 +934,25 @@ impl RetainedState {
                 -1,
             ),
         };
-        let drive = |counters: &mut Counters,
+        let drive = |counters: &Counters,
                      table: &mut ComputedLonghandTable,
                      results: &mut crate::css::style_compute::FfiLonghandDriverResults,
                      effective_color_scheme: &mut i16,
                      phase: u8,
-                     length: *const FfiLengthResolutionContext,
-                     input_line_height_metrics: *const FfiInputLineHeightMetrics,
-                     line_height_before: *const std::ffi::c_void| unsafe {
+                     length: Option<&FfiLengthResolutionContext>,
+                     input_line_height_metrics: Option<&FfiInputLineHeightMetrics>| unsafe {
             let evaluations_before = results.longhand_evaluations;
             drive_property_computation(
-                std::ptr::from_mut(table),
-                std::ptr::null_mut(),
+                table,
                 &store,
                 snapshot.as_ref(),
                 highlight.as_ref(),
-                &raw const environment,
-                u32::MAX,
-                std::ptr::null(),
+                &environment,
+                None,
                 phase,
                 length,
                 input_line_height_metrics,
-                line_height_before,
-                std::ptr::from_mut(results),
+                results,
                 effective_color_scheme,
                 true,
             );
@@ -987,14 +987,13 @@ impl RetainedState {
                 );
             }
             drive(
-                counters,
+                &self.counters,
                 &mut table,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_FONT,
-                &raw const font_length,
-                std::ptr::null(),
-                std::ptr::null(),
+                Some(&font_length),
+                None,
             );
             // A recascaded size that read the viewport makes the element's style and font metrics
             // read it, as C++ marks them beside the size it writes.
@@ -1025,6 +1024,13 @@ impl RetainedState {
             };
             return Err(font_scratch.suspend(target, request, Some(progress)));
         };
+        if request.font_size_adjust == bridge::FontSizeAdjustKind::FromFont {
+            table.set_computed(
+                prop::FONT_SIZE_ADJUST,
+                engine_sample::computed_font_size_adjust_from_font(&request, &resolved),
+                -1,
+            );
+        }
         let own_metrics = |line_height: f64| FfiFontMetrics {
             font_size,
             x_height: drive_font_metric(resolved.x_height),
@@ -1050,14 +1056,13 @@ impl RetainedState {
         };
         if !root_font_complete {
             drive(
-                counters,
+                &self.counters,
                 &mut table,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_LINE_HEIGHT,
-                &raw const line_height_length,
-                std::ptr::null(),
-                std::ptr::null(),
+                Some(&line_height_length),
+                None,
             );
         }
 
@@ -1089,14 +1094,13 @@ impl RetainedState {
         }
         if !color_scheme_complete {
             drive(
-                counters,
+                &self.counters,
                 &mut table,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
+                None,
+                None,
             );
         }
         effective_color_scheme = table.effective_color_scheme();
@@ -1151,20 +1155,18 @@ impl RetainedState {
                 minimum_line_height: 0.0,
             }
         };
-        let line_height_value = table.effective_value(None, prop::LINE_HEIGHT, true).value;
         drive(
-            counters,
+            &self.counters,
             &mut table,
             &mut results,
             &mut effective_color_scheme,
             LONGHAND_DRIVE_PHASE_REMAINING,
-            &raw const remaining_length,
-            &raw const input_line_height_metrics,
-            line_height_value,
+            Some(&remaining_length),
+            Some(&input_line_height_metrics),
         );
         // A tree-counting value is admitted only where the retained tree places the element.
         if results.uses_tree_counting_function && sibling_position.is_none() {
-            counters.bump(Counter::EngineComputedRecordBailDrive);
+            self.counters.bump(Counter::EngineComputedRecordBailDrive);
             return Err(Unanswered::Refused);
         }
         let line_height_used_after = engine_sample::used_line_height(&table, None, &request, &resolved);

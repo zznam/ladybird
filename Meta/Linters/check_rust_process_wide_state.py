@@ -37,6 +37,27 @@ ALLOWED = {
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
 
+# The crates that another crate depends on by path but that are in one library of a process all the same: the crates
+# that depend on each, which have to be exactly these for the claim to hold, and the reason. The state of libweb_rust
+# is still checked below, for the threads that share it.
+IN_ONE_LIBRARY = {
+    "libjs_rust": (
+        {"libweb_bindings_rust"},
+        "a dependency of libweb_bindings_rust alone, whose archive both LibWeb's library and the JavaScript tools "
+        "link in a build with LibWeb; a build without LibWeb imports the crate itself, as the one Rust archive of "
+        "LibJS's library (Libraries/LibJS/CMakeLists.txt)",
+    ),
+    "libweb_rust": (
+        {"libweb_bindings_rust"},
+        "a dependency of libweb_bindings_rust alone, whose archive LibWeb's library links",
+    ),
+    "libwasm_engine": (
+        {"libwasm_jit"},
+        "a dev-dependency of libwasm_jit alone, whose tests run compiled code against it; the engine is the one Rust "
+        "archive of LibWasm's library (Libraries/LibWasm/CMakeLists.txt)",
+    ),
+}
+
 # libweb_rust: `file:name` -> why the state is fine on a thread other than the document's.
 RENDER_STATE_CRATE = "Libraries/LibWeb/Rust"
 
@@ -47,7 +68,6 @@ ENVIRONMENT_SWITCH = "read-once environment switch; every thread sees the same a
 IDENTITY = "process-wide atomic counter handing out unique identities"
 BUILT_ONCE = "built once and read-only after; every thread shares the same table"
 LOCKED = "process-wide and behind a mutex or a lock"
-REPLAY = "style replay capture; replay builds only, or off unless an environment variable turns it on"
 TEST_ONLY = "test only"
 
 
@@ -61,7 +81,6 @@ RENDER_STATE_ALLOWED = {
         [
             "css/style/matching.rs:DISPATCH_POOLS",
             "css/style/native_rules/targets.rs:TARGET_PAGES",
-            "css/style/prefix/relation.rs:RELATION_PROGRAM_MEMORY",
             "css/style/program.rs:RULE_DECLARATIONS",
             "css/style/program/rule_records.rs:RULE_RECORD_PAGES",
             "css/style/program/rule_versions.rs:RULE_VERSION_PAGES",
@@ -97,9 +116,8 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
-            "layout/fc_run_cache.rs:MODE",
-            "layout/update_layout.rs:ENABLED",
-            "painting/record/verify.rs:ENABLED",
+            "layout/in_flow_block_cache.rs:ENABLED",
+            "render_state/clock/hover.rs:LOGS",
         ],
     ),
     **render_state_entries(
@@ -107,30 +125,45 @@ RENDER_STATE_ALLOWED = {
         [
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
-            "css/selector.rs:NEXT_SELECTOR_ID",
             "css/style/index.rs:NEXT",
             "css/style/prefix.rs:NEXT",
+            "css/style/selector.rs:NEXT",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
             "layout/fragment_tree.rs:NEXT_IDENTITY",
-            "render_state.rs:NEXT",
+            "render_state/owner.rs:NEXT",
         ],
     ),
     **render_state_entries(
+        "the render owner's slot; only the thread that holds it reaches its documents' render states",
+        ["render_state/owner.rs:SLOT"],
+    ),
+    **render_state_entries(
+        "per-thread count of the holds of the render owner's slot the thread is in",
+        ["render_state/owner.rs:HOLDS"],
+    ),
+    **render_state_entries(
+        "per-thread list of what the thread let go of in its hold of the render owner's slot, dropped as the hold ends",
+        ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
+    ),
+    f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:UNFINISHED_HANDED": "per-thread count of the jobs the thread made for each stage thread that have yet to run",
+    **render_state_entries(
         BUILT_ONCE,
         [
-            "css/computed_values.rs:FIELD_DESCRIPTORS",
-            "css/computed_values.rs:PROPERTY_DEPENDENCY_MASKS",
-            "css/computed_values.rs:REGISTRY",
+            "css/computed_values.rs:DEFAULTS",
+            "css/computed_values.rs:MASKS",
             "css/counter_representation.rs:DECIMAL",
             "css/css_string.rs:EMPTY",
             "css/custom_properties.rs:EMPTY",
             "css/parser/stylesheet_cache.rs:HASHER",
+            "css/parser/stylesheet_cache.rs:KEYS",
+            "css/property_metadata.rs:SHORTHAND_LEAVES",
             "css/style/publication.rs:REMAINING",
-            "css/style_compute.rs:INITIAL_VALUE_TABLE",
             "css/style_compute.rs:KINDS",
             "css/style_compute.rs:LONGHANDS",
             "css/style_compute.rs:PHASE_BOUNDARIES",
             "css/style_compute.rs:PX",
+            "css/style_compute.rs:TABLE",
         ],
     ),
     **render_state_entries(
@@ -140,21 +173,14 @@ RENDER_STATE_ALLOWED = {
             "css/parser/arbitrary_substitution.rs:ATTR_NAMES_READ_GENERATION",
             "css/parser/stylesheet_cache.rs:CACHE",
             "css/style/atoms.rs:GLOBAL_ATOMS",
-        ],
-    ),
-    **render_state_entries(
-        REPLAY,
-        [
-            "css/computed_values.rs:REPLAY_STYLE_GROUPS",
-            "css/computed_values.rs:REPLAY_STYLE_GROUP_SIZES",
-            "css/style/record_replay.rs:CAPTURE",
-            "css/style_value.rs:REPLAY_STYLE_VALUES",
+            "css/style/inputs.rs:CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST",
+            "css/style/user_agent_selectors.rs:PROGRAMS",
         ],
     ),
     **render_state_entries(
         TEST_ONLY,
         [
-            "css/computed_values.rs:GROUPS",
+            "css/custom_properties.rs:CUSTOM_PROPERTY_COMPUTATIONS",
             "css/declaration_block.rs:DECLARATION_OWNER_ALLOCATIONS",
             "css/descriptor_block.rs:DESCRIPTOR_OWNER_ALLOCATIONS",
             "css/rule.rs:RULE_OWNER_ALLOCATIONS",
@@ -168,7 +194,14 @@ RENDER_STATE_ALLOWED = {
     ),
     f"{RENDER_STATE_CRATE}/src/css/parser/stylesheet_cache.rs:PARSE_DEPENDENCIES": "per-thread record of the parse running on this thread; scoped to that parse",
     f"{RENDER_STATE_CRATE}/src/css/style_value.rs:VALUES": "built-once keyword values, and a replay-only table of the same name",
-    f"{RENDER_STATE_CRATE}/src/render_state.rs:STATES": "the render states of the documents whose messages this thread handles; only it reaches them",
+    f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",
+    f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD": "a test's hold on the next recording that flies, behind a mutex; only internals arms it",
+    f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:STYLE_LAYOUT_THREAD": "the process's one StyleLayout thread, which every thread hands its jobs to",
+    f"{RENDER_STATE_CRATE}/src/paint_stage.rs:PAINT_THREAD": "the process's one Paint thread, which every thread hands its jobs to, and the stage only its own jobs reach",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD": "test only",
 }
 
 STATE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?static\s+(mut\s+)?([A-Z_][A-Z0-9_]*)\s*:\s*(.*)$")
@@ -188,13 +221,26 @@ def crate_name(manifest):
     return match.group(1) if match else None
 
 
+def path_dependencies(manifest):
+    """The names of the crates the manifest depends on by path, as dependencies of any kind."""
+    return set(re.findall(r"^([a-z_0-9]+)\s*=\s*\{[^}]*\bpath\s*=", manifest.read_text(), re.M))
+
+
 def crates_compiled_into_more_than_one_library(manifests):
-    """Every crate some other crate depends on by path: its code, and its statics, end up in both."""
-    shared = set()
+    """Every crate some other crate depends on by path: its code, and its statics, end up in both, unless the crate is
+    one of IN_ONE_LIBRARY, whose claim about the crates that depend on it is checked here."""
+    dependents = {}
     for manifest in manifests:
-        for match in re.finditer(r"^([a-z_0-9]+)\s*=\s*\{[^}]*\bpath\s*=", manifest.read_text(), re.M):
-            shared.add(match.group(1))
-    return shared
+        for dependency in path_dependencies(manifest):
+            dependents.setdefault(dependency, set()).add(crate_name(manifest))
+    for crate, (expected_dependents, _) in IN_ONE_LIBRARY.items():
+        if dependents.get(crate, set()) != expected_dependents:
+            sys.exit(
+                f"{crate} is listed in IN_ONE_LIBRARY as a dependency of {sorted(expected_dependents)} alone, but "
+                f"{sorted(dependents.get(crate, set()))} depend on it; its state is shared unless they are one "
+                "library, so update the list or move the state to C++"
+            )
+    return set(dependents) - set(IN_ONE_LIBRARY)
 
 
 def state_in(root, source_directory, every_thread_local=False):

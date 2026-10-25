@@ -39,11 +39,11 @@ void SyntheticPseudoElement::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_originating_element);
 }
 
-Layout::NodeWithStyle* SyntheticPseudoElement::unsafe_layout_node() const
+Layout::NodeWithStyle* SyntheticPseudoElement::unsafe_layout_node(Layout::BegunRead const& read) const
 {
     if (!m_originating_element)
         return nullptr;
-    return m_originating_element->pseudo_element_unsafe_layout_node(m_type);
+    return m_originating_element->pseudo_element_unsafe_layout_node(read, m_type);
 }
 
 void SyntheticPseudoElement::set_scroll_offset(CSSPixelPoint offset)
@@ -75,7 +75,7 @@ Node& SyntheticPseudoElement::root() const
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
 {
-    if (!m_style_record_identity)
+    if (!m_installed_style.record())
         return;
     effect.update_computed_properties_for_style(context, abstract_element);
 }
@@ -83,12 +83,17 @@ void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::K
 void SyntheticPseudoElement::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
     VERIFY(m_originating_element);
-    auto old_style_record_identity = m_style_record_identity;
-    if (old_style_record_identity == style_record_identity)
+    Layout::ForcedReadScope read { m_originating_element->document() };
+    if (m_installed_style.record() == style_record_identity)
         return;
-    m_style_record_identity = style_record_identity;
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->set_style_record_identity(style_record_identity);
+    auto& style_computer = m_originating_element->document().style_computer();
+    m_installed_style = style_computer.install_style(read, style_record_identity);
+    // The pseudo-element holds the record it installed before until the engine takes the new one in, so the layout node
+    // reads what it moves from before the pseudo-element lets go of it.
+    if (auto* layout_node = unsafe_layout_node(read))
+        layout_node->set_style_record_identity(m_installed_style.record());
+    if (auto style_node_id = m_originating_element->style_node_id(); style_node_id != 0)
+        CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_computer.style_engine().host(), style_node_id, to_underlying(type()), style_record_identity.value());
 }
 
 void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_identity)
@@ -102,19 +107,24 @@ void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_
 
 void SyntheticPseudoElement::clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment)
 {
-    if (auto* layout_node = unsafe_layout_node()) {
-        if (style_to_preserve_for_detachment)
-            layout_node->set_computed_values(style_to_preserve_for_detachment.release_nonnull());
-        else
-            layout_node->pin_style_record_for_detachment();
+    if (m_originating_element) {
+        Layout::ForcedReadScope read { m_originating_element->document() };
+        if (auto* layout_node = unsafe_layout_node(read)) {
+            if (style_to_preserve_for_detachment)
+                layout_node->set_computed_values(read, style_to_preserve_for_detachment.release_nonnull());
+            else
+                layout_node->pin_style_record_for_detachment();
+        }
+        if (auto style_node_id = m_originating_element->style_node_id(); style_node_id != 0 && !!m_installed_style.record())
+            CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(m_originating_element->document().style_computer().style_engine().host(), style_node_id, to_underlying(type()), 0);
     }
-    m_style_record_identity = 0;
+    m_installed_style = {};
 }
 
 void SyntheticPseudoElement::refresh_computed_style(CSS::StyleRecordID style_record_identity)
 {
     replace_style_record(style_record_identity);
-    VERIFY(m_style_record_identity);
+    VERIFY(m_installed_style.record());
 }
 
 SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode(CSS::PseudoElement type)
@@ -133,14 +143,14 @@ void SyntheticPseudoElementTreeNode::visit_edges(JS::Cell::Visitor& visitor)
     TreeNode::visit_edges(visitor);
 }
 
-Layout::NodeWithStyle* ElementReferencePseudoElement::layout_node() const
+Layout::NodeWithStyle* ElementReferencePseudoElement::layout_node(Layout::BegunRead const& read) const
 {
-    return m_referenced_element->layout_node();
+    return m_referenced_element->layout_node(read);
 }
 
-Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node() const
+Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node(Layout::BegunRead const& read) const
 {
-    return m_referenced_element->unsafe_layout_node();
+    return m_referenced_element->unsafe_layout_node(read);
 }
 
 Node& ElementReferencePseudoElement::root() const
@@ -148,9 +158,9 @@ Node& ElementReferencePseudoElement::root() const
     return m_referenced_element->root();
 }
 
-CSS::StyleRecordID ElementReferencePseudoElement::style_record_identity() const
+CSS::InstalledStyle const& ElementReferencePseudoElement::installed_style() const
 {
-    return m_referenced_element->style_record_identity({});
+    return m_referenced_element->installed_style({});
 }
 
 void ElementReferencePseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)

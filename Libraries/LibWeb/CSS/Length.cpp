@@ -21,7 +21,6 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::CSS {
 
@@ -112,19 +111,9 @@ Length Length::percentage_of(Percentage const& percentage) const
     return Length { percentage.as_fraction() * raw_value(), m_unit };
 }
 
-CSSPixels Length::font_relative_length_to_px(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
-{
-    return CSSPixels::nearest_value_for(font_relative_length_to_px_without_rounding(font_metrics, root_font_metrics));
-}
-
 double Length::font_relative_length_to_px_without_rounding(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
 {
     return ratio_between_font_relative_unit_and_px(m_unit, font_metrics, root_font_metrics) * m_value;
-}
-
-CSSPixels Length::viewport_relative_length_to_px(CSSPixelRect const& viewport_rect) const
-{
-    return CSSPixels::nearest_value_for(viewport_relative_length_to_px_without_rounding(viewport_rect));
 }
 
 double Length::viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect) const
@@ -158,8 +147,12 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
             return viewport_length.to_double();
         }
 
-        auto const* layout_node = query_container->unsafe_layout_node();
-        if (!layout_node || !Painting::has_committed_box(*layout_node)) {
+        // The container's box is read without making its layout node: a layout round asks this on the render owner,
+        // which must not allocate one.
+        auto const* arena = query_container->document().layout_node_arena_if_created();
+        Layout::ForcedReadScope read { query_container->document() };
+        CSSPixelSize container_size;
+        if (!arena || !Layout::RustFFI::layout_row_bound_committed_content_size(arena->host(), read, query_container->style_node_id().value(), &container_size)) {
             // A running partial relayout pass reports layout as up to date, but a container
             // with no paintable yet still needs the post-layout evaluation, which routes the
             // follow-up pass to the full layout path that resolves the container's size.
@@ -168,7 +161,7 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
             return 0.0;
         }
 
-        auto container_length = physical_axis == ContainerRelativeAxis::Width ? Painting::content_width(*layout_node) : Painting::content_height(*layout_node);
+        auto container_length = physical_axis == ContainerRelativeAxis::Width ? container_size.width() : container_size.height();
         return container_length.to_double();
     };
 
@@ -248,6 +241,7 @@ Length::ResolutionContext Length::ResolutionContext::for_document(DOM::Document 
 
 Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::NodeWithStyle const& node)
 {
+    auto const& read = node.held_read();
     Layout::NodeWithStyle const* root_layout_node;
     DOM::Element const* subject_element = nullptr;
 
@@ -257,8 +251,8 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
         auto const* root_element = node.document().document_element();
         VERIFY(root_element);
         // NB: Called during CSS length resolution, which may happen during style recalculation.
-        VERIFY(root_element->unsafe_layout_node());
-        root_layout_node = root_element->unsafe_layout_node();
+        VERIFY(root_element->unsafe_layout_node(read));
+        root_layout_node = root_element->unsafe_layout_node(read);
     }
 
     if (auto const* dom_node = node.dom_node(); dom_node && is<DOM::Element>(*dom_node))
@@ -276,13 +270,6 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
 CSSPixels Length::to_px(ResolutionContext const& context) const
 {
     return CSSPixels::nearest_value_for(to_px_without_rounding(context));
-}
-
-CSSPixels Length::to_px_slow_case(Layout::NodeWithStyle const& layout_node) const
-{
-    if (!layout_node.document().browsing_context())
-        return 0;
-    return to_px(ResolutionContext::for_layout_node(layout_node));
 }
 
 void Length::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
@@ -321,21 +308,6 @@ void Length::serialize(Utf16StringBuilder& builder, SerializationMode serializat
     builder.append(unit_name());
 }
 
-String Length::to_string(SerializationMode serialization_mode) const
-{
-    StringBuilder builder;
-    serialize(builder, serialization_mode);
-    return builder.to_string_without_validation();
-}
-
-Optional<Length> Length::absolutize(ResolutionContext const& context) const
-{
-    if (is_px())
-        return {};
-
-    return CSS::Length::make_px(to_px_without_rounding(context));
-}
-
 Length Length::from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<Length> percentage_basis)
 {
     if (style_value->is_length())
@@ -358,13 +330,6 @@ Length Length::from_style_value(NonnullRefPtr<StyleValue const> const& style_val
     }
 
     VERIFY_NOT_REACHED();
-}
-
-LengthOrAuto LengthOrAuto::from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<Length> percentage_basis)
-{
-    if (style_value->has_auto())
-        return make_auto();
-    return LengthOrAuto { Length::from_style_value(style_value, percentage_basis) };
 }
 
 double ratio_between_font_relative_unit_and_px(LengthUnit font_relative_unit, Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics)

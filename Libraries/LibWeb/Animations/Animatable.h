@@ -11,6 +11,7 @@
 #include <AK/FlyString.h>
 #include <AK/HashMap.h>
 #include <AK/Utf16FlyString.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/Animatable.h>
 #include <LibWeb/Export.h>
@@ -45,15 +46,14 @@ public:
 
     WebIDL::ExceptionOr<GC::Ref<Animation>> animate(Vector<BaseKeyframe> keyframes, Variant<double, KeyframeAnimationOptions> const& options);
     WebIDL::ExceptionOr<GC::Ref<Animation>> animate(JS::Realm&, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options);
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(GetAnimationsOptions const& options);
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(Bindings::GetAnimationsOptions const& options);
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations(GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations(Bindings::GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options);
     ReadonlySpan<GC::Ref<Animation>> associated_animations_in_composite_order();
     ReadonlySpan<GC::Ref<Animation>> associated_animations_unordered() const { return m_impl ? m_impl->associated_animations.span() : ReadonlySpan<GC::Ref<Animation>> {}; }
     void invalidate_associated_animation_composite_order();
     bool has_relevant_animations() const;
     bool has_associated_animations() const;
-    bool has_relevant_animations_other_than_transitions() const;
 
     void associate_with_animation(GC::Ref<Animation>);
     void disassociate_with_animation(GC::Ref<Animation>);
@@ -65,14 +65,13 @@ public:
     Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations(Optional<CSS::PseudoElement>);
     void set_css_defined_animations(Optional<CSS::PseudoElement>, Vector<GC::Ref<CSS::CSSAnimation>>&&);
 
-    Vector<CSS::PropertyID> property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement>) const;
-    // Whether the installed style, or a style with the given computed longhand table, gives any longhand a matching
-    // transition-property entry, answered without listing them.
+    // Whether the installed style gives any longhand a matching transition-property entry, answered without listing them.
     bool has_matching_transition_property_entry(Optional<CSS::PseudoElement>) const;
-    bool has_matching_transition_property_entry(Optional<CSS::PseudoElement>, void const* longhand_table) const;
     void set_transition(Optional<CSS::PseudoElement>, CSS::PropertyID, GC::Ref<CSS::CSSTransition>);
     void remove_transition(Optional<CSS::PseudoElement>, CSS::PropertyID);
-    Vector<CSS::PropertyID> property_ids_with_existing_transitions(Optional<CSS::PseudoElement>) const;
+    bool has_existing_transitions(Optional<CSS::PseudoElement>) const;
+    // The running or completed transition for each property, if the element holds any.
+    HashMap<CSS::PropertyID, GC::Ref<CSS::CSSTransition>> const* existing_transitions(Optional<CSS::PseudoElement>) const;
     GC::Ptr<CSS::CSSTransition> property_transition(Optional<CSS::PseudoElement>, CSS::PropertyID) const;
 
 protected:

@@ -13,15 +13,18 @@
 //! reused in is the one the engine kept when it owned the space.
 
 use super::tree::StyleNodeID;
+use crate::css::ffi_support::OwnedBox;
 
 /// The identities of one document's style nodes, in two spaces: elements (with shadow roots and the document), and
 /// text nodes.
+#[derive(Clone)]
 pub struct StyleNodeIdAllocator {
     elements: IdentitySpace,
     texts: IdentitySpace,
 }
 
 /// One space: the index past every identity minted so far, and the indexes released for reuse.
+#[derive(Clone)]
 struct IdentitySpace {
     next: u32,
     released: Vec<u32>,
@@ -82,31 +85,19 @@ pub extern "C" fn style_node_id_allocator_create() -> *mut StyleNodeIdAllocator 
     Box::into_raw(Box::default())
 }
 
-/// # Safety
-/// `allocator` must come from [`style_node_id_allocator_create`] and be destroyed once.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_node_id_allocator_destroy(allocator: *mut StyleNodeIdAllocator) {
-    // SAFETY: Guaranteed by the caller.
-    drop(unsafe { Box::from_raw(allocator) });
+pub extern "C" fn style_node_id_allocator_destroy(allocator: OwnedBox<StyleNodeIdAllocator>) {
+    drop(allocator);
 }
 
-/// Mints `count` identities into `out`: text identities where `text`, otherwise element ones.
-///
-/// # Safety
-/// `allocator` must be live, and `out` must point at `count` writable `u32` values.
+/// Mints an identity into each slot of `out`: text identities where `text`, otherwise element ones.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_node_id_allocator_mint(
-    allocator: *mut StyleNodeIdAllocator,
+pub extern "C" fn style_node_id_allocator_mint(
+    allocator: &mut StyleNodeIdAllocator,
     text: bool,
-    out: *mut u32,
-    count: usize,
+    out: ak::SpanMut<'_, u32>,
 ) {
-    if count == 0 {
-        return;
-    }
-    // SAFETY: Guaranteed by the caller.
-    let (allocator, out) = unsafe { (&mut *allocator, std::slice::from_raw_parts_mut(out, count)) };
-    for slot in out {
+    for slot in out.into_slice() {
         *slot = if text {
             allocator.mint_text()
         } else {

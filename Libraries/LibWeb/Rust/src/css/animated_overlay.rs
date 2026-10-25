@@ -16,6 +16,7 @@
 //! effective-value queries on both the overlay itself and the computed
 //! longhand table.
 
+use crate::css::ffi_support::OwnedBox;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -24,6 +25,8 @@ use crate::css::style_value::{RetainedStyleValueData, StyleValueData, release_st
 #[derive(Default)]
 pub struct AnimatedOverlay {
     entries: Vec<FfiAnimatedOverlayEntry>,
+    /// Properties to treat as included in will-change due to animations, separate from sampled CSS values.
+    pub(crate) implicit_will_change: Vec<u16>,
     pub(crate) animation_preparation: Option<Arc<crate::css::animation::PreparedAnimationBatch>>,
 }
 
@@ -32,14 +35,9 @@ impl Clone for AnimatedOverlay {
         let entries = self.entries.clone();
         Self {
             entries,
+            implicit_will_change: self.implicit_will_change.clone(),
             animation_preparation: self.animation_preparation.clone(),
         }
-    }
-}
-
-impl Drop for AnimatedOverlay {
-    fn drop(&mut self) {
-        crate::css::style::record_replay::invalidate_pointer(std::ptr::from_ref(self) as usize);
     }
 }
 
@@ -84,7 +82,18 @@ impl FfiAnimatedOverlayEntry {
     }
 
     pub(crate) fn value(&self) -> &StyleValueData {
-        unsafe { &*self.value.cast() }
+        self.value_handle().data()
+    }
+
+    /// The entry's value as the handle that owns it.
+    pub(crate) fn value_handle(&self) -> &RetainedStyleValueData {
+        const {
+            assert!(size_of::<RetainedStyleValueData>() == size_of::<*const c_void>());
+            assert!(align_of::<RetainedStyleValueData>() == align_of::<*const c_void>());
+        }
+        // SAFETY: `value` owns one strong reference while the entry is stored, which is exactly what a
+        //         RetainedStyleValueData holds, and that repr(C) type is a single pointer of the same layout.
+        unsafe { &*std::ptr::from_ref(&self.value).cast::<RetainedStyleValueData>() }
     }
 
     pub(crate) fn value_pointer(&self) -> *const StyleValueData {
@@ -115,10 +124,11 @@ impl Drop for FfiAnimatedOverlayEntry {
 }
 
 impl AnimatedOverlay {
-    fn clone_inherited(&self) -> Self {
+    pub(crate) fn clone_inherited(&self) -> Self {
         let entries = self.entries.iter().filter(|entry| entry.inherited).cloned().collect();
         Self {
             entries,
+            implicit_will_change: Vec::new(),
             animation_preparation: self.animation_preparation.clone(),
         }
     }
@@ -132,7 +142,7 @@ impl AnimatedOverlay {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.implicit_will_change.is_empty()
     }
 
     pub(crate) fn set_owned(
@@ -156,15 +166,10 @@ impl AnimatedOverlay {
         self.set_entry(FfiAnimatedOverlayEntry::from_owned(property, value, false, false, true));
     }
 
-    /// Stores an inherited copy of another overlay's entry, as that entry was made.
-    pub(crate) fn set_inherited(&mut self, property: u16, source: &FfiAnimatedOverlayEntry) {
-        self.set_entry(FfiAnimatedOverlayEntry::from_owned(
-            property,
-            source.clone_value(),
-            true,
-            source.result_of_transition,
-            source.post_compute_adjustment,
-        ));
+    /// Drops the value an animation of `property` left, where the overlay holds one of its own.
+    pub(crate) fn remove_animated(&mut self, property: u16) {
+        self.entries
+            .retain(|entry| entry.property != property || entry.inherited || entry.post_compute_adjustment);
     }
 
     fn set_entry(&mut self, entry: FfiAnimatedOverlayEntry) {
@@ -186,61 +191,48 @@ pub(crate) fn overlay_wins(entry: &FfiAnimatedOverlayEntry, base_value_is_import
 pub extern "C" fn rust_animated_overlay_create() -> *mut AnimatedOverlay {
     Box::into_raw(Box::new(AnimatedOverlay {
         entries: Vec::new(),
+        implicit_will_change: Vec::new(),
         animation_preparation: None,
     }))
 }
 
-/// Returns a new overlay holding retained copies of `overlay`'s entries.
-///
-/// # Safety
-/// `overlay` must be a valid overlay.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_clone(overlay: *const AnimatedOverlay) -> *mut AnimatedOverlay {
-    Box::into_raw(Box::new(unsafe { &*overlay }.clone()))
+pub extern "C" fn rust_animated_overlay_is_empty(overlay: &AnimatedOverlay) -> bool {
+    overlay.is_empty()
+}
+
+/// Returns a new overlay holding retained copies of `overlay`'s entries.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_animated_overlay_clone(overlay: &AnimatedOverlay) -> *mut AnimatedOverlay {
+    Box::into_raw(Box::new(overlay.clone()))
 }
 
 /// Returns a new overlay holding retained copies of `overlay`'s inherited entries.
-///
-/// # Safety
-/// `overlay` must be a valid overlay.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_clone_inherited(
-    overlay: *const AnimatedOverlay,
-) -> *mut AnimatedOverlay {
-    Box::into_raw(Box::new(unsafe { &*overlay }.clone_inherited()))
+pub extern "C" fn rust_animated_overlay_clone_inherited(overlay: &AnimatedOverlay) -> *mut AnimatedOverlay {
+    Box::into_raw(Box::new(overlay.clone_inherited()))
 }
 
-/// # Safety
-/// `overlay` must be a valid overlay.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_contains(overlay: *const AnimatedOverlay, property: u16) -> bool {
-    unsafe { &*overlay }.get(property).is_some()
+pub extern "C" fn rust_animated_overlay_contains(overlay: &AnimatedOverlay, property: u16) -> bool {
+    overlay.get(property).is_some()
 }
 
-/// # Safety
-/// `overlay` must be a valid overlay that is not used after this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_free(overlay: *mut AnimatedOverlay) {
-    drop(unsafe { Box::from_raw(overlay) });
+pub extern "C" fn rust_animated_overlay_free(overlay: OwnedBox<AnimatedOverlay>) {
+    drop(overlay);
 }
 
 /// Stores or replaces the overlay entry for a longhand, retaining `value`.
-///
-/// # Safety
-/// `overlay` must be a valid overlay and `value` must point at live style
-/// value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_set(
-    overlay: *mut AnimatedOverlay,
+pub extern "C" fn rust_animated_overlay_set(
+    overlay: &mut AnimatedOverlay,
     property: u16,
-    value: *const c_void,
+    value: crate::css::ffi_support::ArcRef<'_, StyleValueData>,
     inherited: bool,
     result_of_transition: bool,
 ) {
-    let retained = unsafe {
-        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(value.cast()))
-    };
-    let overlay = unsafe { &mut *overlay };
+    let retained = RetainedStyleValueData::from_arc(value.to_arc());
     overlay.set_owned(property, retained, inherited, result_of_transition);
 }
 
@@ -251,26 +243,23 @@ pub unsafe extern "C" fn rust_animated_overlay_set(
 /// the overlay or a subsequent mutation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_animated_overlay_entries(
-    overlay: *const AnimatedOverlay,
+    overlay: &AnimatedOverlay,
     count: *mut usize,
 ) -> *const FfiAnimatedOverlayEntry {
-    let entries = &unsafe { &*overlay }.entries;
+    let entries = &overlay.entries;
     unsafe { *count = entries.len() };
     entries.as_ptr()
 }
 
 /// The overlay's effective value for a longhand under the overlay read rule,
 /// or null when the overlay holds no entry or the important base value wins.
-///
-/// # Safety
-/// `overlay` must be a valid overlay.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_overlay_effective_value(
-    overlay: *const AnimatedOverlay,
+pub extern "C" fn rust_animated_overlay_effective_value(
+    overlay: &AnimatedOverlay,
     property: u16,
     base_value_is_important: bool,
 ) -> *const c_void {
-    unsafe { &*overlay }
+    overlay
         .get(property)
         .filter(|entry| overlay_wins(entry, base_value_is_important))
         .map_or(std::ptr::null(), FfiAnimatedOverlayEntry::value_pointer)

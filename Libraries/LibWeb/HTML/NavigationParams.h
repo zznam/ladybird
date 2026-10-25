@@ -20,6 +20,8 @@
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
+#include <LibWebCommon/HTML/CrossOriginIsolationMode.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/NavigationParamsDescriptor.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
@@ -51,8 +53,20 @@ struct NavigationParams : GC::Cell {
     //         still sees it.
     RefPtr<Fetch::Infrastructure::FetchTimingInfo> fetch_timing_info { nullptr };
 
-    // AD-HOC: The agent cluster of the agent the UI process obtained for the new Document's window.
+    // AD-HOC: The agent cluster of the agent the UI process obtained for the new Document's window, and that agent
+    //         cluster's cross-origin isolation mode.
     Optional<u64> agent_cluster_id;
+    CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode { CrossOriginIsolationMode::None };
+
+    // AD-HOC: The id the UI process gave the new Document.
+    Optional<CrossProcessId> document_id;
+
+    // AD-HOC: The group of the new top-level browsing context the UI process obtained for the new Document, when a
+    //         browsing context group switch gave it one.
+    Optional<u64> new_browsing_context_group_id;
+
+    // AD-HOC: The permissions policy the UI process created for the new Document.
+    Optional<PermissionsPolicy::PermissionsPolicy> permissions_policy;
 
     // null or an algorithm accepting a Document, once it has been created
     GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints { nullptr };

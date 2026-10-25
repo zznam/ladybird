@@ -55,7 +55,7 @@ void Body::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_sniff_bytes_callback);
     m_source.visit(
         [&](GC::Ref<FileAPI::Blob> const& blob) { visitor.visit(blob); },
-        [](auto const&) {});
+        [](auto const&) { });
 }
 
 void Body::append_sniff_bytes(ReadonlyBytes bytes)
@@ -193,7 +193,7 @@ GC::Ref<Streams::ReadableStreamDefaultReader> Body::incrementally_read(JS::Realm
 
     // 3. Perform the incrementally-read loop given reader, taskDestination, processBodyChunk, processEndOfBody, and processBodyError.
     VERIFY(!task_destination.has<Empty>());
-    incrementally_read_loop(reader, task_destination.get<GC::Ref<JS::Object>>(), process_body_chunk, process_end_of_body, process_body_error);
+    incrementally_read_loop(reader, task_destination, process_body_chunk, process_end_of_body, process_body_error);
     return reader;
 }
 

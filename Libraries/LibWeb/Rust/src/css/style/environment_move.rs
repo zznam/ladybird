@@ -7,10 +7,13 @@
 //! Moving the custom-property environments below an element whose own environment moved.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
-use super::inputs::{HeldCustomPropertyEnvironment, HostVarReads, RetainedCustomPropertyData};
+use super::custom_property_cascade::{CustomPropertyNames, sorted_custom_property_names};
+use super::inputs::{HeldCustomPropertyEnvironment, RetainedCustomPropertyData};
 use super::*;
 use crate::css::custom_properties::CustomPropertyStore;
+use crate::css::style_value::StyleValueData;
 
 /// An environment the host holds, as a move names it: the identity, the store behind it, null for
 /// the empty environment.
@@ -22,10 +25,9 @@ pub(crate) struct NamedEnvironment {
 
 /// A move of one element's custom-property environment, as the host made it.
 pub(crate) struct EnvironmentMove {
-    /// What the element's style resolved to before the move and resolves to now. A descendant
-    /// reading a name whose value differs between the two computes again.
-    pub(crate) old_base: NamedEnvironment,
-    pub(crate) new_base: NamedEnvironment,
+    /// What the element held before the move and holds now, including what its animations sampled.
+    pub(crate) old_environment: NamedEnvironment,
+    pub(crate) new_environment: NamedEnvironment,
     /// What the element handed its children before the move.
     pub(crate) old_inheritable: u64,
     /// What it hands them now. Every element the move hands the environment it inherits takes
@@ -56,15 +58,10 @@ pub(crate) enum EnvironmentMoveAction {
     Recompute(StyleNodeID),
 }
 
-/// The custom properties whose values differ between two environments, worked out once per pair
-/// of stores for a style transaction. The names come from what either store holds itself, then
-/// from the stores above them; two chains that share an ancestor pair share that pair's answer.
-/// Most moves under a root that redefines hundreds of names meet the same root pair.
 #[derive(Default)]
 pub(super) struct ChangedCustomPropertyNames {
-    /// By the addresses of the two stores, the raw names whose values differ, sorted.
     by_stores: HashMap<(usize, usize), Arc<[usize]>>,
-    /// The stores the addresses name, kept alive so that no other store takes an address.
+    /// Keeps the stores whose addresses key `by_stores` alive, so that no other store can reuse an address.
     stores: Vec<Arc<CustomPropertyStore>>,
 }
 
@@ -110,10 +107,6 @@ impl ChangedCustomPropertyNames {
     }
 }
 
-/// Whether the value one custom property has differs between two environments: a value pending
-/// substitution differs from every value but itself. The engine's value equality compares an
-/// unresolved value by its spelling, which the host's `StyleValue::equals` may not, so a reader
-/// of such a value can be computed again where the host would hand it the moved environment.
 fn custom_property_value_moved(
     name: usize,
     old: Option<&Arc<CustomPropertyStore>>,
@@ -123,22 +116,19 @@ fn custom_property_value_moved(
     let new = new.and_then(|store| store.get(name));
     let (old, new) = match (old, new) {
         (None, None) => return false,
-        (Some(old), Some(new)) => (old.value.pointer(), new.value.pointer()),
+        (Some(old), Some(new)) => (&old.value, &new.value),
         _ => return true,
     };
-    if std::ptr::eq(old, new) {
+    if std::ptr::eq(old.pointer(), new.pointer()) {
         return false;
     }
-    // SAFETY: Both values are kept alive by the stores that hold them.
-    matches!(unsafe { &*old }, StyleValueData::PendingSubstitution { .. })
-        || !unsafe { crate::css::style_value::rust_style_value_equals(old, new) }
+    matches!(old.optional_data(), Some(StyleValueData::PendingSubstitution { .. }))
+        || !crate::css::style_value::retained_style_values_equal(old, new)
 }
 
-/// A store the host names by its raw `Arc` pointer, with a reference of its own.
-///
 /// # Safety
 /// `store` must be null or a live raw `Arc` pointer to a `CustomPropertyStore`.
-unsafe fn retained_store(store: *const c_void) -> Option<Arc<CustomPropertyStore>> {
+pub(super) unsafe fn retained_store(store: *const c_void) -> Option<Arc<CustomPropertyStore>> {
     if store.is_null() {
         return None;
     }
@@ -149,19 +139,7 @@ unsafe fn retained_store(store: *const c_void) -> Option<Arc<CustomPropertyStore
     }
 }
 
-fn sorted_atoms_intersect(first: &[StyleAtomID], second: &[StyleAtomID]) -> bool {
-    let (mut first, mut second) = (first.iter().peekable(), second.iter().peekable());
-    while let (Some(a), Some(b)) = (first.peek(), second.peek()) {
-        match a.cmp(b) {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => _ = first.next(),
-            std::cmp::Ordering::Greater => _ = second.next(),
-        }
-    }
-    false
-}
-
-impl StyleEngineState {
+impl StyleEngine {
     /// Move the custom-property environments below `origin`, whose own moved as `moved` says, and
     /// answer what the host does for the elements the move reaches, in preorder. An element that
     /// holds the environment it inherits, and reads nothing that moved, takes the moved one here,
@@ -182,7 +160,7 @@ impl StyleEngineState {
         unsafe {
             self.retained
                 .custom_property_environments
-                .retain(moved.new_inheritable.identity, moved.new_inheritable.store);
+                .retain_raw(moved.new_inheritable.identity, moved.new_inheritable.store);
         }
         let mut changed_names = None;
         let mut pending = Vec::new();
@@ -237,7 +215,7 @@ impl StyleEngineState {
         element: StyleNodeID,
         old_parent_inheritable: u64,
         moved: &EnvironmentMove,
-        changed_names: &mut Option<Rc<[StyleAtomID]>>,
+        changed_names: &mut Option<CustomPropertyNames>,
         act: &mut impl FnMut(EnvironmentMoveAction),
     ) -> Option<u64> {
         // An unstyled subtree takes whatever it inherits once it has style.
@@ -250,8 +228,13 @@ impl StyleEngineState {
                 (held.identity, held.sampled_over.is_some(), held.declares)
             });
         // An animation overlay samples over what the element's style resolves to, which a
-        // computation moves.
-        if is_animation_overlay {
+        // computation moves. So does a record composing animated values: only a base record moves
+        // to another environment by itself, and the host would otherwise hold an environment its
+        // record does not name.
+        if is_animation_overlay
+            || computed::FinalStyleRecordID::from_raw(held_style_record)
+                .is_some_and(computed::FinalStyleRecordID::is_animation_overlay)
+        {
             act(EnvironmentMoveAction::Recompute(element));
             return None;
         }
@@ -261,8 +244,13 @@ impl StyleEngineState {
         let holds_inherited_environment = existing == old_parent_inheritable
             || (!declares && !self.retained.node_declares_custom_properties(element));
         if !holds_inherited_environment {
-            // Its declared values stand while it reads nothing that changed.
-            if existing == 0 || !declares || self.environment_move_needs_recompute(element, moved, changed_names) {
+            // Its declared values stand while it reads nothing that changed, over what its parent handed it before
+            // the move. One built over anything else missed an earlier move, which only a computation catches up on.
+            if existing == 0
+                || !declares
+                || !self.environment_is_built_over(existing, old_parent_inheritable)
+                || self.environment_move_needs_recompute(element, moved, changed_names)
+            {
                 act(EnvironmentMoveAction::Recompute(element));
             } else {
                 act(EnvironmentMoveAction::Rebuild(element));
@@ -327,12 +315,6 @@ impl StyleEngineState {
             None => _ = self.retained.element_custom_property_data.remove(&element),
         }
         let republished = self.retained.republish_record_environment(element, new_inheritable);
-        // A replay republishes the record as the host would have asked it to.
-        self.record_boundary_call(super::record_replay::EventKind::RepublishRecordEnvironment, |payload| {
-            payload.write_u32(element.raw());
-            payload.write_u64(new_inheritable);
-            payload.write_u64(republished.unwrap_or(0));
-        });
         let style_record = republished.unwrap_or(held_style_record);
         act(EnvironmentMoveAction::Republish {
             node: element,
@@ -342,57 +324,57 @@ impl StyleEngineState {
         Some(existing)
     }
 
+    /// Whether the environment `identity` names was built over the one `parent` names.
+    fn environment_is_built_over(&self, identity: u64, parent: u64) -> bool {
+        let environments = &self.retained.custom_property_environments;
+        let Some(store) = environments.store(identity) else {
+            return false;
+        };
+        let built_over = store.inheritance_parent().map_or(std::ptr::null(), Arc::as_ptr);
+        built_over == environments.store(parent).map_or(std::ptr::null(), Arc::as_ptr)
+    }
+
     /// Whether a moved environment computes the element again rather than handing it the moved
-    /// one: its style reads the environment other than through `var()`, or reads a name whose
-    /// value moved through `var()`.
+    /// one: its style reads the environment other than through `var()`, or reads a changed custom property.
     fn environment_move_needs_recompute(
         &mut self,
         element: StyleNodeID,
         moved: &EnvironmentMove,
-        changed_names: &mut Option<Rc<[StyleAtomID]>>,
+        changed_names: &mut Option<CustomPropertyNames>,
     ) -> bool {
         if self.retained.element_recomputes_on_environment_move(element) {
             return true;
         }
-        match self.retained.host_var_reads.get(&element) {
-            Some(HostVarReads::Unknown) => true,
-            // The names are worked out only once an element asks about them. A move that reaches
-            // no element reading a name, such as an element arriving with its subtree, needs none.
-            Some(HostVarReads::Names(reads)) if reads.is_empty() => false,
-            Some(HostVarReads::Names(_)) => {
-                let changed = changed_names
-                    .get_or_insert_with(|| self.changed_custom_property_names(moved))
-                    .clone();
-                let Some(HostVarReads::Names(reads)) = self.retained.host_var_reads.get(&element) else {
-                    unreachable!("the reads were just read");
-                };
-                sorted_atoms_intersect(reads, &changed)
-            }
-            // A record the engine computed: the engine knows whether it reads custom properties at
-            // all.
-            None => self.retained.node_style_reads_custom_properties(element),
-        }
+        let changed = changed_names
+            .get_or_insert_with(|| self.changed_custom_property_names(moved))
+            .clone();
+        self.retained
+            .node_style_reads_any_of_custom_properties(element, &changed)
     }
 
-    /// The custom properties whose values differ between what the moved element's style resolved
-    /// to before and resolves to now, as the atoms the host publishes names it reads by. A name no
-    /// host ever interned is read by no element.
-    fn changed_custom_property_names(&mut self, moved: &EnvironmentMove) -> Rc<[StyleAtomID]> {
+    fn changed_custom_property_names(&mut self, moved: &EnvironmentMove) -> CustomPropertyNames {
         // SAFETY: The move's stores are live for the move.
         let (old, new) = unsafe {
             (
-                retained_store(moved.old_base.store),
-                retained_store(moved.new_base.store),
+                retained_store(moved.old_environment.store),
+                retained_store(moved.new_environment.store),
             )
         };
         let names = self
             .host
             .environment_move_changed_names
             .between(old.as_ref(), new.as_ref());
-        let atoms = &self.retained.atoms;
-        let mut changed: Vec<StyleAtomID> = names.iter().filter_map(|&name| atoms.interned_raw(name)).collect();
-        changed.sort_unstable();
-        changed.into()
+        sorted_custom_property_names(
+            names
+                .iter()
+                .filter_map(|&name| {
+                    old.as_ref()
+                        .and_then(|store| store.get(name))
+                        .or_else(|| new.as_ref().and_then(|store| store.get(name)))
+                })
+                .map(|entry| entry.name.clone())
+                .collect(),
+        )
     }
 }
 
@@ -407,13 +389,13 @@ mod tests {
     }
 
     fn moved(old_inheritable: u64, new_inheritable: u64) -> EnvironmentMove {
-        let none = NamedEnvironment {
+        let empty = NamedEnvironment {
             identity: 0,
             store: std::ptr::null(),
         };
         EnvironmentMove {
-            old_base: none,
-            new_base: none,
+            old_environment: empty,
+            new_environment: empty,
             old_inheritable,
             new_inheritable: NamedEnvironment {
                 identity: new_inheritable,
@@ -426,7 +408,14 @@ mod tests {
 
     /// A record for `node` to hold, published as one of no style groups.
     fn held_record(engine: &mut StyleEngine, node: StyleNodeID) -> u64 {
-        let record = engine
+        let record = assigned_record(engine, node, 0);
+        engine.set_held_style_record(node, record);
+        record
+    }
+
+    /// A record of no style groups assigned to `node`, told apart by its dependency flags.
+    fn assigned_record(engine: &mut StyleEngine, node: StyleNodeID, dependency_flags: u8) -> u64 {
+        engine
             .publish_computed_groups(
                 computed::ComputedStyleTarget::new(node, u8::MAX),
                 &[],
@@ -434,7 +423,7 @@ mod tests {
                 0,
                 computed::ComputedMetadataInput {
                     pseudo_element_styles: 0,
-                    dependency_flags: 0,
+                    dependency_flags,
                     counter_style_environment_identity: 0,
                     animation_overlay_identity: 0,
                     animated_overlay: crate::css::host_shared::HostShared::null(),
@@ -443,9 +432,7 @@ mod tests {
                 },
             )
             .style_record_identity
-            .raw();
-        engine.set_held_style_record(node, record);
-        record
+            .raw()
     }
 
     /// The republished records a walk answered, by node and the environment they replaced, after
@@ -473,6 +460,18 @@ mod tests {
             .collect()
     }
 
+    /// Give every node the cascade state of a style reading no custom properties.
+    fn settle_cascades(engine: &mut StyleEngine, nodes: &[StyleNodeID]) {
+        let retained = &mut engine.retained;
+        for &node in nodes {
+            retained.facts.ensure_row(node);
+        }
+        retained.facts.apply_staged();
+        for &node in nodes {
+            engine.match_element_for_cascade(node).unwrap();
+        }
+    }
+
     fn walk(engine: &mut StyleEngine, origin: StyleNodeID, moved: &EnvironmentMove) -> Vec<EnvironmentMoveAction> {
         let mut actions = Vec::new();
         unsafe { engine.move_custom_property_environment(origin, moved, |action| actions.push(action)) };
@@ -483,9 +482,9 @@ mod tests {
     fn a_move_hands_its_environment_to_the_children_holding_the_old_one() {
         let (mut engine, nodes) = linear_document();
         discard_transaction(&mut engine);
+        settle_cascades(&mut engine, &nodes);
         for &node in &nodes[1..] {
             held_record(&mut engine, node);
-            engine.set_element_var_reads(node, true, true, &[]);
             engine.set_element_custom_property_data(node, Some(data(0x1000)), 1, None, true);
         }
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
@@ -498,13 +497,24 @@ mod tests {
         }
     }
 
+    /// Give `identity` a store of no values built over the one `parent` names, or over none.
+    fn note_store_built_over(engine: &mut StyleEngine, identity: u64, parent: u64) {
+        let environments = &mut engine.retained.custom_property_environments;
+        let parent = environments.store(parent).cloned();
+        // SAFETY: The store holds no values.
+        let store = unsafe { CustomPropertyStore::cascaded_child(parent, Vec::new()) };
+        environments.retain(identity, Some(&store));
+    }
+
     #[test]
     fn a_move_stops_at_declarations_readers_overlays_and_unstyled_elements() {
         let (mut engine, nodes) = linear_document();
         discard_transaction(&mut engine);
+        settle_cascades(&mut engine, &nodes);
         // An element declaring its own over another environment is rebuilt over the moved one.
+        note_store_built_over(&mut engine, 1, 0);
+        note_store_built_over(&mut engine, 3, 1);
         held_record(&mut engine, nodes[1]);
-        engine.set_element_var_reads(nodes[1], true, true, &[]);
         engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 3, None, true);
         // An element whose style reads the environment through if() computes again.
         held_record(&mut engine, nodes[2]);
@@ -520,30 +530,43 @@ mod tests {
                 EnvironmentMoveAction::Recompute(nodes[2]),
             ]
         );
-
-        engine.set_element_recomputes_on_environment_move(nodes[2], false);
-        engine.set_element_custom_property_data(nodes[2], Some(data(0x1001)), 4, Some(1), false);
-        // A C++ computation that reads more than its names say computes again too.
-        engine.set_element_var_reads(nodes[1], true, false, &[]);
-        let actions = walk(&mut engine, nodes[0], &moved(1, 2));
-        assert_eq!(
-            actions,
-            [
-                EnvironmentMoveAction::Recompute(nodes[1]),
-                EnvironmentMoveAction::Recompute(nodes[2]),
-            ]
-        );
     }
 
     #[test]
-    fn a_move_reads_no_changed_names_for_an_element_reading_none() {
+    fn a_move_recomputes_a_declaration_that_missed_an_earlier_move() {
         let (mut engine, nodes) = linear_document();
         discard_transaction(&mut engine);
+        settle_cascades(&mut engine, &nodes);
+        // The element's environment was built over one its parent no longer hands down, so its
+        // record may be older than the move: rebuilding it would publish that record as current.
+        note_store_built_over(&mut engine, 1, 0);
+        note_store_built_over(&mut engine, 4, 0);
+        note_store_built_over(&mut engine, 3, 4);
         held_record(&mut engine, nodes[1]);
-        engine.set_element_var_reads(nodes[1], true, true, &[]);
+        engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 3, None, true);
+        let actions = walk(&mut engine, nodes[0], &moved(1, 2));
+        assert_eq!(actions, [EnvironmentMoveAction::Recompute(nodes[1])]);
+    }
+
+    #[test]
+    fn a_move_republishes_the_record_the_host_holds_beneath_a_newer_assignment() {
+        let (mut engine, nodes) = linear_document();
+        discard_transaction(&mut engine);
+        settle_cascades(&mut engine, &nodes);
+        held_record(&mut engine, nodes[1]);
         engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 1, None, false);
+        // A row the host has yet to apply installs the newer assignment, which moves more than the environment.
+        let assigned = assigned_record(&mut engine, nodes[1], 1);
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
         assert_eq!(republished(&engine, &actions, 2), [(nodes[1], 1)]);
-        assert!(engine.host.environment_move_changed_names.by_stores.is_empty());
+        let records = &engine.computed_group_sets;
+        assert!(matches!(
+            actions[..],
+            [EnvironmentMoveAction::Republish { style_record, .. }] if records.style_record_dependency_flags(style_record) == Some(0)
+        ));
+        assert_eq!(
+            records.assigned_style_record(nodes[1]).map(|record| record.raw()),
+            Some(assigned)
+        );
     }
 }

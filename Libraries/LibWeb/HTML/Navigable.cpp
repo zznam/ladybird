@@ -5,6 +5,7 @@
  */
 
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -53,6 +54,19 @@ GC::Ptr<DOM::Document> Navigable::container_document() const
     return container->document();
 }
 
+PermissionsPolicy::PermissionsPolicy Navigable::create_a_permissions_policy_from_a_response(URL::Origin const& origin, HTTP::HeaderList const& response_header_list) const
+{
+    if (!parent())
+        return PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response({}, origin, response_header_list);
+
+    // NB: The container's node document is the parent's active document. An origin not yet replicated is same origin
+    //     with nothing, which withholds features whose default allowlist is 'self'.
+    auto container_document_origin = parent()->active_document_origin().value_or_lazy_evaluated([] { return URL::Origin::create_opaque(); });
+    auto container_state = this->container_state();
+    PermissionsPolicy::NavigableContainerPolicyInputs container { container_state.document_permissions_policy, container_document_origin, container_state.container_policy };
+    return PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response(container, origin, response_header_list);
+}
+
 bool Navigable::is_ancestor_of(Navigable const& other) const
 {
     for (auto ancestor = other.parent(); ancestor; ancestor = ancestor->parent()) {
@@ -83,6 +97,12 @@ GC::Ptr<DOM::Node> Navigable::currently_focused_area_shown_by_focused_navigable(
             return container;
     }
     return nullptr;
+}
+
+void Navigable::set_parent(GC::Ptr<Navigable> parent)
+{
+    m_parent = parent;
+    DOM::Document::invalidate_full_activity();
 }
 
 // AD-HOC: Destroying a child navigable detaches its subtree from the traversable, although the documents in that
@@ -177,9 +197,15 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         // 1. Assert: userInvolvement is not "browser UI".
         VERIFY(params.user_involvement != UserNavigationInvolvement::BrowserUI);
 
+        // AD-HOC: sourceDocument can have no node navigable, e.g. a document without a browsing context that a form
+        //         moved into after it planned a navigation. There is nothing to navigate from.
+        auto source_navigable = source_document->navigable();
+        if (!source_navigable)
+            return {};
+
         // 2. If sourceDocument's node navigable is not allowed by sandboxing to navigate navigable given
         //    sourceSnapshotParams:
-        if (!source_document->navigable()->allowed_by_sandboxing_to_navigate(*this, snapshots.source_snapshot_params)) {
+        if (!source_navigable->allowed_by_sandboxing_to_navigate(*this, snapshots.source_snapshot_params)) {
             // 1. If exceptionsEnabled is true, then throw a "SecurityError" DOMException.
             if (params.exceptions_enabled)
                 return WebIDL::SecurityError::create("Source document's node navigable is not allowed to navigate"_utf16);
@@ -259,7 +285,16 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
 
     // 4. If target is a top-level traversable:
     if (target.is_top_level_traversable()) {
-        // FIXME: 1. If source is the one permitted sandboxed navigator of target, then return true.
+        // 1. If source is the one permitted sandboxed navigator of target, then return true.
+        // NB: The one permitted sandboxed navigator is a browsing context, so we compare the active browsing contexts.
+        auto const* local_source = as_if<LocalNavigable>(source);
+        auto const* local_target = as_if<LocalNavigable>(target);
+        if (local_source && local_target) {
+            auto source_browsing_context = const_cast<LocalNavigable&>(*local_source).active_browsing_context();
+            auto target_browsing_context = const_cast<LocalNavigable&>(*local_target).active_browsing_context();
+            if (source_browsing_context && target_browsing_context && target_browsing_context->the_one_permitted_sandboxed_navigator() == source_browsing_context)
+                return true;
+        }
 
         // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
         if (has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation))
@@ -304,6 +339,7 @@ GC::Ptr<Navigable> navigable_with_id_in_any_page(Page const& preferred_page, Cro
 
 // The top-level browsing contexts of a group, as the navigables they are active in: the traversables this process
 // hosts, and its stand-ins for those other processes host. A traversable hosted here stands ahead of any stand-in.
+// A provisional traversable is not active yet: the stand-in for the traversable another process hosts represents it.
 Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optional<u64> browsing_context_group_id)
 {
     Vector<GC::Root<Navigable>> navigables;
@@ -311,6 +347,8 @@ Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optio
         return navigables;
     auto consider = [&](Navigable& navigable) {
         if (!navigable.is_top_level_traversable() || navigable.has_been_destroyed() || navigable.browsing_context_group_id() != browsing_context_group_id)
+            return;
+        if (auto* local_navigable = as_if<LocalNavigable>(navigable); local_navigable && local_navigable->is_provisional())
             return;
         if (any_of(navigables, [&](auto const& seen) { return seen->id() == navigable.id(); }))
             return;

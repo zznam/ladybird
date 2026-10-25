@@ -12,8 +12,12 @@ const localListStatus = document.querySelector("#local-content-blocker-list-stat
 const customFilters = document.querySelector("#custom-content-blocker-filters");
 const saveCustomFilters = document.querySelector("#save-custom-content-blocker-filters");
 const customFiltersStatus = document.querySelector("#custom-content-blocker-filters-status");
-const maximumCustomFilterSize = 4 * 1024 * 1024;
 const enableContentBlocking = document.querySelector("#enable-content-blocking");
+const showContentBlockerCount = document.querySelector("#show-content-blocker-count");
+const showContentBlockerCountSetting = document.querySelector("#show-content-blocker-count-setting");
+
+const maximumCustomFilterSize = 4 * 1024 * 1024;
+
 let updateTimer;
 let savedCustomFilters = "";
 
@@ -26,24 +30,33 @@ function listStatus(list) {
 
 function createListRow(list, removable = false) {
     const row = document.querySelector("#filter-list-row").content.firstElementChild.cloneNode(true);
-    const label = row.querySelector("label");
     const toggle = row.querySelector("input");
+    const label = row.querySelector("label");
+    const labelText = row.querySelector(".label");
     const details = row.querySelector(".description");
     const metadata = row.querySelector(".filter-list-metadata");
+
+    const id = `content-blocker-list-${list.identifier}`;
     const name = list.name ?? list.url;
-    label.textContent = name;
-    label.htmlFor = toggle.id = `content-blocker-list-${list.identifier}`;
+
+    toggle.id = id;
+    label.htmlFor = id;
+    labelText.textContent = name;
+
     details.id = `${toggle.id}-description`;
     details.textContent = list.description ?? "";
+
     metadata.id = `${toggle.id}-metadata`;
     metadata.textContent = [list.url ? new URL(list.url).host : "Local file", list.url && listStatus(list)]
         .filter(Boolean)
         .join(" · ");
+
     toggle.setAttribute("aria-describedby", `${details.id} ${metadata.id}`);
     toggle.checked = list.enabled;
     toggle.addEventListener("change", () => {
         ladybird.sendMessage("setContentBlockerListEnabled", { identifier: list.identifier, enabled: toggle.checked });
     });
+
     const remove = row.querySelector("button");
     if (removable) {
         remove.setAttribute("aria-label", `Remove ${name}`);
@@ -51,6 +64,7 @@ function createListRow(list, removable = false) {
     } else {
         remove.remove();
     }
+
     return row;
 }
 
@@ -61,40 +75,55 @@ function showEmptyState(container, message) {
     container.append(emptyState);
 }
 
+function loadFeatures(features) {
+    showContentBlockerCountSetting.classList.toggle("hidden", !features?.contentBlockingControls);
+}
+
 function loadSettings(settings) {
-    const contentBlockers = settings.contentBlockers;
-    if (!contentBlockers) {
-        return;
-    }
-    enableContentBlocking.checked = contentBlockers.enabled;
+    if (Object.hasOwn(settings, "contentBlockers")) {
+        const contentBlockers = settings.contentBlockers;
+        enableContentBlocking.checked = contentBlockers.enabled;
+        showContentBlockerCount.checked = contentBlockers.showBlockedCount ?? true;
 
-    for (const container of [builtInLists, languageLists, customSubscriptions, localLists]) {
-        container.replaceChildren();
-    }
-    for (const list of settings.contentBlockerLists) {
-        const container = list.builtIn
-            ? list.languageSpecific
-                ? languageLists
-                : builtInLists
-            : list.url
-              ? customSubscriptions
-              : localLists;
-        container.append(createListRow(list, !list.builtIn));
-    }
-    if (!customSubscriptions.children.length) showEmptyState(customSubscriptions, "No custom subscriptions added.");
-    if (!localLists.children.length) showEmptyState(localLists, "No local lists imported.");
+        if (customFilters.value === savedCustomFilters) {
+            customFilters.value = contentBlockers.customFilters;
+        }
 
-    if (customFilters.value === savedCustomFilters) {
-        customFilters.value = contentBlockers.customFilters;
+        savedCustomFilters = contentBlockers.customFilters;
     }
-    savedCustomFilters = contentBlockers.customFilters;
 
-    updateLists.disabled = settings.contentBlockerListUpdateInProgress;
-    updateLists.innerText = settings.contentBlockerListUpdateInProgress ? "Updating…" : "Update enabled lists";
+    if (Object.hasOwn(settings, "contentBlockerLists")) {
+        for (const container of [builtInLists, languageLists, customSubscriptions, localLists]) {
+            container.replaceChildren();
+        }
 
-    clearTimeout(updateTimer);
-    if (settings.contentBlockerListUpdateInProgress) {
-        updateTimer = setTimeout(() => ladybird.sendMessage("loadCurrentSettings"), 1000);
+        for (const list of settings.contentBlockerLists) {
+            const container = list.builtIn
+                ? list.languageSpecific
+                    ? languageLists
+                    : builtInLists
+                : list.url
+                  ? customSubscriptions
+                  : localLists;
+            container.append(createListRow(list, !list.builtIn));
+        }
+
+        if (!customSubscriptions.children.length) {
+            showEmptyState(customSubscriptions, "No custom subscriptions added.");
+        }
+        if (!localLists.children.length) {
+            showEmptyState(localLists, "No local lists imported.");
+        }
+    }
+
+    if (Object.hasOwn(settings, "contentBlockerListUpdateInProgress")) {
+        updateLists.disabled = settings.contentBlockerListUpdateInProgress;
+        updateLists.innerText = settings.contentBlockerListUpdateInProgress ? "Updating…" : "Update enabled lists";
+
+        clearInterval(updateTimer);
+        if (settings.contentBlockerListUpdateInProgress) {
+            updateTimer = setInterval(() => ladybird.sendMessage("refreshSettings"), 1000);
+        }
     }
 }
 
@@ -116,8 +145,6 @@ addSubscription.addEventListener("click", () => {
 });
 
 updateLists.addEventListener("click", () => {
-    updateLists.disabled = true;
-    updateLists.innerText = "Updating…";
     ladybird.sendMessage("updateContentBlockerLists");
 });
 
@@ -164,8 +191,14 @@ saveCustomFilters.addEventListener("click", () => {
     customFiltersStatus.innerText = "Saved";
 });
 
+showContentBlockerCount.addEventListener("change", () => {
+    ladybird.sendMessage("setShowContentBlockerCount", showContentBlockerCount.checked);
+});
+
 document.addEventListener("WebUIMessage", event => {
-    if (event.detail.name === "loadSettings") {
+    if (event.detail.name === "loadFeatures") {
+        loadFeatures(event.detail.data);
+    } else if (event.detail.name === "loadSettings") {
         loadSettings(event.detail.data);
     } else if (event.detail.name === "contentBlockerResult") {
         const result = event.detail.data;

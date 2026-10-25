@@ -18,7 +18,6 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/FontComputer.h>
-#include <LibWeb/CSS/FontFeatureData.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleProperty.h>
@@ -57,14 +56,8 @@ public:
         Yes
     };
 
-    enum class CreateAnimatedOverlay {
-        No,
-        Yes,
-    };
-
     static NonnullRefPtr<ComputedStyleWorkingSet> create();
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_longhand_table(ComputedValuesFFI::ComputedLonghandTable*);
-    static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedStyleWorkingSet const&);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedValues const&);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_for_animation_update(ComputedValuesFFI::ComputedLonghandTable const*, ComputedValuesFFI::AnimatedOverlay const*);
     ~ComputedStyleWorkingSet();
@@ -73,22 +66,11 @@ public:
     // animated overlay and the dependency flags stay mutable for the refresh paths.
     void freeze_computed_longhand_table();
 
-    // A working set sharing this one's frozen table and mint cache, without the animated
-    // overlay: the base half of an animated style build.
-    NonnullRefPtr<ComputedStyleWorkingSet> copy_without_animations() const;
-
     void set_has_pseudo_element_styles(u64);
-    void set_property_important(PropertyID, Important);
-    void set_property_inherited(PropertyID, Inherited);
     void set_depends_on_viewport_metrics();
     void set_font_metrics_depend_on_viewport_metrics();
-    void set_in_display_none_subtree();
 
-    void set_property(PropertyID, NonnullRefPtr<StyleValue const> value, Inherited = Inherited::No, Important = Important::No);
     // The wrapper-carrying store funnel: dual-writes the Rust table and the wrapper cache.
-    void set_property_without_modifying_flags(PropertyID, NonnullRefPtr<StyleValue const> value);
-    // Invalidates C++ sidecars after the Rust driver stores a value directly in the table.
-    void did_store_property_data_from_drive(PropertyID);
     void set_display_before_box_type_transformation(Display);
 
     bool has_effective_color_scheme() const { return metadata().effective_color_scheme >= 0; }
@@ -97,67 +79,28 @@ public:
     RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
     ComputedValuesFFI::AnimatedOverlay const* animated_overlay() const;
     bool has_animated_property(PropertyID property_id) const;
-    bool is_property_important(PropertyID property_id) const;
-    bool is_property_inherited(PropertyID property_id) const;
     bool depends_on_viewport_metrics() const { return metadata().dependency_flags & to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics); }
     bool font_metrics_depend_on_viewport_metrics() const { return metadata().dependency_flags & to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics); }
     // Whether the element this style was computed for has computed display none, or is a descendant of one that does.
     bool in_display_none_subtree() const { return metadata().in_display_none_subtree; }
-    bool highlight_colors_authored() const { return metadata().dependency_flags & to_underlying(StyleRecordDependencyFlag::HighlightColorsAuthored); }
-    bool highlight_color_is_current_color() const { return metadata().dependency_flags & to_underlying(StyleRecordDependencyFlag::HighlightColorIsCurrentColor); }
     bool has_pseudo_element_style(PseudoElement) const;
-    void set_animated_property(Badge<StyleComputer>, PropertyID, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition, Inherited = Inherited::No);
     ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_mutation(Badge<StyleComputer>);
-    ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>, CreateAnimatedOverlay);
+    ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>);
     ComputedValuesFFI::AnimatedOverlay const* animated_overlay(Badge<StyleComputer>) const;
     void finish_animated_overlay_rust_mutation(Badge<StyleComputer>);
     // Hold every value of `overlay` as the working set's animated values, as the computation that sampled them did.
     void install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const*);
-    void did_apply_style_finalization_from_rust(u16 invalidated_longhands);
     bool requires_animated_post_compute_adjustments() const;
     void prepare_for_animated_post_compute_adjustments(Badge<StyleComputer>);
     void set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value);
     void clear_animated_properties(Badge<StyleComputer>);
     OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_custom_properties() const { return m_animated_custom_properties; }
     StyleValue const& property(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
-    void const* effective_property_data(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
+    StyleValueFFI::StyleValueData const* effective_property_data(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
 
-    Color color(PropertyID, ColorResolutionContext) const;
     PreferredColorScheme color_scheme(PreferredColorScheme, Optional<Vector<Utf16FlyString> const&> document_supported_schemes) const;
-    TextRendering text_rendering() const;
-    CSSPixels text_underline_offset() const;
-    CSSPixels border_spacing_horizontal() const;
-    CSSPixels border_spacing_vertical() const;
-    CaptionSide caption_side() const;
-    Display display() const;
-    Color caret_color(ColorResolutionContext const&) const;
-    ContentVisibility content_visibility() const;
-    CSSPixels word_spacing() const;
-    CSSPixels letter_spacing() const;
-    ListStyleType list_style_type(StyleScope const&) const;
-    Color accent_color(ColorResolutionContext const&) const;
-    Visibility visibility() const;
-    ImageRendering image_rendering() const;
-    FontFeatureData font_feature_data() const;
-    Optional<FontVariantAlternates> font_variant_alternates() const;
-    FontVariantCaps font_variant_caps() const;
-    Optional<FontVariantEastAsian> font_variant_east_asian() const;
     FontVariantEmoji font_variant_emoji() const;
-    Optional<FontVariantLigatures> font_variant_ligatures() const;
-    Optional<FontVariantNumeric> font_variant_numeric() const;
-    FontVariantPosition font_variant_position() const;
-    FontKerning font_kerning() const;
-    Optional<Utf16FlyString> font_language_override() const;
-    HashMap<Utf16FlyString, u8> font_feature_settings() const;
-    HashMap<Utf16FlyString, double> font_variation_settings() const;
-    BorderCollapse border_collapse() const;
-    CSS::EmptyCells empty_cells() const;
-    Direction direction() const;
-    WritingMode writing_mode() const;
     Display display_before_box_type_transformation() const;
-
-    float stop_opacity() const;
-    float flood_opacity() const;
 
     // The font list for text in the given tree scope, whose @font-feature-values font-variant-alternates reads.
     ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> computed_font_list(FontComputer const&, TreeScopeID) const;
@@ -165,16 +108,11 @@ public:
     ComputedValuesFFI::FfiFontGroupBuildInputs font_group_build_inputs(DOM::Document const&, TreeScopeID) const;
     ValueComparingNonnullRefPtr<Gfx::Font const> first_available_computed_font(FontComputer const&) const;
 
-    int math_depth() const;
     [[nodiscard]] CSSPixels line_height(FontComputer const&) const;
     [[nodiscard]] CSSPixels font_size() const;
+    [[nodiscard]] Optional<FontSizeAdjust> font_size_adjust() const;
     Vector<ComputedFontFamily> computed_font_families() const;
-    double font_weight() const;
-    Percentage font_width() const;
-    int font_slope() const;
     FontOpticalSizing font_optical_sizing() const;
-
-    ScrollbarColorData scrollbar_color(ColorResolutionContext const&) const;
 
     // Whole-bitmap views over the table's importance and inheritance flags, in FixedBitmap
     // byte layout; valid while the table is.
@@ -187,24 +125,17 @@ public:
     ComputedValuesFFI::ComputedLonghandTable const* computed_longhand_table() const { return m_computed_longhand_table; }
 
 private:
-    // The sparse per-longhand mint cache over the effective values: an entry holds the
-    // wrapper a store funnel carried or the one property() minted on demand, and is replaced
-    // or invalidated when the drive stores new table data for the longhand. Overlay values
-    // are never cached here; their wrappers live on AnimatedProperties. Shared with the
-    // without-animations copy so both halves of an animated style build mint each wrapper
-    // once, preserving wrapper identity for values with side effects (image loads).
-    struct WrapperMintCache final : public RefCounted<WrapperMintCache> {
-        HashMap<PropertyID, NonnullRefPtr<StyleValue const>> wrappers;
-    };
-
     ComputedStyleWorkingSet();
     explicit ComputedStyleWorkingSet(ComputedValuesFFI::ComputedLonghandTable*);
-    // The without-animations copy: shares the frozen table and the mint cache.
-    struct ShareFrozenTable { };
-    ComputedStyleWorkingSet(ShareFrozenTable, ComputedStyleWorkingSet const&);
 
     AnimatedProperties const& animated_properties() const;
     AnimatedProperties& mutable_animated_properties();
+
+    FontResolutionFeatureValues font_resolution_feature_values() const;
+    int math_depth() const;
+    double font_weight() const;
+    Percentage font_width() const;
+    int font_slope() const;
     ComputedValuesFFI::FfiComputedStyleMetadata& metadata()
     {
         ensure_mutable_computed_longhand_table();
@@ -212,7 +143,6 @@ private:
     }
     ComputedValuesFFI::FfiComputedStyleMetadata const& metadata() const { return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table); }
     void ensure_mutable_computed_longhand_table();
-    void set_animated_property_internal(PropertyID, NonnullRefPtr<StyleValue const>, AnimatedPropertyResultOfTransition, Inherited);
     void clear_computed_font_list_cache()
     {
         m_cached_computed_font_list = nullptr;
@@ -224,7 +154,11 @@ private:
     // written by the store funnels and the flag setters and frozen when the drive completes.
     ComputedValuesFFI::ComputedLonghandTable* m_computed_longhand_table { nullptr };
     bool m_computed_longhand_table_is_shared { false };
-    NonnullRefPtr<WrapperMintCache> m_mint_cache;
+    // The sparse per-longhand mint cache over the effective values: an entry holds the
+    // wrapper a store funnel carried or the one property() minted on demand, and is replaced
+    // or invalidated when the drive stores new table data for the longhand. Overlay values
+    // are never cached here; their wrappers live on AnimatedProperties.
+    mutable HashMap<PropertyID, NonnullRefPtr<StyleValue const>> m_minted_wrappers;
     RefPtr<AnimatedProperties> m_animated_properties;
     bool m_had_animated_post_compute_adjustment_property { false };
     OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> m_animated_custom_properties;
@@ -245,7 +179,7 @@ public:
     ~AnimatedProperties();
 
     u64 identity() const { return m_identity; }
-    bool is_empty() const { return entries().is_empty(); }
+    bool is_empty() const { return ComputedValuesFFI::rust_animated_overlay_is_empty(m_overlay); }
     ReadonlySpan<ComputedValuesFFI::FfiAnimatedOverlayEntry> entries() const;
 
     // The Rust overlay is the authoritative store. C++ wrappers are minted lazily and cached
@@ -273,15 +207,6 @@ NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_da
 
 // https://drafts.csswg.org/css-inline-3/#valdef-line-height-normal
 [[nodiscard]] CSSPixels normal_line_height(Gfx::FontPixelMetrics const&);
-
-// The computed values the font resolver reads beside the family. The style engine resolves a font without a working
-// set to read them from, so each converter below is reachable on its own.
-[[nodiscard]] Optional<FontVariantAlternates> font_variant_alternates_from_style_value(StyleValue const&);
-[[nodiscard]] Optional<FontVariantEastAsian> font_variant_east_asian_from_style_value(StyleValue const&);
-[[nodiscard]] Optional<FontVariantLigatures> font_variant_ligatures_from_style_value(StyleValue const&);
-[[nodiscard]] Optional<FontVariantNumeric> font_variant_numeric_from_style_value(StyleValue const&);
-[[nodiscard]] HashMap<Utf16FlyString, u8> font_feature_settings_from_style_value(StyleValue const&);
-[[nodiscard]] HashMap<Utf16FlyString, double> font_variation_settings_from_style_value(StyleValue const&);
 
 // How many C++ longhand wrappers have been minted process-wide, counting the on-demand mints
 // property() performs and the specified-value wrappers the drive's side effects still need.

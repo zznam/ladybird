@@ -7,23 +7,31 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
+#ifdef AK_OS_MACOS
+#    include <UI/Qt/NativeTextEditingBindings.h>
+#endif
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Forward.h>
 #include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/AccessibilityTreeManager.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
+#include <LibWebView/WebCompatReport.h>
 
 #include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <QImage>
 #include <QPixmap>
+#include <QPointer>
 #include <QTimer>
 #include <QUrl>
 #include <QVariant>
@@ -43,9 +51,17 @@
 #    include <QWidget>
 #endif
 
+#if !defined(Q_OS_WIN)
+#    include <QAccessible>
+#endif
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+#    include "AccessibilityInterface.h"
+#endif
+
 class QKeyEvent;
 class QLabel;
 class QPushButton;
+class QScreen;
 class QShortcut;
 class QSinglePointEvent;
 class QCursor;
@@ -70,25 +86,40 @@ using WebContentViewBase = QWidget;
 
 class CrashOverlayUrlLabel;
 class CrashReportReviewWidget;
+class PageOverlay;
+class ScreenshotSelectionOverlay;
+class ScreenshotViewer;
 class SelectDropdown;
+
+struct WebCompatReportCapture {
+    WebView::WebCompatReport::Page page;
+    QImage frame;
+    QImage screenshot;
+    NonnullRefPtr<Core::Promise<String>> page_dumps;
+};
 
 struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
+    WebView::ViewImplementation const* owner_view { nullptr };
 };
 
 class WebContentView final
     : public WebContentViewBase
-    , public WebView::ViewImplementation {
+    , public WebView::ViewImplementation
+#if !defined(Q_OS_WIN)
+    , public QAccessible::ActivationObserver
+#endif
+{
     Q_OBJECT
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
-#if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
+#if !defined(LADYBIRD_QT_USE_RHI_WIDGET)
     virtual void paintEvent(QPaintEvent*) override;
 #endif
     virtual void resizeEvent(QResizeEvent*) override;
@@ -117,26 +148,40 @@ public:
     void push_viewport_size();
     void set_device_pixel_ratio(double);
     void set_zoom_level(double);
-    void set_maximum_frames_per_second(double);
-    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
     void set_vertical_tab_overlay_insets(int left, int right);
+    void set_bookmarks_bar_overlay_height(int);
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
-    // Offers the reports of earlier crashes on the crash screen, once this view is shown.
-    void show_earlier_crash_reports();
+    void cancel_mouse_press();
+    void review_hidden_crash_report(ByteString const& report_name);
+    void leave_report_review();
+    void review_web_compat_report(WebCompatReportCapture);
+
+    Function<void(WebCompatReportCapture)> on_request_web_compat_report_review;
 
     enum class PaletteMode {
         Default,
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
-    void update_palette(WebView::WebContentPage&, PaletteMode = PaletteMode::Default);
     Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
 
-    using ViewImplementation::client;
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+    void set_has_rounded_corners(bool);
+#endif
+
+    WebView::AccessibilityTreeManager const* accessibility_tree_manager() const { return m_accessibility_manager.ptr(); }
+
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    QAccessibleInterface* accessibility_interface_for_node(i64 node_id);
+#endif
 
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
+
+    // On macOS, Qt ignores mouse movement while Ladybird is inactive, so a view that should still follow it opts in.
+    bool follows_mouse_while_inactive() const { return m_follows_mouse_while_inactive; }
+    void set_follows_mouse_while_inactive(bool follows) { m_follows_mouse_while_inactive = follows; }
 
 signals:
     void ready_to_paint();
@@ -144,7 +189,9 @@ signals:
 
 private:
     // ^WebView::ViewImplementation
-    virtual void prepare_page_for_tab(WebView::WebContentPage&) override;
+    virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
+    virtual Core::AnonymousBuffer system_theme() override;
+    virtual Optional<ScreenRects> screen_rects() const override;
     virtual void update_zoom() override;
     virtual Web::DevicePixelSize viewport_size() const override;
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
@@ -164,6 +211,7 @@ private:
     };
 
     Optional<Paintable> current_paintable() const;
+    QImage visible_snapshot() const;
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
@@ -172,9 +220,6 @@ private:
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     void schedule_frame_damage_repaint();
 #endif
-    void update_compositor_display_metadata();
-    void update_compositor_display_metadata(WebView::WebContentPage&);
-
     Web::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
 
     void enqueue_native_event(Web::MouseEvent::Type, QSinglePointEvent const& event);
@@ -186,15 +231,48 @@ private:
     void enqueue_native_event(Web::KeyEvent::Type, QKeyEvent const& event);
     void finish_handling_key_event(Web::KeyEvent const&);
 
-    void update_screen_rects();
-    void update_screen_rects(WebView::WebContentPage&);
+    void watch_screen_geometry(QScreen&);
 
     void set_crash_overlay_visible(bool);
-    enum class CrashScreen : u8 {
-        ThisPage,
-        Earlier,
-    };
-    void show_crash_report_review(CrashScreen = CrashScreen::ThisPage);
+    void show_crash_report_review(Optional<ByteString> const& hidden_crash_report_name = {});
+
+    void start_web_compat_report();
+    void select_screenshot(QImage const& frame, Function<void(QImage)> on_selected);
+    QPointer<QWidget> show_transient_overlay(QWidget&);
+    void close_transient_overlay(QWidget&, QPointer<QWidget> const& focus_to_restore);
+
+    Array<QWidget*, 4> overlays() const;
+    bool is_page_covered_by_overlay() const;
+
+#if !defined(Q_OS_WIN)
+    virtual void accessibilityActiveChanged(bool active) override;
+    void fetch_accessibility_tree();
+#endif
+
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    void notify_accessibility_focus_on_document_root();
+    void announce_accessibility_focus();
+#endif
+
+    friend void install_accessibility(WebContentView*);
+    friend void post_accessibility_focus_changed(WebContentView*, i64);
+
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    void deregister_accessibility_interfaces();
+    QHash<i64, AccessibilityInterface*> m_accessibility_elements;
+    friend class WebContentViewAccessible;
+#endif
+
+    OwnPtr<WebView::AccessibilityTreeManager> m_accessibility_manager;
+    bool m_posted_initial_accessibility_focus { false };
+    // Set once this view has asked WebContent for the tree; from then on, WebContent pushes every change on its own.
+    bool m_requested_accessibility_tree { false };
+#if !defined(Q_OS_WIN)
+    // Set when an assistive technology turns up mid-page: The next tree to arrive reports the focus to it.
+    bool m_report_accessibility_focus_with_next_tree { false };
+#endif
+
+    bool m_follows_mouse_while_inactive { false };
 
     bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
@@ -209,20 +287,28 @@ private:
 
     SelectDropdown* m_select_dropdown { nullptr };
 
-    QWidget* m_crash_overlay { nullptr };
+    PageOverlay* m_crash_overlay { nullptr };
     CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
     QLabel* m_crash_overlay_message { nullptr };
     QPushButton* m_crash_overlay_reload_button { nullptr };
     QShortcut* m_crash_overlay_reload_shortcut { nullptr };
     QWidget* m_crash_report_container { nullptr };
     CrashReportReviewWidget* m_crash_report_review { nullptr };
-    bool m_show_earlier_crash_reports_when_shown { false };
+
+    QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
+    QPointer<ScreenshotViewer> m_screenshot_viewer;
+    PageOverlay* m_web_compat_report_overlay { nullptr };
+
+#ifdef AK_OS_MACOS
+    NativeTextEditingBindings m_native_text_editing_bindings;
+#endif
 
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     bool ensure_iosurface_layer_attached_to_native_view();
     void present_current_paintable_as_layer_contents();
     void update_iosurface_layer_frame();
     void update_iosurface_layer_background_color();
+    void update_iosurface_layer_border();
     void detach_iosurface_layer_from_native_view();
     void destroy_iosurface_layer();
 
@@ -278,7 +364,10 @@ private:
 
     int m_vertical_tab_overlay_left { 0 };
     int m_vertical_tab_overlay_right { 0 };
+    int m_bookmarks_bar_overlay_height { 0 };
 #endif
 };
+
+bool wheel_event_scrolls_continuously(QWheelEvent const&);
 
 }

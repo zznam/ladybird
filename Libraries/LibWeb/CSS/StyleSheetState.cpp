@@ -31,6 +31,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -252,7 +253,9 @@ size_t StyleSheetState::external_memory_size() const
 // https://www.w3.org/TR/cssom/#dom-cssstylesheet-insertrule
 WebIDL::ExceptionOr<unsigned> StyleSheetState::insert_rule(Utf16View rule, unsigned index)
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    // 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    if (!is_origin_clean())
+        return WebIDL::SecurityError::create("Can't call insert_rule() on cross-origin stylesheets."_utf16);
 
     // If the disallow modification flag is set, throw a NotAllowedError DOMException.
     if (disallow_modification())
@@ -295,7 +298,9 @@ WebIDL::ExceptionOr<unsigned> StyleSheetState::insert_rule(Utf16View rule, unsig
 // https://www.w3.org/TR/cssom/#dom-cssstylesheet-deleterule
 WebIDL::ExceptionOr<void> StyleSheetState::delete_rule(unsigned index)
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    // 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    if (!is_origin_clean())
+        return WebIDL::SecurityError::create("Can't call delete_rule() on cross-origin stylesheets."_utf16);
 
     // 2. If the disallow modification flag is set, throw a NotAllowedError DOMException.
     if (disallow_modification())
@@ -535,31 +540,21 @@ void StyleSheetState::for_each_owning_style_scope(Function<void(StyleScope&)> co
     }
 }
 
-NonnullRefPtr<StyleCache> StyleSheetState::shared_single_constructed_sheet_style_cache()
+StyleRuleCache const& StyleSheetState::rule_cache()
 {
     VERIFY(constructed());
-    if (!m_shared_single_constructed_sheet_style_cache)
-        m_shared_single_constructed_sheet_style_cache = StyleCache::create();
-    return *m_shared_single_constructed_sheet_style_cache;
-}
-
-void StyleSheetState::invalidate_shared_style_cache()
-{
-    m_shared_single_constructed_sheet_style_cache = nullptr;
-    ++m_shared_style_cache_generation;
-
-    // Imported rules contribute to their parent sheet's effective rules.
-    if (auto* import_rule = owner_import()) {
-        if (auto* parent_style_sheet = import_rule->parent_style_sheet())
-            parent_style_sheet->invalidate_shared_style_cache();
+    if (!m_rule_cache) {
+        m_rule_cache = make<StyleRuleCache>();
+        m_rule_cache->add_rules_from_sheet(*this, CascadeOrigin::Author);
     }
+    return *m_rule_cache;
 }
 
 void StyleSheetState::invalidate_owners()
 {
     auto previously_matched = m_native_sheet.media_state();
     m_native_sheet.reset_media_state();
-    invalidate_shared_style_cache();
+    m_rule_cache = nullptr;
 
     // The MediaList may have been mutated (e.g. via MediaList::set_media_text), so refresh the media state before
     // reporting what the sheet now says.
@@ -603,6 +598,18 @@ bool StyleSheetState::has_document_owner() const
 {
     for (auto& document_or_shadow_root : m_owning_documents_or_shadow_roots) {
         if (document_or_shadow_root->is_document())
+            return true;
+    }
+    return false;
+}
+
+bool StyleSheetState::has_counter_style_rules() const
+{
+    if (native_rules().has_counter_style_rules())
+        return true;
+    for (auto const& import_rule : m_import_rules) {
+        auto const* imported_sheet = import_rule->loaded_style_sheet();
+        if (imported_sheet && imported_sheet->has_counter_style_rules())
             return true;
     }
     return false;
@@ -700,11 +707,11 @@ bool StyleSheetState::evaluate_media_queries(DOM::Document const& document, Pars
         state = m_document_media_states.end() - 1;
     }
     MediaEnvironmentSnapshot environment { document };
-    result = Parser::ValueParserFFI::rust_style_sheet_evaluate_media_queries(m_native_sheet.handle(), environment.ffi_environment(), (*state)->state, mutable_document.style_computer().style_engine().rust_handle());
+    result = Parser::ValueParserFFI::rust_style_sheet_evaluate_media_queries(m_native_sheet.handle(), environment.ffi_environment(), (*state)->state, mutable_document.style_computer().style_engine().host());
     if (result.sheet_changed)
         record_conditions_for_owners();
     if (result.any_changed) {
-        invalidate_shared_style_cache();
+        m_rule_cache = nullptr;
         if (owner_import())
             record_stylesheet_rule_conditions(*this, mutable_document);
     }
@@ -760,7 +767,7 @@ void StyleSheetState::remove_css_connected_font_face(u64 rule_identity)
 void StyleSheetState::recalculate_rule_caches()
 {
     invalidate_image_resource_registration();
-    invalidate_shared_style_cache();
+    m_rule_cache = nullptr;
 
     m_import_rules.clear();
     auto previous_imports = move(m_imports);

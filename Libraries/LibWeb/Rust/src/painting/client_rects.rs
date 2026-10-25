@@ -6,9 +6,9 @@
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
+use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::node_painting;
-use crate::painting::paint_read::PaintRead;
+use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::with_inline_pieces;
 use crate::painting::rect_to_viewport_transform::{RectToViewportTransform, transform_rect_to_viewport_or_identity};
@@ -20,9 +20,8 @@ pub(crate) fn can_compute_client_rects_without_visual_context_update(
     viewport_scroll_offset_is_zero: bool,
 ) -> bool {
     let mut node = layout_node;
-    while let Some(kind) = arena.node_kind_if_live(node) {
-        let flags = arena.node_flags_if_live(node);
-        let parent = arena.node_parent_if_live(node).unwrap_or(NodeSlotId::INVALID);
+    while let Some(row) = arena.node(node) {
+        let (kind, flags, parent) = (row.kind(), row.flags(), row.parent());
         if node_facts::kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox || kind == NodeKind::SVGForeignObjectBox {
             return false;
         }
@@ -31,7 +30,7 @@ pub(crate) fn can_compute_client_rects_without_visual_context_update(
             node = parent;
             continue;
         }
-        if let Some(style) = arena.node_style_if_live(node)
+        if let Some(style) = row.style()
             && (style_queries::has_css_transform(arena, node, style)
                 || style.transform().has_perspective
                 || style_queries::is_sticky_position(style))
@@ -67,11 +66,13 @@ fn for_each_inline_piece_border_box_rect(
     let Some(root) = arena.inline_pieces_root(inline_paintable) else {
         return;
     };
-    let root_position = paintable_geometry::absolute_position(arena, root);
+    let root_positions = paintable_geometry::LineRootPositions::new(arena, root);
+    let root_side = arena.committed_side_data(root);
     with_inline_pieces(arena, inline_paintable, |piece, _| {
         if piece.is_geometry_only_placeholder {
             return true;
         }
+        let root_position = root_positions.of_line(root_side.lines(), piece.line_index as usize);
         push_rect(CssPixelRect::from(piece.border_box_rect).translated_by(root_position));
         true
     });
@@ -120,7 +121,13 @@ pub(crate) fn for_each_client_rect(
     }
 
     if row_is_populated {
-        push_rect_in_viewport_space(paintable_geometry::absolute_border_box_rect(arena, layout_node));
+        for index in 0..paintable_geometry::fragment_count(arena, layout_node) {
+            push_rect_in_viewport_space(paintable_geometry::absolute_fragment_border_box_rect(
+                arena,
+                layout_node,
+                index,
+            ));
+        }
     }
 }
 

@@ -31,11 +31,11 @@
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PredefinedColorSpace.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/Crypto/CryptoKey.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
-#include <LibWeb/Crypto/KeyAlgorithms.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/Geometry/DOMPoint.h>
@@ -203,7 +203,7 @@ inline JS::Realm& test_realm()
 }
 
 template<typename T>
-requires(IsBaseOf<Web::Bindings::Wrappable, T>)
+requires(IsBaseOf<Web::Bindings::Wrappable, T> || Web::Bindings::RustInterfaceHandle<T>)
 inline T& unwrap_wrappable(JS::Value value)
 {
     VERIFY(value.is_object());
@@ -226,6 +226,14 @@ inline Web::HTML::StorageSerializationRecord storage_serialize(GC::Ref<T> object
     return MUST(Web::HTML::structured_serialize_for_storage(realm.vm(), JS::Value(wrapper.ptr())));
 }
 
+template<Web::Bindings::RustInterfaceHandle T>
+inline Web::HTML::StorageSerializationRecord storage_serialize(GC::Ref<T> object)
+{
+    auto& realm = test_realm();
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, object);
+    return MUST(Web::HTML::structured_serialize_for_storage(realm.vm(), JS::Value(static_cast<JS::Object*>(wrapper.ptr()))));
+}
+
 template<typename T>
 requires(IsConvertible<T*, Web::Bindings::Wrappable*>)
 inline Web::HTML::IPCSerializationRecord structured_serialize(JS::VM& vm, GC::Ref<T> object)
@@ -233,6 +241,26 @@ inline Web::HTML::IPCSerializationRecord structured_serialize(JS::VM& vm, GC::Re
     auto& realm = test_realm();
     auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, GC::Ref<Web::Bindings::Wrappable> { object });
     return MUST(Web::HTML::structured_serialize(vm, JS::Value(wrapper.ptr())));
+}
+
+template<Web::Bindings::RustInterfaceHandle T>
+inline Web::HTML::IPCSerializationRecord structured_serialize(JS::VM& vm, GC::Ref<T> object)
+{
+    auto& realm = test_realm();
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, object);
+    return MUST(Web::HTML::structured_serialize(vm, JS::Value(static_cast<JS::Object*>(wrapper.ptr()))));
+}
+
+// The value of the property of the object, which is a wrapper that the test reads as script would.
+inline JS::Value property_of(JS::Value object, StringView name)
+{
+    VERIFY(object.is_object());
+    return MUST(object.as_object().get(Utf16FlyString::from_utf8(name)));
+}
+
+inline double number_property(JS::Value object, StringView name)
+{
+    return property_of(object, name).as_double();
 }
 
 inline Web::WebIDL::ExceptionOr<JS::Value> storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
@@ -313,7 +341,7 @@ inline ByteBuffer serialized_object_body(GC::Ref<JS::Object> object)
 }
 
 template<typename T>
-requires(IsConvertible<T*, Web::Bindings::Wrappable*>)
+requires(IsConvertible<T*, Web::Bindings::Wrappable*> || Web::Bindings::RustInterfaceHandle<T>)
 inline ByteBuffer serialized_object_body(GC::Ref<T> object)
 {
     auto header_size = 6uz;
@@ -356,16 +384,18 @@ inline Web::HTML::StorageSerializationRecord array_buffer_view_record(StringView
     return storage_record_with_value(value);
 }
 
-inline Web::HTML::StorageSerializationRecord image_bitmap_record(i32 width, i32 height, u64 pitch, StringView format, StringView alpha_type, ReadonlyBytes data)
+// A bitmap in sRGB has no color space bytes. Any other color space follows the pixels.
+inline Web::HTML::StorageSerializationRecord image_bitmap_record(i32 width, i32 height, u64 pitch, StringView format, StringView alpha_type, ReadonlyBytes data, ReadonlyBytes color_space = {})
 {
     Vector<u8> body;
-    body.append(1);
+    body.append(color_space.is_empty() ? 1 : 2);
     append_storage_signed_leb128(body, width);
     append_storage_signed_leb128(body, height);
     append_storage_leb128(body, pitch);
     append_storage_ascii_utf16(body, format);
     append_storage_ascii_utf16(body, alpha_type);
     append_storage_bytes(body, data);
+    body.append(color_space.data(), color_space.size());
     return serializable_storage_record("ImageBitmap"sv, 1, body);
 }
 

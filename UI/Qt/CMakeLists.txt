@@ -18,15 +18,20 @@ endif()
 if (LINUX AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+    pkg_check_modules(XCB_ICCCM REQUIRED IMPORTED_TARGET xcb-icccm)
 endif()
 
 qt_add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
     Application.cpp
     Autocomplete.cpp
+    BookmarkDialog.cpp
     BookmarksBar.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
+    ContentBlockingButton.cpp
+    ContentBlockingPopover.cpp
+    CrashReportNotifier.cpp
     CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
@@ -39,17 +44,31 @@ target_sources(ladybird PRIVATE
     LocationEdit.cpp
     Menu.cpp
     NativeWindowContainer.cpp
+    NativeTextEditingLineEdit.cpp
     ProcessManagerWindow.cpp
     PerformanceMonitorWidget.cpp
+    PictureInPictureWindow.cpp
+    Popover.cpp
+    ReportReview.cpp
+    ScreenshotSelectionOverlay.cpp
+    ScreenshotViewer.cpp
     SelectDropdown.cpp
-    Settings.cpp
     StringUtils.cpp
     Tab.cpp
     TabBar.cpp
+    WebCompatReportReview.cpp
     WebContentView.cpp
+    WindowCloseCoordinator.cpp
     WindowControlButton.cpp
+    WindowScreenObserver.cpp
     ladybird.qrc
 )
+if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
+    target_sources(ladybird PRIVATE
+        AccessibilityInterface.cpp
+    )
+endif()
+
 target_link_libraries(ladybird PRIVATE Qt::Core Qt::Gui Qt::Widgets)
 
 if (TARGET Qt6::Positioning)
@@ -59,8 +78,8 @@ if (TARGET Qt6::Positioning)
 endif()
 
 if (LINUX AND NOT ANDROID)
-    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp)
-    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO Qt::GuiPrivate)
+    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp X11Window.cpp X11Window.h)
+    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO PkgConfig::XCB_ICCCM Qt::GuiPrivate)
 endif()
 
 if (APPLE)
@@ -69,11 +88,23 @@ if (APPLE)
         Conversions.mm
         DictionaryLookup.mm
         ExternalURLHandler.mm
+        LadybirdAccessibilityElement.mm
         MacWindow.mm
+        MacWindowFocus.mm
+        NativeTextEditingBindings.mm
         Menu.mm
+        ScrollbarPreferencesMac.mm
+        SpellCheckerMac.mm
+        WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    set_source_files_properties(
+        LadybirdAccessibilityElement.mm
+        SpellCheckerMac.mm
+        WebContentViewAccessibility.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+    )
 endif()
 
 if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)
@@ -154,8 +185,29 @@ qt_deploy_runtime_dependencies(
 endif()
 
 if (BUILD_TESTING)
+    if (APPLE)
+        add_library(NativeTextEditingTestMain OBJECT
+            ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/NativeTextEditingTestMain.mm
+            ${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp
+        )
+        target_link_libraries(NativeTextEditingTestMain PRIVATE AK LibTest "-framework AppKit")
+        ladybird_test("${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/TestNativeTextEditingBindings.mm" UI/Qt
+            NO_TEST
+            CUSTOM_MAIN "$<TARGET_OBJECTS:NativeTextEditingTestMain>"
+            LIBS LibWebCommon Qt::Widgets "-framework AppKit"
+        )
+        foreach(mode default custom)
+            add_test(NAME TestNativeTextEditingBindings-${mode}
+                COMMAND ${Python3_EXECUTABLE}
+                    ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/run-native-text-editing-tests.py
+                    $<TARGET_FILE:TestNativeTextEditingBindings> ${mode}
+            )
+        endforeach()
+    endif()
+
     add_executable(TestPerformanceMonitorWidget
         ${LADYBIRD_SOURCE_DIR}/Tests/LibWebView/TestPerformanceMonitorWidget.cpp
+        ChromeStyle.cpp
         PerformanceMonitorWidget.cpp
         StringUtils.cpp
     )

@@ -101,6 +101,51 @@ async function scrollSettled(target, action) {
     await scrollend;
 }
 
+function __describeNodeOfInputHook(node, documentName = "document") {
+    // A nested document comes from another realm, whose Document it is an instance of.
+    if (node.nodeType === Node.DOCUMENT_NODE) return node === document ? documentName : `nested ${documentName}`;
+    if (node.id) return `#${node.id}`;
+    return node.nodeName.toLowerCase();
+}
+
+function __describeScrollerOfInputHook(result) {
+    if (!result.scroller) return "";
+    let description = ` scroller=${__describeNodeOfInputHook(result.scroller, "viewport")}`;
+    if (result.scrollerPseudoElement) description += `::${result.scrollerPseudoElement}`;
+    return description;
+}
+
+// Describes where internals.compositorWheelTargetAt() or internals.recordedDisplayListWheelTargetAt() says a wheel step
+// goes.
+function wheelTargetToString(target) {
+    return `${target.decision}${__describeScrollerOfInputHook(target)}`;
+}
+
+// Whether the compositor, holding a frame of this document, would scroll the first step of a wheel gesture at the
+// position itself.
+function compositorScrollsWheelStepAt(x, y, deltaX, deltaY) {
+    const target = internals.compositorWheelTargetAt(x, y, deltaX, deltaY);
+    return target.document === document && target.decision === "latched";
+}
+
+// Prints what internals.takeInputTrace() returned, one routing decision per line, optionally only those of the given
+// stages. Input events are numbered in the order they first appear, as the ids the UI gives them keep growing from test
+// to test; input that did not come from the UI is marked "-".
+function printInputTrace(trace, { stages } = {}) {
+    const eventNumbers = new Map();
+    for (const record of trace) {
+        let eventNumber = "-";
+        if (record.id !== 0) {
+            if (!eventNumbers.has(record.id)) eventNumbers.set(record.id, eventNumbers.size + 1);
+            eventNumber = `#${eventNumbers.get(record.id)}`;
+        }
+        if (stages && !stages.includes(record.stage)) continue;
+        let line = `${eventNumber} ${record.stage}: ${record.decision}${__describeScrollerOfInputHook(record)}`;
+        if (record.target) line += ` target=${__describeNodeOfInputHook(record.target)}`;
+        println(line);
+    }
+}
+
 async function scrollOffsetStopsChanging(readScrollOffset) {
     let previousScrollOffset = null;
     while (previousScrollOffset !== readScrollOffset()) {
@@ -176,12 +221,23 @@ function promiseTest(f) {
     });
 }
 
+let __pageEchoScope = null;
+
+// The echo server, the HTTP cache and the cookie jar are shared by every test and every --repeat run, so echo paths
+// are scoped to the page that creates them. A test that spans page loads names a scope of its own to share them.
 class HTTPTestServer {
-    constructor(baseURL) {
+    constructor(baseURL, echoScope = null) {
         this.baseURL = baseURL;
+        this.echoScope = echoScope;
+    }
+    withEchoScope(echoScope) {
+        return new HTTPTestServer(this.baseURL, echoScope);
+    }
+    echoURL(path) {
+        return `${this.baseURL}${this.#echoPath(path)}`;
     }
     async createEcho(method, path, options) {
-        const echoPath = `/echo${path}`;
+        const echoPath = this.#echoPath(path);
         const result = await fetch(`${this.baseURL}/echo`, {
             method: "POST",
             headers: {
@@ -194,8 +250,15 @@ class HTTPTestServer {
         }
         return `${this.baseURL}${echoPath}`;
     }
+    recordedRequestHeadersURL(echoURL) {
+        return `${this.baseURL}/recorded-request-headers${new URL(echoURL).pathname}`;
+    }
     getStaticURL(path) {
         return `${this.baseURL}/static/${path}`;
+    }
+    #echoPath(path) {
+        const echoScope = this.echoScope ?? (__pageEchoScope ??= crypto.randomUUID());
+        return `/echo/${echoScope}${path}`;
     }
 }
 

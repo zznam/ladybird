@@ -92,9 +92,13 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
                          // Take implementation-defined steps to set the user agent proxy using the extracted proxy configuration. If the
                          // defined proxy cannot be configured return error with error code session not created. Otherwise set the has
                          // proxy configuration flag to true.
-                         session->close();
-                         state->promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Proxy configuration is not yet supported"sv));
-                         return;
+                         // The browser was already launched with the proxy configuration.
+                         if (!Web::WebDriver::is_supported_proxy_configuration(*proxy)) {
+                             session->close();
+                             state->promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Proxy configuration is not yet supported"sv));
+                             return;
+                         }
+                         Web::WebDriver::set_has_proxy_configuration(true);
                      }
                      // -> Otherwise
                      else {
@@ -183,16 +187,36 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
     return state->promise;
 }
 
+static Optional<ByteString> proxy_autoconfig_url(JsonObject const& capabilities)
+{
+    auto proxy = capabilities.get("proxy"sv);
+    if (!proxy.has_value())
+        return {};
+
+    auto url = Web::WebDriver::proxy_autoconfig_url(*proxy);
+    if (!url.has_value())
+        return {};
+    return url->to_byte_string();
+}
+
 Session::Session(NonnullRefPtr<Client> client, JsonObject const& capabilities, String session_id, Web::WebDriver::SessionFlags flags)
     : m_client(move(client))
     , m_options(capabilities)
+    , m_proxy_autoconfig_url(proxy_autoconfig_url(capabilities))
     , m_session_id(move(session_id))
     , m_session_flags(flags)
     , m_event_loop(Core::EventLoop::current())
 {
 }
 
-Session::~Session() = default;
+Session::~Session()
+{
+    revoke_weak_refs();
+#if defined(AK_OS_MACOS)
+    // NB: Stop bootstrap callbacks before destroying the state they use.
+    m_browser_mach_port_server.clear();
+#endif
+}
 
 ErrorOr<NonnullRefPtr<Session>, Web::WebDriver::Error> Session::find_session(StringView session_id, Web::WebDriver::SessionFlags session_flags, AllowInvalidWindowHandle allow_invalid_window_handle)
 {
@@ -287,7 +311,7 @@ void Session::arm_browser_startup_timeout(NonnullRefPtr<ServerPromise> promise)
 {
     m_start_promise = move(promise);
     static constexpr u32 BROWSER_STARTUP_TIMEOUT_MS = 30'000;
-    m_start_timer = Core::Timer::create_single_shot(BROWSER_STARTUP_TIMEOUT_MS, [this] {
+    m_start_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(BROWSER_STARTUP_TIMEOUT_MS), [this] {
         [[maybe_unused]] auto timer_lifetime_guard = move(m_start_timer);
         reject_start_promise(Error::from_string_literal("Timed out waiting for browser startup"));
         close();
@@ -314,6 +338,7 @@ void Session::close()
     if (m_closing)
         return;
     m_closing = true;
+    revoke_weak_refs();
 
     // NB: Step 2 removes this session from the active-sessions map — usually dropping the last reference to it. So hold
     //     a strong reference across close() — so removal can't destroy the session while the steps below still use it.
@@ -586,7 +611,7 @@ void Session::remove_window(StringView window_handle)
 ErrorOr<void> Session::create_server()
 {
 #if defined(AK_OS_WINDOWS)
-    static_assert(IsSame<IPC::Transport, IPC::TransportSocketWindows>, "Need to handle other IPC transports here");
+    static_assert(IsSame<IPC::Transport, IPC::TransportWindows>, "Need to handle other IPC transports here");
 #elif defined(AK_OS_MACOS)
     static_assert(IsSame<IPC::Transport, IPC::TransportMachPort>, "Need to handle other IPC transports here");
 #else
@@ -600,11 +625,12 @@ ErrorOr<void> Session::create_server()
     if (!m_browser_mach_port_server->is_initialized())
         return Error::from_string_literal("Failed to initialize Mach port server for WebDriver");
 
-    m_browser_mach_port_server->on_bootstrap_request = [this](auto request) {
+    m_browser_mach_port_server->on_bootstrap_request = [this, weak_session = make_weak_ref()](auto request) {
         auto result = m_transport_bootstrap_server.handle_bootstrap_request(request.pid, move(request.reply_port));
         if (result.is_error()) {
-            m_event_loop.deferred_invoke([this, error = result.release_error()]() mutable {
-                reject_start_promise(move(error));
+            m_event_loop.deferred_invoke([weak_session, error = result.release_error()]() mutable {
+                if (auto session = weak_session.strong_ref())
+                    session->reject_start_promise(move(error));
             });
             return;
         }
@@ -613,10 +639,13 @@ ErrorOr<void> Session::create_server()
             [](IPC::TransportBootstrapMachServer::ChildTransportHandled) {
                 VERIFY_NOT_REACHED();
             },
-            [this](IPC::TransportBootstrapMachServer::OnDemandTransport& transport) {
-                m_event_loop.deferred_invoke([this, transport = move(transport.ports)]() mutable {
-                    if (auto result = accept_browser_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right))); result.is_error())
-                        reject_start_promise(result.release_error());
+            [this, weak_session](IPC::TransportBootstrapMachServer::OnDemandTransport& transport) {
+                m_event_loop.deferred_invoke([weak_session, transport = move(transport.ports)]() mutable {
+                    auto session = weak_session.strong_ref();
+                    if (!session)
+                        return;
+                    if (auto result = session->accept_browser_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right))); result.is_error())
+                        session->reject_start_promise(result.release_error());
                 });
             });
     };
@@ -660,7 +689,7 @@ ErrorOr<NonnullRefPtr<Session::ServerPromise>> Session::start(LaunchBrowserCallb
 #endif
     TRY(create_server());
 
-    m_browser_process = TRY(launch_browser_callback(m_browser_endpoint, m_options.headless));
+    m_browser_process = TRY(launch_browser_callback(m_browser_endpoint, m_options.headless, m_proxy_autoconfig_url));
     arm_browser_startup_timeout(promise);
     return promise;
 }

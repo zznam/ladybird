@@ -104,12 +104,6 @@ Process::~Process()
 {
 }
 
-Process Process::current()
-{
-    auto p = Process { getpid() };
-    return p;
-}
-
 #if defined(AK_OS_LINUX)
 static Optional<int> run_file_actions_in_child(Vector<ProcessSpawnOptions::FileActionType> const& file_actions)
 {
@@ -419,6 +413,14 @@ ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
                 return {};
             },
             [&](FileAction::DupFd const& action) -> ErrorOr<void> {
+#if defined(AK_OS_MACOS)
+                // NB: macOS does not clear close-on-exec for a descriptor duplicated onto itself, so it is inherited
+                //     instead.
+                if (action.write_fd == action.fd) {
+                    CHECK(posix_spawn_file_actions_addinherit_np(&spawn_actions, action.fd));
+                    return {};
+                }
+#endif
                 CHECK(posix_spawn_file_actions_adddup2(&spawn_actions, action.write_fd, action.fd));
                 return {};
             }));
@@ -440,7 +442,7 @@ ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<ByteString> argume
 {
     auto process = TRY(spawn({
         .executable = path,
-        .arguments = Vector<ByteString> { arguments },
+        .arguments = arguments,
     }));
 
     return process;

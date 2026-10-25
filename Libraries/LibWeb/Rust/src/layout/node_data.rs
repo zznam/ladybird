@@ -9,7 +9,6 @@ use crate::layout::CssPixels;
 use std::cell::Cell;
 use std::ffi::c_void;
 
-pub use super::node_slot_id::INVALID_NODE_SLOT_INDEX;
 pub const GENERATED_FOR_AFTER: u8 = 1;
 pub const GENERATED_FOR_BACKDROP: u8 = 2;
 pub const GENERATED_FOR_BEFORE: u8 = 3;
@@ -17,10 +16,19 @@ pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
 /// The last pseudo-element an element holds a box for in its own right; the ones from
 /// `GENERATED_FOR_AFTER` up to it are an element's synthetic pseudo-elements.
-pub const GENERATED_FOR_LAST_SYNTHETIC: u8 = 8;
+pub const GENERATED_FOR_LAST_SYNTHETIC: u8 = 11;
 /// `CSS::PseudoElement::Selection`, as the style engine numbers an element's pseudo-element
 /// records. It generates no box, so no row names it.
-pub const SELECTION_PSEUDO_KIND: u8 = 6;
+pub const SELECTION_PSEUDO_KIND: u8 = 8;
+/// `CSS::PseudoElement::SearchText`, as the style engine numbers an element's pseudo-element
+/// records. It generates no box either.
+pub const SEARCH_TEXT_PSEUDO_KIND: u8 = 6;
+/// The current find-in-page match's `::search-text`, as the style engine numbers an element's
+/// pseudo-element records. It generates no box either.
+pub const SEARCH_TEXT_CURRENT_PSEUDO_KIND: u8 = 7;
+/// `CSS::PseudoElement::SpellingError`, as the style engine numbers an element's pseudo-element
+/// records. It generates no box either.
+pub const SPELLING_ERROR_PSEUDO_KIND: u8 = 9;
 
 /// The pseudo-element a row generated for `generated_for` stands for, as the style engine numbers
 /// an element's pseudo-element records. `Layout::Node::encode_generated_for` is its inverse.
@@ -61,6 +69,7 @@ pub struct FfiReplacedContentFacts {
     pub default_preferred_width: CssPixels,
     pub has_default_preferred_height: bool,
     pub default_preferred_height: CssPixels,
+    pub text_entry_content_is_ordinary_box: bool,
 }
 
 impl From<crate::painting::host::FfiNaturalSize> for crate::css::style::NaturalSize {
@@ -144,11 +153,8 @@ pub enum NodeKind {
     ListItemMarkerBox = 13,
     NavigableContainerViewport = 14,
     Node = 15,
-    NodeWithStyle = 16,
     RadioButton = 18,
     RangeInputBox = 19,
-    ReplacedBox = 20,
-    SVGBox = 21,
     SVGClipBox = 22,
     SVGForeignObjectBox = 23,
     SVGGeometryBox = 24,
@@ -207,6 +213,11 @@ pub enum NodeFlag {
     EstablishesFixedPositionContainingBlock = 0x8000_0000,
 }
 
+impl NodeFlag {
+    /// The flags that say what node a row stands for. A row is built with them, and installing a style changes none.
+    pub(crate) const IDENTITY: u32 = Self::Anonymous as u32 | Self::IsBody as u32 | Self::IsDocumentElement as u32;
+}
+
 /// Facts a node takes from its ancestors. They are derived when the node is attached or its
 /// ancestors' styles change, so laying out a subtree never reads above it to learn them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +235,9 @@ pub(crate) enum AncestorFact {
     HasInlineLevelInclusiveAncestor = 1 << 4,
     /// An anonymous box whose nearest non-anonymous ancestor puts an ellipsis on overflowing lines.
     InheritsTextOverflowEllipsis = 1 << 5,
+    ParentLaysOutInColumns = 1 << 6,
+    /// The parent lays out its children with a MathML layout algorithm.
+    ParentUsesMathLayout = 1 << 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +249,7 @@ pub enum CompositorAnimationFrameKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+#[cfg_attr(not(test), expect(dead_code, reason = "C++ constructs the variants"))]
 pub enum FfiNodeLink {
     Parent,
     FirstChild,
@@ -252,9 +267,9 @@ pub enum DomPaintFact {
     NestedNavigableContainer = 1 << 3,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiNodeConstructionFacts {
+pub(crate) struct NodeConstructionFacts {
     pub kind: NodeKind,
     pub is_anonymous: bool,
     pub is_html_input_element: bool,
@@ -270,6 +285,7 @@ pub struct FfiNodeConstructionFacts {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub(crate) struct NodeData {
     pub parent: ShapeCell<NodeSlotId>,
     pub first_child: ShapeCell<NodeSlotId>,
@@ -339,6 +355,8 @@ pub(crate) struct PaintNode {
     pub(crate) style_record: u64,
     /// The node whose style the row carries.
     pub(crate) style_node: Option<crate::css::style::tree::StyleNodeID>,
+    /// Whether the arena derived the row's style record: an anonymous box's, or a style layout adjusted.
+    pub(crate) style_is_derived: bool,
 }
 
 impl Default for PaintNode {
@@ -358,16 +376,19 @@ impl Default for PaintNode {
             style: StylePayloadsRef::null(),
             style_record: 0,
             style_node: None,
+            style_is_derived: false,
         }
     }
 }
 
 impl PaintNode {
-    /// The node's row as `data` holds it, with the style record and node the arena keeps beside it.
+    /// The node's row as `data` holds it, with the style record and node the arena keeps beside it, and whether it
+    /// derived the record.
     pub(crate) fn of(
         data: &NodeData,
         style_record: u64,
         style_node: Option<crate::css::style::tree::StyleNodeID>,
+        style_is_derived: bool,
     ) -> Self {
         Self {
             generation: data.slot_generation.get(),
@@ -384,6 +405,7 @@ impl PaintNode {
             style: data.style.get(),
             style_record,
             style_node,
+            style_is_derived,
         }
     }
 

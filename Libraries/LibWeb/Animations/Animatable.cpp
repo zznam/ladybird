@@ -96,25 +96,41 @@ WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(Vector<BaseKeyframe>
 
 WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(JS::Realm& realm, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options)
 {
-    auto animation = TRY(animate(TRY(process_keyframes(realm, keyframes)), TRY(keyframe_animation_options_from_bindings(options))));
+    auto processed_keyframes = TRY(process_keyframes(realm, keyframes));
+
+    // https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangestart
+    // https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangeend
+    // INTEROP: Like Chrome, the keyframes are processed before the range is parsed, so the keyframes' getters run first.
+    Optional<AnimationAttachmentRange> range;
+    if (auto const* animation_options = options.get_pointer<Bindings::KeyframeAnimationOptions>()) {
+        auto& document = static_cast<DOM::Element*>(this)->document();
+        range = AnimationAttachmentRange {
+            .start = TRY(parse_timeline_range_edge(document, animation_options->range_start, TimelineRangeEdgeSide::Start)),
+            .end = TRY(parse_timeline_range_edge(document, animation_options->range_end, TimelineRangeEdgeSide::End)),
+        };
+    }
+
+    auto animation = TRY(animate(move(processed_keyframes), TRY(keyframe_animation_options_from_bindings(options))));
+    if (range.has_value())
+        animation->set_range(*range);
 
     return animation;
 }
 
 // https://drafts.csswg.org/web-animations-1/#dom-animatable-getanimations
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations(GetAnimationsOptions const& options)
 {
     as<DOM::Element>(*this).document().update_style();
 
     return get_animations_internal(GetAnimationsSorted::Yes, options);
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(Bindings::GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations(Bindings::GetAnimationsOptions const& options)
 {
     return get_animations(TRY(get_animations_options_from_bindings(options)));
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options)
 {
     // 1. Let object be the object on which this method was called.
 
@@ -126,11 +142,13 @@ WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_inter
 
     // 4. If options is passed with subtree set to true, then return the set of relevant animations for a subtree of target.
     //    Otherwise, return the set of relevant animations for target.
-    Vector<GC::Ref<Animation>> relevant_animations;
+    GC::RootVector<GC::Ref<Animation>> relevant_animations;
     if (m_impl) {
         auto& associated_animations = m_impl->associated_animations;
         for (auto const& animation : associated_animations) {
-            if (animation->is_relevant())
+            // AD-HOC: SVG animation elements drive their animations with their own timing model, which script must not
+            //         be able to play, pause or cancel. Like other engines, do not expose them.
+            if (animation->is_relevant() && !animation->is_smil_animation())
                 relevant_animations.append(*animation);
         }
     }
@@ -202,19 +220,6 @@ bool Animatable::has_relevant_animations() const
     return false;
 }
 
-bool Animatable::has_relevant_animations_other_than_transitions() const
-{
-    if (!m_impl)
-        return false;
-
-    for (auto const& animation : m_impl->associated_animations) {
-        if (!animation->is_css_transition() && animation->is_relevant())
-            return true;
-    }
-
-    return false;
-}
-
 void Animatable::associate_with_animation(GC::Ref<Animation> animation)
 {
     auto& impl = ensure_impl();
@@ -223,9 +228,10 @@ void Animatable::associate_with_animation(GC::Ref<Animation> animation)
     impl.associated_animations.append(animation);
     impl.is_sorted_by_composite_order = false;
     // The style engine computes no record for an element whose animations compose its style.
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     as<DOM::Element>(*this).change_associated_animation_count_in_subtree(1);
+    CSS::record_element_associated_with_animation(as<DOM::Element>(*this));
 
     as<DOM::Element>(*this).document().associate_with_animation(animation);
     animation->did_associate_with_target();
@@ -236,7 +242,7 @@ void Animatable::disassociate_with_animation(GC::Ref<Animation> animation)
     auto& impl = *m_impl;
     auto was_associated = impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
     impl.is_sorted_by_composite_order = false;
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     if (was_associated)
         as<DOM::Element>(*this).change_associated_animation_count_in_subtree(-1);
@@ -303,56 +309,22 @@ void Animatable::cancel_css_animations_and_transitions()
         animation->cancel(Animation::ShouldInvalidate::No);
 }
 
-static void const* installed_longhand_table(DOM::Element const& element, Optional<CSS::PseudoElement> pseudo_element)
-{
-    auto style_record = element.style_record_identity(pseudo_element);
-    if (!style_record)
-        return nullptr;
-    auto style = element.document().style_computer().style_engine().style_record_view(style_record);
-    return style.present ? style.longhand_table : nullptr;
-}
-
-// A declaration whose delay and duration are each the single value 0s starts nothing, so it gives no longhand a
-// matching entry unless the element already holds a transition, which such an entry could still cancel.
-bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element, void const* longhand_table) const
-{
-    if (!longhand_table)
-        return false;
-    if (CSS::StyleValueFFI::rust_transition_delay_and_duration_are_single_zero(longhand_table)
-        && property_ids_with_existing_transitions(pseudo_element).is_empty())
-        return false;
-    return CSS::StyleValueFFI::rust_transition_has_entries(longhand_table);
-}
-
 bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    return has_matching_transition_property_entry(pseudo_element, installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element));
+    auto const& style = static_cast<DOM::Element const&>(*this).installed_style(pseudo_element);
+    return style && CSS::StyleValueFFI::rust_transition_has_matching_entries(style.view().longhand_table, has_existing_transitions(pseudo_element));
 }
 
-// The longhands the element's installed style gives a matching transition-property entry, read from
-// the style's transition longhands.
-Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
+bool Animatable::has_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* longhand_table = installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element);
-    if (!has_matching_transition_property_entry(pseudo_element, longhand_table))
-        return {};
-    auto entries = CSS::StyleValueFFI::rust_transition_entries(longhand_table);
-    Vector<CSS::PropertyID> property_ids;
-    property_ids.ensure_capacity(entries.count);
-    for (auto const& entry : ReadonlySpan<CSS::StyleValueFFI::FfiTransitionEntry> { entries.entries, entries.count })
-        property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
-    CSS::StyleValueFFI::rust_transition_entries_release(entries);
-    return property_ids;
+    auto const* transition = transition_if_exists(pseudo_element);
+    return transition && !transition->associated_transitions.is_empty();
 }
 
-Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
+HashMap<CSS::PropertyID, GC::Ref<CSS::CSSTransition>> const* Animatable::existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* maybe_transition = transition_if_exists(pseudo_element);
-
-    if (!maybe_transition)
-        return {};
-
-    return maybe_transition->associated_transitions.keys();
+    auto const* transition = transition_if_exists(pseudo_element);
+    return transition ? &transition->associated_transitions : nullptr;
 }
 
 GC::Ptr<CSS::CSSTransition> Animatable::property_transition(Optional<CSS::PseudoElement> pseudo_element, CSS::PropertyID property) const

@@ -7,12 +7,13 @@
 //! The host's one way to wait for a document's render state, and the rights it spends to do so.
 //!
 //! The host waits only with a [`ScriptForcedRead`], which the host entries script APIs call mint for a current answer,
-//! or a [`LockstepProof`], whose reasons are the waits internal code makes. Each right is minted only by the module
-//! that owns its marker, so code elsewhere has no way to wait.
+//! or in a [`BegunRead`], a read the host began, which a host entry that reaches the render state where the host is
+//! takes from its caller: code that has not begun a read has nothing to reach the state with. What runs beside the host
+//! is taken in without a wait only at a [`TaskBoundary`], which the entries the event loop calls between two tasks
+//! mint.
 
-use super::{DocumentHost, RenderMessage, send};
+use super::DocumentHost;
 use std::marker::PhantomData;
-use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// The one wait of a script API call that needs a current answer: getComputedStyle, an element's geometry, hit
 /// testing, innerText and the like. The host entry the API calls mints it, and a wait takes it by value, so it is
@@ -21,31 +22,126 @@ pub(crate) struct ScriptForcedRead {
     not_send_or_sync: PhantomData<*const ()>,
 }
 
-/// The right of the host to wait for a document's render state outside a script's forced read, for one of the reasons
-/// that have a [`LockstepReason`] marker. It stays on the document's thread.
+/// The right of the host to wait for a recording in flight, for one of the reasons that have a [`LockstepReason`]
+/// marker. It stays on the document's thread.
 pub(crate) struct LockstepProof {
+    not_send_or_sync: PhantomData<*const ()>,
+}
+
+/// A read of a document's render state that the host began and has not ended. A host entry that reaches the render
+/// state where the host is takes it from its caller, as only a read takes a frame in flight in: the host's scope of a
+/// read lends it to the entries it calls (see [`super::document_host::document_host_read_scope_view`]), and nothing
+/// else makes one, so code that reaches the state without a begun read does not compile. It stays on the document's
+/// thread.
+pub struct BegunRead {
+    not_send_or_sync: PhantomData<*const ()>,
+}
+
+impl BegunRead {
+    /// The begun read a host keeps, which its scopes of a read lend.
+    pub(super) fn of_host() -> Self {
+        Self {
+            not_send_or_sync: PhantomData,
+        }
+    }
+}
+
+/// What the reads of a layout node the host holds spend: the read that reached the node. A layout node is reached only
+/// through an entry that takes a [`BegunRead`], as the ones that find the node an element or a row is bound to do, and
+/// that entry took the frame in, which flies again only from a rendering update, after the task that reached the node.
+/// Only the modules whose entries answer a node's reads of its row mint one, each with a [`HeldNodeEntry`] marker.
+pub(crate) struct NodeRead {
+    not_send_or_sync: PhantomData<*const ()>,
+}
+
+impl NodeRead {
+    /// The read of a layout node the host holds, which the entry `_` marks reads.
+    pub(crate) fn of_held_node(_: &impl HeldNodeEntry) -> Self {
+        Self {
+            not_send_or_sync: PhantomData,
+        }
+    }
+}
+
+/// The top of the host's event loop, between two tasks, where the host takes in what has finished beside it and waits
+/// for nothing. It stays on the host's thread.
+pub(crate) struct TaskBoundary {
     not_send_or_sync: PhantomData<*const ()>,
 }
 
 mod private {
     pub trait ScriptEntry {}
     pub trait LockstepReason {}
+    pub trait EventLoopEntry {}
     pub trait RenderWait {}
+    pub trait HeldNodeEntry {}
 }
 
 /// A marker that only a host entry script APIs call can construct, which mints a [`ScriptForcedRead`].
 pub(crate) trait ScriptEntry: private::ScriptEntry {}
 
-/// A marker that only the module waiting for its reason can construct, which mints a [`LockstepProof`].
+/// A marker that only a module whose entries read the row of a layout node the host holds can construct, which mints a
+/// [`NodeRead`].
+pub(crate) trait HeldNodeEntry: private::HeldNodeEntry {}
+
+/// A marker that only the module waiting for its reason can construct, which mints a [`LockstepProof`] to join a
+/// recording in flight.
 pub(crate) trait LockstepReason: private::LockstepReason {}
 
-/// What a wait for a document's render state spends: a script's forced read, or a [`LockstepProof`].
-pub(crate) trait RenderWait: private::RenderWait {}
+/// A marker that only a host entry the event loop calls between two tasks can construct, which mints a
+/// [`TaskBoundary`].
+pub(crate) trait EventLoopEntry: private::EventLoopEntry {}
+
+/// What a wait for a document's render state spends: a script's forced read, or the read the host began.
+pub(crate) trait RenderWait: private::RenderWait {
+    /// What takes a frame in flight in for the wait, which the wait spends only where the frame flies.
+    fn into_forced_read(self) -> ForcedRead;
+
+    /// Whether the wait may reach the render state of `host`'s document: a begun read reaches only the render state of
+    /// the document whose host began it.
+    fn reaches(&self, _host: &DocumentHost) -> bool {
+        true
+    }
+}
 
 impl private::RenderWait for ScriptForcedRead {}
-impl RenderWait for ScriptForcedRead {}
-impl private::RenderWait for LockstepProof {}
-impl RenderWait for LockstepProof {}
+impl RenderWait for ScriptForcedRead {
+    fn into_forced_read(self) -> ForcedRead {
+        ForcedRead::minted()
+    }
+}
+
+impl private::RenderWait for &BegunRead {}
+impl RenderWait for &BegunRead {
+    fn into_forced_read(self) -> ForcedRead {
+        ForcedRead::minted()
+    }
+
+    fn reaches(&self, host: &DocumentHost) -> bool {
+        std::ptr::eq(*self, host.begun_read())
+    }
+}
+
+impl private::RenderWait for ForcedRead {}
+impl RenderWait for ForcedRead {
+    fn into_forced_read(self) -> ForcedRead {
+        self
+    }
+}
+
+impl private::RenderWait for super::NoFrameInFlight {}
+impl RenderWait for super::NoFrameInFlight {
+    fn into_forced_read(self) -> ForcedRead {
+        unreachable!("a frame flies only from a rendering update, which no reach without one runs")
+    }
+}
+
+impl private::RenderWait for NodeRead {}
+impl RenderWait for NodeRead {
+    fn into_forced_read(self) -> ForcedRead {
+        ForcedRead::minted()
+    }
+}
 
 impl ScriptForcedRead {
     /// A forced read for a unit test.
@@ -73,6 +169,42 @@ impl LockstepProof {
     }
 }
 
+impl TaskBoundary {
+    /// A task boundary for a unit test.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            not_send_or_sync: PhantomData,
+        }
+    }
+
+    /// The task boundary at which the event loop calls the entry `_` marks.
+    pub(crate) fn at_event_loop_entry(_: &impl EventLoopEntry) -> Self {
+        Self {
+            not_send_or_sync: PhantomData,
+        }
+    }
+}
+
+/// What a wait for a frame in flight spends: the forced read of a script API call, a read the host began, or the host's
+/// teardown of its document. Only a [`RenderWait`] makes one, but for the teardown.
+pub(crate) struct ForcedRead {
+    not_send_or_sync: PhantomData<*const ()>,
+}
+
+impl ForcedRead {
+    fn minted() -> Self {
+        Self {
+            not_send_or_sync: PhantomData,
+        }
+    }
+
+    /// The read of the host's teardown of its document.
+    pub(super) fn of_teardown() -> Self {
+        Self::minted()
+    }
+}
+
 macro_rules! script_entry {
     ($marker:path) => {
         impl private::ScriptEntry for $marker {}
@@ -91,78 +223,51 @@ macro_rules! lockstep_reason {
     };
 }
 
-// The waits internal code makes, each minted only by the module its marker belongs to.
-lockstep_reason!(crate::layout::layout_changes::HostPaysTheWrite);
-lockstep_reason!(crate::layout::shell_reads::HostReadsItsOwnWrite);
-lockstep_reason!(crate::painting::ffi::InputReadsBoxes);
-lockstep_reason!(crate::painting::ffi::ScrollSnaps);
-lockstep_reason!(crate::painting::paint_passes::HostPaintStep);
-lockstep_reason!(crate::layout::text_queries::InputSelectsByWord);
-lockstep_reason!(crate::css::style::engine_calls::EngineDoor);
-lockstep_reason!(crate::layout::LayoutUpdate);
+// The waits internal code makes for a recording, each minted only by the module its marker belongs to.
+lockstep_reason!(crate::painting::recording_slot::RecordingNeedsItsRecorder);
 
-/// Where the render side answers a host that waits for it. Only an answer goes through it: a reply dropped unanswered
-/// is a render state that died.
-pub(crate) struct ReplyTo<R>(Sender<R>);
-
-impl<R> ReplyTo<R> {
-    fn channel() -> (Self, Receiver<R>) {
-        let (reply, answered) = channel();
-        (Self(reply), answered)
-    }
-
-    /// Answers with what `job` answers. A panic in `job` drops the reply unanswered, which ends the process where the
-    /// host waits, and goes on to end the message.
-    pub(crate) fn answer(self, job: impl FnOnce() -> R) {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
-            // The waiting host keeps the receiver until it has the answer.
-            Ok(answer) => {
-                let _ = self.0.send(answer);
-            }
-            Err(payload) => {
-                drop(self);
-                std::panic::resume_unwind(payload);
-            }
+/// Defines `HeldNode`, the marker of a module whose host entries read or write the row of a layout node the host holds,
+/// and `node_read()`, the [`NodeRead`] they spend. The module's marker is listed below.
+macro_rules! held_node_entries {
+    () => {
+        /// Marks the host entries of this module, which read or write the row of a layout node the host holds.
+        pub(crate) struct HeldNode {
+            _private: (),
         }
-    }
+
+        /// The read of the layout node the host holds, which this module's entries spend.
+        fn node_read() -> $crate::render_state::NodeRead {
+            $crate::render_state::NodeRead::of_held_node(&HeldNode { _private: () })
+        }
+    };
 }
 
-/// Sends the render state of `host`'s document the message `message` makes of where it answers, and waits for the
-/// answer, spending `_wait`. The host is only ever shared, so what an outer call holds of it stays live across the wait.
-pub(crate) fn wait_for_render_state<R>(
-    _wait: impl RenderWait,
-    _host: &DocumentHost,
-    message: impl FnOnce(ReplyTo<R>) -> RenderMessage,
-) -> R {
-    let (reply, answered) = ReplyTo::channel();
-    send(message(reply));
-    answered.try_recv().unwrap_or_else(|_| render_state_died())
+pub(crate) use held_node_entries;
+
+macro_rules! held_node_entry {
+    ($marker:path) => {
+        impl private::HeldNodeEntry for $marker {}
+        impl HeldNodeEntry for $marker {}
+    };
 }
 
-/// Sends the render state of the document `main_thread` was minted for the message `message` makes of where it
-/// answers, and waits for the answer, spending `_wait`. An entry that runs a step of the host sends its jobs this way:
-/// it holds the host only through its token, so it borrows nothing of what a wait could change.
-pub(crate) fn wait_from_entry<R>(
-    _wait: impl RenderWait,
-    _main_thread: &crate::stage::MainThread,
-    message: impl FnOnce(ReplyTo<R>) -> RenderMessage,
-) -> R {
-    let (reply, answered) = ReplyTo::channel();
-    send(message(reply));
-    answered.try_recv().unwrap_or_else(|_| render_state_died())
-}
+// The modules whose host entries read or write the row of a layout node the host holds.
+held_node_entry!(crate::layout::shell_reads::HeldNode);
+held_node_entry!(crate::layout::ArenaHeldNode);
+held_node_entry!(crate::layout::PartialRelayoutHeldNode);
+held_node_entry!(crate::layout::text_queries::HeldNode);
+held_node_entry!(crate::painting::ffi::HeldNode);
+held_node_entry!(crate::painting::layout_tree_dump::HeldNode);
 
-/// Ends the process, on a host whose wait for a render state found no answer: the message panicked, and may have left
-/// the document's render state half changed, so nothing can go on over it.
-#[cold]
-pub(crate) fn render_state_died() -> ! {
-    std::process::abort()
-}
+// The host entries the event loop calls between two tasks.
+impl private::EventLoopEntry for crate::painting::ffi::TakesFinishedRecordingIn {}
+impl EventLoopEntry for crate::painting::ffi::TakesFinishedRecordingIn {}
+impl private::EventLoopEntry for crate::css::style::style_job::TakesFinishedStyleIn {}
+impl EventLoopEntry for crate::css::style::style_job::TakesFinishedStyleIn {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::TryRecvError;
 
     trait AmbiguousIfSend<A> {
         fn marker() {}
@@ -183,19 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_answers_through_its_reply() {
-        let (reply, answered) = ReplyTo::channel();
-        reply.answer(|| 7);
-        assert_eq!(answered.try_recv(), Ok(7));
-    }
-
-    #[test]
-    fn a_panic_in_a_job_for_a_waiting_caller_drops_its_reply() {
-        let (reply, answered) = ReplyTo::<u32>::channel();
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reply.answer(|| panic!("the job panicked"));
-        }));
-        assert!(panicked.is_err());
-        assert_eq!(answered.try_recv(), Err(TryRecvError::Disconnected));
+    fn a_task_boundary_is_not_send() {
+        <TaskBoundary as AmbiguousIfSend<_>>::marker();
     }
 }

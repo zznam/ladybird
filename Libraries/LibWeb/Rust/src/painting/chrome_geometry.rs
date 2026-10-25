@@ -7,10 +7,11 @@
 use crate::css::css_enums;
 use crate::css::css_pixels::{CssPixelFraction, CssPixelPoint, CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX;
 use crate::painting::ffi::{FfiChromeMetrics, ScrollDirection};
 use crate::painting::host::{FfiHitTestQueryCallbacks, RootBackgroundSource};
-use crate::painting::paint_read::PaintRead;
+use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::paintable_data::PaintableFlag;
 use crate::painting::paintable_geometry;
 use crate::painting::record::RecordingInputs;
@@ -133,27 +134,74 @@ pub(crate) fn has_resizer(arena: &impl PaintRead, slot: NodeSlotId) -> bool {
     axes.horizontal || axes.vertical
 }
 
-pub(crate) fn wheel_scrollable_axes(
-    arena: &impl PaintRead,
-    slot: NodeSlotId,
-    viewport_wheel_overflow_x: u8,
-    viewport_wheel_overflow_y: u8,
-) -> PhysicalAxes {
+/// What a box does with a scroll that reaches the boundary of its scroll range, along each physical axis.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollBoundaryBehavior {
+    /// The scroll is passed on to the scrollers around the box.
+    pub(crate) chains_to_ancestors: PhysicalAxes,
+    pub(crate) shows_overscroll_effect: PhysicalAxes,
+}
+
+// https://drafts.csswg.org/css-overscroll-1/#overscroll-behavior-properties
+// NB: The viewport's own overscroll behavior is the one the layout pass propagated to it from the root element.
+pub(crate) fn scroll_boundary_behavior(arena: &impl PaintRead, slot: NodeSlotId) -> ScrollBoundaryBehavior {
+    let unrestricted = ScrollBoundaryBehavior {
+        chains_to_ancestors: PhysicalAxes {
+            horizontal: true,
+            vertical: true,
+        },
+        shows_overscroll_effect: PhysicalAxes {
+            horizontal: true,
+            vertical: true,
+        },
+    };
+    // An element that is not scroll container must accept but ignore the values of this property.
+    let Some(row) = arena.node(slot) else {
+        return unrestricted;
+    };
+    if !node_facts::kind_is_box(row.kind())
+        || !node_facts::kind_and_style_make_scroll_container(row.kind(), row.style())
+    {
+        return unrestricted;
+    }
+    let Some(style) = row.style() else {
+        return unrestricted;
+    };
+
+    use css_enums::overscroll_behavior::{AUTO, CHAIN, CONTAIN};
+    let misc_reset = style.misc_reset();
+    // contain: The element must not perform non-local boundary default actions such as scroll chaining. This value
+    //          must not modify the behavior of how local boundary default actions should behave, such as showing any
+    //          overscroll affordances.
+    // none: This value implies the same behavior as contain and in addition this element must also not perform local
+    //       boundary default actions such as showing any overscroll affordances.
+    // chain: The element may perform non-local boundary default actions such as scroll chaining. However, the element
+    //        must not perform local boundary default actions, such as showing any overscroll affordances.
+    let chains = |value: u8| value == AUTO || value == CHAIN;
+    let shows_overscroll_effect = |value: u8| value == AUTO || value == CONTAIN;
+    ScrollBoundaryBehavior {
+        chains_to_ancestors: PhysicalAxes {
+            horizontal: chains(misc_reset.overscroll_behavior_x),
+            vertical: chains(misc_reset.overscroll_behavior_y),
+        },
+        shows_overscroll_effect: PhysicalAxes {
+            horizontal: shows_overscroll_effect(misc_reset.overscroll_behavior_x),
+            vertical: shows_overscroll_effect(misc_reset.overscroll_behavior_y),
+        },
+    }
+}
+
+// NB: The viewport's own overflow is the one the layout pass propagated to it, as applied to the viewport.
+pub(crate) fn wheel_scrollable_axes(arena: &impl PaintRead, slot: NodeSlotId) -> PhysicalAxes {
     let Some(style) = arena.node_style_if_live(slot) else {
         return PhysicalAxes::default();
     };
     let box_values = style.box_values();
-    let is_viewport = arena.node_kind_if_live(slot) == Some(NodeKind::Viewport);
-    let (overflow_x, overflow_y) = if is_viewport {
-        (viewport_wheel_overflow_x, viewport_wheel_overflow_y)
-    } else {
-        (box_values.overflow_x, box_values.overflow_y)
-    };
     let allows_wheel_scrolling =
         |overflow| overflow == css_enums::overflow::AUTO || overflow == css_enums::overflow::SCROLL;
     let mut axes = PhysicalAxes {
-        horizontal: allows_wheel_scrolling(overflow_x),
-        vertical: allows_wheel_scrolling(overflow_y),
+        horizontal: allows_wheel_scrolling(box_values.overflow_x),
+        vertical: allows_wheel_scrolling(box_values.overflow_y),
     };
     if !axes.horizontal && !axes.vertical {
         return axes;
@@ -199,20 +247,24 @@ pub(crate) fn scrollbar_is_enlarged(arena: &impl PaintRead, slot: NodeSlotId, di
     arena.paintable_data(slot).has_flag(flag)
 }
 
+pub(crate) fn scrollbar_is_hidden(arena: &impl PaintRead, slot: NodeSlotId, direction: ScrollDirection) -> bool {
+    let flag = match direction {
+        ScrollDirection::Horizontal => PaintableFlag::HorizontalScrollbarHidden,
+        ScrollDirection::Vertical => PaintableFlag::VerticalScrollbarHidden,
+    };
+    arena.paintable_data(slot).has_flag(flag)
+}
+
 pub(crate) struct ChromeGeometry<'a, Arena: PaintRead> {
     pub(crate) arena: &'a Arena,
     pub(crate) metrics: FfiChromeMetrics,
-    pub(crate) viewport_wheel_overflow_x: u8,
-    pub(crate) viewport_wheel_overflow_y: u8,
 }
 
 impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
-    pub(crate) fn for_recording(arena: &'a Arena, inputs: &RecordingInputs<'_>) -> Self {
+    pub(crate) fn for_recording(arena: &'a Arena, inputs: &RecordingInputs) -> Self {
         Self {
             arena,
             metrics: inputs.uncaptured.chrome_metrics,
-            viewport_wheel_overflow_x: inputs.uncaptured.viewport_wheel_overflow_x,
-            viewport_wheel_overflow_y: inputs.uncaptured.viewport_wheel_overflow_y,
         }
     }
 
@@ -220,18 +272,11 @@ impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
         Self {
             arena,
             metrics: callbacks.chrome_metrics,
-            viewport_wheel_overflow_x: callbacks.viewport_wheel_overflow_x,
-            viewport_wheel_overflow_y: callbacks.viewport_wheel_overflow_y,
         }
     }
 
     fn wheel_scrollable_axes(&self, slot: NodeSlotId) -> PhysicalAxes {
-        wheel_scrollable_axes(
-            self.arena,
-            slot,
-            self.viewport_wheel_overflow_x,
-            self.viewport_wheel_overflow_y,
-        )
+        wheel_scrollable_axes(self.arena, slot)
     }
 
     pub(crate) fn absolute_resizer_rect(&self, slot: NodeSlotId) -> Option<CssPixelRect> {

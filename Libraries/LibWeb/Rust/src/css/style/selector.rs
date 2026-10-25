@@ -25,8 +25,6 @@
 //! arrives with the semantics it needs rather than as a placeholder that would have to be guessed
 //! at now.
 
-use super::capacity::ShallowCapacityBytes;
-use super::capacity::capacity_bytes;
 use super::column::BitColumn;
 use super::column::Column;
 use super::column::PagedColumn;
@@ -54,9 +52,6 @@ use std::sync::OnceLock;
 
 use super::TransactionFactSide;
 use super::TransactionFactView;
-use super::memory::MemoryCategory;
-use super::memory::MemoryController;
-use super::memory::MemoryLease;
 use super::partial_view::Lookup;
 use super::planning::SequenceEntry;
 use super::planning::SequenceEntryIndex;
@@ -84,16 +79,6 @@ use super::tree::StyleNodeTree;
 use super::tree::TreeScopeID;
 use crate::css::css_tokenizer::TokenizerInput;
 pub use crate::css::selector::Specificity;
-
-#[cfg(feature = "style-recording")]
-pub mod replay;
-#[cfg(not(feature = "style-recording"))]
-pub mod replay {
-    use super::SelectorProgram;
-    use crate::css::style::record_replay::PayloadWriter;
-
-    pub fn write(_program: &SelectorProgram, _payload: &mut PayloadWriter) {}
-}
 
 define_id! {
     /// Index into one program's node arena.
@@ -493,9 +478,6 @@ impl ValueStateTestKind {
 pub enum ValueStateKind {
     /// `:dir()`
     Directionality,
-    /// `:lang()`. Every `:lang()` routes under this one key, because a range is not a name: this
-    /// kind names the input, not a value, and no selector operator carries it.
-    Language,
     /// `:state()`, a custom element's state.
     CustomState,
 }
@@ -699,21 +681,7 @@ pub(super) enum SelectorPrefixPredicate {
     Language(Box<[Box<[u16]>]>),
 }
 
-impl SelectorPrefixPredicate {
-    pub(super) fn capacity_bytes(&self) -> usize {
-        match self {
-            Self::Leaf(_) => 0,
-            Self::Attribute(_, text) => size_of_val(text.as_ref()),
-            Self::And(operands) | Self::Or(operands) => {
-                size_of_val(operands.as_ref()) + operands.iter().map(Self::capacity_bytes).sum::<usize>()
-            }
-            Self::Not(inner) => size_of::<Self>() + inner.capacity_bytes(),
-            Self::Language(ranges) => {
-                size_of_val(ranges.as_ref()) + ranges.iter().map(|range| size_of_val(range.as_ref())).sum::<usize>()
-            }
-        }
-    }
-}
+impl SelectorPrefixPredicate {}
 
 /// Whose names the atoms of a selector program are.
 ///
@@ -798,6 +766,21 @@ impl<A: AtomSpace> SelectorProgram<A> {
         visited
     }
 
+    /// The names of the attributes the program tests, by any operator.
+    pub fn tested_attribute_names(&self) -> impl Iterator<Item = StyleAtomID> + '_ {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node {
+                SelectorOp::Feature(FeatureTest::Attribute(test)) => Some(test),
+                _ => None,
+            })
+            .flat_map(|test| {
+                [Some(test.name), (test.folded != test.name).then_some(test.folded)]
+                    .into_iter()
+                    .flatten()
+            })
+    }
+
     /// Attribute names whose tests cannot be answered from the value atom alone.
     pub fn attribute_value_text_names(&self) -> impl Iterator<Item = StyleAtomID> + '_ {
         self.nodes
@@ -852,9 +835,8 @@ impl<A: AtomSpace> SelectorProgram<A> {
 
     #[must_use]
     pub fn contains_relational_selector(&self) -> bool {
-        self.nodes
-            .iter()
-            .any(|node| matches!(node, SelectorOp::RelativeExists(_)))
+        // Every relative query is pushed together with the one RelativeExists node evaluating it.
+        !self.relative_queries.is_empty()
     }
 
     /// Whether any node in this subtree tests sibling position. A retained witness for a
@@ -912,49 +894,6 @@ impl<A: AtomSpace> SelectorProgram<A> {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
-
-    /// The compact byte length of the program, which is what the document memory budget is written
-    /// in. Allocator padding and optional acceleration are excluded on purpose.
-    #[must_use]
-    pub fn compact_bytes(&self) -> u64 {
-        (self.nodes.len() * size_of::<SelectorOp>()
-            + self.operands.len() * size_of::<SelectorNodeID>()
-            + self.text.len() * size_of::<u16>()
-            + self.entries.len() * size_of::<SelectorEntry>()
-            + self.relative_queries.len() * size_of::<RelativeQuery>()
-            + size_of::<bool>()) as u64
-    }
-
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.nodes,
-                self.operands,
-                self.text,
-                self.entries,
-                self.relative_queries,
-                self.language_ranges,
-                self.dispatch_metadata.0,
-            ];
-            cached [];
-            nested [
-                size_of::<bool>(),
-                self.dispatch_metadata.0
-                    .iter()
-                    .map(|metadata| {
-                        size_of_val(metadata.subject_dispatch_keys.as_ref()) as u64
-                            + size_of_val(metadata.subject_required_keys.as_ref()) as u64
-                            + metadata
-                                .prefix_chain
-                                .as_ref()
-                                .map_or(0, |chain| size_of_val(chain.as_ref()) as u64)
-                    })
-                    .sum::<u64>(),
-            ];
-            skip [self.can_leave_scope, self.subject_can_leave_scope];
-        }
-    }
 }
 
 /// Builds one selector program. C++ parses the selector text and drives this; the IR and its
@@ -966,6 +905,7 @@ pub struct SelectorProgramBuilder<A: AtomSpace = EngineAtoms> {
 
 impl SelectorProgramBuilder {
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1068,6 +1008,7 @@ impl<A: AtomSpace> SelectorProgramBuilder<A> {
     }
 
     /// Add an ancestor step: the subject has an ancestor satisfying `inner`.
+    #[cfg(test)]
     pub fn push_ancestor(&mut self, inner: SelectorNodeID) -> SelectorNodeID {
         self.push(SelectorOp::Ancestor(inner))
     }
@@ -1804,6 +1745,17 @@ impl<A: AtomSpace> SelectorProgram<A> {
         query: DispatchQuery,
         out: &mut Vec<DispatchKey>,
     ) -> bool {
+        self.dispatch_analysis_excluding(id, relation, query, out, None)
+    }
+
+    fn dispatch_analysis_excluding(
+        &self,
+        id: SelectorNodeID,
+        relation: DispatchRelation,
+        query: DispatchQuery,
+        out: &mut Vec<DispatchKey>,
+        excluded: Option<DispatchKey>,
+    ) -> bool {
         if relation != DispatchRelation::Subject {
             let operands = match self.node(id) {
                 SelectorOp::And { first, count } => self.operands(first, count),
@@ -1818,14 +1770,20 @@ impl<A: AtomSpace> SelectorProgram<A> {
                             }
                             return false;
                         }
-                        return self.dispatch_analysis(inner, DispatchRelation::Subject, query, out);
+                        return self.dispatch_analysis_excluding(
+                            inner,
+                            DispatchRelation::Subject,
+                            query,
+                            out,
+                            excluded,
+                        );
                     }
                     (
                         DispatchRelation::Parent,
                         SelectorOp::PreviousSibling(inner) | SelectorOp::PrecedingSibling(inner),
                     ) => {
                         let start = out.len();
-                        self.dispatch_analysis(inner, relation, query, out);
+                        self.dispatch_analysis_excluding(inner, relation, query, out, excluded);
                         if query != DispatchQuery::Required && out.len() != start {
                             return true;
                         }
@@ -1836,14 +1794,20 @@ impl<A: AtomSpace> SelectorProgram<A> {
                         if self.mentions_the_host(inner) {
                             continue;
                         }
-                        self.dispatch_analysis(inner, DispatchRelation::Subject, query, out);
-                        self.dispatch_analysis(inner, relation, query, out);
+                        self.dispatch_analysis_excluding(inner, DispatchRelation::Subject, query, out, excluded);
+                        self.dispatch_analysis_excluding(inner, relation, query, out, excluded);
                     }
                     (DispatchRelation::Ancestor, SelectorOp::Ancestor(inner)) => {
                         if self.mentions_the_host(inner) {
                             return false;
                         }
-                        return self.dispatch_analysis(inner, DispatchRelation::Subject, query, out);
+                        return self.dispatch_analysis_excluding(
+                            inner,
+                            DispatchRelation::Subject,
+                            query,
+                            out,
+                            excluded,
+                        );
                     }
                     (
                         DispatchRelation::Ancestor,
@@ -1852,7 +1816,7 @@ impl<A: AtomSpace> SelectorProgram<A> {
                         | SelectorOp::PrecedingSibling(inner),
                     ) => {
                         let start = out.len();
-                        self.dispatch_analysis(inner, relation, query, out);
+                        self.dispatch_analysis_excluding(inner, relation, query, out, excluded);
                         if out.len() != start {
                             return true;
                         }
@@ -1866,6 +1830,9 @@ impl<A: AtomSpace> SelectorProgram<A> {
         match self.node(id) {
             SelectorOp::Feature(test) => {
                 let key = Self::dispatch_key_for_feature(test);
+                if excluded == Some(key) {
+                    return query == DispatchQuery::Required;
+                }
                 match query {
                     DispatchQuery::Alternatives | DispatchQuery::Required if key == DispatchKey::Universal => {
                         return query == DispatchQuery::Required;
@@ -1877,7 +1844,7 @@ impl<A: AtomSpace> SelectorProgram<A> {
             SelectorOp::And { first, count } => match query {
                 DispatchQuery::Required => {
                     for &operand in self.operands(first, count) {
-                        self.dispatch_analysis(operand, relation, query, out);
+                        self.dispatch_analysis_excluding(operand, relation, query, out, excluded);
                     }
                     true
                 }
@@ -1886,7 +1853,7 @@ impl<A: AtomSpace> SelectorProgram<A> {
                     let mut candidate = Vec::new();
                     for &operand in self.operands(first, count) {
                         candidate.clear();
-                        if !self.dispatch_analysis(operand, relation, query, &mut candidate) {
+                        if !self.dispatch_analysis_excluding(operand, relation, query, &mut candidate, excluded) {
                             continue;
                         }
                         if best
@@ -1910,7 +1877,7 @@ impl<A: AtomSpace> SelectorProgram<A> {
                 DispatchQuery::Alternatives => {
                     let start = out.len();
                     for &operand in self.operands(first, count) {
-                        if !self.dispatch_analysis(operand, relation, query, out)
+                        if !self.dispatch_analysis_excluding(operand, relation, query, out, excluded)
                             || out.len() - start > MAX_DISPATCH_KEYS
                         {
                             out.truncate(start);
@@ -1930,7 +1897,9 @@ impl<A: AtomSpace> SelectorProgram<A> {
                 }
                 DispatchQuery::Required => {
                     let mut keys = Vec::new();
-                    if self.dispatch_analysis(id, relation, DispatchQuery::Alternatives, &mut keys) && keys.len() == 1 {
+                    if self.dispatch_analysis_excluding(id, relation, DispatchQuery::Alternatives, &mut keys, excluded)
+                        && keys.len() == 1
+                    {
                         out.push(keys[0]);
                     }
                     true
@@ -1939,9 +1908,11 @@ impl<A: AtomSpace> SelectorProgram<A> {
             SelectorOp::Where(inner)
             | SelectorOp::Host(inner)
             | SelectorOp::Slotted(inner)
-            | SelectorOp::ExposedToHost { parts: inner, .. } => self.dispatch_analysis(inner, relation, query, out),
+            | SelectorOp::ExposedToHost { parts: inner, .. } => {
+                self.dispatch_analysis_excluding(inner, relation, query, out, excluded)
+            }
             SelectorOp::InScope { inner, .. } if query != DispatchQuery::Required => {
-                self.dispatch_analysis(inner, relation, query, out)
+                self.dispatch_analysis_excluding(inner, relation, query, out, excluded)
             }
             SelectorOp::Part(part) => {
                 out.push(DispatchKey::Part(part));
@@ -1966,6 +1937,9 @@ impl<A: AtomSpace> SelectorProgram<A> {
             // without one names nothing, and admitting it as a candidate key would take the
             // compound away from names that do.
             SelectorOp::State(state) if query == DispatchQuery::Required || state.has_selector_posting() => {
+                if excluded == Some(DispatchKey::State(state)) {
+                    return query == DispatchQuery::Required;
+                }
                 out.push(DispatchKey::State(state));
                 true
             }
@@ -2569,7 +2543,80 @@ fn dispatch_selectivity(key: DispatchKey) -> u8 {
 
 struct SharedSelectorProgram {
     program: SelectorProgram,
-    _memory: MemoryLease,
+    hash: u64,
+    /// The document and rule that routed the program first, as `transpose_router` packs them, or
+    /// `UNROUTED` before any did.
+    first_transpose_router: std::sync::atomic::AtomicU64,
+    /// Each entry's transpose entry points, walked once a second rule or document routes the program. Routing copies
+    /// the sites it visits, so keeping them only pays off for a program that more than one rule or document routes.
+    transpose_sites: std::sync::OnceLock<TransposeSites>,
+}
+
+/// The transpose entry points of each entry of a shared program, charged to the process's program pools.
+struct TransposeSites {
+    by_entry: Box<[Box<[OwnedTransposeSite]>]>,
+}
+
+/// A transpose entry point kept beside the program it was walked from.
+struct OwnedTransposeSite {
+    key: RoutingKey,
+    node: SelectorNodeID,
+    origin: SelectorNodeID,
+    path: Box<[InverseStep]>,
+    anchor: Option<RelativeAnchor>,
+    origin_dispatch: Box<[DispatchKey]>,
+    origin_required: Box<[DispatchKey]>,
+    parent_dispatch: Box<[DispatchKey]>,
+    waypoints: Box<[DispatchKey]>,
+}
+
+impl OwnedTransposeSite {
+    fn new(site: TransposeSite<'_>) -> Self {
+        Self {
+            key: site.key,
+            node: site.node,
+            origin: site.origin,
+            path: site.path.into(),
+            anchor: site.anchor,
+            origin_dispatch: site.origin_dispatch.into(),
+            origin_required: site.origin_required.into(),
+            parent_dispatch: site.parent_dispatch.into(),
+            waypoints: site.waypoints.into(),
+        }
+    }
+
+    fn site(&self) -> TransposeSite<'_> {
+        TransposeSite {
+            key: self.key,
+            node: self.node,
+            origin: self.origin,
+            path: &self.path,
+            anchor: self.anchor,
+            origin_dispatch: &self.origin_dispatch,
+            origin_required: &self.origin_required,
+            parent_dispatch: &self.parent_dispatch,
+            waypoints: &self.waypoints,
+        }
+    }
+}
+
+/// A selector program interned for the whole process, which a document attaches without compiling it.
+#[derive(Clone)]
+pub(super) struct ProcessSelectorProgram(Arc<SharedSelectorProgram>);
+
+impl ProcessSelectorProgram {
+    pub(super) fn share(program: SelectorProgram) -> Self {
+        let hash = SelectorPrograms::program_hash(&program);
+        Self(share_selector_program(
+            program,
+            hash,
+            &mut selector_program_pools().programs,
+        ))
+    }
+
+    pub(super) fn program(&self) -> &SelectorProgram {
+        &self.0.program
+    }
 }
 
 /// A strong identity for an interned selector. Keeping the payload alive prevents an
@@ -2593,17 +2640,18 @@ impl Hash for SharedSelectorIdentity {
 
 fn share_selector_program(
     program: SelectorProgram,
+    hash: u64,
     pool: &mut WeakPool<SharedSelectorProgram>,
 ) -> Arc<SharedSelectorProgram> {
-    let hash = SelectorPrograms::program_hash(&program);
     if let Some(found) = pool.find(hash, |candidate| candidate.program == program) {
         return found;
     }
-    let mut program_memory = MemoryLease::new(MemoryCategory::RuleProgram);
-    program_memory.reconcile_committed(&mut pool.memory, program.capacity_bytes());
+
     let program = Arc::new(SharedSelectorProgram {
         program,
-        _memory: program_memory,
+        hash,
+        first_transpose_router: std::sync::atomic::AtomicU64::new(UNROUTED),
+        transpose_sites: std::sync::OnceLock::new(),
     });
     pool.insert(hash, &program);
     program
@@ -2645,12 +2693,10 @@ impl SelectorProgramStorage {
         }
     }
 
-    fn document_capacity_bytes(&self) -> u64 {
+    fn hash(&self) -> u64 {
         match self {
-            Self::Document(program) => {
-                (size_of::<SelectorProgram>() + 2 * size_of::<usize>()) as u64 + program.capacity_bytes()
-            }
-            Self::Process(_) => 0,
+            Self::Document(program) => SelectorPrograms::program_hash(program),
+            Self::Process(program) => program.hash,
         }
     }
 }
@@ -2704,36 +2750,16 @@ impl SelectorEntryIDs {
     fn iter(&self) -> impl ExactSizeIterator<Item = EntryID> + '_ {
         (0..self.len()).map(|index| self.get(index))
     }
-
-    fn capacity_bytes(&self) -> usize {
-        match self {
-            Self::Consecutive { .. } => 0,
-            Self::Explicit(entries) => {
-                size_of_val(entries.as_ref().as_ref()) + size_of_val(entries.as_ref()) + 2 * size_of::<usize>()
-            }
-        }
-    }
 }
 
 /// The process's pools for selector programs and their attachments, shared by every engine.
+#[derive(Default)]
 struct SelectorProgramPools {
     programs: WeakPool<SharedSelectorProgram>,
     entry_attachments: SharedVectorPool<Option<SelectorEntryIDs>>,
     program_attachments: SharedVectorPool<Option<SelectorProgramStorage>>,
     program_indices: SharedVectorPool<Option<NonZeroU32>>,
     entry_locations: SharedVectorPool<Option<(NonZeroU32, u32)>>,
-}
-
-impl Default for SelectorProgramPools {
-    fn default() -> Self {
-        Self {
-            programs: WeakPool::default(),
-            entry_attachments: SharedVectorPool::new(MemoryCategory::RuleProgram),
-            program_attachments: SharedVectorPool::new(MemoryCategory::RuleProgram),
-            program_indices: SharedVectorPool::new(MemoryCategory::RuleProgram),
-            entry_locations: SharedVectorPool::new(MemoryCategory::RuleProgram),
-        }
-    }
 }
 
 fn selector_program_pools() -> MutexGuard<'static, SelectorProgramPools> {
@@ -2743,15 +2769,22 @@ fn selector_program_pools() -> MutexGuard<'static, SelectorProgramPools> {
     SELECTOR_PROGRAM_POOLS.get_or_init(Mutex::default).lock().unwrap()
 }
 
+const UNROUTED: u64 = u64::MAX;
+
+fn next_document_router() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One document's attachments to compiled selector programs.
 ///
 /// The immutable program payloads are interned in the process's pool. Entry identities,
 /// attached rules, and every selector-result materialization remain document-local.
+#[derive(Clone)]
 pub struct SelectorPrograms {
     programs: SharedVector<Option<SelectorProgramStorage>>,
     vacant_programs: Vec<SelectorProgramID>,
     entry_ids_by_program: SharedVector<Option<SelectorEntryIDs>>,
-    entry_ids_bytes: usize,
     entry_locations: SharedVector<Option<(NonZeroU32, u32)>>,
     vacant_entries: Vec<EntryID>,
     /// Open-addressed structural interning table. Reclamation rebuilds it, so lookup never has to
@@ -2761,9 +2794,9 @@ pub struct SelectorPrograms {
     /// once compiled, so this is settled by the one place that can move it - which matters because
     /// compiling a rule settles the charge, and deriving it by walking the list would make a sheet
     /// cost a pass over every rule already in the document for each rule it adds.
-    program_memory: MemoryLease,
-    memory: MemoryLease,
     scope: SelectorProgramScope,
+    /// Tells this document's routing of a process-shared program apart from other documents'.
+    router: u32,
 }
 
 impl Default for SelectorPrograms {
@@ -2772,13 +2805,12 @@ impl Default for SelectorPrograms {
             programs: SharedVector::default(),
             vacant_programs: Vec::new(),
             entry_ids_by_program: SharedVector::default(),
-            entry_ids_bytes: 0,
             entry_locations: SharedVector::default(),
             vacant_entries: Vec::new(),
             program_index: SharedVector::default(),
-            program_memory: MemoryLease::new(MemoryCategory::RuleProgram),
-            memory: MemoryLease::new(MemoryCategory::RuleProgram),
+
             scope: SelectorProgramScope::Document,
+            router: next_document_router(),
         }
     }
 }
@@ -2793,6 +2825,7 @@ impl SelectorPrograms {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -2805,7 +2838,9 @@ impl SelectorPrograms {
         }
     }
 
-    pub(super) fn for_replay() -> Self {
+    /// Programs shared with every other document's, as a live engine's are outside tests.
+    #[cfg(test)]
+    pub(super) fn shared_across_documents() -> Self {
         Self {
             scope: SelectorProgramScope::Process,
             ..Self::default()
@@ -2817,34 +2852,56 @@ impl SelectorPrograms {
     }
 
     pub(super) fn add_with_status(&mut self, program: SelectorProgram) -> (SelectorProgramID, bool) {
+        let hash = Self::program_hash(&program);
+        let bucket = match self.find(hash, &program) {
+            Ok(id) => return (id, false),
+            Err(bucket) => bucket,
+        };
+        let program = match self.scope {
+            SelectorProgramScope::Document => SelectorProgramStorage::Document(Arc::new(program)),
+            SelectorProgramScope::Process => SelectorProgramStorage::Process(share_selector_program(
+                program,
+                hash,
+                &mut selector_program_pools().programs,
+            )),
+        };
+        (self.insert(bucket, program), true)
+    }
+
+    /// Attach a program the process already holds, neither compiling nor hashing it again.
+    pub(super) fn add_process_program(&mut self, program: &ProcessSelectorProgram) -> SelectorProgramID {
+        match self.find(program.0.hash, &program.0.program) {
+            Ok(id) => id,
+            Err(bucket) => self.insert(bucket, SelectorProgramStorage::Process(program.0.clone())),
+        }
+    }
+
+    /// The program equal to `program`, or the index bucket it would take.
+    fn find(&mut self, hash: u64, program: &SelectorProgram) -> Result<SelectorProgramID, usize> {
         let live_program_count = self.programs.len() - self.vacant_programs.len();
         if self.program_index.is_empty() || (live_program_count + 1) * 2 > self.program_index.len() {
             self.rebuild_program_index();
         }
-        let mut bucket = Self::program_hash(&program) as usize & (self.program_index.len() - 1);
+        let mut bucket = hash as usize & (self.program_index.len() - 1);
         loop {
             match self.program_index[bucket] {
-                Some(id) if self.get(SelectorProgramID(id.get() - 1)) == &program => {
-                    return (SelectorProgramID(id.get() - 1), false);
+                Some(id) if self.get(SelectorProgramID(id.get() - 1)) == program => {
+                    return Ok(SelectorProgramID(id.get() - 1));
                 }
                 Some(_) => bucket = (bucket + 1) & (self.program_index.len() - 1),
-                None => break,
+                None => return Err(bucket),
             }
         }
+    }
 
-        let entry_count = program.entries().len();
+    fn insert(&mut self, bucket: usize, program: SelectorProgramStorage) -> SelectorProgramID {
+        let entry_count = program.program().entries().len();
         let id = self.vacant_programs.last().copied().unwrap_or_else(|| {
             SelectorProgramID(u32::try_from(self.programs.len()).expect("selector program space exhausted"))
         });
         let stored_id = Self::stored_program_id(id);
         self.vacant_programs.pop();
-        let program = match self.scope {
-            SelectorProgramScope::Document => SelectorProgramStorage::Document(Arc::new(program)),
-            SelectorProgramScope::Process => {
-                SelectorProgramStorage::Process(share_selector_program(program, &mut selector_program_pools().programs))
-            }
-        };
-        self.program_memory.grow_committed(program.document_capacity_bytes());
+
         if id.0 as usize == self.programs.len() {
             self.programs.make_mut().push(Some(program));
         } else {
@@ -2887,7 +2944,6 @@ impl SelectorPrograms {
                 .collect();
             SelectorEntryIDs::from_entries(entries)
         };
-        self.entry_ids_bytes += entries.capacity_bytes();
         if self.entry_ids_by_program.len() <= id.0 as usize {
             self.entry_ids_by_program
                 .make_mut()
@@ -2895,7 +2951,7 @@ impl SelectorPrograms {
         }
         self.entry_ids_by_program.make_mut()[id.0 as usize] = Some(entries);
         self.program_index.make_mut()[bucket] = Some(Self::stored_program_id(id));
-        (id, true)
+        id
     }
 
     fn rebuild_program_index(&mut self) {
@@ -2906,10 +2962,10 @@ impl SelectorPrograms {
             .programs
             .iter()
             .enumerate()
-            .filter_map(|(index, program)| program.as_ref().map(|program| (index, program.program())))
+            .filter_map(|(index, program)| program.as_ref().map(|program| (index, program)))
         {
             let id = SelectorProgramID(u32::try_from(index).expect("selector program space exhausted"));
-            let mut bucket = Self::program_hash(program) as usize & (capacity - 1);
+            let mut bucket = program.hash() as usize & (capacity - 1);
             while self.program_index[bucket].is_some() {
                 bucket = (bucket + 1) & (capacity - 1);
             }
@@ -2921,7 +2977,7 @@ impl SelectorPrograms {
         NonZeroU32::new(id.0.checked_add(1).expect("selector program space exhausted")).unwrap()
     }
 
-    pub(super) fn share_indices(&mut self, memory: &mut MemoryController) {
+    pub(super) fn share_indices(&mut self) {
         if matches!(self.scope, SelectorProgramScope::Process) {
             self.programs.share(&mut selector_program_pools().program_attachments);
         }
@@ -2930,7 +2986,6 @@ impl SelectorPrograms {
         self.entry_locations.share(&mut pools.entry_locations);
         self.entry_ids_by_program.share(&mut pools.entry_attachments);
         drop(pools);
-        self.settle_memory(memory);
     }
 
     fn program_hash(program: &SelectorProgram) -> u64 {
@@ -2945,6 +3000,59 @@ impl SelectorPrograms {
             .as_ref()
             .expect("a selector program identity must remain live while referenced")
             .program()
+    }
+
+    /// Visit the transpose entry points of one entry of a program that `rule` routes, as
+    /// `SelectorProgram::collect_transpose_entry_points` does. A program the whole process shares
+    /// is walked once for every later rule or document that routes it.
+    pub fn for_each_transpose_entry_point(
+        &self,
+        program: SelectorProgramID,
+        entry: usize,
+        rule: RuleID,
+        mut visit: impl FnMut(TransposeSite<'_>),
+    ) {
+        match self.programs[program.0 as usize]
+            .as_ref()
+            .expect("a selector program identity must remain live while referenced")
+        {
+            SelectorProgramStorage::Process(shared) => {
+                // NB: A document rebuilding its routing routes the same rules again, which does not
+                //     make keeping the sites pay off.
+                let router = (u64::from(self.router) << 32) | u64::from(rule.0);
+                if shared.transpose_sites.get().is_none() {
+                    let first = match shared.first_transpose_router.compare_exchange(
+                        UNROUTED,
+                        router,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    ) {
+                        Ok(_) => router,
+                        Err(first) => first,
+                    };
+                    if first == router {
+                        shared.program.collect_transpose_entry_points(entry, visit);
+                        return;
+                    }
+                }
+                let sites = shared.transpose_sites.get_or_init(|| {
+                    let by_entry: Box<[Box<[OwnedTransposeSite]>]> = (0..shared.program.entries().len())
+                        .map(|entry| {
+                            let mut sites = Vec::new();
+                            shared.program.collect_transpose_entry_points(entry, |site| {
+                                sites.push(OwnedTransposeSite::new(site));
+                            });
+                            sites.into_boxed_slice()
+                        })
+                        .collect();
+                    TransposeSites { by_entry }
+                });
+                for site in &sites.by_entry[entry] {
+                    visit(site.site());
+                }
+            }
+            SelectorProgramStorage::Document(compiled) => compiled.collect_transpose_entry_points(entry, visit),
+        }
     }
 
     #[must_use]
@@ -2994,11 +3102,8 @@ impl SelectorPrograms {
                 assert!(slot.is_some(), "a referenced selector program must remain live");
                 continue;
             }
-            if let Some(program) = slot.take() {
-                self.program_memory.shrink_committed(program.document_capacity_bytes());
-            }
+            *slot = None;
             if let Some(entries) = self.entry_ids_by_program.make_mut()[index].take() {
-                self.entry_ids_bytes -= entries.capacity_bytes();
                 for entry in entries.iter() {
                     self.entry_locations.make_mut()[entry.0 as usize] = None;
                     self.vacant_entries.push(entry);
@@ -3020,51 +3125,9 @@ impl SelectorPrograms {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.programs.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.programs.len() == self.vacant_programs.len()
-    }
-
-    /// Compact program bytes, which is the stylesheet term of the document memory budget. It
-    /// deliberately measures the minimal encoding rather than the allocated capacity, so
-    /// acceleration overhead can never inflate its own allowance.
-    #[must_use]
-    pub fn compact_bytes(&self) -> u64 {
-        self.programs
-            .iter()
-            .flatten()
-            .map(|program| program.program().compact_bytes())
-            .sum()
-    }
-
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.programs,
-                self.vacant_programs,
-                self.entry_ids_by_program,
-                self.entry_locations,
-                self.vacant_entries,
-                self.program_index,
-            ];
-            cached [self.program_memory.bytes()];
-            // Consecutive identities live inline; charge only fragmented lists without
-            // walking every program when settling after each rule.
-            nested [self.entry_ids_bytes];
-            skip [self.memory];
-        }
-    }
-
-    pub fn settle_memory(&mut self, memory: &mut MemoryController) {
-        let program = self.program_memory.bytes();
-        self.program_memory.reconcile_committed(memory, program);
-        let header = self.capacity_bytes() - self.program_memory.bytes();
-        self.memory.resize_required_to(memory, header);
     }
 }
 
@@ -3089,14 +3152,6 @@ pub enum InverseStep {
     FollowingSiblings,
     /// A change inside a positional argument moves indices within the whole child sequence.
     SiblingSequence,
-    /// From a possible `:has()` witness to its possible anchors: the element parent.
-    AnchorParent,
-    /// From a possible witness to its ancestors, up to the query's scope boundary.
-    AnchorAncestors,
-    /// From a possible witness to the immediately preceding element sibling.
-    AnchorPreviousSibling,
-    /// From a possible witness to the preceding element siblings in the same child sequence.
-    AnchorPrecedingSiblings,
     /// From a shadow host to the tree it hosts. Deliberately not a descendant step: a generic
     /// descendant walk does not pierce a shadow root.
     HostedTree,
@@ -3194,7 +3249,6 @@ struct FlatRouteDirectoryData {
 
 struct SharedFlatRouteDirectory {
     data: FlatRouteDirectoryData,
-    _memory: MemoryLease,
 }
 
 fn share_flat_route_directory(
@@ -3220,17 +3274,13 @@ fn share_flat_route_directory(
     if let Some(found) = pool.find(hash, |candidate| candidate.data == data) {
         return Some(found);
     }
-    let mut memory = MemoryLease::new(MemoryCategory::RoutingRegistry);
-    memory.resize_required_to(
-        &mut pool.memory,
-        size_of::<SharedFlatRouteDirectory>() as u64
-            + data.ranges.shallow_capacity_bytes()
-            + data.routes.shallow_capacity_bytes(),
-    );
-    let shared = Arc::new(SharedFlatRouteDirectory { data, _memory: memory });
+
+    let shared = Arc::new(SharedFlatRouteDirectory { data });
     pool.insert(hash, &shared);
     Some(shared)
 }
+
+#[derive(Clone)]
 
 enum RouteDirectory {
     BuildingAfterIdle(HashMap<RoutingKey, Vec<RouteID>>),
@@ -3313,6 +3363,31 @@ impl RouteDirectory {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::BuildingAfterIdle(building)
+            | Self::BuildingAfterChange(building)
+            | Self::BuildingIdleAfterChange(building) => building.is_empty(),
+            Self::FlatAfterIdle { data } | Self::FlatAfterChange { data } => data.is_none(),
+        }
+    }
+
+    /// Whether this directory is the flat directory `other` is, which nothing has been pushed to since.
+    fn is_flat_copy_of(&self, other: &Self) -> bool {
+        let (
+            Self::FlatAfterIdle { data } | Self::FlatAfterChange { data },
+            Self::FlatAfterIdle { data: other } | Self::FlatAfterChange { data: other },
+        ) = (self, other)
+        else {
+            return false;
+        };
+        match (data, other) {
+            (None, None) => true,
+            (Some(data), Some(other)) => Arc::ptr_eq(data, other),
+            _ => false,
+        }
+    }
+
     fn finish(&mut self, pool: &mut WeakPool<SharedFlatRouteDirectory>) -> bool {
         match std::mem::take(self) {
             Self::FlatAfterIdle { data } | Self::FlatAfterChange { data } => {
@@ -3332,6 +3407,16 @@ impl RouteDirectory {
                 true
             }
         }
+    }
+
+    /// Flatten the directory now, however recently it changed.
+    fn flatten_now(&mut self, pool: &mut WeakPool<SharedFlatRouteDirectory>) {
+        *self = match std::mem::take(self) {
+            Self::BuildingAfterIdle(building)
+            | Self::BuildingAfterChange(building)
+            | Self::BuildingIdleAfterChange(building) => Self::flatten(building, false, pool),
+            flat => flat,
+        };
     }
 
     fn flatten(
@@ -3364,21 +3449,6 @@ impl RouteDirectory {
             Self::FlatAfterChange { data }
         } else {
             Self::FlatAfterIdle { data }
-        }
-    }
-
-    fn capacity_bytes(&self) -> u64 {
-        match self {
-            Self::BuildingAfterIdle(building)
-            | Self::BuildingAfterChange(building)
-            | Self::BuildingIdleAfterChange(building) => capacity_bytes! {
-                shallow [building];
-                cached [];
-                nested [building.values().map(|routes| routes.capacity() * size_of::<RouteID>()).sum::<usize>()];
-                skip [];
-            },
-            // Immutable directory allocations are charged once to the pool's ledger.
-            Self::FlatAfterIdle { .. } | Self::FlatAfterChange { .. } => 0,
         }
     }
 }
@@ -3426,6 +3496,7 @@ impl Hash for RouteColumnData {
 // Route columns contain immutable selector descriptors and integer identities. Equal contents
 // can be shared even when documents interpret the identities through different selector programs.
 // A later stylesheet edit detaches the columns before appending routes.
+#[derive(Clone)]
 enum RouteColumns {
     Owned(Box<RouteColumnData>),
     Shared(Arc<SharedRouteColumns>),
@@ -3450,26 +3521,15 @@ impl std::ops::Deref for RouteColumns {
 
 struct SharedRouteColumns {
     data: RouteColumnData,
-    _memory: MemoryLease,
 }
 
 /// The process's pools for routing registries, shared by every engine.
+#[derive(Default)]
 struct RoutingPools {
     route_columns: WeakPool<SharedRouteColumns>,
     route_ranges: SharedVectorPool<RouteRange>,
     flat_route_directories: WeakPool<SharedFlatRouteDirectory>,
     sibling_entry_maps: SharedVectorPool<u32>,
-}
-
-impl Default for RoutingPools {
-    fn default() -> Self {
-        Self {
-            route_columns: WeakPool::default(),
-            route_ranges: SharedVectorPool::new(MemoryCategory::RoutingRegistry),
-            flat_route_directories: WeakPool::default(),
-            sibling_entry_maps: SharedVectorPool::new(MemoryCategory::RoutingRegistry),
-        }
-    }
 }
 
 fn routing_pools() -> MutexGuard<'static, RoutingPools> {
@@ -3499,14 +3559,6 @@ impl RouteColumns {
         self.make_mut().push(header, ranges);
     }
 
-    fn capacity_bytes(&self) -> u64 {
-        match self {
-            Self::Owned(data) => size_of::<RouteColumnData>() as u64 + data.capacity_bytes(),
-            // The immutable allocation is charged once to the pool's ledger.
-            Self::Shared(_) => 0,
-        }
-    }
-
     fn share(&mut self, pools: &mut RoutingPools) {
         if matches!(self, Self::Shared(_)) || self.is_empty() {
             return;
@@ -3527,12 +3579,8 @@ impl RouteColumns {
                 data.origin_requirements.share(&mut pools.route_ranges);
                 data.parents.share(&mut pools.route_ranges);
                 data.waypoints.share(&mut pools.route_ranges);
-                let mut memory = MemoryLease::new(MemoryCategory::RoutingRegistry);
-                memory.resize_required_to(&mut pools.route_columns.memory, data.capacity_bytes());
-                let shared = Arc::new(SharedRouteColumns {
-                    data: *data,
-                    _memory: memory,
-                });
+
+                let shared = Arc::new(SharedRouteColumns { data: *data });
                 pools.route_columns.insert(hash, &shared);
                 shared
             }
@@ -3575,30 +3623,6 @@ impl RouteColumnData {
 
     fn is_empty(&self) -> bool {
         self.headers.is_empty()
-    }
-
-    fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.headers,
-                self.paths,
-                self.origins,
-                self.origin_requirements,
-                self.parents,
-                self.waypoints,
-                self.anchors,
-                self.entry_facts,
-                self.inverse_steps,
-                self.keys,
-                self.relational,
-                self.sibling_first,
-                self.canonical_route_heads,
-                self.canonical_next,
-            ];
-            cached [];
-            nested [];
-            skip [];
-        }
     }
 }
 
@@ -3691,7 +3715,15 @@ impl<A: AtomSpace> SelectorProgram<A> {
     ) {
         let emit = |walk: &mut TransposeWalk, key: RoutingKey, visit: &mut dyn FnMut(TransposeSite<'_>)| {
             walk.origin_dispatch.clear();
-            if !self.dispatch_keys_of(enclosing, &mut walk.origin_dispatch) {
+            // NB: The hover bit changes at the origin. Use its other features to find possible origins even before
+            //     anything is hovered, including alternatives inside :is() and :where().
+            if !self.dispatch_analysis_excluding(
+                enclosing,
+                DispatchRelation::Subject,
+                DispatchQuery::Alternatives,
+                &mut walk.origin_dispatch,
+                (key == RoutingKey::State(StateFact::Hover)).then_some(key),
+            ) {
                 walk.origin_dispatch.clear();
             }
             walk.origin_required.clear();
@@ -3918,7 +3950,6 @@ impl<A: AtomSpace> SelectorProgram<A> {
                     match kind.routing_kind() {
                         ValueStateKind::Directionality => RoutingKey::Directionality(value),
                         ValueStateKind::CustomState => RoutingKey::CustomState(value),
-                        ValueStateKind::Language => unreachable!("language has its own selector operator"),
                     },
                     visit,
                 );
@@ -4043,11 +4074,13 @@ fn state_is_published_on_arrival(fact: StateFact) -> bool {
 
 /// Maps each semantic input key to the canonical transpose routes that mention it.
 ///
-/// This is required program state, not an evictable view. Scanning every selector header for every
+/// This is required program state, not an optional view. Scanning every selector header for every
 /// ordinary mutation would change the hot path's asymptotics, so routing has to be an index.
-/// Feature postings may accelerate subject enumeration on top of it, but evicting a posting never
+/// Feature postings may accelerate subject enumeration on top of it, but a missing posting never
 /// changes which routes run.
 const LIVENESS_LOCK: &str = "the routing liveness view is never held across a panic";
+
+#[derive(Clone)]
 
 pub struct RoutingRegistry {
     routes: RouteColumns,
@@ -4064,13 +4097,11 @@ pub struct RoutingRegistry {
     live_sequence_entries: Vec<SequenceEntry>,
     /// The two members of the view a routing pass mutates as it runs. Each is taken once per
     /// pass, never per route, so the lock is a formality that makes the registry shareable.
-    live_sibling_workspace: Mutex<SiblingCandidateWorkspace>,
-    live_sequence_index: Mutex<SequenceEntryIndex>,
+    live_sibling_workspace: crate::fork::ForkLocked<SiblingCandidateWorkspace>,
+    live_sequence_index: crate::fork::ForkLocked<SequenceEntryIndex>,
     /// The live routes whose rules may move layout geometry, part of the liveness view.
     geometry_routes: BitColumn,
     route_liveness_version: Option<u64>,
-    memory: MemoryLease,
-    nested_memory: MemoryLease,
 }
 
 impl Default for RoutingRegistry {
@@ -4084,15 +4115,13 @@ impl Default for RoutingRegistry {
             live_relational_routes: Vec::new(),
             live_sibling_entries: Vec::new(),
             live_sequence_entries: Vec::new(),
-            live_sibling_workspace: Mutex::new(SiblingCandidateWorkspace::new(
+            live_sibling_workspace: crate::fork::ForkLocked::new(SiblingCandidateWorkspace::new(
                 &[],
                 &mut routing_pools().sibling_entry_maps,
             )),
-            live_sequence_index: Mutex::new(SequenceEntryIndex::default()),
+            live_sequence_index: crate::fork::ForkLocked::new(SequenceEntryIndex::default()),
             geometry_routes: BitColumn::default(),
             route_liveness_version: None,
-            memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
-            nested_memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
         }
     }
 }
@@ -4101,12 +4130,6 @@ impl RoutingRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn push_route(memory: &mut MemoryLease, routes: &mut Vec<RouteID>, route: RouteID) {
-        let capacity_before = routes.capacity();
-        routes.push(route);
-        memory.grow_committed(((routes.capacity() - capacity_before) * size_of::<RouteID>()) as u64);
     }
 
     fn insert(&mut self, key: RoutingKey, descriptor: RouteDescriptor<'_>) -> RouteID {
@@ -4196,11 +4219,11 @@ impl RoutingRegistry {
                 self.routes.make_mut().sibling_first.push(route);
                 if origin_dispatch.is_empty() {
                     let routes = self.sibling_first_by_origin.entry(DispatchKey::Universal).or_default();
-                    Self::push_route(&mut self.nested_memory, routes, route);
+                    routes.push(route);
                 } else {
                     for &origin in origin_dispatch {
                         let routes = self.sibling_first_by_origin.entry(origin).or_default();
-                        Self::push_route(&mut self.nested_memory, routes, route);
+                        routes.push(route);
                     }
                 }
             }
@@ -4523,13 +4546,9 @@ impl RoutingRegistry {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.routes.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
     }
 
     #[must_use]
@@ -4544,6 +4563,57 @@ impl RoutingRegistry {
             | self.arrival_by_input.finish(&mut pools.flat_route_directories);
         self.routes.share(&mut pools);
         changed
+    }
+
+    /// Flatten the directories and share the route columns now, for a registry other engines take copies of.
+    pub(super) fn finish_for_sharing(&mut self) {
+        let mut pools = routing_pools();
+        self.by_input.flatten_now(&mut pools.flat_route_directories);
+        self.arrival_by_input.flatten_now(&mut pools.flat_route_directories);
+        self.routes.share(&mut pools);
+    }
+
+    /// Whether no rule has been routed.
+    pub(super) fn is_empty(&self) -> bool {
+        self.routes.is_empty() && self.by_input.is_empty() && self.arrival_by_input.is_empty()
+    }
+
+    /// Whether this registry holds the finished routes of `other` and has routed nothing since: every route either
+    /// joins the route columns or is pushed to a directory, and either one stops sharing it.
+    pub(super) fn is_finished_copy_of(&self, other: &Self) -> bool {
+        matches!(
+            (&self.routes, &other.routes),
+            (RouteColumns::Shared(routes), RouteColumns::Shared(other)) if Arc::ptr_eq(routes, other)
+        ) && self.by_input.is_flat_copy_of(&other.by_input)
+            && self.arrival_by_input.is_flat_copy_of(&other.arrival_by_input)
+    }
+
+    /// A copy of the routes for another engine, whose liveness view is prepared again before it is read: the view
+    /// was prepared for this engine's program, whose liveness version the other's may share.
+    pub(super) fn copy_for_another_engine(&self) -> Self {
+        Self {
+            route_liveness_version: None,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this registry routes what `other` routes, to the same routes.
+    #[cfg(test)]
+    pub(super) fn has_routes_of(&self, other: &Self) -> bool {
+        fn directory(directory: &RouteDirectory) -> HashMap<RoutingKey, Vec<RouteID>> {
+            match directory {
+                RouteDirectory::BuildingAfterIdle(building)
+                | RouteDirectory::BuildingAfterChange(building)
+                | RouteDirectory::BuildingIdleAfterChange(building) => building.clone(),
+                RouteDirectory::FlatAfterIdle { data } | RouteDirectory::FlatAfterChange { data } => {
+                    RouteDirectory::reopen(data.clone())
+                }
+            }
+        }
+        *self.routes == *other.routes
+            && self.sibling_first_by_origin == other.sibling_first_by_origin
+            && directory(&self.by_input) == directory(&other.by_input)
+            && directory(&self.arrival_by_input) == directory(&other.arrival_by_input)
     }
 
     #[cfg(test)]
@@ -4615,7 +4685,7 @@ impl RoutingRegistry {
             let subject_required = compiled.subject_required_keys(entry);
             let subject_position = compiled.subject_position(entry);
             let mut entry_registered = false;
-            compiled.collect_transpose_entry_points(entry, |site| {
+            programs.for_each_transpose_entry_point(program, entry, rule, |site| {
                 if !entry_registered {
                     self.register_entry_facts(
                         entry_id,
@@ -4655,45 +4725,11 @@ impl RoutingRegistry {
             });
         }
     }
-
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.sibling_first_by_origin,
-            ];
-            cached [self.nested_memory.bytes()];
-            nested [
-                self.routes.capacity_bytes()
-                    + self.by_input.capacity_bytes()
-                    + self.arrival_by_input.capacity_bytes()
-                    + self.route_liveness.capacity_bytes()
-                    + self.geometry_routes.capacity_bytes()
-                    + self.live_relational_routes.capacity() as u64 * size_of::<LiveRelationalRoute>() as u64
-                    + self.live_sibling_entries.capacity() as u64 * size_of::<SiblingEntry>() as u64
-                    + self.live_sibling_workspace.lock().expect(LIVENESS_LOCK).capacity_bytes()
-                    + self.live_sequence_entries.capacity() as u64 * size_of::<SequenceEntry>() as u64
-                    + self.live_sequence_index.lock().expect(LIVENESS_LOCK).capacity_bytes()
-            ];
-            skip [self.memory];
-        }
-    }
-
-    pub fn settle_memory(&mut self, memory: &mut MemoryController) {
-        let nested = self.nested_memory.bytes();
-        self.nested_memory.reconcile_committed(memory, nested);
-        let header = self.capacity_bytes() - self.nested_memory.bytes();
-        self.memory.resize_required_to(memory, header);
-    }
-
-    pub fn release_memory(&mut self) {
-        self.memory.release();
-        self.nested_memory.release();
-    }
 }
 
 /// Why a match evaluation could not produce an exact answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(clippy::enum_variant_names, reason = "each variant names the facts that are missing")]
 pub enum Incomplete {
     /// The fact batch does not cover a style node the evaluation had to read. This is never a
     /// negative answer: the caller widens the batch or asks a different question.
@@ -4956,14 +4992,14 @@ pub(crate) type MatchEvaluator<'a> = SelectorEvaluator<EngineSubject<'a>>;
 /// Exact invalidation evaluates the same selector entry over a region. In tree order, an ancestor
 /// or preceding-sibling relation differs from the preceding candidate by one edge, so retaining
 /// that answer turns repeated prefix walks into a dynamic program.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MatchRelationCache {
     answers: MatchRelationAnswers,
     preceding_sibling_parent_ids: HashMap<StyleNodeID, PrecedingSiblingParentID>,
     preceding_sibling_prefixes: PrecedingSiblingPrefixes,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MatchRelationAnswers {
     columns: ProgramRelationColumns<RelationAnswerColumn>,
 }
@@ -4980,7 +5016,7 @@ struct MatchRelationAnswerGap {
 /// Only a small subset of document parents normally owns a sibling sequence under evaluation.
 /// Intern those parents once at the cache boundary, then keep every compiled relation's repeatedly
 /// updated prefix state in a direct column rather than repeating the three identities in a hash key.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PrecedingSiblingPrefixes {
     columns: ProgramRelationColumns<PrecedingSiblingPrefixColumn>,
 }
@@ -4989,21 +5025,21 @@ define_id! { pub(crate) struct PrecedingSiblingParentID(); }
 
 type PrecedingSiblingPrefix = super::selector_evaluation::PrecedingSiblingPrefix<StyleNodeID>;
 
+#[derive(Clone)]
+
 struct ProgramRelationColumns<C> {
     programs: Column<Option<Box<ProgramColumns<C>>>>,
-    footprint: MemoryLease,
 }
 
 impl<C> Default for ProgramRelationColumns<C> {
     fn default() -> Self {
         Self {
             programs: Column::default(),
-            footprint: MemoryLease::new(MemoryCategory::BatchScratch),
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProgramColumns<C> {
     relations: Column<Option<C>>,
 }
@@ -5020,32 +5056,15 @@ impl<C: Default> ProgramRelationColumns<C> {
 
     fn column_mut(&mut self, program: SelectorProgramID, relation: SelectorNodeID) -> (&mut C, bool) {
         let program_index = program.0 as usize;
-        self.footprint.grow_committed(self.programs.ensure(program_index));
-
-        let program_was_absent = self.programs[program_index].is_none();
+        self.programs.ensure(program_index);
         let program_columns = self.programs[program_index].get_or_insert_with(Box::default);
-        self.footprint
-            .grow_committed((usize::from(program_was_absent) * size_of::<ProgramColumns<C>>()) as u64);
-
         let relation_index = relation.0 as usize;
-        self.footprint
-            .grow_committed(program_columns.relations.ensure(relation_index));
-
+        program_columns.relations.ensure(relation_index);
         let column_was_absent = program_columns.relations[relation_index].is_none();
         (
             program_columns.relations[relation_index].get_or_insert_with(C::default),
             column_was_absent,
         )
-    }
-
-    #[must_use]
-    fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [];
-            cached [self.footprint.bytes()];
-            nested [];
-            skip [self.programs];
-        }) as usize
     }
 }
 
@@ -5060,7 +5079,7 @@ const RELATION_ANSWER_PAGE_WORDS: usize = RELATION_ANSWER_PAGE_BITS / u64::BITS 
 /// in every answer.
 type RelationAnswerColumn = PagedColumn<RelationAnswerPage>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RelationAnswerPage {
     known: [u64; RELATION_ANSWER_PAGE_WORDS],
     answers: [u64; RELATION_ANSWER_PAGE_WORDS],
@@ -5122,28 +5141,9 @@ impl MatchRelationAnswers {
         node: StyleNodeID,
         answer: bool,
     ) -> (bool, bool) {
-        let (column_was_absent, page_was_absent, bytes_grown) = {
-            let (column, column_was_absent) = self.columns.column_mut(program, relation);
-            let column_bytes_before = column.capacity_bytes();
-            let page_was_absent = column.insert(node.element_index().unwrap() as usize, answer).1;
-            (
-                column_was_absent,
-                page_was_absent,
-                column.capacity_bytes() - column_bytes_before,
-            )
-        };
-        self.columns.footprint.grow_committed(bytes_grown);
+        let (column, column_was_absent) = self.columns.column_mut(program, relation);
+        let page_was_absent = column.insert(node.element_index().unwrap() as usize, answer).1;
         (column_was_absent, page_was_absent)
-    }
-
-    #[must_use]
-    fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [];
-            cached [self.columns.capacity_bytes()];
-            nested [];
-            skip [];
-        }) as usize
     }
 }
 
@@ -5164,23 +5164,8 @@ impl PrecedingSiblingPrefixes {
         parent: PrecedingSiblingParentID,
         prefix: PrecedingSiblingPrefix,
     ) {
-        let bytes_grown = {
-            let (column, _) = self.columns.column_mut(program, relation);
-            let column_bytes_before = column.capacity_bytes();
-            column.insert(parent.0 as usize, prefix);
-            column.capacity_bytes() - column_bytes_before
-        };
-        self.columns.footprint.grow_committed(bytes_grown);
-    }
-
-    #[must_use]
-    fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [];
-            cached [self.columns.capacity_bytes()];
-            nested [];
-            skip [];
-        }) as usize
+        let (column, _) = self.columns.column_mut(program, relation);
+        column.insert(parent.0 as usize, prefix);
     }
 }
 
@@ -5198,6 +5183,8 @@ struct SiblingSequenceMembership {
 
 const VALUE_PAGE_SHIFT: usize = 6;
 const VALUE_PAGE_SIZE: usize = 1 << VALUE_PAGE_SHIFT;
+
+#[derive(Clone)]
 
 struct ValuePage<T: Copy + Default> {
     known: u64,
@@ -5232,7 +5219,7 @@ type PrecedingSiblingPrefixColumn = PagedColumn<ValuePage<PrecedingSiblingPrefix
 type SiblingPositionColumn = PagedColumn<ValuePage<SiblingPositions>>;
 type SiblingSequenceMembershipColumn = PagedColumn<ValuePage<SiblingSequenceMembership>>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SiblingSequenceGeometry {
     sequences: Vec<Arc<[StyleNodeID]>>,
     memberships: SiblingSequenceMembershipColumn,
@@ -5284,15 +5271,6 @@ impl SiblingSequenceGeometry {
             from_end: count - ordinal,
         })
     }
-
-    pub(super) fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [self.sequences];
-            cached [self.sequence_bytes];
-            nested [self.memberships.capacity_bytes()];
-            skip [];
-        }) as usize
-    }
 }
 
 /// The semantic side of a match-program evaluation.
@@ -5316,7 +5294,7 @@ impl MatchEvaluationSide {
 /// old-fact matching share the current sequence positions; the old-tree side has its own. Type
 /// positions and selector answers additionally depend on the fact side and therefore remain
 /// distinct.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MatchScratch {
     relations_by_evaluation_side: [MatchRelationCache; 3],
     sibling_geometry_by_tree_side: [SiblingSequenceGeometry; 2],
@@ -5325,10 +5303,9 @@ pub struct MatchScratch {
     positional_answers_by_evaluation_side: [PositionalAnswers; 3],
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PositionalAnswers {
     by_test: Vec<(NthPosition, HashMap<StyleNodeID, bool>)>,
-    answer_capacity_bytes: u64,
 }
 
 impl PositionalAnswers {
@@ -5344,51 +5321,17 @@ impl PositionalAnswers {
     fn insert(&mut self, position: NthPosition, node: StyleNodeID, answer: bool) {
         match self.by_test.iter_mut().find(|(candidate, _)| *candidate == position) {
             Some((_, answers)) => {
-                let previous_bytes = answers.shallow_capacity_bytes();
                 answers.insert(node, answer);
-                self.answer_capacity_bytes += answers.shallow_capacity_bytes() - previous_bytes;
             }
             None => {
                 let answers = HashMap::from_iter([(node, answer)]);
-                self.answer_capacity_bytes += answers.shallow_capacity_bytes();
                 self.by_test.push((position, answers));
             }
         }
     }
-
-    fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [self.by_test];
-            cached [self.answer_capacity_bytes];
-            nested [];
-            skip [];
-        }) as usize
-    }
 }
 
 impl MatchRelationCache {
-    #[must_use]
-    fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [
-                self.answers.capacity_bytes(),
-                {
-                    let parent_ids = &self.preceding_sibling_parent_ids;
-                    capacity_bytes! {
-                        shallow [parent_ids];
-                        cached [];
-                        nested [];
-                        skip [];
-                    }
-                },
-                self.preceding_sibling_prefixes.capacity_bytes(),
-            ];
-            skip [];
-        }
-    }
-
     /// Discard selector-specific answers before a following matching traversal.
     ///
     /// Exact planning asks a narrow set of selector entries, while matching asks every candidate
@@ -5442,35 +5385,6 @@ impl MatchRelationCache {
 }
 
 impl MatchScratch {
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [
-                self.relations_by_evaluation_side
-                    .iter()
-                    .map(MatchRelationCache::capacity_bytes)
-                    .sum::<u64>(),
-                self
-                .sibling_geometry_by_tree_side
-                .iter()
-                .map(|geometry| geometry.capacity_bytes())
-                .sum::<usize>(),
-                self
-                .type_positions_by_evaluation_side
-                .iter()
-                .map(|positions| positions.capacity_bytes())
-                .sum::<u64>(),
-                self.positional_answers_by_evaluation_side
-                .iter()
-                .map(|answers| answers.capacity_bytes())
-                .sum::<usize>(),
-            ];
-            skip [];
-        }
-    }
-
     /// Keep only reusable current-tree, current-fact data for the following matching traversal.
     pub(super) fn retain_current_for_matching(&mut self) {
         self.relations_by_evaluation_side[MatchEvaluationSide::Current as usize].clear_selector_answers();
@@ -5629,14 +5543,6 @@ impl<'a> MatchEvaluator<'a> {
         self
     }
 
-    #[inline]
-    pub(super) fn match_scratch_capacity_bytes(&self) -> u64 {
-        self.subject
-            .match_workspace
-            .as_ref()
-            .map_or(0, |(scratch, _)| scratch.capacity_bytes())
-    }
-
     /// How far the subject is from the scoping root its `@scope` resolved through.
     ///
     /// The specification creates one scope per element matching `<scope-start>`, and a declaration
@@ -5648,7 +5554,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<u32, Incomplete> {
         let Some(scope_root) = entry.scope_root else {
             return Ok(u32::MAX);
@@ -5675,7 +5581,7 @@ impl<'a> MatchEvaluator<'a> {
         &mut self,
         program: &SelectorProgram,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<Option<SelectorEntry>, Incomplete> {
         let mut best: Option<SelectorEntry> = None;
         for entry in program.entries() {
@@ -5696,7 +5602,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         self.matches_node(program, entry.root, node, counters)
     }
@@ -5711,7 +5617,7 @@ impl<'a> MatchEvaluator<'a> {
         entry: &SelectorEntry,
         known: DispatchKey,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let is_known_operand = |operand| {
             matches!(program.node(operand), SelectorOp::Feature(_) | SelectorOp::State(_))
@@ -5745,39 +5651,12 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let previous = self.subject.transitive_relation_program.replace(program_id);
         let result = self.matches_node(program, entry.root, node, counters);
         self.subject.transitive_relation_program = previous;
         result
-    }
-
-    /// Evaluate one entry without admitting its primitive and transitive relation answers to the
-    /// shared program caches. Narrow exact comparisons consume the answer once, so they keep the
-    /// workspace's positional geometry but avoid canonicalization and sparse-column traffic.
-    #[inline]
-    pub(super) fn matches_entry_without_program_caches(
-        &mut self,
-        program: &SelectorProgram,
-        entry: &SelectorEntry,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> Result<bool, Incomplete> {
-        self.matches_node(program, entry.root, node, counters)
-    }
-
-    /// Whether `node` matches one selector IR node. Routing's retained-witness check uses this to
-    /// re-evaluate a simple query's compound on the one retained witness.
-    #[inline]
-    pub(super) fn matches_selector_node(
-        &mut self,
-        program: &SelectorProgram,
-        id: SelectorNodeID,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> Result<bool, Incomplete> {
-        self.matches_node(program, id, node, counters)
     }
 
     /// Match the local half of one top-down selector-prefix step.
@@ -5787,7 +5666,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         local: SelectorPrefixLocal,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let previous = self.subject.transitive_relation_program.replace(program_id);
         let result = match program.node(local.root) {
@@ -6470,8 +6349,6 @@ mod tests {
     use super::super::index::LocalFeatureKey;
     use super::super::index::StateSet;
     use super::super::instrumentation::Counter;
-    use super::super::memory::DeviceClass;
-    use super::super::memory::MemoryController;
     use super::super::relative_selector::RelativeAxis;
     use super::*;
 
@@ -6574,7 +6451,6 @@ mod tests {
                 node: first,
             })
         );
-        assert!(cache.answers.capacity_bytes() > 0);
     }
 
     #[test]
@@ -6603,7 +6479,6 @@ mod tests {
         prefixes.insert(program, relation, first_parent, replacement);
         assert!(prefixes.get(program, relation, first_parent).unwrap().answer);
         assert_eq!(prefixes.get(program, relation, first_parent).unwrap().next, None);
-        assert!(prefixes.capacity_bytes() > 0);
     }
 
     #[test]
@@ -6652,7 +6527,7 @@ mod tests {
 
     #[test]
     fn positional_answers_are_shared_across_programs() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let first = single_entry(|builder| {
             builder.push(SelectorOp::NthPosition(NthPosition {
                 step: 2,
@@ -6677,12 +6552,12 @@ mod tests {
 
         assert!(
             !evaluator
-                .matches_entry(&first, &first.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&first, &first.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
         assert!(
             !evaluator
-                .matches_entry(&second, &second.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&second, &second.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
         assert_eq!(fixture.counters.get(Counter::StructuralTests), 1);
@@ -6690,7 +6565,7 @@ mod tests {
 
     #[test]
     fn feature_answers_are_recomputed_across_programs() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let first = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
         let second = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
         let mut workspace = MatchScratch::default();
@@ -6704,7 +6579,7 @@ mod tests {
                     &first,
                     &first.entries()[0],
                     fixture.nodes[1],
-                    &mut fixture.counters,
+                    &fixture.counters,
                 )
                 .unwrap()
         );
@@ -6715,7 +6590,7 @@ mod tests {
                     &second,
                     &second.entries()[0],
                     fixture.nodes[1],
-                    &mut fixture.counters,
+                    &fixture.counters,
                 )
                 .unwrap()
         );
@@ -6724,7 +6599,6 @@ mod tests {
 
     /// A four-element document: `root > [first.item, second.item#target, third]`.
     struct Fixture {
-        memory: MemoryController,
         tree: StyleNodeTree,
         facts: StyleNodeFacts,
         nodes: Vec<StyleNodeID>,
@@ -6737,6 +6611,7 @@ mod tests {
     const CLASS_THEME: StyleAtomID = StyleAtomID(11);
     const ID_TARGET: StyleAtomID = StyleAtomID(20);
     const ATTR_HREF: StyleAtomID = StyleAtomID(30);
+    const VALUE_HREF: StyleAtomID = StyleAtomID(41);
     const ATTR_TYPE: StyleAtomID = StyleAtomID(31);
     const VALUE_TEXT: StyleAtomID = StyleAtomID(40);
 
@@ -6778,9 +6653,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-            let mut tree = StyleNodeTree::new(&mut memory);
-            let nodes: Vec<StyleNodeID> = (0..4).map(|_| tree.allocate_element(&mut memory)).collect();
+            let mut tree = StyleNodeTree::new();
+            let nodes: Vec<StyleNodeID> = (0..4).map(|_| tree.allocate_element()).collect();
             tree.set_first_element_child(nodes[0], Some(nodes[1]));
             for index in 1..4 {
                 tree.set_parent(nodes[index], Some(nodes[0]));
@@ -6790,7 +6664,7 @@ mod tests {
 
             let mut facts = StyleNodeFacts::new();
             let href: Vec<u16> = "https://example.com/a".encode_utf16().collect();
-            let (offset, length) = facts.push_text(&href);
+            facts.set_attribute_value_text_for_test(VALUE_HREF, &href);
             facts.push_row(
                 nodes[0],
                 TAG_DIV,
@@ -6807,9 +6681,7 @@ mod tests {
                 &[CLASS_ITEM],
                 &[AttributeFact {
                     name: ATTR_HREF,
-                    value: StyleAtomID::NONE,
-                    text_offset: offset,
-                    text_length: length,
+                    value: VALUE_HREF,
                 }],
             );
             let mut hovered = StateSet::default();
@@ -6823,8 +6695,6 @@ mod tests {
                 &[AttributeFact {
                     name: ATTR_TYPE,
                     value: VALUE_TEXT,
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 }],
             );
             let row = facts.row_of(nodes[2]).unwrap();
@@ -6832,7 +6702,6 @@ mod tests {
             facts.push_row(nodes[3], TAG_DIV, StyleAtomID::NONE, StateSet::default(), &[], &[]);
 
             Self {
-                memory,
                 tree,
                 facts,
                 nodes,
@@ -6843,7 +6712,7 @@ mod tests {
         fn matches(&mut self, program: &SelectorProgram, node: usize) -> bool {
             let mut evaluator = MatchEvaluator::new(&self.tree, &self.facts);
             evaluator
-                .matches_entry(program, &program.entries()[0], self.nodes[node], &mut self.counters)
+                .matches_entry(program, &program.entries()[0], self.nodes[node], &self.counters)
                 .unwrap()
         }
 
@@ -6852,7 +6721,7 @@ mod tests {
             let shadow_root = self.nodes[shadow_root];
             let mut evaluator = MatchEvaluator::new(&self.tree, &self.facts).in_shadow_tree(shadow_root);
             evaluator
-                .matches_entry(program, &program.entries()[0], self.nodes[node], &mut self.counters)
+                .matches_entry(program, &program.entries()[0], self.nodes[node], &self.counters)
                 .unwrap()
         }
     }
@@ -7049,13 +6918,13 @@ mod tests {
 
         assert!(
             !MatchEvaluator::new(&fixture.tree, &fixture.facts)
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters,)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters,)
                 .unwrap()
         );
         assert!(
             MatchEvaluator::new(&fixture.tree, &fixture.facts)
                 .with_transaction_fact_view(&view, TransactionFactSide::Before)
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters,)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters,)
                 .unwrap()
         );
     }
@@ -7068,7 +6937,7 @@ mod tests {
             let div = builder.push_feature(FeatureTest::TagName(TagTest::exact(TAG_DIV)));
             builder.push_compound(&[div, preceding])
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[3],
@@ -7081,7 +6950,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[1],
                 last_exclusive: Some(fixture.nodes[3]),
@@ -7097,7 +6966,7 @@ mod tests {
             let div = builder.push_feature(FeatureTest::TagName(TagTest::exact(TAG_DIV)));
             builder.push_compound(&[div, previous])
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[3],
@@ -7110,7 +6979,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingFacts(fixture.nodes[2]))
         );
     }
@@ -7118,8 +6987,8 @@ mod tests {
     #[test]
     fn a_missing_fact_below_a_sibling_names_its_descendant_range() {
         let mut fixture = Fixture::new();
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let child = fixture.tree.allocate_element(&mut memory);
+
+        let child = fixture.tree.allocate_element();
         fixture.tree.set_parent(child, Some(fixture.nodes[1]));
         fixture.tree.set_first_element_child(fixture.nodes[1], Some(child));
         let program = single_entry(|builder| {
@@ -7139,7 +7008,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingDescendantFacts {
                 root: fixture.nodes[1],
                 first: child,
@@ -7160,7 +7029,7 @@ mod tests {
                 match_in_shadow_tree: false,
             })
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[1],
@@ -7173,7 +7042,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[2],
                 last_exclusive: None,
@@ -7271,18 +7140,18 @@ mod tests {
             builder.push_compound(&[scope, item])
         });
 
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts).with_scope_root(fixture.nodes[0]);
         assert!(
             evaluator
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
 
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts).with_scope_root(fixture.nodes[1]);
         assert!(
             !evaluator
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
     }
@@ -7366,7 +7235,7 @@ mod tests {
                 of_type: true,
             }))
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut first_only = StyleNodeFacts::new();
         first_only.push_row(
             fixture.nodes[1],
@@ -7378,12 +7247,7 @@ mod tests {
         );
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &first_only);
         assert_eq!(
-            evaluator.matches_entry(
-                &from_end,
-                &from_end.entries()[0],
-                fixture.nodes[1],
-                &mut fixture.counters
-            ),
+            evaluator.matches_entry(&from_end, &from_end.entries()[0], fixture.nodes[1], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[2],
                 last_exclusive: None,
@@ -7405,7 +7269,7 @@ mod tests {
                 &from_start,
                 &from_start.entries()[0],
                 fixture.nodes[3],
-                &mut fixture.counters
+                &fixture.counters
             ),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[1],
@@ -7437,10 +7301,10 @@ mod tests {
         );
         let program = builder.finish();
 
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
         let matched = evaluator
-            .match_entries(&program, fixture.nodes[2], &mut fixture.counters)
+            .match_entries(&program, fixture.nodes[2], &fixture.counters)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -7456,11 +7320,11 @@ mod tests {
     #[test]
     fn a_missing_fact_row_is_reported_rather_than_answered() {
         let program = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let missing = StyleNodeID::element(99);
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], missing, &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], missing, &fixture.counters),
             Err(Incomplete::MissingFacts(missing))
         );
     }
@@ -7601,7 +7465,6 @@ mod tests {
 
     #[test]
     fn the_registry_returns_only_the_routes_that_mention_an_input() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
         let mut registry = RoutingRegistry::new();
         let mut programs = SelectorPrograms::new();
 
@@ -7639,7 +7502,6 @@ mod tests {
         registry.add_rule(RuleID(2), unrelated, &programs);
         registry.add_rule(RuleID(3), sibling, &programs);
         registry.add_rule(RuleID(4), relational, &programs);
-        registry.settle_memory(&mut memory);
 
         // A hover change reaches only the rule that mentions it.
         let routed = registry.routes_for(RoutingKey::State(StateFact::Hover));
@@ -7654,19 +7516,6 @@ mod tests {
         assert_eq!(arrivals.len(), 2);
         assert_eq!(registry.rule_of(arrivals[0]), RuleID(3));
         assert_eq!(registry.rule_of(arrivals[1]), RuleID(4));
-        assert!(memory.bytes_in_category(MemoryCategory::RoutingRegistry) > 0);
-    }
-
-    #[test]
-    fn route_liveness_charges_its_packed_word_storage() {
-        let mut registry = RoutingRegistry::new();
-        let before = registry.capacity_bytes();
-
-        let (changed, growth) = registry.route_liveness.set(511, true);
-
-        assert!(changed);
-        assert_eq!(registry.capacity_bytes() - before, growth);
-        assert_eq!(registry.route_liveness.capacity_bytes(), growth);
     }
 
     #[test]
@@ -7820,7 +7669,6 @@ mod tests {
 
     #[test]
     fn the_running_program_total_tracks_what_the_programs_reserve() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
         let mut programs = SelectorPrograms::new();
         // Enough programs, of differing sizes, to reallocate the list several times over.
         for index in 0..64_u32 {
@@ -7833,11 +7681,6 @@ mod tests {
             });
             programs.add(program);
         }
-        programs.settle_memory(&mut memory);
-        assert_eq!(
-            memory.bytes_in_category(MemoryCategory::RuleProgram),
-            programs.capacity_bytes()
-        );
     }
 
     #[test]
@@ -7864,11 +7707,11 @@ mod tests {
         let make_program = |atom| single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(atom))));
         let mut first = SelectorPrograms::new();
         let mut second = SelectorPrograms::new();
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+
         for programs in [&mut first, &mut second] {
             programs.add(make_program(7));
             programs.add(make_program(8));
-            programs.share_indices(&mut memory);
+            programs.share_indices();
         }
         assert_eq!(first.program_index.as_ptr(), second.program_index.as_ptr());
         assert_eq!(first.entry_locations.as_ptr(), second.entry_locations.as_ptr());
@@ -7889,7 +7732,6 @@ mod tests {
     fn selector_entry_runs_keep_fragmented_recycled_identities() {
         let consecutive = SelectorEntryIDs::from_entries(vec![EntryID(7), EntryID(8), EntryID(9)]);
         assert!(matches!(consecutive, SelectorEntryIDs::Consecutive { .. }));
-        assert_eq!(consecutive.capacity_bytes(), 0);
         assert_eq!(
             consecutive.iter().collect::<Vec<_>>(),
             [EntryID(7), EntryID(8), EntryID(9)]
@@ -7927,17 +7769,8 @@ mod tests {
                 allocated_entries
             );
             assert_eq!(programs.entry_locations.iter().flatten().count(), allocated_entries);
-            assert_eq!(
-                programs.entry_ids_bytes,
-                programs
-                    .entry_ids_by_program
-                    .iter()
-                    .flatten()
-                    .map(SelectorEntryIDs::capacity_bytes)
-                    .sum::<usize>()
-            );
         };
-        for mut programs in [SelectorPrograms::new(), SelectorPrograms::for_replay()] {
+        for mut programs in [SelectorPrograms::new(), SelectorPrograms::shared_across_documents()] {
             check(&programs);
             let first = programs.add(make_program(1, 5));
             let retained = programs.add(make_program(10, 2));
@@ -7961,12 +7794,41 @@ mod tests {
     }
 
     #[test]
+    fn process_programs_keep_transpose_sites_once_another_rule_or_document_routes_them() {
+        // NB: The pool is shared with every other test in the process; nothing else interns a class selector on this
+        //     atom.
+        let make_program = || single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(9301))));
+        let mut first = SelectorPrograms::shared_across_documents();
+        let mut second = SelectorPrograms::shared_across_documents();
+        let first_id = first.add(make_program());
+        let second_id = second.add(make_program());
+        let Some(SelectorProgramStorage::Process(shared)) = first.programs[first_id.0 as usize].clone() else {
+            panic!("shared selector programs must have process storage");
+        };
+        let visit = |programs: &SelectorPrograms, program, rule| {
+            let mut sites = 0;
+            programs.for_each_transpose_entry_point(program, 0, rule, |_| sites += 1);
+            sites
+        };
+
+        let sites = visit(&first, first_id, RuleID(1));
+        assert!(sites > 0);
+        // A document routing the same rule again, as rebuilding its routing does, keeps nothing.
+        assert_eq!(visit(&first, first_id, RuleID(1)), sites);
+        assert!(shared.transpose_sites.get().is_none());
+
+        assert_eq!(visit(&second, second_id, RuleID(1)), sites);
+        assert!(shared.transpose_sites.get().is_some());
+        assert_eq!(visit(&first, first_id, RuleID(2)), sites);
+    }
+
+    #[test]
     fn process_programs_share_payload_and_its_memory_lifetime() {
         let make_program = || single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(91))));
-        let expected_bytes = make_program().capacity_bytes();
+
         let program_hash = SelectorPrograms::program_hash(&make_program());
-        let mut first = SelectorPrograms::for_replay();
-        let mut second = SelectorPrograms::for_replay();
+        let mut first = SelectorPrograms::shared_across_documents();
+        let mut second = SelectorPrograms::shared_across_documents();
         let first_id = first.add(make_program());
         let second_id = second.add(make_program());
 
@@ -7974,12 +7836,11 @@ mod tests {
             first.programs[first_id.0 as usize].as_ref().unwrap(),
             second.programs[second_id.0 as usize].as_ref().unwrap(),
         ) else {
-            panic!("replay selector programs must have process storage");
+            panic!("shared selector programs must have process storage");
         };
         assert!(Arc::ptr_eq(first_program, second_program));
         // The pool is shared with every other test running in the process, so this test only
         // looks at its own program: nothing else interns a class selector on this atom.
-        assert_eq!(first_program._memory.bytes(), expected_bytes);
         assert_eq!(selector_program_pools().programs.live_values_under(program_hash), 1);
 
         drop(first);
@@ -8165,13 +8026,11 @@ mod tests {
         let host = fixture.nodes[0];
         let slotted = fixture.nodes[1];
         let shadow_root = fixture.nodes[3];
-        fixture.tree.set_shadow_root(host, shadow_root, &mut fixture.memory);
+        fixture.tree.set_shadow_root(host, shadow_root);
+        fixture.tree.set_assigned_slot(slotted, Some(fixture.nodes[2]));
         fixture
             .tree
-            .set_assigned_slot(slotted, Some(fixture.nodes[2]), &mut fixture.memory);
-        fixture
-            .tree
-            .set_part_hosts(fixture.nodes[2], &[(StyleAtomID(77), host)], &mut fixture.memory);
+            .set_part_hosts(fixture.nodes[2], &[(StyleAtomID(77), host)]);
 
         let host_rule = single_entry(|builder| {
             let any = builder.push_feature(FeatureTest::AnyElement);
@@ -8257,9 +8116,7 @@ mod tests {
     #[test]
     fn a_generic_descendant_walk_does_not_pierce_a_shadow_root() {
         let mut fixture = Fixture::new();
-        fixture
-            .tree
-            .set_shadow_root(fixture.nodes[0], fixture.nodes[3], &mut fixture.memory);
+        fixture.tree.set_shadow_root(fixture.nodes[0], fixture.nodes[3]);
 
         // .theme .item still means DOM ancestry; hosting changes nothing about it.
         let program = single_entry(|builder| {

@@ -70,9 +70,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
 
     auto view = WebView::HeadlessWebView::create(theme, { 800, 600 });
-    auto& stub = static_cast<WebContentClientStub&>(view->client());
-    auto page_id = view->page_id();
-    auto& traversable = view->client().page(page_id)->traversable();
+    auto& stub = static_cast<WebContentClientStub&>(view->page().client());
+    auto page_id = view->page().id();
+    auto& traversable = view->traversable();
 
     auto start_navigation = [&](URL::Origin initiator_origin) {
         auto uuid = generate_random_uuid();
@@ -96,10 +96,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             .navigation_api_state = {},
             .navigation_api_key = {},
             .navigation_api_id = {},
+            .directive_state_id = {},
+            .directive_state_value = {},
         };
         stub.did_request_navigation_start(page_id, traversable.id(), Web::NavigationTarget::TopLevel, URL::about_blank(), navigation_id, move(request));
-        auto const& ongoing_navigation = traversable.ongoing_navigation();
-        return ongoing_navigation.has_value() && ongoing_navigation->navigation_id == navigation_id;
+        return traversable.navigation_with_id(navigation_id) != nullptr;
     };
 
     // An about:blank document takes its initiator origin, so a victim's would give the renderer a document of its origin.

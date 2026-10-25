@@ -11,6 +11,7 @@
 #include <LibGC/HeapGroup.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
+#include <LibGC/WeakInlines.h>
 #include <LibTest/TestCase.h>
 
 namespace {
@@ -43,7 +44,31 @@ private:
 
 GC_DEFINE_ALLOCATOR(LinkedCell);
 
-NEVER_INLINE void scrub_stack()
+Optional<bool> s_weak_to_dead_foreign_cell_was_null_while_finalizing;
+
+class WeakCreatingCell final : public GC::Cell {
+    GC_CELL(WeakCreatingCell, GC::Cell);
+    GC_DECLARE_ALLOCATOR(WeakCreatingCell);
+
+public:
+    // Not visited, so that the foreign cell dies whether or not we do.
+    GC::RawPtr<LinkedCell> foreign_cell;
+
+private:
+    WeakCreatingCell() = default;
+
+    virtual void finalize() override
+    {
+        Base::finalize();
+        s_weak_to_dead_foreign_cell_was_null_while_finalizing = !GC::Weak<LinkedCell> { foreign_cell.ptr() };
+    }
+};
+
+GC_DEFINE_ALLOCATOR(WeakCreatingCell);
+
+// Under ASan, an instrumented function's locals live on a fake stack, so filling them would leave the real stack as it
+// was — and the conservative scan reads the real stack. So this function isn't instrumented.
+NO_SANITIZE_ADDRESS NEVER_INLINE void scrub_stack()
 {
     u8 volatile filler[8 * KiB];
     for (size_t i = 0; i < sizeof(filler); ++i)
@@ -77,6 +102,12 @@ NEVER_INLINE GC::Root<LinkedCell> allocate_cross_heap_chain(GC::Heap& heap_a, GC
     return holder;
 }
 
+NEVER_INLINE void allocate_weak_creating_cell_and_foreign_garbage(GC::Heap& heap_a, GC::Heap& heap_b)
+{
+    auto cell = heap_a.allocate<WeakCreatingCell>();
+    cell->foreign_cell = heap_b.allocate<LinkedCell>().ptr();
+}
+
 NEVER_INLINE void allocate_garbage(GC::Heap& heap)
 {
     (void)heap.allocate<LinkedCell>();
@@ -84,7 +115,7 @@ NEVER_INLINE void allocate_garbage(GC::Heap& heap)
 
 }
 
-TEST_CASE(sanity_single_heap_frees_garbage)
+static NEVER_INLINE void sanity_single_heap_frees_garbage()
 {
     GC::Heap heap([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
     heap.set_incremental_sweep_enabled(false);
@@ -96,7 +127,7 @@ TEST_CASE(sanity_single_heap_frees_garbage)
     EXPECT_EQ(s_live_linked_cells, 0u);
 }
 
-TEST_CASE(incoming_cross_heap_member_roots_local_collection)
+static NEVER_INLINE void incoming_cross_heap_member_roots_local_collection()
 {
     GC::Heap heap_a([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
     GC::Heap heap_b([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
@@ -130,7 +161,7 @@ TEST_CASE(incoming_cross_heap_member_roots_local_collection)
     group.remove(heap_b);
 }
 
-TEST_CASE(group_collection_breaks_cross_heap_cycles)
+static NEVER_INLINE void group_collection_breaks_cross_heap_cycles()
 {
     GC::Heap heap_a([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
     GC::Heap heap_b([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
@@ -159,7 +190,7 @@ TEST_CASE(group_collection_breaks_cross_heap_cycles)
     group.remove(heap_b);
 }
 
-TEST_CASE(group_collection_traces_live_cross_heap_chains)
+static NEVER_INLINE void group_collection_traces_live_cross_heap_chains()
 {
     GC::Heap heap_a([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
     GC::Heap heap_b([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
@@ -185,4 +216,62 @@ TEST_CASE(group_collection_traces_live_cross_heap_chains)
 
     group.remove(heap_a);
     group.remove(heap_b);
+}
+
+static NEVER_INLINE void group_collection_finalizer_creates_null_weak_to_dead_foreign_cell()
+{
+    GC::Heap heap_a([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
+    GC::Heap heap_b([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
+
+    heap_a.set_incremental_sweep_enabled(false);
+    heap_b.set_incremental_sweep_enabled(false);
+    GC::HeapGroup group;
+    group.add(heap_a);
+    group.add(heap_b);
+
+    // The finalizer runs while heap B's weak pointers have already been cleared, whether or not B has run its own
+    // finalizers yet, so a weak pointer that it creates to B's dead cell must be null.
+    s_weak_to_dead_foreign_cell_was_null_while_finalizing = {};
+    allocate_weak_creating_cell_and_foreign_garbage(heap_a, heap_b);
+    scrub_stack();
+    group.collect_garbage();
+    EXPECT_EQ(s_weak_to_dead_foreign_cell_was_null_while_finalizing, true);
+    EXPECT_EQ(s_live_linked_cells, 0u);
+
+    group.remove(heap_a);
+    group.remove(heap_b);
+}
+
+// Under ASan with detect_stack_use_after_return, a function's locals live on a fake stack, but its frame on the real
+// stack still reserves room for them — room it never writes, so it keeps whatever earlier calls left there, and the
+// conservative scan reads it. A stale pointer there can keep a dropped cell alive. So each case runs in a frame of its
+// own, on stack that scrub_stack() has just cleared.
+TEST_CASE(sanity_single_heap_frees_garbage)
+{
+    scrub_stack();
+    sanity_single_heap_frees_garbage();
+}
+
+TEST_CASE(incoming_cross_heap_member_roots_local_collection)
+{
+    scrub_stack();
+    incoming_cross_heap_member_roots_local_collection();
+}
+
+TEST_CASE(group_collection_breaks_cross_heap_cycles)
+{
+    scrub_stack();
+    group_collection_breaks_cross_heap_cycles();
+}
+
+TEST_CASE(group_collection_traces_live_cross_heap_chains)
+{
+    scrub_stack();
+    group_collection_traces_live_cross_heap_chains();
+}
+
+TEST_CASE(group_collection_finalizer_creates_null_weak_to_dead_foreign_cell)
+{
+    scrub_stack();
+    group_collection_finalizer_creates_null_weak_to_dead_foreign_cell();
 }

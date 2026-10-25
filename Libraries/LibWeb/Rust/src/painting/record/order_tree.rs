@@ -276,7 +276,7 @@ fn scope_kind_from_code(code: u8) -> PaintScopeKind {
 
 pub(crate) const SCOPE_KIND_COUNT: u8 = 1 + StackingContextPaintPhase::COUNT as u8;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PaintOrderTree {
     nodes: Vec<ScopeNode>,
     free_nodes: Vec<u32>,
@@ -309,6 +309,26 @@ impl PaintOrderTree {
     #[cfg(test)]
     pub(crate) fn child_entry_capacity(&self) -> usize {
         self.children.len()
+    }
+
+    /// Every scope reachable from the root, in tree order, with its child list.
+    #[cfg(test)]
+    pub(crate) fn structure(&self) -> Vec<(ScopeId, PaintScope, Vec<ChildEntry>)> {
+        let mut structure = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if id.is_none() {
+                continue;
+            }
+            let children = self.children(id).to_vec();
+            for entry in children.iter().rev() {
+                if let ChildKey::Scope(child) = entry.key() {
+                    stack.push(child);
+                }
+            }
+            structure.push((id, self.scope_of(id), children));
+        }
+        structure
     }
 
     fn node(&self, id: ScopeId) -> &ScopeNode {

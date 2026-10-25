@@ -3,6 +3,7 @@ set(TEST_SOURCES
     TestHSTSPolicy.cpp
     TestHSTSPreloadData.cpp
     TestHTTPUtils.cpp
+    TestStructuredFields.cpp
 )
 
 foreach(source IN LISTS TEST_SOURCES)
@@ -12,3 +13,4 @@ endforeach()
 ladybird_test("TestCacheIndex.cpp" LibWeb LIBS LibHTTP LibDatabase)
 ladybird_test("TestDiskCache.cpp" LibWeb LIBS LibHTTP LibURL)
 ladybird_test("TestMemoryCache.cpp" LibWeb LIBS LibHTTP LibURL)
+ladybird_test("TestProxy.cpp" LibWeb LIBS LibHTTP LibURL)

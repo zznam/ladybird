@@ -26,7 +26,7 @@ extern "C" fn is_panicking() -> bool {
 
 #[cfg(not(test))]
 #[unsafe(export_name = concat!("ladybird_init_rust_panic_", env!("CARGO_PKG_NAME")))]
-extern "C" fn initialize() {
+pub(crate) extern "C" fn initialize() {
     static INITIALIZE: std::sync::Once = std::sync::Once::new();
     INITIALIZE.call_once(|| {
         let previous = std::panic::take_hook();
@@ -51,6 +51,12 @@ extern "C" fn initialize() {
                     column,
                     is_panicking,
                 );
+            }
+            // Nothing can catch this panic, so no later code gets to capture the backtrace.
+            #[cfg(panic = "abort")]
+            // SAFETY: The bridge only reads the message stored above.
+            unsafe {
+                ladybird_rust_panic_will_abort();
             }
             previous(info);
         }));

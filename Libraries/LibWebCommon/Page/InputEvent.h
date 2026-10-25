@@ -6,11 +6,13 @@
 
 #pragma once
 
+#include <AK/GenericShorthands.h>
 #include <AK/OwnPtr.h>
+#include <AK/Vector.h>
 #include <LibGfx/Point.h>
-#include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/Page/AsyncScrollNodeStableID.h>
+#include <LibWebCommon/Page/TextEditingCommand.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
@@ -38,11 +40,13 @@ struct WEBCOMMON_API KeyEvent {
     bool repeat { false };
     bool should_insert_text { false };
 
-    OwnPtr<BrowserInputData> browser_data;
+    OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
 
     // The UI process numbers the events it sends, and a completion names the event it finished.
     u64 id { 0 };
+    Vector<TextEditingCommand> editing_commands {};
+    bool native_editing_binding_resolved { false };
 };
 
 inline bool is_keyboard_scroll_key(Web::UIEvents::KeyCode key, u32 modifiers)
@@ -50,12 +54,15 @@ inline bool is_keyboard_scroll_key(Web::UIEvents::KeyCode key, u32 modifiers)
     switch (key) {
     case Web::UIEvents::KeyCode::Key_Space:
         return (modifiers & ~(Web::UIEvents::Mod_Shift | Web::UIEvents::Mod_Keypad)) == Web::UIEvents::Mod_None;
-    case Web::UIEvents::KeyCode::Key_PageUp:
-    case Web::UIEvents::KeyCode::Key_PageDown:
     case Web::UIEvents::KeyCode::Key_Up:
     case Web::UIEvents::KeyCode::Key_Down:
+        return first_is_one_of(modifiers & ~Web::UIEvents::Mod_Keypad, Web::UIEvents::Mod_None, Web::UIEvents::Mod_PlatformCtrl);
+    case Web::UIEvents::KeyCode::Key_PageUp:
+    case Web::UIEvents::KeyCode::Key_PageDown:
     case Web::UIEvents::KeyCode::Key_Left:
     case Web::UIEvents::KeyCode::Key_Right:
+    case Web::UIEvents::KeyCode::Key_Home:
+    case Web::UIEvents::KeyCode::Key_End:
         return (modifiers & ~Web::UIEvents::Mod_Keypad) == Web::UIEvents::Mod_None;
     default:
         return false;
@@ -68,6 +75,23 @@ enum class WheelDeltaPrecision : u8 {
     Discrete,
     Precise,
 };
+
+// Besides its pixel delta, wheel input counts how far the wheel turned in 120ths of a tick, the unit of the legacy
+// wheelDelta. A tick is a wheel notch, or one line on platforms that accelerate the wheel by whole lines. Input that
+// reports only a pixel delta counts its ticks from that: a notch scrolls three 40-pixel lines, and precise input has
+// no notches, so it counts one tick per 40-pixel line step.
+// INTEROP: For macOS touchpad scrolling, Blink, WebKit, and Gecko all report 3 units per pixel; Blink and WebKit
+//          truncate, Gecko rounds. For the ctrl-wheel events of a pinch, WebKit and Gecko also report 3 units per
+//          pixel, while Blink reports 120 units per event.
+constexpr double wheel_tick_120ths_from_pixel_delta(double pixel_delta, WheelDeltaPrecision precision)
+{
+    constexpr double tick_120ths_per_tick = 120;
+    constexpr double pixels_per_notch = 3 * 40;
+    constexpr double pixels_per_precise_tick = 40;
+    if (precision == WheelDeltaPrecision::Precise)
+        return pixel_delta * (tick_120ths_per_tick / pixels_per_precise_tick);
+    return pixel_delta * (tick_120ths_per_tick / pixels_per_notch);
+}
 
 // Input that scrolls with a gesture, such as a touchpad, reports whether the user is still making that gesture,
 // whether a flick has handed the scrolling over to momentum, and when it ends.
@@ -84,6 +108,7 @@ struct WEBCOMMON_API MouseEvent {
         MouseUp,
         MouseMove,
         MouseLeave,
+        MouseCancel,
         MouseWheel,
     };
 
@@ -97,11 +122,13 @@ struct WEBCOMMON_API MouseEvent {
     Web::UIEvents::KeyModifier modifiers { Web::UIEvents::KeyModifier::Mod_None };
     double wheel_delta_x { 0 };
     double wheel_delta_y { 0 };
+    double wheel_tick_120ths_x { 0 };
+    double wheel_tick_120ths_y { 0 };
     WheelDeltaPrecision wheel_delta_precision { WheelDeltaPrecision::Discrete };
     ScrollGesturePhase scroll_gesture_phase { ScrollGesturePhase::None };
     int click_count { 0 };
 
-    OwnPtr<BrowserInputData> browser_data;
+    OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
     u64 id { 0 };
     Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
@@ -116,24 +143,4 @@ struct WEBCOMMON_API PinchEvent {
 
 }
 
-namespace IPC {
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::KeyEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::KeyEvent> decode(Decoder&);
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::MouseEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::MouseEvent> decode(Decoder&);
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::PinchEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::PinchEvent> decode(Decoder&);
-
-}
+#include <LibWebCommon/Page/InputEventCodecs.h>

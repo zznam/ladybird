@@ -37,7 +37,15 @@ WEB_API void register_layout_host(NodeArena&, DOM::Document&);
 // identity. An element's attributes are layout input that no pass can change, so the document publishes them as
 // they are written rather than answering for them while a pass runs.
 void publish_svg_attribute_facts(DOM::Element&);
+void publish_math_attribute_facts(DOM::Element const&);
 void publish_svg_style_references(DOM::Element&);
+
+// Which shape an SVG geometry element draws, and the endpoints a <line> parses. The other fields keep their defaults.
+// Layout reads these from the published facts, and the DOM's geometry queries pass them to the same shape builders.
+RustFFI::FfiSvgAttributeFacts svg_geometry_facts(DOM::Element const&);
+
+// The points a <polygon> or <polyline> parses. Every other element has none.
+ReadonlySpan<Gfx::FloatPoint> svg_shape_points(DOM::Element const&);
 
 // Publishes whether a row built for the node sits in the user agent shadow tree of the focused text control, which is
 // what a caret is painted inside. The overflow pass reserves a pixel for the caret, so it reads the published answer
@@ -60,13 +68,7 @@ inline RustFFI::FfiSvgNumberPercentage to_ffi_number_percentage(SVG::NumberPerce
 
 }
 
-// Per-code-point classification lookups for native text processing. The
-// line-break-class groupings implement the css-text-4 word-break policies.
-extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32);
-extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32);
-extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32);
-extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32);
-extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32);
+// The general category facts of a code point, for finding the first letter of a block.
 extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32);
 
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void*);

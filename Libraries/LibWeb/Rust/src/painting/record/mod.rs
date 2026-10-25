@@ -24,7 +24,6 @@ pub mod svg_resources;
 pub mod trace;
 pub mod traversal;
 pub(crate) mod vector_images;
-pub(crate) mod verify;
 
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixelRect;
@@ -41,6 +40,7 @@ use crate::painting::hit_test::HitTestList;
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::record::frame_inputs::FrameInputs;
 use crate::painting::record::svg_resources::SvgResourceWalk;
+use crate::painting::selection::HighlightPseudoElement;
 use std::sync::Arc;
 
 pub(crate) use inputs::RecordingInputs;
@@ -59,7 +59,9 @@ pub struct RecordingOutput {
     pub has_blocking_wheel_event_listeners: bool,
     pub wheel_event_listener_state_generation: u64,
     pub is_identical_to_published_recording: bool,
-    pub(crate) capture_log_for_verification: Option<verify::CaptureLog>,
+    pub(crate) capture_log: Option<trace::CaptureLog>,
+    /// The SVG images whose display lists, which the host rendered, the recording draws, and the ids of those lists.
+    pub(crate) vector_image_display_lists: Vec<(vector_images::VectorImageRenderRequest, u64)>,
 }
 
 pub(crate) struct RecordingResult {
@@ -70,6 +72,8 @@ pub(crate) struct RecordingResult {
 /// The hit-test items of the published recording, shared with the list that hit testing reads.
 pub struct PublishedHitTestItems {
     pub items: Arc<Vec<HitTestItem>>,
+    /// The structural epoch of the visual context tree the items were recorded against, whose nodes they name.
+    pub structural_epoch: u64,
 }
 
 // What a recording shares with hit testing and with later recordings.
@@ -100,7 +104,7 @@ impl PaintPhase {
 pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) source: &'a PaintSource<'a>,
     pub(crate) paint_state: &'a crate::painting::published_frame::PublishedPaintState,
-    pub(crate) inputs: &'a RecordingInputs<'a>,
+    pub(crate) inputs: &'a RecordingInputs,
     pub(crate) recorder: DisplayListRecorder,
     pub(crate) converter: DevicePixelConverter,
     pub(crate) svg_resource_walk: Option<SvgResourceWalk>,
@@ -110,16 +114,15 @@ pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) source_items: Option<Arc<PublishedHitTestItems>>,
     // Set while a producer records output that must record again every frame.
     live_producer: bool,
-    // The verification recording plans from current style instead of the prepared per-row
-    // inputs, so a snapshot that went stale shows up as a difference.
-    pub(crate) plan_from_prepared_inputs: bool,
     // Rows of the layout subtrees whose root moved: every producer of theirs records again.
     pub(crate) moved_expansion: FastSet<NodeSlotId>,
     pub(crate) blocking_wheel_event_region_count: u32,
+    pub(crate) records_per_box_wheel_hit_test_targets: bool,
     pub(crate) observer: O,
     list: HitTestList,
     pub(crate) scratch: &'a mut scratch::RecordingScratch,
     pub(crate) resources: resources::RecordingResourceManifest,
+    line_root_positions: Option<(NodeSlotId, crate::painting::paintable_geometry::LineRootPositions)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -131,12 +134,27 @@ pub(crate) struct BasePaintFacts {
     pub paints_border_image: bool,
     pub has_fixed_background: bool,
     pub has_scroll_offset_dependent_background: bool,
+    pub paints_column_rules: bool,
     pub paint_phase_mask: u8,
 }
 
 impl<O: Observer> PaintRecorder<'_, O> {
     pub(crate) fn mark_live_producer(&mut self) {
         self.live_producer = true;
+    }
+
+    pub(crate) fn line_root_positions(
+        &mut self,
+        root: NodeSlotId,
+    ) -> crate::painting::paintable_geometry::LineRootPositions {
+        if let Some((cached_root, positions)) = &self.line_root_positions
+            && *cached_root == root
+        {
+            return positions.clone();
+        }
+        let positions = crate::painting::paintable_geometry::LineRootPositions::new(self.source, root);
+        self.line_root_positions = Some((root, positions.clone()));
+        positions
     }
 
     pub(crate) fn data(&self, paintable: NodeSlotId) -> &PaintableData {
@@ -151,7 +169,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(facts) = self.scratch.hit_test_facts(paintable) {
             return facts;
         }
-        let facts = hit_test_items::hit_test_facts(self.source, paintable, self.inputs);
+        let facts = hit_test_items::hit_test_facts(self.source, paintable);
         self.scratch.set_hit_test_facts(paintable, facts);
         facts
     }
@@ -175,9 +193,31 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.resources.note_video_sink(resource_id, sink_handle)
     }
 
+    /// The color scheme an SVG image the box `owner` draws renders in: the box's own where it or its document opts into
+    /// `light` or `dark`, and otherwise the preferred one.
+    pub(crate) fn vector_image_color_scheme(&self, owner: crate::layout::node_data::NodeSlotId) -> u8 {
+        let names_light_or_dark = |schemes: &[crate::css::retained_fly_string::RetainedUtf16FlyString]| {
+            schemes.iter().any(|scheme| {
+                let scheme = scheme.to_utf16();
+                scheme.iter().copied().eq("light".encode_utf16()) || scheme.iter().copied().eq("dark".encode_utf16())
+            })
+        };
+        // INTEROP: Like Firefox, images use the preferred scheme when neither the element nor its document opts into a
+        //          supported scheme. Controls still default to light.
+        self.source
+            .node_style_if_live(owner)
+            .and_then(|style| {
+                let ui = style.inherited_ui();
+                (self.inputs.document_supports_light_or_dark || names_light_or_dark(ui.color_schemes.as_slice()))
+                    .then_some(ui.color_scheme)
+            })
+            .unwrap_or(self.inputs.image_fallback_color_scheme)
+    }
+
     pub(crate) fn paint_vector_image(
         &mut self,
         source: vector_images::VectorImageSource,
+        content_identity: u64,
         has_active_view_box: bool,
         dest_rect: libgfx_rust::FloatRect,
         accumulated_scale: libgfx_rust::FloatSize,
@@ -192,6 +232,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 geometry.css_width,
                 geometry.css_height,
                 geometry.raster_scale,
+                content_identity,
+                self.vector_image_color_scheme(source.owner()),
             ));
         if compositing_and_blending_operator != CompositingAndBlendingOperator::Normal {
             let dest_device_rect = libgfx_rust::enclosing_int_rect(dest_rect);
@@ -260,10 +302,10 @@ impl<O: Observer> PaintRecorder<'_, O> {
             return answer.clone();
         }
         let style_source = self.source.node_parent_if_live(node).unwrap_or(NodeSlotId::INVALID);
-        let committed = self
-            .first_non_anonymous_ancestor_row(node)
-            .and_then(|element_row| self.committed_selection_pseudo_style(node, element_row));
-        let answer = self.selection_style_answer(committed, node, style_source);
+        let committed = self.first_non_anonymous_ancestor_row(node).and_then(|element_row| {
+            self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, node, element_row)
+        });
+        let answer = Self::highlight_style_answer(committed, || self.default_selection_style(node, style_source));
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
     }
@@ -276,27 +318,79 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(answer) = self.scratch.selection_style_cache.get(&key) {
             return answer.clone();
         }
-        let committed = self.committed_selection_pseudo_style(element_row, element_row);
-        let answer = self.selection_style_answer(committed, element_row, element_row);
+        let committed =
+            self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, element_row, element_row);
+        let answer = Self::highlight_style_answer(committed, || self.default_selection_style(element_row, element_row));
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
     }
 
-    /// A committed style that authored neither color takes the paired default background and
-    /// keeps its shadows and decorations.
-    fn selection_style_answer(
-        &self,
-        committed: Option<Arc<paint::text::SelectionStyleAnswer>>,
+    pub(crate) fn search_text_style(
+        &mut self,
         node: crate::layout::node_data::NodeSlotId,
-        style_source: crate::layout::node_data::NodeSlotId,
+        highlight: HighlightPseudoElement,
+    ) -> Arc<paint::text::SelectionStyleAnswer> {
+        let key = node.index;
+        let is_current = highlight == HighlightPseudoElement::SearchTextCurrent;
+        let cached = if is_current {
+            self.scratch.search_text_current_style_cache.get(&key)
+        } else {
+            self.scratch.search_text_style_cache.get(&key)
+        };
+        if let Some(answer) = cached {
+            return answer.clone();
+        }
+        let style_source = self.source.node_parent_if_live(node).unwrap_or(NodeSlotId::INVALID);
+        let committed = self
+            .first_non_anonymous_ancestor_row(node)
+            .and_then(|element_row| self.committed_highlight_pseudo_style(highlight, node, element_row));
+        let answer = Self::highlight_style_answer(committed, || {
+            self.default_search_text_style(node, style_source, highlight)
+        });
+        let cache = if is_current {
+            &mut self.scratch.search_text_current_style_cache
+        } else {
+            &mut self.scratch.search_text_style_cache
+        };
+        cache.insert(key, answer.clone());
+        answer
+    }
+
+    pub(crate) fn spelling_error_style(
+        &mut self,
+        node: crate::layout::node_data::NodeSlotId,
+    ) -> Arc<paint::text::SelectionStyleAnswer> {
+        let key = node.index;
+        if let Some(answer) = self.scratch.spelling_error_style_cache.get(&key) {
+            return answer.clone();
+        }
+        let committed = self.first_non_anonymous_ancestor_row(node).and_then(|element_row| {
+            self.committed_highlight_pseudo_style(HighlightPseudoElement::SpellingError, node, element_row)
+        });
+        // The UA stylesheet's `:root::spelling-error` rule supplies the underline; with no committed style, a
+        // misspelling paints nothing of its own.
+        let answer = Self::highlight_style_answer(committed, || paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts::default(),
+            shadows: Vec::new(),
+        });
+        self.scratch.spelling_error_style_cache.insert(key, answer.clone());
+        answer
+    }
+
+    /// A committed style that authored neither color takes the paired default colors and keeps
+    /// its shadows and decorations.
+    fn highlight_style_answer(
+        committed: Option<Arc<paint::text::SelectionStyleAnswer>>,
+        defaults: impl FnOnce() -> paint::text::SelectionStyleAnswer,
     ) -> Arc<paint::text::SelectionStyleAnswer> {
         match committed {
             Some(answer) if answer.facts.colors_authored => answer,
-            None => Arc::new(self.default_selection_style(node, style_source)),
+            None => Arc::new(defaults()),
             Some(answer) => {
-                let mut defaults = self.default_selection_style(node, style_source);
+                let mut defaults = defaults();
                 defaults.facts = crate::painting::host::FfiSelectionStyleFacts {
                     background_color: defaults.facts.background_color,
+                    background_color_is_current_color: defaults.facts.background_color_is_current_color,
                     wash_color: defaults.facts.wash_color,
                     ..answer.facts
                 };
@@ -306,12 +400,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
         }
     }
 
-    fn committed_selection_pseudo_style(
+    fn committed_highlight_pseudo_style(
         &self,
+        highlight: HighlightPseudoElement,
         node: crate::layout::node_data::NodeSlotId,
         element_row: crate::layout::node_data::NodeSlotId,
     ) -> Option<Arc<paint::text::SelectionStyleAnswer>> {
-        let styles = &self.paint_state.selection_pseudo_styles;
+        let styles = self.paint_state.highlight_pseudo_styles(highlight);
         if let Some(answer) = styles.get(&node) {
             return Some(answer.clone());
         }
@@ -347,6 +442,52 @@ impl<O: Observer> PaintRecorder<'_, O> {
         node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
     ) -> paint::text::SelectionStyleAnswer {
+        let background_color = self.default_selection_background(node, style_source, self.inputs.window_is_focused);
+        paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts {
+                background_color,
+                wash_color: background_color,
+                ..Default::default()
+            },
+            shadows: Vec::new(),
+        }
+    }
+
+    fn default_search_text_style(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        style_source: crate::layout::node_data::NodeSlotId,
+        highlight: HighlightPseudoElement,
+    ) -> paint::text::SelectionStyleAnswer {
+        if highlight == HighlightPseudoElement::SearchTextCurrent {
+            let background_color = self.default_selection_background(node, style_source, true);
+            return paint::text::SelectionStyleAnswer {
+                facts: crate::painting::host::FfiSelectionStyleFacts {
+                    background_color,
+                    wash_color: background_color,
+                    ..Default::default()
+                },
+                shadows: Vec::new(),
+            };
+        }
+        let background_color = libgfx_rust::Color::from_rgb(255, 255, 0);
+        paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts {
+                background_color,
+                text_color: Some(libgfx_rust::Color::from_rgb(0, 0, 0)).into(),
+                wash_color: background_color,
+                ..Default::default()
+            },
+            shadows: Vec::new(),
+        }
+    }
+
+    fn default_selection_background(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        style_source: crate::layout::node_data::NodeSlotId,
+        window_is_focused: bool,
+    ) -> libgfx_rust::Color {
         use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, PREFERRED_COLOR_SCHEME_LIGHT};
         let inputs = self.inputs;
         let (color_scheme, color_scheme_is_normal) =
@@ -361,20 +502,25 @@ impl<O: Observer> PaintRecorder<'_, O> {
         } else {
             PREFERRED_COLOR_SCHEME_LIGHT
         };
-        let background_color = if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
-            inputs.selection_background_from_palette
-        } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
-            inputs.selection_background_dark
+        let (from_palette, light, dark) = if window_is_focused {
+            (
+                inputs.selection_background_from_palette,
+                inputs.selection_background_light,
+                inputs.selection_background_dark,
+            )
         } else {
-            inputs.selection_background_light
+            (
+                inputs.inactive_selection_background_from_palette,
+                inputs.inactive_selection_background_light,
+                inputs.inactive_selection_background_dark,
+            )
         };
-        paint::text::SelectionStyleAnswer {
-            facts: crate::painting::host::FfiSelectionStyleFacts {
-                background_color,
-                wash_color: background_color,
-                ..Default::default()
-            },
-            shadows: Vec::new(),
+        if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
+            from_palette
+        } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
+            dark
+        } else {
+            light
         }
     }
 
@@ -395,6 +541,41 @@ impl<O: Observer> PaintRecorder<'_, O> {
             piece.border_box_rect.height,
             piece.present_edges,
         )
+    }
+
+    pub(crate) fn fragment_border_box(
+        &mut self,
+        paintable: NodeSlotId,
+        index: usize,
+    ) -> (crate::css::css_pixels::CssPixelRect, BorderRadii) {
+        let rect =
+            crate::painting::paintable_geometry::absolute_fragment_border_box_rect(self.source, paintable, index);
+        let Some(style) = self.source.node_style_if_live(paintable) else {
+            return (rect, BorderRadii::default());
+        };
+        let radii = crate::painting::visual_context::node_values::piece_border_radii_data(
+            style,
+            rect.width,
+            rect.height,
+            crate::painting::paintable_geometry::committed_fragment_present_edges(self.source, paintable, index),
+        );
+        (rect, radii)
+    }
+
+    pub(crate) fn border_boxes_of_fragments(
+        &mut self,
+        paintable: NodeSlotId,
+    ) -> smallvec::SmallVec<[(CssPixelRect, BorderRadii); 1]> {
+        let fragment_count = crate::painting::paintable_geometry::fragment_count(self.source, paintable);
+        if fragment_count > 1 && !crate::painting::node_painting::is_fragmented_inline(self.source, paintable) {
+            return (0..fragment_count)
+                .map(|index| self.fragment_border_box(paintable, index))
+                .collect();
+        }
+        smallvec::smallvec![(
+            crate::painting::paintable_geometry::absolute_border_box_rect(self.source, paintable),
+            self.border_radii(paintable),
+        )]
     }
 
     pub(crate) fn base_paint_facts(&mut self, paintable: NodeSlotId) -> BasePaintFacts {
@@ -434,6 +615,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                     self.inputs.uncaptured.root_background_source,
                     paintable,
                 ),
+            paints_column_rules: paint::column_rule::has_visible_column_rule(style),
             paint_phase_mask: 0,
         };
         facts.paint_phase_mask = paint::paint_phase_mask(self, paintable, style, &facts);
@@ -537,11 +719,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
         &mut self,
         pattern: NodeSlotId,
         tile_content_transform: libgfx_rust::FloatMatrix4x4,
+        tile_surface_rect: libgfx_rust::FloatRect,
     ) -> Arc<Vec<u8>> {
         let root_transform = tile_content_transform.extract_2d_affine();
         let key = PatternTileKey {
             pattern: pattern.index,
             root_transform_bits: root_transform.values.map(f32::to_bits),
+            tile_surface_size_bits: [tile_surface_rect.width.to_bits(), tile_surface_rect.height.to_bits()],
         };
         if let Some(records) = self.scratch.pattern_tile_records.get(&key) {
             return records.clone();
@@ -551,7 +735,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         // tile shader instead, so the tiling grid repeats under it rather than the content scaling
         // twice.
         self.trace_paint(Operation::Named(Some(pattern), "svg-pattern"), |this| {
-            this.walk_svg_resource(pattern, root_transform, false, false);
+            this.walk_svg_resource(pattern, root_transform, false, false, tile_surface_rect);
         });
         let records = Arc::new(self.recorder.finish_detached_records(detached));
         self.scratch.pattern_tile_records.insert(key, records.clone());
@@ -563,4 +747,5 @@ impl<O: Observer> PaintRecorder<'_, O> {
 struct PatternTileKey {
     pattern: u32,
     root_transform_bits: [u32; 6],
+    tile_surface_size_bits: [u32; 2],
 }

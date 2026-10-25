@@ -7,9 +7,8 @@
 //! The capability separating code that may call into C++ from code that computes layout or
 //! records paint.
 
-use crate::layout::{ArenaHandle, HostTables};
+use crate::layout::HostTables;
 use crate::render_state::DocumentHost;
-use std::ffi::c_void;
 use std::marker::PhantomData;
 
 /// Proof that a call entered Rust from the document's main thread, and the way to that document's
@@ -62,7 +61,7 @@ impl<'host> MainThread<'host> {
     }
 }
 
-/// Mint a main thread token for an FFI entry point called on the arena `arena_handle` names.
+/// Mint a main thread token for an FFI entry point called with the document host `host`.
 ///
 /// The marker's type can only be constructed by the module that owns it, and this module lists
 /// those types below, so code elsewhere cannot mint a token with a marker of its own. A module
@@ -72,41 +71,36 @@ impl<'host> MainThread<'host> {
 ///
 /// # Safety
 ///
-/// The caller must be an FFI entry point whose C++ contract requires the document thread, and
-/// `arena_handle` must come from `render_state_arena_for_unconverted_entry` and outlive the token.
-pub(crate) unsafe fn from_ffi_entry<'host>(_: &impl FfiEntry, arena_handle: *mut c_void) -> MainThread<'host> {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { ArenaHandle::host(arena_handle) };
-    // A tree build's walk runs without a token, so the C++ its callbacks run must not mint one.
-    assert!(
-        !host.host_tables().tree_build_walk_is_open(),
-        "a tree build walk's callback entered Rust again"
-    );
+/// The caller must be an FFI entry point whose C++ contract requires the document thread.
+pub(crate) unsafe fn from_ffi_entry<'host>(_: &impl FfiEntry, host: &'host DocumentHost) -> MainThread<'host> {
     MainThread {
         host: Some(host),
         not_send_or_sync: PhantomData,
     }
 }
 
-/// Mint a main thread token for an FFI entry point called with the document host `host`.
-///
-/// # Safety
-///
-/// The caller must be an FFI entry point whose C++ contract requires the document thread.
-pub(crate) unsafe fn from_ffi_entry_with_host<'host>(
-    _: &impl FfiEntry,
-    host: &'host DocumentHost,
-) -> MainThread<'host> {
-    // A tree build's walk runs without a token, so the C++ its callbacks run must not mint one.
-    assert!(
-        !host.host_tables().tree_build_walk_is_open(),
-        "a tree build walk's callback entered Rust again"
-    );
-    MainThread {
-        host: Some(host),
-        not_send_or_sync: PhantomData,
-    }
+/// Defines `MainThreadFfiEntry`, the marker of a module whose FFI entry points mint main thread tokens, which only that
+/// module can make, and `main_thread()`, which mints the token with it. The module's marker is listed below.
+macro_rules! main_thread_ffi_entries {
+    () => {
+        /// Mints the main thread token for this module's FFI entry points; only this module can make one.
+        pub(crate) struct MainThreadFfiEntry {
+            _private: (),
+        }
+
+        /// The main thread token for one of this module's FFI entry points, called with the document host `host`.
+        ///
+        /// # Safety
+        ///
+        /// As for [`crate::stage::from_ffi_entry`].
+        unsafe fn main_thread(host: &$crate::render_state::DocumentHost) -> $crate::stage::MainThread<'_> {
+            // SAFETY: Guaranteed by the caller.
+            unsafe { $crate::stage::from_ffi_entry(&MainThreadFfiEntry { _private: () }, host) }
+        }
+    };
 }
+
+pub(crate) use main_thread_ffi_entries;
 
 macro_rules! ffi_entry {
     ($entry:path) => {
@@ -116,13 +110,12 @@ macro_rules! ffi_entry {
 }
 
 ffi_entry!(crate::layout::ArenaMainThreadFfiEntry);
-ffi_entry!(crate::layout::LayoutMainThreadFfiEntry);
 ffi_entry!(crate::layout::UpdateMainThreadFfiEntry);
-ffi_entry!(crate::layout::TreeBuildMainThreadFfiEntry);
 ffi_entry!(crate::painting::ffi::MainThreadFfiEntry);
 ffi_entry!(crate::painting::display_list::dump::MainThreadFfiEntry);
 ffi_entry!(crate::painting::layout_tree_dump::MainThreadFfiEntry);
 ffi_entry!(crate::painting::stacking_context::dump::MainThreadFfiEntry);
+ffi_entry!(crate::render_state::OwedWorkPayment);
 
 #[cfg(test)]
 mod tests {

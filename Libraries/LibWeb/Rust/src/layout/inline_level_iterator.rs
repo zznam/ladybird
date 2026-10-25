@@ -65,8 +65,52 @@ fn shape_glyph_data(
         glyphs: shaped.into_glyphs(),
         font,
         text_type,
+        is_upright: false,
     };
     (glyph_data, trailing_whitespace)
+}
+
+/// Whether text in the given writing mode and text orientation that starts with `code_point` is set with its glyphs
+/// upright, stacked along the vertical inline axis, rather than turned sideways like a horizontal line of text.
+/// https://drafts.csswg.org/css-writing-modes-4/#text-orientation
+pub(crate) fn text_is_set_upright(writing_mode: u8, text_orientation: u8, code_point: u32) -> bool {
+    // NB: The sideways writing modes set all text sideways, whatever its text orientation.
+    if !matches!(writing_mode, writing_mode::VERTICAL_RL | writing_mode::VERTICAL_LR) {
+        return false;
+    }
+    match text_orientation {
+        // upright: Typographic character units from horizontal-only scripts are typeset upright, i.e. in their
+        // standard horizontal orientation. Typographic character units from vertical scripts are typeset with their
+        // intrinsic orientation and shaped normally.
+        // FIXME: This value causes the used value of 'direction' to be 'ltr', and for the purposes of bidi
+        //        reordering, causes all characters to be treated as strong LTR.
+        text_orientation::UPRIGHT => true,
+        // mixed: Typographic character units from horizontal-only scripts are typeset sideways, i.e. 90° clockwise
+        // from their standard orientation in horizontal text. Typographic character units from vertical scripts are
+        // typeset with their intrinsic orientation.
+        text_orientation::MIXED => text_chunker::code_point_is_upright_in_mixed_orientation(code_point),
+        _ => false,
+    }
+}
+
+/// Sets shaped glyphs upright: each of them takes one em along the inline axis, which runs downwards in the frame of
+/// a vertical writing mode, while keeping its own horizontal width, which painting centers it within.
+// FIXME: Use the vertical metrics of the font, where it has them.
+fn set_glyphs_upright(glyph_data: &mut line_box_fragment::GlyphData, inline_offset: f32, advance: f32) {
+    let glyphs = glyph_data.glyphs.to_mut();
+    let mut pen = inline_offset;
+    let mut count = 0usize;
+    for glyph in glyphs.iter_mut() {
+        if glyph.length_in_code_units != 0 {
+            if count > 0 {
+                pen += advance;
+            }
+            count += 1;
+        }
+        glyph.x = pen;
+    }
+    glyph_data.width = advance * count as f32;
+    glyph_data.is_upright = true;
 }
 
 impl Item {
@@ -150,6 +194,71 @@ impl Item {
         })
     }
 
+    pub(crate) fn drop_prefix_before(
+        &mut self,
+        split_offset_in_node: usize,
+        text: &[u16],
+        letter_spacing: f32,
+        word_spacing: f32,
+    ) {
+        let end = self.offset_in_node + self.length_in_node;
+        if split_offset_in_node <= self.offset_in_node || split_offset_in_node >= end {
+            return;
+        }
+        let Some(glyph_data) = self.glyphs.as_ref() else {
+            return;
+        };
+        let remainder_glyphs = self
+            .shaped_glyphs_after(split_offset_in_node - self.offset_in_node)
+            .unwrap_or_else(|| {
+                shape_glyph_data(
+                    &text[split_offset_in_node..end],
+                    glyph_data.font.clone(),
+                    glyph_data.text_type,
+                    0.0,
+                    letter_spacing,
+                    word_spacing,
+                )
+                .0
+            });
+        self.drop_prefix(split_offset_in_node, remainder_glyphs);
+    }
+
+    fn shaped_glyphs_after(&self, code_units: usize) -> Option<line_box_fragment::GlyphData> {
+        let glyph_data = self.glyphs.as_ref()?;
+        if glyph_data.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL
+            || glyph_data
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.length_in_code_units)
+                .sum::<usize>()
+                != self.length_in_node
+        {
+            return None;
+        }
+        let mut consumed = 0;
+        let split_glyph_index = glyph_data.glyphs.iter().position(|glyph| {
+            let at_split = consumed == code_units && glyph.length_in_code_units != 0;
+            consumed += glyph.length_in_code_units;
+            at_split
+        })?;
+        let split_x = glyph_data.glyphs[split_glyph_index].x;
+        let glyphs: Vec<_> = glyph_data.glyphs[split_glyph_index..]
+            .iter()
+            .map(|glyph| libgfx_rust::text_layout::DrawGlyph {
+                x: glyph.x - split_x,
+                ..*glyph
+            })
+            .collect();
+        Some(line_box_fragment::GlyphData {
+            glyphs: glyphs.into(),
+            font: glyph_data.font.clone(),
+            text_type: glyph_data.text_type,
+            width: glyph_data.width - split_x,
+            is_upright: glyph_data.is_upright,
+        })
+    }
+
     fn take_prefix_before(
         &mut self,
         split_offset_in_node: usize,
@@ -165,8 +274,12 @@ impl Item {
         prefix.padding_start = self.padding_start;
         prefix.can_break_before = self.can_break_before;
         prefix.glyphs = Some(prefix_glyphs);
+        self.drop_prefix(split_offset_in_node, remainder_glyphs);
+        prefix
+    }
 
-        self.length_in_node -= prefix.length_in_node;
+    fn drop_prefix(&mut self, split_offset_in_node: usize, remainder_glyphs: line_box_fragment::GlyphData) {
+        self.length_in_node -= split_offset_in_node - self.offset_in_node;
         self.offset_in_node = split_offset_in_node;
         self.inline_size = CssPixels::nearest_value_for_f32(remainder_glyphs.width);
         self.glyphs = Some(remainder_glyphs);
@@ -174,8 +287,6 @@ impl Item {
         self.border_start = CssPixels::default();
         self.padding_start = CssPixels::default();
         self.can_break_before = false;
-
-        prefix
     }
 
     fn split_at_shaped_glyph(
@@ -226,6 +337,7 @@ impl Item {
             font: prefix.font.clone(),
             text_type: prefix.text_type,
             width: prefix.width - split_x,
+            is_upright: prefix.is_upright,
         };
         prefix.width = split_x;
 
@@ -350,7 +462,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
         iterator.generate_all_items();
         Some(InlineLevelIterator {
             entered_box_model_nodes: iterator.entered_box_model_nodes,
-            items: iterator.items.into_iter(),
+            items: ItemQueue::Owned(iterator.items.into_iter()),
         })
     }
 
@@ -569,6 +681,18 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             .unwrap_or(line_box_fragment::GLYPH_TEXT_TYPE_CONTEXT_DEPENDENT)
     }
 
+    /// The end edges of inline boxes that end right after an out-of-flow box are pending when the iterator reaches
+    /// that box. It takes no edges itself, so they precede the next item rather than follow its content.
+    fn carry_trailing_metrics_past_out_of_flow_box(&mut self) {
+        let Some(trailing) = self.extra_trailing_metrics.take() else {
+            return;
+        };
+        let leading = self.extra_leading_metrics.get_or_insert_default();
+        leading.margin += trailing.margin;
+        leading.border += trailing.border;
+        leading.padding += trailing.padding;
+    }
+
     fn add_extra_box_model_metrics_to_item(
         &mut self,
         item: &mut Item,
@@ -605,13 +729,20 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             && is_last_chunk
             && text_context.text.is_empty()
             && self.context().facts(text_node).produces_line_box_fragment_when_empty();
+        // INTEROP: A text control's text that ends in a preserved newline keeps the empty line after it, which gives
+        //          that line its height and the caret on it a fragment.
+        let synthesize_chunk_after_trailing_newline = chunk.is_none()
+            && text_context.next_chunk_index == chunks.len()
+            && text_context.should_respect_linebreaks
+            && chunks.last().is_some_and(|last| last.has_breaking_newline)
+            && self.context().facts(text_node).is_text_control_text();
         let chunk = if let Some(chunk) = chunk {
             chunk
-        } else if synthesize_zero_length_chunk {
-            text_context.next_chunk_index = 1;
+        } else if synthesize_zero_length_chunk || synthesize_chunk_after_trailing_newline {
+            text_context.next_chunk_index = chunks.len() + 1;
             let parent_style = self.context().style(self.context().parent_node(text_node));
             text_chunker::TextChunk {
-                start: 0,
+                start: text_context.text.len(),
                 length: 0,
                 font: parent_style.first_available_font(),
                 has_breaking_newline: false,
@@ -684,7 +815,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             inline_offset = tab_stop_distance.to_double() as f32;
         }
         let shaped_text = &full_text[shaped_start..shaped_start + shaped_length];
-        let (glyphs, shaped_trailing_whitespace) = shape_glyph_data(
+        let (mut glyphs, shaped_trailing_whitespace) = shape_glyph_data(
             shaped_text,
             chunk.font.clone(),
             text_type,
@@ -692,8 +823,23 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             style.letter_spacing().to_double() as f32,
             word_spacing.to_double() as f32,
         );
+        if !shaped_text.is_empty()
+            && text_is_set_upright(
+                style.writing_mode(),
+                style.text_orientation(),
+                text_chunker::code_point_at(shaped_text, 0),
+            )
+        {
+            // NB: The font's own size takes any font-size-adjust into account.
+            set_glyphs_upright(
+                &mut glyphs,
+                inline_offset,
+                chunk.font.facts().pixel_size + style.letter_spacing().to_double() as f32,
+            );
+        }
         let chunk_inline_size = CssPixels::nearest_value_for_f32(glyphs.width + inline_offset);
         let generated_empty = synthesize_zero_length_chunk
+            || synthesize_chunk_after_trailing_newline
             || (self.context().facts(text_node).is_generated_for_pseudo_element() && chunk.length == 0);
         let mut item = Item::new(ItemType::Text, text_node);
         item.glyphs = Some(glyphs);
@@ -738,12 +884,14 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
                         || extra.border != CssPixels::default()
                         || extra.padding != CssPixels::default()
                 });
+                self.carry_trailing_metrics_past_out_of_flow_box();
                 self.skip_to_next();
                 let mut item = Item::new(ItemType::AbsolutelyPositionedElement, node);
                 item.preceded_by_unattached_inline_start_edges = preceded;
                 return Some(item);
             }
             if facts.is_floating() {
+                self.carry_trailing_metrics_past_out_of_flow_box();
                 self.skip_to_next();
                 return Some(Item::new(ItemType::FloatingElement, node));
             }
@@ -833,20 +981,9 @@ fn record_entered_inline_box<'context>(
     let used = context.create_used_values(node, constraints);
     let style = context.style(node);
     let basis = constraints.inline_basis();
-    used.margin_top.set(style.margin_top().to_px(basis));
-    used.margin_bottom.set(style.margin_bottom().to_px(basis));
-    used.margin_left.set(style.margin_left().to_px(basis));
-    used.border_left.set(style.border_left_width());
-    used.padding_left.set(style.padding_left().to_px(basis));
-    used.margin_right.set(style.margin_right().to_px(basis));
-    used.border_right.set(style.border_right_width());
-    used.padding_right.set(style.padding_right().to_px(basis));
-    used.border_top.set(style.border_top_width());
-    used.border_bottom.set(style.border_bottom_width());
-    used.padding_bottom.set(style.padding_bottom().to_px(basis));
-    used.padding_top.set(style.padding_top().to_px(basis));
+    used.resolve_box_model(&style, basis);
     context.compute_inset(node);
-    if context.run.fragments.is_some() {
+    if context.run.fragments.is_some() && context.run.fragmentainer.is_none() {
         formatting_context::place_child(context.run, node, FfiCssPixelPoint::default(), None);
     }
     used
@@ -857,15 +994,116 @@ pub(crate) struct StashedInlineItems {
     entered_box_model_nodes: Vec<Node>,
 }
 
+struct SharedInlineItems {
+    items: std::rc::Rc<[Item]>,
+    entered_box_model_nodes: std::rc::Rc<[Node]>,
+}
+
+#[derive(Default)]
+pub(crate) struct InlineItemCache {
+    items_by_block_container: RefCell<HashMap<Node, SharedInlineItems>>,
+}
+
+enum ItemQueue {
+    Owned(std::vec::IntoIter<Item>),
+    Shared { items: std::rc::Rc<[Item]>, next: usize },
+}
+
+impl ItemQueue {
+    fn as_slice(&self) -> &[Item] {
+        match self {
+            Self::Owned(items) => items.as_slice(),
+            Self::Shared { items, next } => &items[*next..],
+        }
+    }
+
+    fn next(&mut self) -> Option<Item> {
+        match self {
+            Self::Owned(items) => items.next(),
+            Self::Shared { items, next } => {
+                let item = items.get(*next).cloned();
+                *next += usize::from(item.is_some());
+                item
+            }
+        }
+    }
+
+    fn skip(&mut self, count: usize) {
+        assert!(count <= self.as_slice().len());
+        match self {
+            Self::Owned(items) => items.by_ref().take(count).for_each(drop),
+            Self::Shared { next, .. } => *next += count,
+        }
+    }
+
+    fn into_vec(self) -> Vec<Item> {
+        match self {
+            Self::Owned(items) => items.collect(),
+            Self::Shared { items, next } => items[next..].to_vec(),
+        }
+    }
+}
+
 pub(crate) struct InlineLevelIterator {
     entered_box_model_nodes: Vec<Node>,
-    items: std::vec::IntoIter<Item>,
+    items: ItemQueue,
 }
 
 impl InlineLevelIterator {
     pub(crate) fn new(context: &mut inline_formatting_context::InlineFormattingContext<'_>) -> Self {
         Self::reuse_or_generate(context, AtomicInlineSizing::Layout)
             .expect("normal inline item generation always succeeds")
+    }
+
+    pub(crate) fn new_sharing_items(
+        context: &mut inline_formatting_context::InlineFormattingContext<'_>,
+        cache: &InlineItemCache,
+    ) -> Self {
+        let containing_block = context.containing_block;
+        let shared = cache
+            .items_by_block_container
+            .borrow()
+            .get(&containing_block)
+            .map(|shared| (shared.items.clone(), shared.entered_box_model_nodes.clone()));
+        if let Some((items, entered_box_model_nodes)) = shared {
+            for node in entered_box_model_nodes.iter() {
+                record_entered_inline_box(context, *node);
+            }
+            return Self {
+                entered_box_model_nodes: entered_box_model_nodes.to_vec(),
+                items: ItemQueue::Shared { items, next: 0 },
+            };
+        }
+        let iterator = Self::new(context);
+        if !iterator.items.as_slice().iter().all(|item| {
+            matches!(
+                item.type_,
+                ItemType::Text | ItemType::ForcedBreak | ItemType::Element | ItemType::AbsolutelyPositionedElement
+            )
+        }) {
+            return iterator;
+        }
+        let items = iterator.items.into_vec();
+        let shared_items: std::rc::Rc<[Item]> = items.as_slice().into();
+        cache.items_by_block_container.borrow_mut().insert(
+            containing_block,
+            SharedInlineItems {
+                items: shared_items.clone(),
+                entered_box_model_nodes: iterator.entered_box_model_nodes.as_slice().into(),
+            },
+        );
+        let laid_out_atomic_inlines = items.iter().any(|item| item.type_ == ItemType::Element);
+        Self {
+            entered_box_model_nodes: iterator.entered_box_model_nodes,
+            items: if laid_out_atomic_inlines {
+                ItemQueue::Owned(items.into_iter())
+            } else {
+                ItemQueue::Shared {
+                    items: shared_items,
+                    next: 0,
+                }
+            },
+        }
     }
 
     pub(crate) fn for_intrinsic_inline_size(
@@ -891,34 +1129,36 @@ impl InlineLevelIterator {
         }
         Self {
             entered_box_model_nodes: stash.entered_box_model_nodes,
-            items: stash.items.into_iter(),
+            items: ItemQueue::Owned(stash.items.into_iter()),
         }
     }
 
     /// Element items and percentage inline-box margins and paddings depend on the run's available space.
-    pub(crate) fn stash_for_reuse(self, context: &inline_formatting_context::InlineFormattingContext<'_>) {
-        if self
-            .items
+    fn is_independent_of_available_space(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        self.items
             .as_slice()
             .iter()
-            .any(|item| !matches!(item.type_, ItemType::Text | ItemType::ForcedBreak))
-        {
+            .all(|item| matches!(item.type_, ItemType::Text | ItemType::ForcedBreak))
+            && self.entered_box_model_nodes.iter().all(|node| {
+                let style = context.style(*node);
+                !style.margin_left().contains_percentage()
+                    && !style.margin_right().contains_percentage()
+                    && !style.padding_left().contains_percentage()
+                    && !style.padding_right().contains_percentage()
+            })
+    }
+
+    pub(crate) fn stash_for_reuse(self, context: &inline_formatting_context::InlineFormattingContext<'_>) {
+        if !self.is_independent_of_available_space(context) {
             return;
-        }
-        for node in &self.entered_box_model_nodes {
-            let style = context.style(*node);
-            if style.margin_left().contains_percentage()
-                || style.margin_right().contains_percentage()
-                || style.padding_left().contains_percentage()
-                || style.padding_right().contains_percentage()
-            {
-                return;
-            }
         }
         context.callbacks.scratch().store_inline_item_stash(
             context.containing_block,
             StashedInlineItems {
-                items: self.items.collect(),
+                items: self.items.into_vec(),
                 entered_box_model_nodes: self.entered_box_model_nodes,
             },
         );
@@ -928,13 +1168,20 @@ impl InlineLevelIterator {
         self.items.next()
     }
 
+    pub(crate) fn entered_inline_boxes(&self) -> &[Node] {
+        &self.entered_box_model_nodes
+    }
+
+    pub(crate) fn shares_items(&self) -> bool {
+        matches!(self.items, ItemQueue::Shared { .. })
+    }
+
     pub(crate) fn items(&self) -> &[Item] {
         self.items.as_slice()
     }
 
     pub(crate) fn skip_items(&mut self, count: usize) {
-        assert!(count <= self.items.len());
-        self.items.by_ref().take(count).for_each(drop);
+        self.items.skip(count);
     }
 
     pub(crate) fn next_inline_run_size(

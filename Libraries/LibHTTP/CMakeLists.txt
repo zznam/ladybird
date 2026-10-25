@@ -13,6 +13,10 @@ set(SOURCES
     HTTP.cpp
     HttpRequest.cpp
     Method.cpp
+    NetworkIsolationKey.cpp
+    Port.cpp
+    Proxy.cpp
+    StructuredFields.cpp
 )
 
 include(hsts_preload)

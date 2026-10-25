@@ -6,6 +6,7 @@
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::layout::node_data::NodeSlotId;
+use crate::painting::record::inputs::RecordingInputs;
 use crate::painting::record::order_tree::PaintOrderTree;
 use crate::painting::record::scratch::RecordingScratch;
 use crate::painting::record::{PublishedHitTestItems, RecordingOutput};
@@ -20,14 +21,31 @@ pub(crate) struct RecorderState {
     /// The last recording that published, which the next one copies clean output from.
     pub(crate) published_recording: Option<Arc<RecordingOutput>>,
     pub(crate) published_hit_test_items: Option<Arc<PublishedHitTestItems>>,
-    /// The paint-order tree describing the published recording; a recording appends to it and
-    /// publication or discarding decides what stays.
+    /// The paint-order tree describing the published recording; a recording that publishes
+    /// appends to it and publication or discarding decides what stays.
     pub(crate) paint_order_tree: PaintOrderTree,
     /// The recording's workspace, whose tables one recording leaves for the next to reuse.
     pub(crate) scratch: RecordingScratch,
     /// The absolute rects the recordings computed, which stay valid while the document's geometry
     /// does.
     pub(crate) absolute_rects: RefCell<AbsoluteRectMemo>,
+    /// The inputs the last recording that publishes recorded with, which a clock lane's ticks record again with.
+    pub(crate) published_inputs: Option<RecordingInputs>,
+}
+
+impl RecorderState {
+    /// A fork of the recorder state, for a fork of the document's render state to record with: it copies clean output
+    /// from the same recording, and keeps no scratch or memo of its own.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            published_recording: self.published_recording.clone(),
+            published_hit_test_items: self.published_hit_test_items.clone(),
+            paint_order_tree: self.paint_order_tree.clone(),
+            scratch: Default::default(),
+            absolute_rects: Default::default(),
+            published_inputs: self.published_inputs.clone(),
+        }
+    }
 }
 
 /// Each row's absolute rect, with the geometry epoch of the frame it was computed from.

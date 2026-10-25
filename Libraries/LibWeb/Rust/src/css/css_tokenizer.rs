@@ -16,8 +16,8 @@ const TOKENIZER_EOF: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
+#[expect(clippy::upper_case_acronyms, reason = "C++ names the tokens CDO and CDC")]
 pub enum CssTokenType {
-    Invalid,
     EndOfFile,
     Ident,
     Function,
@@ -112,36 +112,6 @@ pub(crate) struct Token {
     range: Range<SourcePosition>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum OwnedTokenKind {
-    Ident(Vec<u16>),
-    Function(Vec<u16>),
-    AtKeyword,
-    Hash,
-    Url,
-    BadUrl,
-    Number,
-    Percentage,
-    Dimension,
-    Cdc,
-    Delim(u32),
-    Whitespace,
-    Comma,
-    OpenSquare,
-    CloseSquare,
-    OpenParen,
-    CloseParen,
-    OpenCurly,
-    CloseCurly,
-    Other,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OwnedToken {
-    pub kind: OwnedTokenKind,
-    pub source: ParserSource,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum TokenizerInput<'a> {
     Ascii(&'a [u8]),
@@ -162,8 +132,8 @@ impl TokenizerInput<'_> {
             return Some(Self::Ascii(&[]));
         }
         match (ascii.is_null(), utf16.is_null()) {
-            (false, true) => Some(Self::Ascii(unsafe { std::slice::from_raw_parts(ascii, length) })),
-            (true, false) => Some(Self::Utf16(unsafe { std::slice::from_raw_parts(utf16, length) })),
+            (false, true) => Some(Self::Ascii(unsafe { ak::slice_from_raw_parts(ascii, length) })),
+            (true, false) => Some(Self::Utf16(unsafe { ak::slice_from_raw_parts(utf16, length) })),
             _ => None,
         }
     }
@@ -357,6 +327,13 @@ pub(crate) enum ParserString {
 }
 
 impl ParserString {
+    /// Moves the string out of the storage it shares with the other strings of its tokens (see `TextDetacher`).
+    pub(crate) fn detach(&mut self, detacher: &mut TextDetacher) {
+        if let Self::Shared { storage, range } = self {
+            detacher.string(storage, range);
+        }
+    }
+
     fn finish_shared(&mut self, storage: Arc<[u16]>, offset: usize) {
         let Self::Pending(range) = self else {
             return;
@@ -442,8 +419,21 @@ pub(crate) enum ParserTokenKind {
 }
 
 impl ParserTokenKind {
+    /// Detaches the token's string, if it has one (see `ParserString::detach`).
+    pub(crate) fn detach(&mut self, detacher: &mut TextDetacher) {
+        if let Some(string) = self.string_mut() {
+            string.detach(detacher);
+        }
+    }
+
     fn finish_shared_strings(&mut self, storage: Arc<[u16]>, offset: usize) {
-        let string = match self {
+        if let Some(string) = self.string_mut() {
+            string.finish_shared(storage, offset);
+        }
+    }
+
+    fn string_mut(&mut self) -> Option<&mut ParserString> {
+        match self {
             Self::Ident(value)
             | Self::Function(value)
             | Self::AtKeyword(value)
@@ -452,9 +442,6 @@ impl ParserTokenKind {
             Self::Hash { value, .. } => Some(value),
             Self::Dimension { unit, .. } => Some(unit),
             _ => None,
-        };
-        if let Some(string) = string {
-            string.finish_shared(storage, offset);
         }
     }
 }
@@ -483,6 +470,77 @@ pub(crate) enum SourceStorage {
     Utf16(Box<[u16]>),
 }
 
+impl SourceStorage {
+    fn from_input(input: TokenizerInput<'_>) -> Self {
+        match input {
+            TokenizerInput::Ascii(units) => Self::Ascii(units.into()),
+            TokenizerInput::Utf16(units) => Self::Utf16(units.into()),
+        }
+    }
+
+    fn as_input(&self) -> TokenizerInput<'_> {
+        match self {
+            Self::Ascii(units) => TokenizerInput::Ascii(units),
+            Self::Utf16(units) => TokenizerInput::Utf16(units),
+        }
+    }
+}
+
+/// Moves the text that values outliving their parse keep out of the storage they share with the rest of the sheet, so
+/// that keeping them does not keep the whole sheet's text alive. The values are walked twice: once to find the span of
+/// each storage they keep, and once to point them into one copy of that span.
+#[derive(Default)]
+pub(crate) struct TextDetacher {
+    sources: DetachedSpans<SourceStorage>,
+    strings: DetachedSpans<[u16]>,
+}
+
+/// Each storage values keep text of, the span of it they keep, and its copy once it is made.
+type DetachedSpans<T> = Vec<(Arc<T>, Range<usize>, Option<Arc<T>>)>;
+
+impl TextDetacher {
+    /// Detaches the text of the values `walk` hands to the detacher, by calling it twice.
+    pub(crate) fn detach(mut walk: impl FnMut(&mut Self)) {
+        let mut detacher = Self::default();
+        walk(&mut detacher);
+        for (storage, span, copy) in &mut detacher.sources {
+            *copy = Some(Arc::new(match storage.as_ref() {
+                SourceStorage::Ascii(units) => SourceStorage::Ascii(units[span.clone()].into()),
+                SourceStorage::Utf16(units) => SourceStorage::Utf16(units[span.clone()].into()),
+            }));
+        }
+        for (storage, span, copy) in &mut detacher.strings {
+            *copy = Some(storage[span.clone()].into());
+        }
+        walk(&mut detacher);
+    }
+
+    fn source(&mut self, storage: &mut Arc<SourceStorage>, range: &mut Range<usize>) {
+        Self::visit(&mut self.sources, storage, range);
+    }
+
+    fn string(&mut self, storage: &mut Arc<[u16]>, range: &mut Range<usize>) {
+        Self::visit(&mut self.strings, storage, range);
+    }
+
+    fn visit<T: ?Sized>(spans: &mut DetachedSpans<T>, storage: &mut Arc<T>, range: &mut Range<usize>) {
+        let Some((_, span, copy)) = spans.iter_mut().find(|(candidate, ..)| Arc::ptr_eq(candidate, storage)) else {
+            spans.push((Arc::clone(storage), range.clone(), None));
+            return;
+        };
+        match copy {
+            None => {
+                span.start = span.start.min(range.start);
+                span.end = span.end.max(range.end);
+            }
+            Some(copy) => {
+                *storage = Arc::clone(copy);
+                *range = range.start - span.start..range.end - span.start;
+            }
+        }
+    }
+}
+
 pub(crate) enum ParserSourceIter<'a> {
     Empty,
     Owned(std::slice::Iter<'a, u16>),
@@ -509,6 +567,13 @@ impl ParserSource {
 
     fn shared(storage: Arc<SourceStorage>, range: Range<usize>) -> Self {
         Self::Shared { storage, range }
+    }
+
+    /// Moves the source text out of the whole source it shares with every other token (see `TextDetacher`).
+    pub(crate) fn detach(&mut self, detacher: &mut TextDetacher) {
+        if let Self::Shared { storage, range } = self {
+            detacher.source(storage, range);
+        }
     }
 
     pub(crate) fn covering(first: &Self, last: &Self) -> Option<Self> {
@@ -562,26 +627,6 @@ impl ParserSource {
         }
     }
 
-    pub(crate) fn equals_ascii(&self, expected: &[u8]) -> bool {
-        if self.len() != expected.len() {
-            return false;
-        }
-        match self {
-            Self::Empty => expected.is_empty(),
-            Self::Owned(source) => source
-                .iter()
-                .zip(expected)
-                .all(|(&left, &right)| left == u16::from(right)),
-            Self::Shared { storage, range } => match storage.as_ref() {
-                SourceStorage::Ascii(source) => &source[range.clone()] == expected,
-                SourceStorage::Utf16(source) => source[range.clone()]
-                    .iter()
-                    .zip(expected)
-                    .all(|(&left, &right)| left == u16::from(right)),
-            },
-        }
-    }
-
     pub(crate) fn to_vec(&self) -> Vec<u16> {
         let mut result = Vec::with_capacity(self.len());
         self.append_to(&mut result);
@@ -598,7 +643,10 @@ impl PartialEq for ParserSource {
 impl Eq for ParserSource {}
 
 pub(crate) fn tokenize_for_parser<'a>(input: impl Into<TokenizerInput<'a>>) -> Vec<ParserToken> {
-    tokenize_for_parser_internal(input, true)
+    let input = input.into();
+    let mut tokens = Vec::with_capacity(input.len() / 3);
+    ParserTokenFeed::new(input).fill(&mut tokens, usize::MAX);
+    tokens
 }
 
 pub(crate) fn tokenize_for_parser_without_source<'a>(input: impl Into<TokenizerInput<'a>>) -> SmallParserTokenList {
@@ -665,132 +713,115 @@ fn tokenize_for_parser_without_source_internal<'a>(input: impl Into<TokenizerInp
     tokens
 }
 
-fn tokenize_for_parser_internal<'a>(
-    input: impl Into<TokenizerInput<'a>>,
-    retain_original_source: bool,
-) -> Vec<ParserToken> {
-    let input = input.into();
-    let estimated_token_count = input.len() / 3;
-    let mut tokens = Vec::with_capacity(estimated_token_count);
-    let mut string_storage = Vec::with_capacity(input.len() / 2);
-    let mut source_storage = None;
-    tokenize(input, |token, filtered_input| {
-        if matches!(token.token_type, TokenType::EndOfFile) {
-            return;
-        }
-        // Copy the filtered source only when tokens will keep slices into it.
-        let source_storage = retain_original_source.then(|| {
-            source_storage.get_or_insert_with(|| {
-                Arc::new(match filtered_input {
-                    TokenizerInput::Ascii(units) => SourceStorage::Ascii(units.into()),
-                    TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
-                })
-            })
-        });
-        let mut string = |value: &[u16]| {
-            let start = string_storage.len();
-            string_storage.extend_from_slice(value);
-            ParserString::Pending(start..string_storage.len())
-        };
-        let kind = match &token.token_type {
-            TokenType::Ident { value } => ParserTokenKind::Ident(string(value)),
-            TokenType::Function { name } => ParserTokenKind::Function(string(name)),
-            TokenType::AtKeyword { name } => ParserTokenKind::AtKeyword(string(name)),
-            TokenType::Hash { hash_type, value } => ParserTokenKind::Hash {
-                value: string(value),
-                is_id: *hash_type == CssHashType::Id,
-            },
-            TokenType::String { value } => ParserTokenKind::String(string(value)),
-            TokenType::BadString => ParserTokenKind::BadString,
-            TokenType::Url { value } => ParserTokenKind::Url(string(value)),
-            TokenType::BadUrl => ParserTokenKind::BadUrl,
-            TokenType::Delim { value } => ParserTokenKind::Delim(*value),
-            TokenType::Number { number } => ParserTokenKind::Number {
-                value: number.value,
-                number_type: number.number_type,
-            },
-            TokenType::Percentage { number } => ParserTokenKind::Percentage {
-                value: number.value,
-                number_type: number.number_type,
-            },
-            TokenType::Dimension { number, unit } => ParserTokenKind::Dimension {
-                value: number.value,
-                number_type: number.number_type,
-                unit: string(unit),
-            },
-            TokenType::Whitespace => ParserTokenKind::Whitespace,
-            TokenType::Cdo => ParserTokenKind::Cdo,
-            TokenType::Cdc => ParserTokenKind::Cdc,
-            TokenType::Colon => ParserTokenKind::Colon,
-            TokenType::Semicolon => ParserTokenKind::Semicolon,
-            TokenType::Comma => ParserTokenKind::Comma,
-            TokenType::OpenSquare => ParserTokenKind::OpenSquare,
-            TokenType::CloseSquare => ParserTokenKind::CloseSquare,
-            TokenType::OpenParen => ParserTokenKind::OpenParen,
-            TokenType::CloseParen => ParserTokenKind::CloseParen,
-            TokenType::OpenCurly => ParserTokenKind::OpenCurly,
-            TokenType::CloseCurly => ParserTokenKind::CloseCurly,
-            TokenType::EndOfFile => unreachable!(),
-        };
-        tokens.push(ParserToken {
-            kind,
-            source: match source_storage {
-                Some(storage) => ParserSource::shared(storage.clone(), token.original_source_range.clone()),
-                None => ParserSource::Empty,
-            },
-            start_position: token.range.start,
-            end_position: token.range.end,
-        });
-    });
-    let string_storage: Arc<[u16]> = string_storage.into();
-    for token in &mut tokens {
-        token.kind.finish_shared_strings(string_storage.clone(), 0);
+// Converts a token, appending its string value to string_storage — which finish_shared_strings() then hands to the
+// tokens converted with it.
+fn parser_token(
+    token: &Token,
+    source_storage: Option<&Arc<SourceStorage>>,
+    string_storage: &mut Vec<u16>,
+) -> ParserToken {
+    let mut string = |value: &[u16]| {
+        let start = string_storage.len();
+        string_storage.extend_from_slice(value);
+        ParserString::Pending(start..string_storage.len())
+    };
+    let kind = match &token.token_type {
+        TokenType::Ident { value } => ParserTokenKind::Ident(string(value)),
+        TokenType::Function { name } => ParserTokenKind::Function(string(name)),
+        TokenType::AtKeyword { name } => ParserTokenKind::AtKeyword(string(name)),
+        TokenType::Hash { hash_type, value } => ParserTokenKind::Hash {
+            value: string(value),
+            is_id: *hash_type == CssHashType::Id,
+        },
+        TokenType::String { value } => ParserTokenKind::String(string(value)),
+        TokenType::BadString => ParserTokenKind::BadString,
+        TokenType::Url { value } => ParserTokenKind::Url(string(value)),
+        TokenType::BadUrl => ParserTokenKind::BadUrl,
+        TokenType::Delim { value } => ParserTokenKind::Delim(*value),
+        TokenType::Number { number } => ParserTokenKind::Number {
+            value: number.value,
+            number_type: number.number_type,
+        },
+        TokenType::Percentage { number } => ParserTokenKind::Percentage {
+            value: number.value,
+            number_type: number.number_type,
+        },
+        TokenType::Dimension { number, unit } => ParserTokenKind::Dimension {
+            value: number.value,
+            number_type: number.number_type,
+            unit: string(unit),
+        },
+        TokenType::Whitespace => ParserTokenKind::Whitespace,
+        TokenType::Cdo => ParserTokenKind::Cdo,
+        TokenType::Cdc => ParserTokenKind::Cdc,
+        TokenType::Colon => ParserTokenKind::Colon,
+        TokenType::Semicolon => ParserTokenKind::Semicolon,
+        TokenType::Comma => ParserTokenKind::Comma,
+        TokenType::OpenSquare => ParserTokenKind::OpenSquare,
+        TokenType::CloseSquare => ParserTokenKind::CloseSquare,
+        TokenType::OpenParen => ParserTokenKind::OpenParen,
+        TokenType::CloseParen => ParserTokenKind::CloseParen,
+        TokenType::OpenCurly => ParserTokenKind::OpenCurly,
+        TokenType::CloseCurly => ParserTokenKind::CloseCurly,
+        TokenType::EndOfFile => unreachable!(),
+    };
+    ParserToken {
+        kind,
+        source: match source_storage {
+            Some(storage) => ParserSource::shared(storage.clone(), token.original_source_range.clone()),
+            None => ParserSource::Empty,
+        },
+        start_position: token.range.start,
+        end_position: token.range.end,
     }
-    tokens
 }
 
-pub(crate) fn tokenize_owned<'a>(input: impl Into<TokenizerInput<'a>>) -> Vec<OwnedToken> {
-    let input = input.into();
-    let mut storage = None;
-    let mut tokens = Vec::new();
-    tokenize(input, |token, filtered_input| {
-        let storage = storage.get_or_insert_with(|| {
-            Arc::new(match filtered_input {
-                TokenizerInput::Ascii(units) => SourceStorage::Ascii(units.into()),
-                TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
-            })
-        });
-        if matches!(token.token_type, TokenType::EndOfFile) {
-            return;
+fn finish_shared_strings(tokens: &mut [ParserToken], string_storage: Vec<u16>) {
+    let string_storage: Arc<[u16]> = string_storage.into();
+    for token in tokens {
+        token.kind.finish_shared_strings(string_storage.clone(), 0);
+    }
+}
+
+/// Tokenizes a source for the parser a chunk of tokens at a time, as the parser asks for them — so the tokens of a
+/// whole style sheet never have to exist at once.
+pub(crate) struct ParserTokenFeed {
+    source: Arc<SourceStorage>,
+    // None once the tokenizer has reached the end of the source.
+    cursor: Option<TokenizerCursor>,
+}
+
+impl ParserTokenFeed {
+    pub(crate) fn new(input: TokenizerInput<'_>) -> Self {
+        let source = Arc::new(SourceStorage::from_input(filter_code_points(input).as_input()));
+        let cursor = Tokenizer::new(source.as_input()).cursor();
+        Self {
+            source,
+            cursor: Some(cursor),
         }
-        let kind = match &token.token_type {
-            TokenType::Ident { value } => OwnedTokenKind::Ident(value.to_vec()),
-            TokenType::Function { name } => OwnedTokenKind::Function(name.to_vec()),
-            TokenType::AtKeyword { .. } => OwnedTokenKind::AtKeyword,
-            TokenType::Hash { .. } => OwnedTokenKind::Hash,
-            TokenType::Url { .. } => OwnedTokenKind::Url,
-            TokenType::BadUrl => OwnedTokenKind::BadUrl,
-            TokenType::Number { .. } => OwnedTokenKind::Number,
-            TokenType::Percentage { .. } => OwnedTokenKind::Percentage,
-            TokenType::Dimension { .. } => OwnedTokenKind::Dimension,
-            TokenType::Cdc => OwnedTokenKind::Cdc,
-            TokenType::Delim { value } => OwnedTokenKind::Delim(*value),
-            TokenType::Whitespace => OwnedTokenKind::Whitespace,
-            TokenType::Comma => OwnedTokenKind::Comma,
-            TokenType::OpenSquare => OwnedTokenKind::OpenSquare,
-            TokenType::CloseSquare => OwnedTokenKind::CloseSquare,
-            TokenType::OpenParen => OwnedTokenKind::OpenParen,
-            TokenType::CloseParen => OwnedTokenKind::CloseParen,
-            TokenType::OpenCurly => OwnedTokenKind::OpenCurly,
-            TokenType::CloseCurly => OwnedTokenKind::CloseCurly,
-            _ => OwnedTokenKind::Other,
+    }
+
+    /// Appends up to `count` more tokens to `tokens`, and returns false if the source had none left.
+    pub(crate) fn fill(&mut self, tokens: &mut Vec<ParserToken>, count: usize) -> bool {
+        let Some(cursor) = self.cursor else {
+            return false;
         };
-        tokens.push(OwnedToken {
-            kind,
-            source: ParserSource::shared(storage.clone(), token.original_source_range.clone()),
-        });
-    });
-    tokens
+        let first = tokens.len();
+        let mut string_storage = Vec::new();
+        let mut tokenizer = Tokenizer::resume(self.source.as_input(), cursor);
+        self.cursor = loop {
+            if tokens.len() - first == count {
+                break Some(tokenizer.cursor());
+            }
+            let token = tokenizer.next_token();
+            if matches!(token.token_type, TokenType::EndOfFile) {
+                break None;
+            }
+            tokens.push(parser_token(&token, Some(&self.source), &mut string_storage));
+        };
+        finish_shared_strings(&mut tokens[first..], string_storage);
+        tokens.len() > first
+    }
 }
 
 type TokenString = SmallVec<[u16; 16]>;
@@ -888,8 +919,22 @@ struct Tokenizer<'a> {
     prev_position: SourcePosition,
 }
 
+// The state a tokenizer resumes from, at the start of its next token.
+#[derive(Clone, Copy)]
+struct TokenizerCursor {
+    index: usize,
+    prev_index: usize,
+    current_code_point: u32,
+    position: SourcePosition,
+    prev_position: SourcePosition,
+}
+
 impl<'a> Tokenizer<'a> {
     fn new(input: TokenizerInput<'a>) -> Self {
+        // Checked once here, not per code point: that made debug builds quadratic in the input length.
+        if let TokenizerInput::Ascii(units) = input {
+            debug_assert!(units.is_ascii(), "an ASCII tokenizer input holds only ASCII bytes");
+        }
         Self {
             input,
             index: 0,
@@ -900,14 +945,40 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    fn resume(input: TokenizerInput<'a>, cursor: TokenizerCursor) -> Self {
+        Self {
+            input,
+            index: cursor.index,
+            prev_index: cursor.prev_index,
+            current_code_point: cursor.current_code_point,
+            position: cursor.position,
+            prev_position: cursor.prev_position,
+        }
+    }
+
+    fn cursor(&self) -> TokenizerCursor {
+        TokenizerCursor {
+            index: self.index,
+            prev_index: self.prev_index,
+            current_code_point: self.current_code_point,
+            position: self.position,
+            prev_position: self.prev_position,
+        }
+    }
+
+    fn next_token(&mut self) -> Token {
+        let token_start = self.position;
+        let mut token = self.consume_a_token();
+        token.range = token_start..self.position;
+        token
+    }
+
     fn tokenize<F>(mut self, mut callback: F)
     where
         F: FnMut(&Token, TokenizerInput<'a>),
     {
         loop {
-            let token_start = self.position;
-            let mut token = self.consume_a_token();
-            token.range = token_start..self.position;
+            let token = self.next_token();
             let is_eof = matches!(token.token_type, TokenType::EndOfFile);
             callback(&token, self.input);
 
@@ -960,10 +1031,7 @@ impl<'a> Tokenizer<'a> {
 
     fn code_point_at(&self, index: usize) -> Option<(u32, usize)> {
         match self.input {
-            TokenizerInput::Ascii(units) => {
-                debug_assert!(units.is_ascii());
-                units.get(index).map(|unit| (u32::from(*unit), 1))
-            }
+            TokenizerInput::Ascii(units) => units.get(index).map(|unit| (u32::from(*unit), 1)),
             TokenizerInput::Utf16(units) => {
                 let first = *units.get(index)?;
                 if (0xD800..=0xDBFF).contains(&first)
@@ -2230,7 +2298,7 @@ mod tests {
         let ascii = b"color: rgb(1 2 3)";
         let utf16 = ascii.iter().copied().map(u16::from).collect::<Vec<_>>();
 
-        assert_eq!(tokenize_owned(ascii), tokenize_owned(&utf16));
+        assert_eq!(tokenize_for_parser(ascii), tokenize_for_parser(&utf16));
     }
 
     #[test]
@@ -2251,7 +2319,7 @@ mod tests {
         ];
         let filtered = "a\nb\nc\nd\u{fffd}e\u{fffd}f".encode_utf16().collect::<Vec<_>>();
 
-        assert_eq!(tokenize_owned(&unfiltered), tokenize_owned(&filtered));
+        assert_eq!(tokenize_for_parser(&unfiltered), tokenize_for_parser(&filtered));
     }
 
     #[test]
@@ -2277,7 +2345,7 @@ mod tests {
 
     #[test]
     fn token_sources_preserve_the_input_storage_representation() {
-        let ascii_tokens = tokenize_owned(b"color");
+        let ascii_tokens = tokenize_for_parser(b"color");
         let ParserSource::Shared { storage, range } = &ascii_tokens[0].source else {
             panic!("token source should use shared storage");
         };
@@ -2285,7 +2353,7 @@ mod tests {
         assert_eq!(range.clone(), 0..5);
 
         let utf16 = "café".encode_utf16().collect::<Vec<_>>();
-        let utf16_tokens = tokenize_owned(&utf16);
+        let utf16_tokens = tokenize_for_parser(&utf16);
         let ParserSource::Shared { storage, range } = &utf16_tokens[0].source else {
             panic!("token source should use shared storage");
         };

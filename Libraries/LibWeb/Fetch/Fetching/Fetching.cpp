@@ -46,7 +46,6 @@
 #include <LibWeb/Fetch/Infrastructure/PortBlocking.h>
 #include <LibWeb/Fetch/Infrastructure/PreflightCache.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -62,24 +61,30 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/MixedContent/AbstractOperations.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/SRI/SRI.h>
-#include <LibWeb/SecureContexts/AbstractOperations.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/Streams/TransformStream.h>
-#include <LibWeb/Streams/TransformStreamDefaultController.h>
-#include <LibWeb/Streams/TransformStreamOperations.h>
+#include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
+#include <LibWebCommon/Fetch/Infrastructure/DataURL.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 
 namespace Web::Fetch::Fetching {
 
 static bool g_http_memory_cache_enabled = false;
+
+// In test mode, RequestServer's disk cache stores only the responses to requests that ask for it with a header, which a
+// page cannot add to a navigation request. Tests can have every navigation request ask for it.
+static bool g_disk_cache_enabled_for_navigations_for_testing = false;
 
 #define TRY_OR_IGNORE(expression)                                                                    \
     ({                                                                                               \
@@ -95,14 +100,14 @@ class HTTPCache {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    HTTP::MemoryCache& get(Infrastructure::NetworkPartitionKey const& key)
+    HTTP::MemoryCache& get(Utf16String const& key)
     {
         return *m_cache.ensure(key, [] {
             return HTTP::MemoryCache::create();
         });
     }
 
-    HTTP::MemoryCache* get_if_exists(Infrastructure::NetworkPartitionKey const& key)
+    HTTP::MemoryCache* get_if_exists(Utf16String const& key)
     {
         auto it = m_cache.find(key);
         if (it == m_cache.end())
@@ -122,7 +127,7 @@ public:
     }
 
 private:
-    HashMap<Infrastructure::NetworkPartitionKey, NonnullRefPtr<HTTP::MemoryCache>> m_cache;
+    HashMap<Utf16String, NonnullRefPtr<HTTP::MemoryCache>> m_cache;
 };
 
 // https://fetch.spec.whatwg.org/#determine-the-http-cache-partition
@@ -131,12 +136,16 @@ static RefPtr<HTTP::MemoryCache> determine_the_http_cache_partition(Infrastructu
     // 1. Let key be the result of determining the network partition key given request.
     auto key = Infrastructure::determine_the_network_partition_key(request);
 
+    // NB: We partition this cache like RequestServer's disk cache, which a request from a document with an opaque
+    //     origin does not use.
+    auto partition = key.has_value() ? key->disk_cache_partition() : OptionalNone {};
+
     // 2. If key is null, then return null.
-    if (!key.has_value())
+    if (!partition.has_value())
         return nullptr;
 
     // 3. Return the unique HTTP cache associated with key. [HTTP-CACHING]
-    return HTTPCache::the().get(key.value());
+    return HTTPCache::the().get(*partition);
 }
 
 static GC::Ptr<Infrastructure::Response> select_response_from_cache(JS::Realm& realm, HTTP::MemoryCache& http_cache, Infrastructure::Request const& request)
@@ -264,6 +273,7 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
         // 3. Let foundPreloadedResource be the result of invoking consume a preloaded resource for request’s
         //    window, given request’s URL, request’s destination, request’s mode, request’s credentials mode,
         //    request’s integrity metadata, and onPreloadedResponseAvailable.
+        bool preload_reports_timing = false;
         auto found_preloaded_resource = HTML::consume_a_preloaded_resource(
             *client_window,
             request.url(),
@@ -272,7 +282,9 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
             request.credentials_mode(),
             request.integrity_metadata(),
             on_preloaded_response_available,
-            fetch_params->task_destination());
+            fetch_params->task_destination(),
+            preload_reports_timing);
+        fetch_params->set_preload_reports_timing(preload_reports_timing);
 
         // 4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null, then set
         //    fetchParams’s preloaded response candidate to "pending".
@@ -358,6 +370,9 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
         request.client()->fetch_group().append(record);
     }
 
+    if (Core::StatsLog::the() && client_window && request.is_subresource_request())
+        begin_rendering_pending_operation(fetch_params->controller().ptr(), client_window->associated_document(), RenderingPendingReason::ResourceFetchesInFlight);
+
     // 15. Run main fetch given fetchParams.
     (void)main_fetch(realm, fetch_params);
 
@@ -432,7 +447,8 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     // 4. Run report Content Security Policy violations for request.
     ContentSecurityPolicy::report_content_security_policy_violations_for_request(realm, request);
 
-    // FIXME: 5. Upgrade request to a potentially trustworthy URL, if appropriate.
+    // 5. Upgrade request to a potentially trustworthy URL, if appropriate.
+    UpgradeInsecureRequests::upgrade_request_to_a_potentially_trustworthy_url_if_appropriate(request);
 
     // 6. Upgrade a mixed content request to a potentially trustworthy URL, if appropriate.
     MixedContent::upgrade_a_mixed_content_request_to_a_potentially_trustworthy_url_if_appropriate(request);
@@ -895,6 +911,7 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
         auto process_response_end_of_body_task = GC::create_function(GC::Heap::the(), [&fetch_params, &response] {
             // 1. Set fetchParams’s request’s done flag.
             fetch_params.request()->set_done(true);
+            end_rendering_pending_operation(fetch_params.controller().ptr());
 
             // 2. If fetchParams’s process response end-of-body is non-null, then run fetchParams’s process response
             //    end-of-body given response.
@@ -904,9 +921,11 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
             // 3. If fetchParams’s request’s initiator type is non-null and fetchParams’s request’s client’s global
             //    object is fetchParams’s task destination, then run fetchParams’s controller’s report timing steps
             //    given fetchParams’s request’s client’s global object.
+            // AD-HOC: Not when this fetch consumed a preload that reports its own timing. Other engines report a single
+            //         entry for a preloaded resource and its consumer.
             auto client = fetch_params.request()->client();
             auto const* task_destination_global_object = fetch_params.task_destination().get_pointer<GC::Ref<JS::Object>>();
-            if (client != nullptr && task_destination_global_object != nullptr) {
+            if (client != nullptr && task_destination_global_object != nullptr && !fetch_params.preload_reports_timing()) {
                 if (fetch_params.request()->initiator_type().has_value() && &client->global_object() == task_destination_global_object->ptr())
                     fetch_params.controller()->report_timing(client->global_object());
             }
@@ -926,6 +945,9 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
 
     // 5. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
     auto internal_response = response.is_network_error() ? GC::Ref { response } : response.unsafe_response();
+
+    if (Core::StatsLog::the() && internal_response->body())
+        track_rendering_pending_stream(fetch_params.controller().ptr(), *internal_response->body()->stream());
 
     auto algorithms = fetch_params.algorithms();
 
@@ -963,11 +985,13 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
         HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 1. Let transformStream be a new TransformStream.
-        auto transform_stream = GC::Heap::the().allocate<Streams::TransformStream>();
+        auto transform_stream = Streams::TransformStream::create(realm);
 
         // 2. Let identityTransformAlgorithm be an algorithm which, given chunk, enqueues chunk in transformStream.
         auto identity_transform_algorithm = GC::create_function(GC::Heap::the(), [&realm, transform_stream](JS::Value chunk) -> GC::Ref<WebIDL::Promise> {
-            MUST(Streams::transform_stream_default_controller_enqueue(realm, *transform_stream->controller(), chunk));
+            if (auto result = transform_stream->enqueue(chunk); result.is_error())
+                return WebIDL::create_rejected_promise_from_exception(realm, result.release_error());
+
             return WebIDL::create_resolved_promise(realm, JS::js_undefined());
         });
 
@@ -999,9 +1023,11 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
 
         // 2. Let processBodyError be this step: run fetchParams’s process response consume body given response and
         //    failure.
-        auto process_body_error = GC::create_function(GC::Heap::the(), [algorithms, &response, setup_report_timing_steps](JS::Value) {
+        auto process_body_error = GC::create_function(GC::Heap::the(), [algorithms, &response, controller = fetch_params.controller(), setup_report_timing_steps](JS::Value) {
             // AD-HOC: See comment on setup_report_timing_steps above.
             setup_report_timing_steps();
+            // NB: A failed read does not always close or error the body's stream, which would otherwise end this.
+            end_rendering_pending_operation(controller.ptr());
             (algorithms->process_response_consume_body())(response, Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag {});
         });
 
@@ -1226,7 +1252,7 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
             }
 
             // 8. Let slicedBlob be the result of invoking slice blob given blob, rangeStart, rangeEnd + 1, and type.
-            auto sliced_blob = MUST(blob->slice_blob(*range_start, *range_end + 1, type));
+            auto sliced_blob = blob->slice_blob(*range_start, *range_end + 1, type);
 
             // 9. Let slicedBodyWithType be the result of safely extracting slicedBlob.
             auto sliced_body_with_type = safely_extract_body(realm, sliced_blob->raw_bytes());
@@ -1300,9 +1326,11 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
             return error;
 
         auto origin_is_allowed = [&] {
-            // Only a client that itself came from a file:// URL may reach the local file system.
+            // Only a client that itself came from a file:// URL may reach the local file system. Traversing back to a
+            // file:// entry fetches it with the client of the document it replaces, though, which the UI process lets
+            // read the file of an entry that held local file content.
             if (request->current_url().scheme() == "file"sv)
-                return origin->is_file_origin();
+                return origin->is_file_origin() || (request->mode() == Infrastructure::Request::Mode::Navigate && request->history_navigation());
 
             // resource:// URLs are bundled browser assets rather than user data, and the internal pages that
             // load them do have a standard opaque origin, so any opaque origin is accepted for those.
@@ -1497,9 +1525,11 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
         // NOTE: The cross-origin resource policy check runs for responses coming from the network and responses coming
         //       from the service worker. This is different from the CORS check, as request’s client and the service
         //       worker can have different embedder policies.
+        // AD-HOC: request's client can be null, which the check does not allow for. Such a request is checked against a
+        //         new embedder policy.
+        auto client_embedder_policy = request->client() ? request->client()->policy_container()->embedder_policy : HTML::EmbedderPolicy {};
         if ((request->response_tainting() == Infrastructure::Request::ResponseTainting::Opaque || response->type() == Infrastructure::Response::Type::Opaque)
-            && false // FIXME: "and the cross-origin resource policy check with request’s origin, request’s client, request’s destination, and actualResponse returns blocked"
-        ) {
+            && cross_origin_resource_policy_check(request->origin().get<URL::Origin>(), client_embedder_policy, *internal_response) == Infrastructure::RequestOrResponseBlocking::Blocked) {
             returned_pending_response->resolve(Infrastructure::Response::network_error("Response was blocked by cross-origin resource policy check"_string));
             return;
         }
@@ -1891,6 +1921,13 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
             http_request->set_cache_mode(HTTP::CacheMode::NoStore);
         }
 
+        // AD-HOC: While a document loads bypassing the HTTP cache, so do the requests it makes without a cache mode of
+        //         their own, as do its child navigables' navigations (see create navigation params by fetching).
+        if (http_request->cache_mode() == HTTP::CacheMode::Default && http_request->mode() != Infrastructure::Request::Mode::Navigate && http_request->client()) {
+            if (auto* window = HTML::window_from_global_object(http_request->client()->global_object()); window && window->associated_document().is_loading_bypassing_cache())
+                http_request->set_cache_mode(HTTP::CacheMode::Reload);
+        }
+
         // 17. If httpRequest’s cache mode is "no-cache", httpRequest’s prevent no-cache cache-control header
         //     modification flag is unset, and httpRequest’s header list does not contain `Cache-Control`, then append
         //     (`Cache-Control`, `max-age=0`) to httpRequest’s header list.
@@ -2052,7 +2089,8 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
             //    invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP
             //    Caching, and set storedResponse to null.
             if (method_is_unsafe && forward_response->status() >= 200 && forward_response->status() <= 399) {
-                // FIXME: "invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP Caching"
+                if (http_cache)
+                    http_cache->invalidate(http_request->current_url());
                 stored_response = nullptr;
             }
 
@@ -2282,7 +2320,13 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
     auto& page = Bindings::principal_host_defined_page(realm);
 
-    LoadRequest load_request { request->header_list() };
+    auto load_request_headers = request->header_list();
+    if (g_disk_cache_enabled_for_navigations_for_testing && request->mode() == Infrastructure::Request::Mode::Navigate) {
+        load_request_headers = HTTP::HeaderList::create(request->header_list()->headers());
+        load_request_headers->set({ HTTP::TEST_CACHE_ENABLED_HEADER, "1"sv });
+    }
+
+    LoadRequest load_request { move(load_request_headers) };
     load_request.set_url(request->current_url());
     load_request.set_page(page);
     load_request.set_method(request->method());
@@ -2295,6 +2339,12 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     load_request.set_is_navigation_request(request->is_navigation_request());
     load_request.set_priority(request->priority());
     load_request.set_source_url(content_blocker_source_url_for_request(*request));
+    load_request.set_network_isolation_key(Infrastructure::determine_the_network_partition_key(*request));
+
+    if (auto environment = request->reserved_client())
+        load_request.set_top_level_creation_url(environment->top_level_creation_url);
+    else if (auto client = request->client())
+        load_request.set_top_level_creation_url(client->top_level_creation_url);
 
     if (auto const* body = request->body().get_pointer<GC::Ref<Infrastructure::Body>>()) {
         (*body)->source().visit(
@@ -2326,7 +2376,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
     // 10. Let stream be a new ReadableStream.
-    auto stream = GC::Heap::the().allocate<Streams::ReadableStream>();
+    auto stream = Streams::ReadableStream::create(realm);
 
     // 9. Let buffer be an empty byte sequence.
     auto fetched_data_receiver = GC::Heap::the().allocate<FetchedDataReceiver>(fetch_params, stream, move(http_cache));
@@ -2452,6 +2502,65 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     if (network_request && fetch_params.has_response_body_transfer_lease())
         network_request->set_body_delivery_paused(true);
     fetch_params.controller()->set_pending_request(network_request);
+
+    // To transmit request’s body body, run these steps:
+    // 1. If body is null and fetchParams’s process request end-of-body is non-null, then queue a fetch task given
+    //    fetchParams’s process request end-of-body and fetchParams’s task destination.
+    if (request->body().has<Empty>()) {
+        if (fetch_params.algorithms()->process_request_end_of_body()) {
+            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.task_destination(), GC::create_function(GC::Heap::the(), [&fetch_params]() {
+                fetch_params.algorithms()->process_request_end_of_body()();
+            }));
+        }
+    }
+    // 2. Otherwise, if body is non-null:
+    else if (auto const* body = request->body().get_pointer<GC::Ref<Infrastructure::Body>>()) {
+        // 1. Let processBodyChunk given bytes be these steps:
+        auto process_body_chunk = GC::create_function(GC::Heap::the(), [&fetch_params](ByteBuffer bytes) {
+            // 1. If fetchParams is canceled, then abort these steps.
+            if (fetch_params.is_canceled())
+                return;
+
+            // 2. Run this step in parallel: transmit bytes.
+            // NB: The whole body was handed to RequestServer above, from body's source.
+
+            // 3. If fetchParams’s process request body chunk length is non-null, then run fetchParams’s process
+            //    request body chunk length given bytes’s length.
+            if (fetch_params.algorithms()->process_request_body_chunk_length())
+                fetch_params.algorithms()->process_request_body_chunk_length()(bytes.size());
+        });
+
+        // 2. Let processEndOfBody be these steps:
+        auto process_end_of_body = GC::create_function(GC::Heap::the(), [&fetch_params]() {
+            // 1. If fetchParams is canceled, then abort these steps.
+            if (fetch_params.is_canceled())
+                return;
+
+            // 2. If fetchParams’s process request end-of-body is non-null, then run fetchParams’s process request
+            //    end-of-body.
+            if (fetch_params.algorithms()->process_request_end_of_body())
+                fetch_params.algorithms()->process_request_end_of_body()();
+        });
+
+        // 3. Let processBodyError given e be these steps:
+        auto process_body_error = GC::create_function(GC::Heap::the(), [&realm, &fetch_params](JS::Value error) {
+            // 1. If fetchParams is canceled, then abort these steps.
+            if (fetch_params.is_canceled())
+                return;
+
+            // 2. If e is an "AbortError" DOMException, then abort fetchParams’s controller.
+            auto const* exception = error.is_object() ? Bindings::dom_exception_from_object(error.as_object()) : nullptr;
+            if (exception && exception->name() == "AbortError"_utf16_fly_string)
+                fetch_params.controller()->abort(realm, {});
+            // 3. Otherwise, terminate fetchParams’s controller.
+            else
+                fetch_params.controller()->terminate();
+        });
+
+        // 4. Incrementally read request’s body given processBodyChunk, processEndOfBody, processBodyError, and
+        //    fetchParams’s task destination.
+        (void)(*body)->incrementally_read(realm, process_body_chunk, process_end_of_body, process_body_error, fetch_params.task_destination());
+    }
 
     return pending_response;
 }
@@ -2885,6 +2994,16 @@ void set_http_memory_cache_enabled(bool const enabled)
     g_http_memory_cache_enabled = enabled;
 }
 
+void set_disk_cache_enabled_for_navigations_for_testing(bool const enabled)
+{
+    g_disk_cache_enabled_for_navigations_for_testing = enabled;
+}
+
+bool disk_cache_enabled_for_navigations_for_testing()
+{
+    return g_disk_cache_enabled_for_navigations_for_testing;
+}
+
 bool http_memory_cache_enabled()
 {
     return g_http_memory_cache_enabled;
@@ -2895,13 +3014,13 @@ void clear_http_memory_cache()
     HTTPCache::the().clear_cache();
 }
 
-void update_javascript_bytecode_cache_in_http_memory_cache(Infrastructure::NetworkPartitionKey const& partition_key, URL::URL const& url, ByteString const& method, HTTP::HeaderList const& request_headers, u64 vary_key, Core::ImmutableBytes javascript_bytecode_cache)
+void update_javascript_bytecode_cache_in_http_memory_cache(Utf16String const& partition, URL::URL const& url, ByteString const& method, HTTP::HeaderList const& request_headers, u64 vary_key, Core::ImmutableBytes javascript_bytecode_cache)
 {
     if (!g_http_memory_cache_enabled)
         return;
 
     // Only back-fill into a partition that already has a cache; do not create an empty one just to drop bytecode into.
-    if (auto* http_cache = HTTPCache::the().get_if_exists(partition_key))
+    if (auto* http_cache = HTTPCache::the().get_if_exists(partition))
         http_cache->update_javascript_bytecode_cache(url, method, request_headers, vary_key, move(javascript_bytecode_cache));
 }
 

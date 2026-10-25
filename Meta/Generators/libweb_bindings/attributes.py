@@ -70,11 +70,16 @@ def validate_direct_getter(context: GenerationContext, interface: Interface, att
     target_interface = context.interface(resolved_type)
     if target_interface is None or target_interface.is_callback_interface:
         raise RuntimeError(f"{description} must have an interface type")
+    if target_interface.extended_attributes.get("ImplementedIn") == "Rust":
+        # NB: The engine reads the wrapper of a direct getter's object as a Wrappable keeps it, and the object of an
+        #     interface implemented in Rust is a cell that keeps its wrapper elsewhere.
+        raise RuntimeError(f"{description} cannot return {target_interface.name}, which is implemented in Rust")
     if not cpp_type_for_idl_type_details(resolved_type, context).gc_ref_target_type:
         raise RuntimeError(f"{description} must convert from a GC pointer")
 
     incompatible_extended_attributes = (
         "CachedAttribute",
+        "CachedAccessor",
         "ImplementedInBindings",
         "LegacyUnforgeable",
         "Reflect",
@@ -246,13 +251,13 @@ def define_the_attributes(
                 attribute
             )
             includes.add("LibGC/Weak.h")
+            includes.add("LibJS/Runtime/HostObject.h")
             includes.add("LibJS/Runtime/NativeFunction.h")
-            includes.add("LibWeb/Bindings/PlatformObject.h")
             includes.add("LibWeb/Bindings/Wrappable.h")
             implementation_type = fully_qualified_name_for_interface(interface)
             definition.write(
                 f"""    auto {native_getter_name} = JS::DirectGetterFunction::create(realm, {getter_name}, 0, {cpp_name}_id, {{
-        .wrapper_implementation_offset = PlatformObject::wrapped_implementation_offset(),
+        .wrapper_implementation_offset = JS::HostObject::wrappable_offset(),
         .implementation_value_offset = {implementation_type}::{direct_getter_field}_offset(),
         .main_world_wrapper_offset = Wrappable::main_world_wrapper_offset(),
         .weak_impl_value_offset = GC::WeakImpl::value_offset(),
@@ -278,6 +283,8 @@ def define_the_attributes(
                 definition.write(
                     f'    auto {native_setter_name} = JS::NativeFunction::create(realm, {setter_name}, 1, {cpp_name}_id, &realm, "set"sv);\n'
                 )
+        if "CachedAccessor" in attribute.extended_attributes and not attribute.readonly:
+            raise RuntimeError(f"[CachedAccessor] attribute '{attribute.name}' must be readonly")
         define_accessor = f"object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"
         if "CachedAttribute" in attribute.extended_attributes and "LegacyUnforgeable" in attribute.extended_attributes:
             # Cache the result only on the main-world wrapper, whose cached
@@ -289,6 +296,9 @@ def define_the_attributes(
         object.define_direct_cached_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);
     else
         object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"""
+        # [CachedAccessor] promises that the result is immutable for each receiver's lifetime.
+        if "CachedAccessor" in attribute.extended_attributes:
+            define_accessor = f"object.define_direct_cached_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes, JS::CachedAccessorValueLocation::Receiver);"
         definition.write(
             f"""
     // 4. Let configurable be false if attr is unforgeable and true otherwise.

@@ -59,7 +59,7 @@ public:
     Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::Document>> intersection_root() const;
     GC::Ref<DOM::Node> intersection_root_node() const;
     bool is_implicit_root() const { return !m_root; }
-    CSSPixelRect root_intersection_rectangle(Compositing::AccumulatedVisualContextTree const* = nullptr) const;
+    CSSPixelRect root_intersection_rectangle(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const* = nullptr) const;
 
     void queue_entry(Badge<DOM::Document>, GC::Ref<IntersectionObserverEntry>);
 
@@ -67,7 +67,6 @@ private:
     explicit IntersectionObserver(GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverRoot const& root, GC::Ref<DOM::Document> implicit_root_document, Vector<CSS::LengthPercentage> root_margin, Vector<CSS::LengthPercentage> scroll_margin, Vector<double>&& thresholds, double delay, bool track_visibility);
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
-    virtual void finalize() override;
 
     static Optional<Vector<CSS::LengthPercentage>> parse_a_margin(String);
 

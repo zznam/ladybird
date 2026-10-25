@@ -21,12 +21,15 @@
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOM/Utils.h>
+#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 
 namespace Web::DOM {
@@ -50,6 +53,10 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
 {
     // 1. Let found be false.
     bool found = false;
+
+    // NB: Event's currentTarget stays the same while its listeners run, so it's only checked once for being a node —
+    //     and not at all when it has no listeners for the event, as most targets in an event's path don't.
+    auto* current_target_node = listeners.is_empty() ? nullptr : as_if<Node>(event.current_target().ptr());
 
     // 2. For each listener of listeners, whose removed is false:
     for (auto& listener : listeners) {
@@ -75,30 +82,47 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
         if (listener->once)
             event.current_target()->remove_an_event_listener(*listener);
 
-        // 6. Let global be listener callback’s associated Realm’s global object.
         auto& callback = listener->callback->callback();
 
-        // 7. Let currentEvent be undefined.
-        Event* current_event = nullptr;
+        // 6. Let targetGlobal be event's currentTarget's node document's relevant global object if event's currentTarget
+        //    is a node; otherwise event's currentTarget's relevant global object.
+        auto* target_global = current_target_node
+            ? current_target_node->document().relevant_global_event_target().ptr()
+            : Bindings::current_target_global(callback, event);
 
-        // 8. If global is a Window object, then:
-        auto* window = Bindings::window_from_callback(callback);
-        if (window) {
-            // 1. Set currentEvent to global’s current event.
-            current_event = window->current_event();
+        // 7. Let listenerGlobal be listener callback's associated realm's global object.
+        auto* listener_window = Bindings::window_from_callback(callback);
 
-            // 2. If invocationTargetInShadowTree is false, then set global’s current event to event.
-            if (!invocation_target_in_shadow_tree)
-                window->set_current_event(&event);
+        // 8. If targetGlobal or listenerGlobal is a Window object whose associated Document is not fully active, then
+        //    continue.
+        if (listener_window && !listener_window->associated_document().is_fully_active())
+            continue;
+        // NB: Mostly, targetGlobal is listenerGlobal, which was just checked.
+        if (target_global != listener_window) {
+            if (auto* target_window = as_if<HTML::Window>(target_global); target_window && !target_window->associated_document().is_fully_active())
+                continue;
         }
 
-        // 9. If listener’s passive is true, then set event’s in passive listener flag.
+        // 9. Let currentEvent be undefined.
+        Event* current_event = nullptr;
+
+        // 10. If listenerGlobal is a Window object:
+        if (listener_window) {
+            // 1. Set currentEvent to listenerGlobal's current event.
+            current_event = listener_window->current_event();
+
+            // 2. If invocationTargetInShadowTree is false, then set listenerGlobal's current event to event.
+            if (!invocation_target_in_shadow_tree)
+                listener_window->set_current_event(&event);
+        }
+
+        // 11. If listener’s passive is true, then set event’s in passive listener flag.
         if (listener->passive == true)
             event.set_in_passive_listener(true);
 
-        // FIXME: 10. If global is a Window object, then record timing info for event listener given event and listener.
+        // FIXME: 12. If listenerGlobal is a Window object, then record timing info for event listener given event and listener.
 
-        // 11. Call a user object’s operation with listener’s callback, "handleEvent", « event », and event’s currentTarget attribute value.
+        // 13. Call a user object’s operation with listener’s callback, "handleEvent", « event », and event’s currentTarget attribute value.
         auto result = Bindings::invoke_event_listener(callback, event);
 
         // If this throws an exception, then:
@@ -110,14 +134,14 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
             legacy_output_did_listeners_throw = true;
         }
 
-        // 12. Unset event’s in passive listener flag.
+        // 14. Unset event’s in passive listener flag.
         event.set_in_passive_listener(false);
 
-        // 13. If global is a Window object, then set global’s current event to currentEvent.
-        if (window)
-            window->set_current_event(current_event);
+        // 15. If listenerGlobal is a Window object, then set listenerGlobal's current event to currentEvent.
+        if (listener_window)
+            listener_window->set_current_event(current_event);
 
-        // 14. If event’s stop immediate propagation flag is set, then break.
+        // 16. If event’s stop immediate propagation flag is set, then break.
         if (event.should_stop_immediate_propagation())
             break;
     }
@@ -201,6 +225,30 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     // 1. Set event’s dispatch flag.
     event.set_dispatched(true);
 
+    // https://w3c.github.io/largest-contentful-paint/#sec-modifications-DOM
+    // If target's relevant global object is a Window object, event's type is scroll and its isTrusted is true, set
+    // target's relevant global object's has dispatched scroll event to true.
+    if (event.is_trusted() && event.type() == HTML::EventNames::scroll) {
+        if (auto* window = EventTiming::relevant_window_of_event_target(*target))
+            window->set_has_dispatched_scroll_event();
+    }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-DOM
+    // OPTIMIZATION: Only trusted events of some types are timed, so nothing else needs to look up the window.
+    GC::Ptr<EventTiming::PerformanceEventTiming> timing_entry;
+    GC::Ptr<HTML::Window> timing_window;
+    if (EventTiming::is_considered_for_event_timing(event)) {
+        timing_window = EventTiming::relevant_window_of_event_target(*target);
+        if (timing_window) {
+            // 1. Let interactionId be the result of computing interactionId given event.
+            auto interaction_id = EventTiming::compute_interaction_id(event, *timing_window);
+
+            // 2. Let timingEntry be the result of initializing event timing given event, the current high resolution
+            //    time, and interactionId.
+            timing_entry = EventTiming::initialize_event_timing(event, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*timing_window)), interaction_id);
+        }
+    }
+
     // 2. Let targetOverride be target, if legacy target override flag is not given, and target’s associated Document otherwise. [HTML]
     // NOTE: legacy target override flag is only used by HTML and only when target is a Window object.
     GC::Ptr<EventTarget> target_override;
@@ -236,7 +284,7 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     // 6. If target is not relatedTarget or target is event’s relatedTarget, then:
     if (should_dispatch && (related_target != target || event.related_target() == target)) {
         // 1. Let touchTargets be a new list.
-        Event::TouchTargetList touch_targets;
+        GC::RootVector<GC::Ptr<EventTarget>> touch_targets;
 
         // 2. For each touchTarget of event’s touch target list, append the result of retargeting touchTarget against target to touchTargets.
         for (auto& touch_target : event.touch_target_list()) {
@@ -443,6 +491,9 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
         }
     }
 
+    // NB: The last target of the event, which finalizing event timing below uses, is cleared by the next steps.
+    GC::Ptr<EventTarget> last_event_target = event.target() ? event.target() : target.ptr();
+
     // 7. Set event’s eventPhase attribute to NONE.
     event.set_phase(Event::Phase::None);
 
@@ -481,6 +532,11 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             activation_target->legacy_cancelled_activation_behavior();
         }
     }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-DOM
+    // 1. Finalize event timing passing timingEntry, event, target, and the current high resolution time as inputs.
+    if (timing_entry)
+        EventTiming::finalize_event_timing(timing_entry, event, *last_event_target, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*timing_window)));
 
     // 13. Return false if event’s canceled flag is set; otherwise true.
     return !event.cancelled();

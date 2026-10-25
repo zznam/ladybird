@@ -9,21 +9,29 @@ const loadFeatures = features => {
 };
 
 const loadSettings = settings => {
+    if (!Object.hasOwn(settings, "appearance")) {
+        return;
+    }
+
     APPEARANCE = settings.appearance || {};
 
     showMenuBar.checked = !!APPEARANCE.showMenuBar;
-    showBookmarksBar.checked = !!APPEARANCE.showBookmarksBar;
+    showBookmarksBar.value = APPEARANCE.showBookmarksBar || "always";
 };
 
-function addChangeHandler(input, name) {
-    input.addEventListener("change", () => {
-        APPEARANCE[name] = input.checked;
-        ladybird.sendMessage("setAppearance", APPEARANCE);
-    });
+function saveAppearance() {
+    ladybird.sendMessage("setAppearance", APPEARANCE);
 }
 
-addChangeHandler(showMenuBar, "showMenuBar");
-addChangeHandler(showBookmarksBar, "showBookmarksBar");
+showMenuBar.addEventListener("change", () => {
+    APPEARANCE.showMenuBar = showMenuBar.checked;
+    saveAppearance();
+});
+
+showBookmarksBar.addEventListener("change", () => {
+    APPEARANCE.showBookmarksBar = showBookmarksBar.value;
+    saveAppearance();
+});
 
 document.addEventListener("WebUIMessage", event => {
     if (event.detail.name === "loadFeatures") {

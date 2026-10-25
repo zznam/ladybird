@@ -42,12 +42,12 @@ public:
 private:
     virtual void die() override;
 
-    virtual void video_edge_ready(u64 edge_id, Media::VideoEdgeQueue edge, Media::PresentedFramePage presented_frame_page, Media::MediaTimeReader time_reader) override;
+    virtual void video_edge_ready(u64 edge_id, Media::VideoEdgeQueue edge, Media::MediaTimeReader time_reader) override;
     virtual void update_edge_time_reader(u64 edge_id, Media::MediaTimeReader time_reader) override;
     virtual void announce_video_frame_slot(u64 edge_id, Media::VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer, RefPtr<Media::VideoSurface> surface) override;
     virtual void retire_video_frame_pool(u64 edge_id, Media::VideoFramePoolID pool_id) override;
     virtual void notify_data_available(u64 edge_id) override;
-    virtual void seek_sink(u64 edge_id, u32 requested_seek_id) override;
+    virtual void seek_sink(u64 edge_id, u32 requested_seek_id, InvalidateHeldData) override;
 
     struct EdgeState {
         VideoSinkHandle handle;

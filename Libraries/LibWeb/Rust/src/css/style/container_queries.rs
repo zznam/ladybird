@@ -178,6 +178,28 @@ impl RetainedState {
         })
     }
 
+    /// The color a parsed `<color>` names against a style record: the record's used color-scheme and `color`, with
+    /// lengths resolving as the record computes them. With no such record, it resolves against no style at all.
+    pub(crate) fn color_against_style_record(
+        &self,
+        style_record: u64,
+        value: &crate::css::style_value::StyleValueData,
+    ) -> Option<crate::css::color_resolution::Rgba> {
+        use crate::css::color_resolution::{ColorResolutionInput, EMPTY_INPUT, to_color};
+        let Some(view) = self.computed_group_sets.style_record_view(style_record) else {
+            return to_color(value, &EMPTY_INPUT);
+        };
+        let length = self.record_length_resolution_context(&view);
+        let values = crate::css::computed_value_views::ComputedValuesView::new(
+            crate::css::host_shared::SharedPayload::as_pointer_slice(view.payloads),
+        );
+        let input = ColorResolutionInput {
+            length: length.as_ref(),
+            ..ColorResolutionInput::for_style(values)
+        };
+        to_color(value, &input)
+    }
+
     /// The basis of one physical axis for a subject's container-relative lengths. A
     /// pseudo-element's are its originating element's.
     fn container_unit_basis(&self, subject: StyleNodeID, axis_is_horizontal: bool) -> ContainerUnitBasis {
@@ -479,14 +501,16 @@ impl RetainedState {
             // as the container's record computes them.
             let mut style_context = None;
             if requirements & CONTAINER_QUERY_REQUIRES_STYLE != 0 {
-                let store = match self
-                    .computed_group_sets
-                    .style_record_custom_property_environment(inputs.style_record)
-                    .unwrap_or_default()
-                {
+                let environment = match self.element_custom_property_data.get(&candidate) {
+                    Some(held) if held.sampled_over.is_some() => held.identity,
+                    _ => self
+                        .computed_group_sets
+                        .style_record_custom_property_environment(inputs.style_record)
+                        .unwrap_or_default(),
+                };
+                let store = match environment {
                     0 => None,
-                    // SAFETY: The store is live while the container's record names its environment.
-                    identity => Some(unsafe { &*self.custom_property_environments.store(identity)?.cast() }),
+                    identity => Some(&**self.custom_property_environments.store(identity)?),
                 };
                 let values = crate::css::computed_value_views::ComputedValuesView::new(
                     crate::css::host_shared::SharedPayload::as_pointer_slice(view.payloads),
@@ -600,15 +624,28 @@ impl RetainedState {
     /// Keep what a row the engine answers read of its containers for the host, which records it
     /// when it installs the element's record, as it does for a row it computes itself.
     pub(super) fn note_container_effects_for_host(&mut self, node: StyleNodeID, verdict: ContainerVerdict) {
-        self.container_effects_for_host
-            .entry(node)
-            .or_default()
-            .add_reads(verdict);
+        self.container_effects_for_host.note(node, verdict);
     }
 
     /// What the rows the host installs read of their containers, taken as it installs each.
     pub(crate) fn take_container_effects_for_host(&mut self, node: StyleNodeID) -> Option<ContainerVerdict> {
-        self.container_effects_for_host.remove(&node)
+        self.container_effects_for_host.set(node, None)
+    }
+
+    /// See [`Self::detach_host_flags_for_fork`].
+    pub(super) fn detach_container_effects_held_for_fork(&mut self) {
+        let held = self
+            .container_effects_for_host
+            .held
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.container_effects_for_host.held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(held));
+    }
+
+    /// Raises `flag`, which the document's host reads, while the engine keeps any row's container effects for the
+    /// host, rather than a flag of the engine's own. The engine keeps none yet.
+    pub(crate) fn share_container_effects_held(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        debug_assert!(self.container_effects_for_host.effects.is_empty());
+        self.container_effects_for_host.held = flag;
     }
 
     /// Whether the winners published for a node hold a rule's container conditions: they hold a
@@ -661,7 +698,6 @@ impl RetainedState {
         &mut self,
         rule_program_is_changing: bool,
         republication: super::publication::WinnerRepublication,
-        counters: &mut Counters,
     ) {
         if self.published_container_verdicts.is_empty() {
             return;
@@ -673,11 +709,7 @@ impl RetainedState {
             .filter(|&node| self.container_verdicts_moved(node))
             .collect();
         for node in moved {
-            if rule_program_is_changing
-                || self
-                    .republish_winners_from_answer(node, republication, counters)
-                    .is_none()
-            {
+            if rule_program_is_changing || self.republish_winners_from_answer(node, republication).is_none() {
                 self.published_container_verdicts.remove(&node);
                 self.winner_groups.remove(node);
             }
@@ -840,5 +872,41 @@ impl RetainedState {
             }
             _ => true,
         }
+    }
+}
+
+/// What the container conditions of the rows the engine answered read of their containers, per element, kept for the
+/// host until it takes each as it installs the element's record, and a flag the host reads, without asking, for whether
+/// any is kept.
+#[derive(Clone, Default)]
+pub(super) struct ContainerEffectsForHost {
+    effects: HashMap<StyleNodeID, ContainerVerdict>,
+    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ContainerEffectsForHost {
+    pub(super) fn get(&self, node: &StyleNodeID) -> Option<&ContainerVerdict> {
+        self.effects.get(node)
+    }
+
+    fn note(&mut self, node: StyleNodeID, verdict: ContainerVerdict) {
+        self.effects.entry(node).or_default().add_reads(verdict);
+        self.held.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Keeps `verdict` for `node`, or none, and answers what it kept before.
+    pub(super) fn set(&mut self, node: StyleNodeID, verdict: Option<ContainerVerdict>) -> Option<ContainerVerdict> {
+        let previous = match verdict {
+            Some(verdict) => self.effects.insert(node, verdict),
+            None => self.effects.remove(&node),
+        };
+        self.held
+            .store(!self.effects.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        previous
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.effects.clear();
+        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }

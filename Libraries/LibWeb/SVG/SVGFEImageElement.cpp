@@ -5,12 +5,8 @@
  */
 
 #include "SVGFEImageElement.h"
-#include <LibCore/Timer.h>
-#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGFEImageElement.h>
-#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
@@ -31,6 +27,15 @@ void SVGFEImageElement::visit_edges(Cell::Visitor& visitor)
     SVGFilterPrimitiveStandardAttributes::visit_edges(visitor);
     SVGURIReferenceMixin::visit_edges(visitor);
     visitor.visit(m_resource_request);
+    visitor.visit(m_preserve_aspect_ratio);
+}
+
+// https://drafts.fxtf.org/filter-effects/#dom-svgfeimageelement-preserveaspectratio
+GC::Ref<SVGAnimatedPreserveAspectRatio> SVGFEImageElement::preserve_aspect_ratio_for_bindings()
+{
+    if (!m_preserve_aspect_ratio)
+        m_preserve_aspect_ratio = SVGAnimatedPreserveAspectRatio::create(*this);
+    return *m_preserve_aspect_ratio;
 }
 
 void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -64,7 +69,7 @@ void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             document().note_svg_paint_resources_changed();
-            document().schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::FilterResourcesChanged);
+            document().schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::EveryBox);
             document().set_needs_repaint(Badge<SVGFEImageElement> {}, InvalidateDisplayList::PaintCommands);
         },
         nullptr);
@@ -81,34 +86,6 @@ GC::Ptr<HTML::DecodedImageData> SVGFEImageElement::image_data() const
     if (!m_resource_request)
         return {};
     return m_resource_request->image_data();
-}
-
-Optional<Gfx::DecodedImageFrame> SVGFEImageElement::current_image_frame(Gfx::IntSize size) const
-{
-    if (auto data = image_data())
-        return data->default_frame(size);
-    return {};
-}
-
-Optional<Gfx::IntRect> SVGFEImageElement::content_rect() const
-{
-    auto bitmap = current_image_frame();
-    if (!bitmap.has_value())
-        return {};
-    auto computed_style = this->computed_style();
-    if (!computed_style)
-        return {};
-    auto width = computed_style->width().to_px(0);
-    if (width == 0)
-        width = bitmap->width();
-
-    auto height = computed_style->height().to_px(0);
-    if (height == 0)
-        height = bitmap->height();
-
-    auto x = computed_style->x().to_px(0);
-    auto y = computed_style->y().to_px(0);
-    return Gfx::enclosing_int_rect({ x, y, width, height });
 }
 
 }

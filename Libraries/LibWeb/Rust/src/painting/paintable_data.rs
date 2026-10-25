@@ -16,7 +16,15 @@ pub enum PaintableFlag {
     HasNonInvertibleCssTransform = 1 << 0,
     HorizontalScrollbarEnlarged = 1 << 1,
     VerticalScrollbarEnlarged = 1 << 2,
+    HorizontalScrollbarHidden = 1 << 3,
+    VerticalScrollbarHidden = 1 << 4,
+    InLaterContainingBlockFragment = 1 << 5,
+    HasLaterBoxFragments = 1 << 6,
 }
+
+/// The flag bits that hold the writing mode of the frame a box was laid out in.
+const FRAME_WRITING_MODE_SHIFT: u32 = 7;
+const FRAME_WRITING_MODE_MASK: u32 = 0b111;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -84,6 +92,16 @@ impl PaintableData {
         self.flags & flag as u32 != 0
     }
 
+    /// The writing mode of the frame the box was laid out in: that of its containing block.
+    pub(crate) fn frame(&self) -> crate::layout::geometry::Frame {
+        crate::layout::geometry::Frame::of(((self.flags >> FRAME_WRITING_MODE_SHIFT) & FRAME_WRITING_MODE_MASK) as u8)
+    }
+
+    pub(crate) fn set_frame(&mut self, frame: crate::layout::geometry::Frame) {
+        self.flags = (self.flags & !(FRAME_WRITING_MODE_MASK << FRAME_WRITING_MODE_SHIFT))
+            | ((u32::from(frame.writing_mode()) & FRAME_WRITING_MODE_MASK) << FRAME_WRITING_MODE_SHIFT);
+    }
+
     pub fn set_flag(&mut self, flag: PaintableFlag, value: bool) {
         if value {
             self.flags |= flag as u32;
@@ -100,6 +118,25 @@ pub struct FfiSelectionEntry {
     // Text entries name the DOM text's primary layout node; Rust expands its slices.
     pub layout_node: NodeSlotId,
     pub state: u8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSearchTextRange {
+    pub first_entry: usize,
+    pub entry_count: usize,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub is_current: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSpellingError {
+    /// The DOM text's primary layout node; Rust expands its slices.
+    pub layout_node: NodeSlotId,
+    pub start_offset: usize,
+    pub end_offset: usize,
 }
 
 pub const SELECTION_STATE_NONE: u8 = 0;
@@ -130,10 +167,6 @@ pub enum BorderEdge {
 
 impl BorderEdge {
     pub const ALL: [BorderEdge; 4] = [BorderEdge::Top, BorderEdge::Right, BorderEdge::Bottom, BorderEdge::Left];
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
 }
 
 pub const PIECE_EDGE_TOP: u8 = 1 << 0;
@@ -158,7 +191,7 @@ impl InlineBoxPieceRecord {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintableSideData {
     // Invalidation also runs while paint geometry is borrowed. Keep this
     // mutable cache state out of the plain-data row shared with C++.
@@ -168,6 +201,12 @@ pub struct PaintableSideData {
     // paints a different selection of fragments than before.
     pub(crate) fragment_ownership_before_recommit:
         Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommittedBoxFragment {
+    pub(crate) link: crate::layout::fragment_tree::FragmentLink,
+    pub(crate) containing_block_fragment: u32,
 }
 
 /// What a row committed beside its geometry that painting reads with it: its inline content, the
@@ -188,6 +227,8 @@ pub(crate) struct CommittedSideData {
     pub(crate) fragment_ownership: Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
     /// The paint-order decisions paint preparation gathered for the row, if it gathered them.
     pub(crate) order_inputs: crate::painting::paint_order_plan::PaintOrderInputs,
+    pub(crate) containing_block_fragment: u32,
+    pub(crate) box_fragments: Option<std::sync::Arc<Vec<CommittedBoxFragment>>>,
 }
 
 /// Rows are the same when they hold equal records; a shared record is compared only when the rows
@@ -208,6 +249,14 @@ impl PartialEq for CommittedSideData {
             && same_payload(self.inline_content.as_ref(), other.inline_content.as_ref(), |a, b| {
                 a == b
             })
+            && self.containing_block_fragment == other.containing_block_fragment
+            && same_payload(self.box_fragments.as_ref(), other.box_fragments.as_ref(), |a, b| {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(left, right)| {
+                        left.containing_block_fragment == right.containing_block_fragment
+                            && left.link.places_same_fragment_identically_to(&right.link)
+                    })
+            })
     }
 }
 
@@ -221,6 +270,10 @@ impl CommittedSideData {
         self.piece_indices = None;
     }
 
+    pub(crate) fn box_fragments(&self) -> &[CommittedBoxFragment] {
+        self.box_fragments.as_deref().map_or(&[], Vec::as_slice)
+    }
+
     /// The indices of an inline box's pieces in its line root's inline content.
     pub(crate) fn piece_indices(&self) -> &[u32] {
         self.piece_indices.as_deref().unwrap_or_default()
@@ -228,6 +281,16 @@ impl CommittedSideData {
 
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.lines)
+    }
+    pub(crate) fn elided_content_rects(&self) -> &[(u32, used_values::FfiCssPixelRect)] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| &content.elided_content_rects)
+    }
+    pub(crate) fn lines_after_clamp_point_rect(&self) -> Option<used_values::FfiCssPixelRect> {
+        self.inline_content
+            .as_ref()
+            .and_then(|content| content.lines_after_clamp_point_rect.as_deref().copied())
     }
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)

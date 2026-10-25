@@ -76,6 +76,9 @@ struct HTMLElement::RareData final
     // https://html.spec.whatwg.org/multipage/custom-elements.html#attached-internals
     GC::Ptr<ElementInternals> attached_internals;
 
+    // https://html.spec.whatwg.org/multipage/custom-elements.html#internal-content-attribute-map
+    OrderedHashMap<Utf16FlyString, Utf16String> internal_content_attribute_map;
+
     // https://html.spec.whatwg.org/multipage/popover.html#popover-trigger
     GC::Ptr<HTMLElement> popover_trigger;
 
@@ -378,14 +381,219 @@ struct RequiredLineBreakCount {
     int count { 0 };
 };
 
+// NB: The text of a CSS text box produced by a Text node, before the CSS 'white-space' processing rules have been
+//     applied to it. These rules collapse whitespace across the boundaries of inline boxes, so they are applied once
+//     the text of a whole inline formatting context has been collected.
+struct UnprocessedText {
+    Utf16String text;
+    CSS::WhiteSpaceCollapse white_space_collapse;
+};
+
+// NB: These mark the start and the end of the items of a box that establishes an independent formatting context
+//     without being block-level, such as an inline-block. The text of such a box has the CSS 'white-space'
+//     processing rules applied as its own block, and to the text around it, the box is content that whitespace does
+//     not collapse across.
+struct AtomicInlineStart { };
+struct AtomicInlineEnd { };
+
+using RenderedTextItem = Variant<Utf16String, RequiredLineBreakCount, UnprocessedText, AtomicInlineStart, AtomicInlineEnd>;
+
+enum class StartsAndEndsLine : u8 {
+    No,
+    Yes,
+};
+
+// https://drafts.csswg.org/css-text/#white-space-processing
+// NB: This applies the rules to the unprocessed text in items, as modified by the rendered text collection steps:
+//     collapsible spaces at the end of lines are always collapsed, but they are only removed if the line is the last
+//     line of the block, or it ends with a br element. Only forced line breaks and the start and end of blocks end
+//     lines here, so collapsible spaces at soft wrap opportunities are never removed.
+static void apply_white_space_processing_rules(Vector<RenderedTextItem>& items, StartsAndEndsLine starts_and_ends_line)
+{
+    enum class Kind : u8 {
+        Other,
+        CollapsibleSpace,
+        CollapsibleSegmentBreak,
+        PreservedSegmentBreak,
+        Removed,
+    };
+
+    struct Character {
+        size_t item_index { 0 };
+        char16_t code_unit { 0 };
+        Kind kind { Kind::Other };
+    };
+
+    // NB: An entry of the inline formatting context that is not a character of unprocessed text.
+    enum class Boundary : u8 {
+        LineBreak,
+        AtomicInline,
+    };
+
+    Vector<Variant<Character, Boundary>> entries;
+    if (starts_and_ends_line == StartsAndEndsLine::Yes)
+        entries.append(Boundary::LineBreak);
+
+    for (size_t index = 0; index < items.size(); ++index) {
+        auto const& item = items[index];
+        if (auto const* run = item.get_pointer<UnprocessedText>()) {
+            auto mode = run->white_space_collapse;
+            auto spaces_are_collapsible = first_is_one_of(mode, CSS::WhiteSpaceCollapse::Collapse, CSS::WhiteSpaceCollapse::Discard, CSS::WhiteSpaceCollapse::PreserveBreaks);
+            auto segment_breaks_are_collapsible = first_is_one_of(mode, CSS::WhiteSpaceCollapse::Collapse, CSS::WhiteSpaceCollapse::Discard);
+            auto text = run->text.utf16_view();
+            for (size_t offset = 0; offset < text.length_in_code_units(); ++offset) {
+                auto code_unit = text.code_unit_at(offset);
+                Character character { index, code_unit, Kind::Other };
+                // NB: Carriage returns are treated identically to spaces in all respects.
+                if (code_unit == ' ' || code_unit == '\t' || code_unit == '\r') {
+                    if (mode == CSS::WhiteSpaceCollapse::Discard)
+                        character.kind = Kind::Removed;
+                    else if (spaces_are_collapsible)
+                        character.kind = Kind::CollapsibleSpace;
+                } else if (code_unit == '\n') {
+                    if (mode == CSS::WhiteSpaceCollapse::Discard)
+                        character.kind = Kind::Removed;
+                    else if (segment_breaks_are_collapsible)
+                        character.kind = Kind::CollapsibleSegmentBreak;
+                    else if (mode == CSS::WhiteSpaceCollapse::PreserveSpaces)
+                        character.code_unit = ' ';
+                    else
+                        character.kind = Kind::PreservedSegmentBreak;
+                }
+
+                if (character.kind == Kind::PreservedSegmentBreak) {
+                    entries.append(Boundary::LineBreak);
+                    entries.append(character);
+                    entries.append(Boundary::LineBreak);
+                } else {
+                    entries.append(character);
+                }
+            }
+        } else if (auto const* string = item.get_pointer<Utf16String>()) {
+            if (*string == u"\n"sv)
+                entries.append(Boundary::LineBreak);
+        } else if (item.has<RequiredLineBreakCount>()) {
+            entries.append(Boundary::LineBreak);
+        } else if (item.has<AtomicInlineStart>()) {
+            // NB: The items of the box have already been processed, so skip over them.
+            size_t depth = 1;
+            while (depth > 0 && ++index < items.size()) {
+                if (items[index].has<AtomicInlineStart>())
+                    ++depth;
+                else if (items[index].has<AtomicInlineEnd>())
+                    --depth;
+            }
+            entries.append(Boundary::AtomicInline);
+        }
+    }
+
+    if (starts_and_ends_line == StartsAndEndsLine::Yes)
+        entries.append(Boundary::LineBreak);
+
+    // Phase I: Collapsing and Transformation
+    // 1. Any sequence of collapsible spaces and tabs immediately preceding or following a segment break is removed.
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto const* segment_break = entries[index].get_pointer<Character>();
+        if (!segment_break || !first_is_one_of(segment_break->kind, Kind::CollapsibleSegmentBreak, Kind::PreservedSegmentBreak))
+            continue;
+        // NB: Returns whether the walk away from the segment break continues past the entry at other_index.
+        auto remove_collapsible_space = [&](size_t other_index) {
+            auto& entry = entries[other_index];
+            if (auto const* boundary = entry.get_pointer<Boundary>())
+                return *boundary == Boundary::LineBreak;
+            auto& character = entry.get<Character>();
+            if (character.kind == Kind::CollapsibleSpace)
+                character.kind = Kind::Removed;
+            return character.kind == Kind::Removed;
+        };
+        for (size_t other_index = index; other_index > 0 && remove_collapsible_space(other_index - 1); --other_index) { }
+        for (size_t other_index = index + 1; other_index < entries.size() && remove_collapsible_space(other_index); ++other_index) { }
+    }
+
+    // 2. Collapsible segment breaks are transformed for rendering according to the segment break transformation
+    //    rules.
+    // 3. Every collapsible tab is converted to a collapsible space (U+0020).
+    // NB: Any collapsible segment break that is not removed is converted to a space. A collapsible segment break that
+    //     follows another one becomes a space that the next step collapses.
+    for (auto& entry : entries) {
+        if (auto* character = entry.get_pointer<Character>()) {
+            if (character->kind == Kind::CollapsibleSegmentBreak)
+                character->kind = Kind::CollapsibleSpace;
+            if (character->kind == Kind::CollapsibleSpace)
+                character->code_unit = ' ';
+        }
+    }
+
+    // 4. Any collapsible space immediately following another collapsible space, even one outside the boundary of the
+    //    inline containing that space, provided both spaces are within the same inline formatting context, is
+    //    collapsed to have zero advance width.
+    bool previous_is_collapsible_space = false;
+    for (auto& entry : entries) {
+        if (auto* character = entry.get_pointer<Character>()) {
+            if (character->kind == Kind::Removed)
+                continue;
+            if (character->kind == Kind::CollapsibleSpace) {
+                if (previous_is_collapsible_space)
+                    character->kind = Kind::Removed;
+                previous_is_collapsible_space = true;
+                continue;
+            }
+        }
+        previous_is_collapsible_space = false;
+    }
+
+    // Phase II: Trimming and Positioning
+    // 1. A sequence of collapsible spaces at the beginning of a line is removed.
+    // 3. A sequence of collapsible spaces at the end of a line is removed.
+    auto remove_collapsible_spaces_at_line_edge = [&](Vector<size_t> const& indices) {
+        bool at_line_edge = false;
+        for (auto index : indices) {
+            auto& entry = entries[index];
+            if (auto* boundary = entry.get_pointer<Boundary>()) {
+                at_line_edge = *boundary == Boundary::LineBreak;
+                continue;
+            }
+            auto& character = entry.get<Character>();
+            if (character.kind == Kind::Removed)
+                continue;
+            if (character.kind == Kind::CollapsibleSpace && at_line_edge) {
+                character.kind = Kind::Removed;
+                continue;
+            }
+            at_line_edge = false;
+        }
+    };
+    Vector<size_t> indices;
+    indices.ensure_capacity(entries.size());
+    for (size_t index = 0; index < entries.size(); ++index)
+        indices.append(index);
+    remove_collapsible_spaces_at_line_edge(indices);
+    indices.reverse();
+    remove_collapsible_spaces_at_line_edge(indices);
+
+    // NB: Replace the unprocessed text with the characters that remain.
+    Vector<Vector<char16_t>> remaining_code_units;
+    remaining_code_units.resize(items.size());
+    for (auto const& entry : entries) {
+        if (auto const* character = entry.get_pointer<Character>(); character && character->kind != Kind::Removed)
+            remaining_code_units[character->item_index].append(character->code_unit);
+    }
+    for (size_t index = 0; index < items.size(); ++index) {
+        if (items[index].has<UnprocessedText>()) {
+            auto const& code_units = remaining_code_units[index];
+            items[index] = code_units.is_empty() ? Utf16String {} : Utf16String::from_utf16(Utf16View { code_units.data(), code_units.size() });
+        }
+    }
+}
+
 // https://html.spec.whatwg.org/multipage/dom.html#rendered-text-collection-steps
-static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collection_steps(DOM::Node const& node)
+static Vector<RenderedTextItem> rendered_text_collection_steps(Layout::BegunRead const& read, DOM::Node const& node)
 {
     // 1. Let items be the result of running the rendered text collection steps with each child node of node in tree
     //    order, and then concatenating the results to a single list.
-    Vector<Variant<Utf16String, RequiredLineBreakCount>> items;
+    Vector<RenderedTextItem> items;
     node.for_each_child([&](auto const& child) {
-        auto child_items = rendered_text_collection_steps(child);
+        auto child_items = rendered_text_collection_steps(read, child);
         items.extend(move(child_items));
         return IterationDecision::Continue;
     });
@@ -398,7 +606,7 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
     //    FIXME: - select elements have an associated non-replaced inline CSS box whose child boxes include only those of optgroup and option element child nodes;
     //    FIXME: - optgroup elements have an associated non-replaced block-level CSS box whose child boxes include only those of option element child nodes; and
     //    FIXME: - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for non-replaced block-level CSS boxes.
-    auto* layout_node = node.layout_node();
+    auto* layout_node = node.layout_node(read);
     if (!layout_node)
         return items;
     if (!layout_node->has_style_or_parent_with_style())
@@ -417,14 +625,16 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
 
     // 4. If node is a Text node, then for each CSS text box produced by node, in content order, compute the text of the
     //    box after application of the CSS 'white-space' processing rules and 'text-transform' rules, set items to the
-    //    list of the resulting strings, and return items.
-
-    //    FIXME: The CSS 'white-space' processing rules are slightly modified: collapsible spaces at the end of lines are
-    //    always collapsed, but they are only removed if the line is the last line of the block, or it ends with a br
-    //    element. Soft hyphens should be preserved. [CSSTEXT]
-
+    //    list of the resulting strings, and return items. The CSS 'white-space' processing rules are slightly modified:
+    //    collapsible spaces at the end of lines are always collapsed, but they are only removed if the line is the last
+    //    line of the block, or it ends with a br element. Soft hyphens should be preserved. [CSSTEXT]
+    // NB: The 'white-space' processing rules are applied by apply_white_space_processing_rules() once the text of the
+    //     whole inline formatting context has been collected.
     if (auto const* layout_text_node = as_if<Layout::TextNode>(layout_node)) {
-        items.append(layout_text_node->rendered_text_for_dom(true));
+        items.append(UnprocessedText {
+            layout_text_node->rendered_text_for_dom(),
+            style_node.style_group<CSS::ComputedValues::InheritedTextValues>().white_space_collapse_value(),
+        });
         return items;
     }
 
@@ -435,6 +645,14 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
     }
 
     auto display = style_node.display();
+
+    // NB: A box that establishes an independent formatting context without being block-level has its text processed
+    //     as its own block. To the text around it, the box is content that whitespace does not collapse across.
+    if (layout_node->is_atomic_inline() || display.is_table_cell()) {
+        apply_white_space_processing_rules(items, StartsAndEndsLine::Yes);
+        items.prepend(AtomicInlineStart {});
+        items.append(AtomicInlineEnd {});
+    }
 
     // 6. If node's computed value of 'display' is 'table-cell', and node's CSS box is not the last 'table-cell' box of its enclosing 'table-row' box, then append a string containing a single U+0009 TAB code point to items.
     if (display.is_table_cell() && node.next_sibling())
@@ -464,29 +682,38 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
 Utf16String HTMLElement::get_the_text_steps()
 {
     // 1. If element is not being rendered or if the user agent is a non-CSS user agent, then return element's descendant text content.
+    Layout::ForcedReadScope read { document() };
     document().update_layout(DOM::UpdateLayoutReason::HTMLElementGetTheTextSteps);
     if (!has_layout_box())
         return descendant_text_content();
 
     // 2. Let results be a new empty list.
-    Vector<Variant<Utf16String, RequiredLineBreakCount>> results;
+    Vector<RenderedTextItem> results;
 
     // 3. For each child node node of element:
     for_each_child([&](Node const& node) {
         // 1. Let current be the list resulting in running the rendered text collection steps with node.
         //    Each item in results will either be a string or a positive integer (a required line break count).
-        auto current = rendered_text_collection_steps(node);
+        auto current = rendered_text_collection_steps(read, node);
 
         // 2. For each item item in current, append item to results.
         results.extend(move(current));
         return IterationDecision::Continue;
     });
 
+    // NB: Apply the CSS 'white-space' processing rules to the text that remains unprocessed. The start and the end of
+    //     the element only start and end lines if the element is not inline-level.
+    auto const* layout_node = this->layout_node(read);
+    auto element_is_inline = layout_node && layout_node->is_inline_node();
+    apply_white_space_processing_rules(results, element_is_inline ? StartsAndEndsLine::No : StartsAndEndsLine::Yes);
+    results.remove_all_matching([](auto const& item) {
+        return item.template has<AtomicInlineStart>() || item.template has<AtomicInlineEnd>();
+    });
+
     // 4. Remove any items from results that are the empty string.
-    results.remove_all_matching([](auto& item) {
-        return item.visit(
-            [](Utf16String const& string) { return string.is_empty(); },
-            [](RequiredLineBreakCount const&) { return false; });
+    results.remove_all_matching([](auto const& item) {
+        auto const* string = item.template get_pointer<Utf16String>();
+        return string && string->is_empty();
     });
 
     // 5. Remove any runs of consecutive required line break count items at the start or end of results.
@@ -499,23 +726,22 @@ Utf16String HTMLElement::get_the_text_steps()
     //    U+000A LF code points as the maximum of the values in the required line break count items.
     Utf16StringBuilder builder;
     for (size_t i = 0; i < results.size(); ++i) {
-        results[i].visit(
-            [&](Utf16String const& string) {
-                builder.append(string);
-            },
-            [&](RequiredLineBreakCount const& line_break_count) {
-                int max_line_breaks = line_break_count.count;
-                size_t j = i + 1;
-                while (j < results.size() && results[j].has<RequiredLineBreakCount>()) {
-                    max_line_breaks = max(max_line_breaks, results[j].get<RequiredLineBreakCount>().count);
-                    ++j;
-                }
+        if (auto const* string = results[i].get_pointer<Utf16String>()) {
+            builder.append(*string);
+            continue;
+        }
 
-                // Skip over the run of required line break counts.
-                i = j - 1;
+        int max_line_breaks = results[i].get<RequiredLineBreakCount>().count;
+        size_t j = i + 1;
+        while (j < results.size() && results[j].has<RequiredLineBreakCount>()) {
+            max_line_breaks = max(max_line_breaks, results[j].get<RequiredLineBreakCount>().count);
+            ++j;
+        }
 
-                builder.append_repeated_ascii('\n', max_line_breaks);
-            });
+        // Skip over the run of required line break counts.
+        i = j - 1;
+
+        builder.append_repeated_ascii('\n', max_line_breaks);
     }
 
     // 7. Return the concatenation of the string items in results.
@@ -545,6 +771,7 @@ static bool any_ancestor_establishes_a_fixed_position_containing_block(Layout::N
 GC::Ptr<DOM::Element> HTMLElement::scroll_parent() const
 {
     // NOTE: We have to ensure that the layout is up-to-date before querying the layout tree.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementScrollParent);
 
     // 1. If any of the following holds true, return null and terminate this algorithm:
@@ -552,18 +779,18 @@ GC::Ptr<DOM::Element> HTMLElement::scroll_parent() const
     //    - The element is the root element.
     //    - The element is the body element.
     //    - The element’s computed value of the position property is fixed and no ancestor establishes a fixed position containing block.
-    if (!layout_node())
+    if (!layout_node(read))
         return nullptr;
     if (is_document_element())
         return nullptr;
     if (is_html_body_element())
         return nullptr;
-    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node());
-    if (layout_node()->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
+    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node(read));
+    if (layout_node(read)->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
         return nullptr;
 
     // 2. Let ancestor be the containing block of the element in the flat tree and repeat these substeps:
-    auto ancestor = layout_node()->containing_block();
+    auto ancestor = layout_node(read)->containing_block();
     while (ancestor) {
         // 1. If ancestor is the initial containing block, return the scrollingElement for the element’s document if it
         //    is not closed-shadow-hidden from the element, otherwise return null.
@@ -597,6 +824,7 @@ GC::Ptr<DOM::Element> HTMLElement::scroll_parent() const
 GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
 {
     // NOTE: We have to ensure that the layout is up-to-date before querying the layout tree.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetParent);
 
     // 1. If any of the following holds true return null and terminate this algorithm:
@@ -604,20 +832,20 @@ GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
     //    - The element is the root element.
     //    - The element is the HTML body element.
     //    - The element’s computed value of the position property is fixed and no ancestor establishes a fixed position containing block.
-    if (!layout_node())
+    if (!layout_node(read))
         return nullptr;
     if (is_document_element())
         return nullptr;
     if (is_html_body_element())
         return nullptr;
-    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node());
-    if (layout_node()->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
+    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node(read));
+    if (layout_node(read)->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
         return nullptr;
 
     // NB: The spec does not define "the element is in a fixed position containing block".  Other engines treat it as
     //     holding only when the element itself is fixed-positioned. We also set it to true for the remainder of the
     //     walk once a fixed-positioned ancestor is crossed.
-    auto element_is_in_a_fixed_position_containing_block = layout_node()->is_fixed_position();
+    auto element_is_in_a_fixed_position_containing_block = layout_node(read)->is_fixed_position();
 
     // 2. Let ancestor be the parent of the element in the flat tree and repeat these substeps:
     auto ancestor = first_flat_tree_ancestor_of_type<DOM::Element>();
@@ -629,7 +857,7 @@ GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
         auto const* ancestor_box_values = ancestor->style_group<CSS::ComputedValues::BoxValues>();
         VERIFY(ancestor_box_values);
         bool ancestor_is_fixed_position = static_cast<CSS::Positioning>(ancestor_box_values->position) == CSS::Positioning::Fixed;
-        auto const* ancestor_layout_node = ancestor->layout_node();
+        auto const* ancestor_layout_node = ancestor->layout_node(read);
         if (ancestor_is_closed_shadow_hidden
             && ancestor_is_fixed_position
             && no_ancestor_establishes_a_fixed_position_containing_block)
@@ -690,9 +918,10 @@ int HTMLElement::offset_top() const
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetTop);
 
-    auto const* layout_node = principal_layout_node();
+    auto const* layout_node = principal_layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -703,7 +932,7 @@ int HTMLElement::offset_top() const
     //    relative to the initial containing block origin,
     //    ignoring any transforms that apply to the element and its ancestors, and terminate this algorithm.
     auto offset_parent = this->offset_parent();
-    auto const* offset_parent_layout_node = offset_parent ? offset_parent->layout_node() : nullptr;
+    auto const* offset_parent_layout_node = offset_parent ? offset_parent->layout_node(read) : nullptr;
     if (!offset_parent_layout_node || !Painting::has_committed_box(*offset_parent_layout_node)) {
         return top_border_edge_of_element.to_int();
     }
@@ -734,9 +963,10 @@ int HTMLElement::offset_left() const
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetLeft);
 
-    auto const* layout_node = principal_layout_node();
+    auto const* layout_node = principal_layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -747,7 +977,7 @@ int HTMLElement::offset_left() const
     //    relative to the initial containing block origin,
     //    ignoring any transforms that apply to the element and its ancestors, and terminate this algorithm.
     auto offset_parent = this->offset_parent();
-    auto const* offset_parent_layout_node = offset_parent ? offset_parent->layout_node() : nullptr;
+    auto const* offset_parent_layout_node = offset_parent ? offset_parent->layout_node(read) : nullptr;
     if (!offset_parent_layout_node || !Painting::has_committed_box(*offset_parent_layout_node)) {
         return left_border_edge_of_element.to_int();
     }
@@ -774,10 +1004,11 @@ int HTMLElement::offset_left() const
 int HTMLElement::offset_width() const
 {
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetWidth);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* layout_node = principal_layout_node();
+    auto const* layout_node = principal_layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -786,17 +1017,18 @@ int HTMLElement::offset_width() const
     //
     //    If the element’s principal box is an inline-level box which was "split" by a block-level descendant, also
     //    include fragments generated by the block-level descendants, unless they are zero width or height.
-    return round(Painting::absolute_border_box_rect(*layout_node).width()).to_int();
+    return round(Painting::border_box_rect_of_fragments(*layout_node).width()).to_int();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetheight
 int HTMLElement::offset_height() const
 {
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetHeight);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* layout_node = principal_layout_node();
+    auto const* layout_node = principal_layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -805,7 +1037,7 @@ int HTMLElement::offset_height() const
     //
     //    If the element’s principal box is an inline-level box which was "split" by a block-level descendant, also
     //    include fragments generated by the block-level descendants, unless they are zero width or height.
-    return round(Painting::absolute_border_box_rect(*layout_node).height()).to_int();
+    return round(Painting::border_box_rect_of_fragments(*layout_node).height()).to_int();
 }
 
 void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -854,8 +1086,7 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
     }
 
     // 1. If namespace is not null, or localName is not the name of an event handler content attribute on element, then return.
-    // FIXME: Add the namespace part once we support attribute namespaces.
-    if (name.view().starts_with(u"on"sv)) {
+    if (!namespace_.has_value() && name.view().starts_with(u"on"sv)) {
 #undef __ENUMERATE
 #define __ENUMERATE(attribute_name, event_name)               \
     if (name == HTML::AttributeNames::attribute_name) {       \
@@ -1095,8 +1326,102 @@ bool HTMLElement::is_form_associated_custom_element() const
     return custom_element_definition() && custom_element_definition()->form_associated();
 }
 
+OrderedHashMap<Utf16FlyString, Utf16String>& HTMLElement::internal_content_attribute_map()
+{
+    return ensure_html_element_rare_data().internal_content_attribute_map;
+}
+
+Optional<Utf16String> HTMLElement::internal_content_attribute(Utf16FlyString const& name) const
+{
+    auto const* rare_data = html_element_rare_data();
+    if (!rare_data)
+        return {};
+    return rare_data->internal_content_attribute_map.get(name).copy();
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#wai-aria
+Optional<Utf16String> HTMLElement::default_aria_state_or_property_value(Utf16FlyString const& state_or_property) const
+{
+    // Similarly, for a custom element element, the default ARIA state and property semantics, for a state or property
+    // named stateOrProperty, are determined as follows:
+    if (!is_custom())
+        return {};
+
+    // 1. If element's attached internals is non-null:
+    //    1. If element's attached internals's get the stateOrProperty-associated element exists, then return the
+    //       result of running it.
+    //    2. If element's attached internals's get the stateOrProperty-associated elements exists, then return the
+    //       result of running it.
+    // NB: The associated elements are given by default_aria_state_or_property_elements(). They are also stored with an
+    //     empty string value in the internal content attribute map, so we return no value for them here.
+    if (auto const* rare_data = html_element_rare_data(); rare_data && rare_data->attached_internals) {
+#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute)      \
+    if (state_or_property == ARIA::AttributeNames::referencing_attribute) \
+        return {};
+        ENUMERATE_ARIA_ELEMENT_REFERENCING_ATTRIBUTES
+        ENUMERATE_ARIA_ELEMENT_LIST_REFERENCING_ATTRIBUTES
+#undef __ENUMERATE_ARIA_ATTRIBUTE
+    }
+
+    // 2. If element's internal content attribute map[stateOrProperty] exists, then return it.
+    // 3. Return the default value for stateOrProperty.
+    // NB: The caller falls back to the default value when we return no value.
+    return internal_content_attribute(state_or_property);
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#wai-aria
+Optional<GC::RootVector<GC::Ref<DOM::Element>>> HTMLElement::default_aria_state_or_property_elements(Utf16FlyString const& state_or_property) const
+{
+    // NB: This is step 1 of the default ARIA state and property semantics of a custom element, for the states and
+    //     properties that refer to elements.
+    if (!is_custom())
+        return {};
+
+    // 1. If element's attached internals is non-null:
+    auto const* rare_data = html_element_rare_data();
+    if (!rare_data || !rare_data->attached_internals)
+        return {};
+    auto const& internals = *rare_data->attached_internals;
+
+    //    1. If element's attached internals's get the stateOrProperty-associated element exists, then return the
+    //       result of running it.
+#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute)                                                 \
+    if (state_or_property == ARIA::AttributeNames::referencing_attribute) {                                          \
+        GC::RootVector<GC::Ref<DOM::Element>> elements;                                                              \
+        if (auto element = internals.get_the_attribute_associated_element(state_or_property, internals.attribute())) \
+            elements.append(*element);                                                                               \
+        return elements;                                                                                             \
+    }
+    ENUMERATE_ARIA_ELEMENT_REFERENCING_ATTRIBUTES
+#undef __ENUMERATE_ARIA_ATTRIBUTE
+
+    //    2. If element's attached internals's get the stateOrProperty-associated elements exists, then return the
+    //       result of running it.
+#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute)      \
+    if (state_or_property == ARIA::AttributeNames::referencing_attribute) \
+        return internals.get_the_attribute_associated_elements(state_or_property, internals.attribute());
+    ENUMERATE_ARIA_ELEMENT_LIST_REFERENCING_ATTRIBUTES
+#undef __ENUMERATE_ARIA_ATTRIBUTE
+
+    return {};
+}
+
 Optional<ARIA::Role> HTMLElement::default_role() const
 {
+    // https://html.spec.whatwg.org/multipage/dom.html#wai-aria
+    // In addition to the rules there, for a custom element element, the default ARIA role semantics are determined as
+    // follows:
+    if (is_custom()) {
+        // 1. Let map be element's internal content attribute map.
+        // 2. If map["role"] exists, then return it.
+        if (auto role = internal_content_attribute(ARIA::AttributeNames::role); role.has_value())
+            return role_from_role_value(role, RoleSource::DefaultSemantics);
+
+        // 3. Return no role.
+        // AD-HOC: A customized built-in element keeps the default role of the element it extends, so we fall
+        //         through to the rules below, which give no role to an autonomous custom element.
+    }
+
     // https://www.w3.org/TR/html-aria/#el-address
     if (local_name() == TagNames::address)
         return ARIA::Role::group;
@@ -1883,7 +2208,7 @@ GC::Ptr<HTMLElement> HTMLElement::topmost_popover_ancestor(GC::Ptr<DOM::Node> ne
     }
 
     // 3. Let popoverPositions be an empty ordered map.
-    OrderedHashMap<GC::Ref<HTMLElement>, int> popover_positions;
+    GC::OrderedRootHashMap<GC::Ref<HTMLElement>, int> popover_positions;
 
     // 4. Let index be 0.
     int index = 0;

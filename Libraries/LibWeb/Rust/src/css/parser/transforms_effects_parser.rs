@@ -10,8 +10,7 @@
 use super::component_value::{ComponentKind, ComponentValue};
 use super::token_stream::TokenStream;
 use super::value_parser::{
-    NumericRange, ParseContext, ParseOutcome, VALUE_TYPE_ANGLE, VALUE_TYPE_INTEGER, VALUE_TYPE_NUMBER,
-    VALUE_TYPE_PERCENTAGE, equals_ascii_case_insensitive, parse_angle_value,
+    NumericRange, ParseContext, ParseOutcome, equals_ascii_case_insensitive, parse_angle_value,
     parse_calculated_numeric_value_with_ranges, parse_integer_value, parse_length_from_stream,
     parse_length_percentage_from_stream, parse_number_from_stream, parse_number_percentage_value, parse_number_value,
     parse_percentage_value, parse_tree_counting_value, parse_url_value,
@@ -26,9 +25,10 @@ use crate::css::style_value::{
     RetainedLinearEasingStop, RetainedLinearEasingStopList, RetainedStyleValueData, RetainedStyleValueDataList,
     StyleValueData,
 };
+use crate::css::value_codes::{VALUE_TYPE_ANGLE, VALUE_TYPE_INTEGER, VALUE_TYPE_NUMBER, VALUE_TYPE_PERCENTAGE};
 use std::sync::Arc;
 
-include!(concat!(env!("OUT_DIR"), "/transform_functions_generated.rs"));
+pub(crate) use crate::css::transform_functions::*;
 
 const PARAMETER_ANGLE: u8 = 0;
 const PARAMETER_LENGTH: u8 = 1;
@@ -821,23 +821,8 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(property: u16, source: &str) -> ParseOutcome {

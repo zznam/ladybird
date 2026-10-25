@@ -29,9 +29,11 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
+#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
@@ -39,6 +41,7 @@
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/Dates.h>
@@ -55,7 +58,6 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -69,6 +71,7 @@
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
+#include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace {
 
@@ -92,11 +95,6 @@ bool is_integral_multiple(double value, double step)
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLInputElement);
-
-Layout::Node const* HTMLInputElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name, DOM::EventInit const& event_init = {})
 {
@@ -383,24 +381,6 @@ FileFilter HTMLInputElement::parse_accept_attribute() const
     return filter;
 }
 
-// https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-void HTMLInputElement::update_the_file_selection(GC::Ref<FileAPI::FileList> files)
-{
-    // 1. Queue an element task on the user interaction task source given element and the following steps:
-    // https://github.com/whatwg/html/issues/1080
-    // INTEROP: Other engines perform these steps synchronously once the user has selected the files.
-
-    set_files(files.ptr());
-
-    // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-    auto input_event = create_event_for_element(*this, EventNames::input, { .bubbles = true, .composed = true });
-    this->dispatch_event(input_event);
-
-    // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-    auto change_event = create_event_for_element(*this, EventNames::change, { .bubbles = true });
-    this->dispatch_event(change_event);
-}
-
 // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
 static void show_the_picker_if_applicable(HTMLInputElement& element)
 {
@@ -468,7 +448,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
         if (element.type_state() == HTMLInputElement::TypeAttributeState::Color) {
             auto weak_element = GC::Weak<HTMLInputElement> { element };
             element.set_is_open(true);
-            element.document().page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
+            element.document().page().did_request_color_picker(weak_element, element.value_as_color());
         }
     }
 }
@@ -508,6 +488,11 @@ WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::E
     if (type_state() == TypeAttributeState::Checkbox || type_state() == TypeAttributeState::RadioButton) {
         // 1. If the element is not connected, then return.
         if (!is_connected())
+            return {};
+
+        // INTEROP: Browsers do not fire input and change events at a radio button that was already checked before it
+        //          was activated.
+        if (type_state() == TypeAttributeState::RadioButton && m_before_legacy_pre_activation_behavior_checked)
             return {};
 
         // 2. Fire an event named input at the element with the bubbles and composed attributes initialized to true.
@@ -601,8 +586,8 @@ void HTMLInputElement::did_pick_color(Optional<Color> picked_color, ColorPickerU
 {
     if (type_state() == TypeAttributeState::Color && picked_color.has_value()) {
         // then when the user changes the element's value
-        m_value = value_sanitization_algorithm(picked_color->to_utf16_string_without_alpha());
         m_dirty_value = true;
+        m_value = value_sanitization_algorithm(picked_color->to_utf16_string_without_alpha());
 
         update_color_well_element();
 
@@ -653,16 +638,12 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
         auto contents = selected_file.take_contents();
 
         auto mime_type = MimeSniff::Resource::sniff(contents);
-        auto blob = FileAPI::Blob::create(move(contents), mime_type.essence());
 
         // FIXME: The FileAPI should use ByteString for file names.
         auto file_name = selected_file.name();
 
         // FIXME: Fill in other fields (e.g. last_modified).
-        FileAPI::FilePropertyBag options {};
-        options.type = Utf16String::from_ascii_without_validation(mime_type.essence().bytes());
-
-        auto file = MUST(FileAPI::File::create({ { blob } }, file_name, move(options)));
+        auto file = FileAPI::File::create(contents, file_name, Utf16String::from_ascii_without_validation(mime_type.essence().bytes()));
         files->add_file(file);
     }
 
@@ -765,6 +746,14 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_relevant_value(Utf16View value)
     return {};
 }
 
+WebIDL::ExceptionOr<void> HTMLInputElement::set_value_binding(Utf16View value)
+{
+    // INTEROP: Browsers forget the undo history of a text control when a script sets its value.
+    if (auto history = document().editing_history_if_exists())
+        history->forget_steps_for(*this);
+    return set_value(value);
+}
+
 WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
 {
     switch (value_attribute_mode()) {
@@ -787,8 +776,6 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
         //    and the element has a text entry cursor position, move the text entry cursor position to the end of the
         //    text control, unselecting any selected text and resetting the selection direction to "none".
         if (m_value != old_value) {
-            relevant_value_was_changed();
-
             // AD-HOC: Changing the value may change which validity pseudo-classes match.
             CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
@@ -796,6 +783,9 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
                 m_text_node->set_data(m_value);
                 update_placeholder_visibility();
             }
+
+            // NB: The relevant value is read from the text node — so, this has to come after the text node is updated.
+            relevant_value_was_changed();
 
             if (selection_or_range_applies())
                 set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units());
@@ -1622,6 +1612,8 @@ void HTMLInputElement::did_receive_focus()
 
 void HTMLInputElement::did_lose_focus()
 {
+    reveal_cursor_if_pending();
+
     if (m_text_node)
         m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
@@ -1667,13 +1659,26 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
             else
                 m_value = {};
 
-            if (m_value != old_value)
-                relevant_value_was_changed();
-
             if (m_text_node)
                 m_text_node->set_data(m_value);
 
+            // The relevant value is read from the text node — so, this has to come after the text node is updated.
+            if (m_value != old_value)
+                relevant_value_was_changed();
+
             update_shadow_tree();
+        }
+    } else if (name == HTML::AttributeNames::alpha || name == HTML::AttributeNames::colorspace) {
+        // https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)
+        // Whenever the element's alpha or colorspace attributes are changed, the user agent must run update a color
+        // well control color given the element.
+        if (type_state() == TypeAttributeState::Color) {
+            auto old_value = move(m_value);
+            m_value = update_a_color_well_control_color(old_value);
+            if (m_value != old_value) {
+                relevant_value_was_changed();
+                update_color_well_element();
+            }
         }
     } else if (name == HTML::AttributeNames::placeholder) {
         if (m_placeholder_text_node) {
@@ -1856,6 +1861,10 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     request->set_use_url_credentials(true);
 
     // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
+    // NB: Fetching the image must delay the load event of the element's node document until the task that is queued by
+    //     the networking task source once the resource has been fetched (defined below) has been run.
+    m_load_event_delayer.emplace(document());
+
     m_resource_request = SharedResourceRequest::get_or_create(document(), request->url());
     CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
@@ -1888,16 +1897,15 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
             //     now that the load failed it renders its alt text instead.
             update_image_button_alt_text_shadow_tree();
             set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
+        },
+        [this]() {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
         m_resource_request->fetch_resource(request);
     }
     update_image_button_alt_text_shadow_tree();
-
-    // Fetching the image must delay the load event of the element's node document until the task that is queued by the
-    // networking task source once the resource has been fetched (defined below) has been run.
-    m_load_event_delayer.emplace(document());
 
     return {};
 }
@@ -1943,21 +1951,157 @@ bool HTMLInputElement::can_have_text_editing_cursor() const
     return true;
 }
 
-// https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-simple-colour
-static bool is_valid_simple_color(Utf16View const& value)
+// https://drafts.csswg.org/css-color/#parse-a-css-color-value
+static RefPtr<CSS::StyleValue const> parse_a_css_color_value(Utf16View input)
 {
-    // if it is exactly seven characters long,
-    if (value.length_in_code_units() != 7)
-        return false;
-    // and the first character is a U+0023 NUMBER SIGN character (#),
-    if (!value.starts_with('#'))
-        return false;
-    // and the remaining six characters are all ASCII hex digits
-    for (size_t i = 1; i < value.length_in_code_units(); i++)
-        if (!is_ascii_hex_digit(value.code_unit_at(i)))
-            return false;
+    // 1. Parse input as a <color>. If the result is failure, return failure; otherwise, let color be the result.
+    auto color = parse_css_type(CSS::Parser::ParsingParams {}, input, CSS::ValueType::Color);
+    if (!color)
+        return nullptr;
 
-    return true;
+    // 3. Let used color be the result of resolving color to a used color. If the value of other properties on the
+    //    element a <color> is on is required to do the resolution (such as resolving a 'currentcolor' or system
+    //    color), use element if it was passed, or the initial values of the properties if not.
+    // 4. Return used color.
+    // NB: The used color is resolved against the initial values when it is converted to a color space.
+    return color;
+}
+
+// NB: Resolves color to a used color against the initial values of the properties, and converts it to the color
+//     space of color_type.
+static Array<float, 4> used_color_components_in_color_space(CSS::StyleValue const& color, CSS::ColorStyleValue::ColorType color_type)
+{
+    auto resolved = CSS::StyleValueFFI::rust_style_value_to_color_components(color.rust_style_value_data(), nullptr, to_underlying(color_type));
+    if (!resolved.resolved)
+        return { 0, 0, 0, 1 };
+
+    // NB: Converting a color with infinite components to another color space can produce infinite or NaN
+    //     components, which serialize to strings that do not parse as a color. Keep the components finite.
+    Array<float, 4> components;
+    for (size_t i = 0; i < components.size(); ++i) {
+        auto component = resolved.components[i];
+        components[i] = isnan(component) ? 0.0f : clamp(component, NumericLimits<float>::lowest(), NumericLimits<float>::max());
+    }
+    return components;
+}
+
+Color HTMLInputElement::value_as_color() const
+{
+    auto color = parse_a_css_color_value(m_value);
+    if (!color)
+        return Color::Black;
+    return color->to_color({}).value_or(Color::Black);
+}
+
+// https://html.spec.whatwg.org/multipage/input.html#update-a-color-well-control-color
+// NB: This returns the string that the element's value is set to, as the value sanitization algorithm does.
+//     Callers that are about to set the element's value to element_value pass it, as the value sanitization
+//     algorithm runs before the new value is stored.
+Utf16String HTMLInputElement::update_a_color_well_control_color(Utf16View element_value) const
+{
+    // 1. Assert: element is an input element whose type attribute is in the Color state.
+    VERIFY(type_state() == TypeAttributeState::Color);
+
+    // 2. Let value be the result of running these steps:
+    auto value = [&] {
+        // 1. If element's dirty value flag is false, then return the result of getting an attribute by namespace and
+        //    local name given null, "value", and element.
+        if (!m_dirty_value)
+            return get_attribute_value(AttributeNames::value);
+
+        // 2. Return element's value.
+        return Utf16String::from_utf16(element_value);
+    }();
+
+    // 3. Let color be the result of parsing value.
+    auto color = parse_a_css_color_value(value);
+
+    // 4. If color is failure, then set color to opaque black.
+    if (!color)
+        color = CSS::ColorStyleValue::create_from_color(Color::Black, CSS::ColorSyntax::Legacy);
+
+    // 5. Set element's value to the result of serializing a color well control color given element and color.
+    return serialize_a_color_well_control_color(*color);
+}
+
+// https://html.spec.whatwg.org/multipage/input.html#attr-input-colorspace
+HTMLInputElement::ColorSpaceState HTMLInputElement::color_space_state() const
+{
+    // The attribute's missing value default and invalid value default are both the Limited sRGB state.
+    if (auto value = attribute(AttributeNames::colorspace); value.has_value() && value->equals_ignoring_ascii_case(u"display-p3"sv))
+        return ColorSpaceState::DisplayP3;
+    return ColorSpaceState::LimitedSRGB;
+}
+
+// https://html.spec.whatwg.org/multipage/input.html#serialize-a-color-well-control-color
+Utf16String HTMLInputElement::serialize_a_color_well_control_color(CSS::StyleValue const& color) const
+{
+    // 1. Assert: element is an input element whose type attribute is in the Color state.
+    VERIFY(type_state() == TypeAttributeState::Color);
+
+    // 2. Let htmlCompatible be false.
+    bool html_compatible = false;
+
+    // 3. If element's alpha attribute is not specified, then set color's alpha component to be fully opaque.
+    // NB: Converting color to another color space keeps its alpha component, so this is applied as part of the
+    //     conversion below.
+    auto has_alpha_attribute = has_attribute(AttributeNames::alpha);
+    auto convert_color = [&](CSS::ColorStyleValue::ColorType color_type) {
+        auto components = used_color_components_in_color_space(color, color_type);
+        if (!has_alpha_attribute)
+            components[3] = 1.0f;
+        return components;
+    };
+
+    Array<float, 4> components;
+    CSS::ColorStyleValue::ColorType color_type;
+
+    // 4. If element's colorspace attribute is in the Limited sRGB state:
+    if (color_space_state() == ColorSpaceState::LimitedSRGB) {
+        // 1. Set color to color converted to the 'srgb' color space.
+        color_type = CSS::ColorStyleValue::ColorType::sRGB;
+        components = convert_color(color_type);
+
+        // 2. Round each of color's components so they are in the range 0 to 255, inclusive. Components are to be
+        //    rounded towards +∞.
+        for (auto& component : components)
+            component = floorf(clamp(component * 255.0f, 0.0f, 255.0f) + 0.5f);
+
+        // 3. If element's alpha attribute is not specified, then set htmlCompatible to true.
+        if (!has_alpha_attribute) {
+            html_compatible = true;
+        }
+        // NOTE: This intentionally uses a different serialization path for compatibility with an earlier version of
+        //       the color well control.
+        // 4. Otherwise, set color to color converted using the 'color()' function.
+        else {
+            for (auto& component : components)
+                component /= 255.0f;
+        }
+    }
+    // Otherwise:
+    else {
+        // 1. Assert: element's colorspace attribute is in the Display P3 state.
+        VERIFY(color_space_state() == ColorSpaceState::DisplayP3);
+
+        // 2. Set color to color converted to the 'display-p3' color space.
+        color_type = CSS::ColorStyleValue::ColorType::DisplayP3;
+        components = convert_color(color_type);
+    }
+
+    // 5. Return the result of serializing color. If htmlCompatible is true, then do so with HTML-compatible
+    //    serialization requested.
+    // https://drafts.csswg.org/css-color-4/#HTML-compatible-serialization-of-srgb
+    if (html_compatible)
+        return Utf16String::formatted("#{:02x}{:02x}{:02x}", static_cast<u8>(components[0]), static_cast<u8>(components[1]), static_cast<u8>(components[2]));
+
+    auto serialized_color = CSS::ColorFunctionStyleValue::create(
+        color_type,
+        CSS::NumberStyleValue::create(components[0]),
+        CSS::NumberStyleValue::create(components[1]),
+        CSS::NumberStyleValue::create(components[2]),
+        CSS::NumberStyleValue::create(components[3]));
+    return serialized_color->to_utf16_string(CSS::SerializationMode::Normal);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
@@ -2119,11 +2263,8 @@ Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16View value) cons
     }
     // https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color):value-sanitization-algorithm
     else if (type_state() == HTMLInputElement::TypeAttributeState::Color) {
-        // If the value of the element is a valid simple color, then set it to the value of the element converted to
-        // ASCII lowercase; otherwise, set it to the string "#000000".
-        if (is_valid_simple_color(value))
-            return value.to_ascii_lowercase();
-        return "#000000"_utf16;
+        // Run update a color well control color for the element.
+        return update_a_color_well_control_color(value);
     }
 
     return Utf16String::from_utf16(value);
@@ -2151,9 +2292,6 @@ void HTMLInputElement::reset_algorithm()
     // and then invoke the value sanitization algorithm, if the type attribute's current state defines one.
     m_value = value_sanitization_algorithm(m_value);
 
-    if (m_value != old_value)
-        relevant_value_was_changed();
-
     // AD-HOC: Resetting may change the value and the user validity, affecting which validity pseudo-classes match.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
@@ -2161,6 +2299,10 @@ void HTMLInputElement::reset_algorithm()
         m_text_node->set_data(m_value);
         update_placeholder_visibility();
     }
+
+    // NB: The relevant value is read from the text node — so, this has to come after the text node is updated.
+    if (m_value != old_value)
+        relevant_value_was_changed();
 
     update_shadow_tree();
 }
@@ -2190,13 +2332,14 @@ void HTMLInputElement::clear_algorithm()
     // changes caused by the user (and thus, e.g. do cause input events to fire).
     user_interaction_did_change_input_value();
 
-    if (m_value != old_value)
-        relevant_value_was_changed();
-
     if (m_text_node) {
         m_text_node->set_data(m_value);
         update_placeholder_visibility();
     }
+
+    // NB: The relevant value is read from the text node — so, this has to come after the text node is updated.
+    if (m_value != old_value)
+        relevant_value_was_changed();
 
     update_shadow_tree();
 }
@@ -2313,10 +2456,8 @@ void HTMLInputElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
             // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
             // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
             // vertical middle of the element with the parent element's baseline.
-            // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
-            //        as Firefox and Chrome do with engine-specific legacy values.
             if (value.equals_ignoring_ascii_case(u"center"sv) || value.equals_ignoring_ascii_case(u"middle"sv))
-                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
+                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::LibwebBaselineMiddle) });
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
                 auto width_style_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
@@ -2547,6 +2688,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-height
 WebIDL::UnsignedLong HTMLInputElement::height() const
 {
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementHeight);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
@@ -2554,7 +2696,7 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
         return 0;
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_height(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -2582,6 +2724,7 @@ void HTMLInputElement::set_height(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-width
 WebIDL::UnsignedLong HTMLInputElement::width() const
 {
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementWidth);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
@@ -2589,7 +2732,7 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
         return 0;
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_width(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -3247,7 +3390,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL
 
     // 5. If applying the algorithm to convert a string to a number to the string given by the element's value does not result in an error,
     // then let value be the result of that algorithm. Otherwise, let value be zero.
-    double value = convert_string_to_number(this->value()).value_or(0);
+    auto maybe_value = convert_string_to_number(this->value());
+    double value = maybe_value.value_or(0);
 
     // 6. Let valueBeforeStepping be value.
     double value_before_stepping = value;
@@ -3291,11 +3435,12 @@ WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL
 
     // 10. If either the method invoked was the stepDown() method and value is greater than valueBeforeStepping,
     // or the method invoked was the stepUp() method and value is less than valueBeforeStepping, then return.
-    if (is_down) {
-        if (value > value_before_stepping)
+    // INTEROP: Browsers only do this when the element's value could be converted to a number, so stepping an
+    //          element without a value always gives it one.
+    if (maybe_value.has_value()) {
+        if (is_down && value > value_before_stepping)
             return {};
-    } else {
-        if (value < value_before_stepping)
+        if (!is_down && value < value_before_stepping)
             return {};
     }
 
@@ -4038,7 +4183,7 @@ bool HTMLInputElement::suffering_from_bad_input() const
     case TypeAttributeState::Color:
         // https://html.spec.whatwg.org/multipage/input.html#color-state-(type%3Dcolor)%3Asuffering-from-bad-input
         // While the element's value is not the empty string and parsing it returns failure, the control is suffering from bad input.
-        return !relevant_value.is_empty() && !is_valid_simple_color(relevant_value);
+        return !relevant_value.is_empty() && !parse_a_css_color_value(relevant_value);
     default:
         break;
     }

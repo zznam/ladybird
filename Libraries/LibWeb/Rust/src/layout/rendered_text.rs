@@ -9,7 +9,6 @@ use super::text_transform::{TextRenderingOptions, may_require_bidi_processing, r
 use super::{ComputedValuesView, LayoutNodeArena};
 use crate::css::css_enums::text_transform;
 use std::cell::{OnceCell, RefCell};
-use std::ffi::c_void;
 use std::sync::Arc;
 
 /// Selects the beginning or end of a transformed span for offsets inside it.
@@ -78,10 +77,10 @@ impl PartialEq for PublishedTextSlot {
 }
 
 /// A text row's rendered text, with what layout caches beside it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TextContent {
     rendered: Arc<RenderedText>,
-    grapheme_segmenter: OnceCell<super::text_chunker::GraphemeSegmenter>,
+    grapheme_segmenter: crate::fork::ForkReset<OnceCell<super::text_chunker::GraphemeSegmenter>>,
     chunks: RefCell<Option<Arc<CachedTextChunks>>>,
     pub(super) rendering_key: Option<TextRenderingKey>,
 }
@@ -147,6 +146,7 @@ pub(crate) struct TextChunkCacheKey {
     pub(crate) word_break: u8,
     pub(crate) font_variant_emoji: u8,
     pub(crate) frozen_font_list: std::sync::Arc<libgfx_rust::font::FrozenFontList>,
+    pub(crate) splits_at_orientation_changes: bool,
 }
 
 impl PartialEq for TextChunkCacheKey {
@@ -157,6 +157,7 @@ impl PartialEq for TextChunkCacheKey {
             && self.white_space_collapse == other.white_space_collapse
             && self.word_break == other.word_break
             && self.font_variant_emoji == other.font_variant_emoji
+            && self.splits_at_orientation_changes == other.splits_at_orientation_changes
             // A frozen cascade is immutable, so naming the same one is the whole of equality.
             && std::sync::Arc::ptr_eq(&self.frozen_font_list, &other.frozen_font_list)
     }
@@ -336,12 +337,6 @@ impl TextFragments {
     }
 }
 
-#[repr(C)]
-pub struct FfiRenderedTextView {
-    pub text: *const u16,
-    pub length_in_code_units: usize,
-}
-
 /// The code units a published string spells, without widening ASCII storage to count them.
 pub(super) fn length_in_code_units(text: &ak::Utf16String) -> usize {
     match text.as_units() {
@@ -350,20 +345,8 @@ pub(super) fn length_in_code_units(text: &ak::Utf16String) -> usize {
     }
 }
 
-/// # Safety
-///
-/// The arena must be live on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_text_has_source_range(arena: *mut c_void, id: NodeSlotId) -> bool {
-    // SAFETY: The caller lends the arena for this synchronous metadata query.
-    unsafe { LayoutNodeArena::from_handle(arena) }.text_has_source_range(id)
-}
-
-/// The arena must be live on the document thread with no outstanding borrows.
-/// `id` must name a live text node with a styled parent.
-pub(super) unsafe fn ensure_text_content(arena: *mut LayoutNodeArena, id: NodeSlotId) {
-    // SAFETY: The caller lends the arena for this invalidation check and the publication after it.
-    let arena = unsafe { &mut *arena };
+/// Publishes the rendered text of `id`, a live text node with a styled parent, where what it renders changed.
+pub(super) fn ensure_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
     if arena.text_content_needs_sync(id) {
         sync_text_content(arena, id);
     }
@@ -413,32 +396,13 @@ fn sync_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
                 dom_length_in_code_units: source_range.length,
                 edits: rendered.edits,
             }),
-            grapheme_segmenter: OnceCell::new(),
+            grapheme_segmenter: crate::fork::ForkReset::default(),
             chunks: RefCell::default(),
             rendering_key: Some(key),
         };
         arena.set_text_content(id, content);
     }
     arena.finish_text_content_sync(id);
-}
-
-/// # Safety
-///
-/// The arena must be exclusively available on the document thread, and `id`
-/// must name a live text node with a styled parent. Refresh may request source
-/// facts from the host. The returned view lasts until republication or freeing.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_text_for_rendering(arena: *mut c_void, id: NodeSlotId) -> FfiRenderedTextView {
-    // SAFETY: The caller lends the arena for refresh before borrowing its text.
-    unsafe { ensure_text_content(arena.cast(), id) };
-    // SAFETY: The host keeps the arena and its published text live during the read.
-    let content = unsafe { LayoutNodeArena::from_handle(arena) }
-        .text_content(id)
-        .expect("text must be published before borrowing its rendered view");
-    FfiRenderedTextView {
-        text: content.text.as_ptr(),
-        length_in_code_units: content.text.len(),
-    }
 }
 
 #[cfg(test)]
@@ -479,6 +443,7 @@ mod tests {
             word_break: 0,
             font_variant_emoji: 0,
             frozen_font_list: std::sync::Arc::new(libgfx_rust::font::FrozenFontList::empty()),
+            splits_at_orientation_changes: false,
         };
         let chunk = TextChunk {
             start: 0,
@@ -782,19 +747,33 @@ mod tests {
     }
 
     #[test]
+    fn slice_ranges_are_clamped_to_text_that_changed_after_the_split() {
+        let mut arena = LayoutNodeArena::new();
+        let (first, remainder) = first_letter_slices(&mut arena, 1, 19);
+        assert_eq!(
+            arena.text_source_range(remainder, 5),
+            FfiTextSourceRange { start: 1, length: 4 }
+        );
+        let _ = arena.free_subtree(first);
+        assert_eq!(
+            arena.text_source_range(remainder, 0),
+            FfiTextSourceRange { start: 0, length: 0 }
+        );
+    }
+
+    #[test]
     fn selection_entries_expand_the_primary_text_node_to_both_slices() {
         use crate::painting::paintable_data::{FfiSelectionEntry, SELECTION_STATE_START_AND_END};
 
         let mut arena = LayoutNodeArena::new();
-        let viewport = arena.allocate_for_test().slot;
-        arena.populate_paintable_row(viewport);
         let (first, remainder) = first_letter_slices(&mut arena, 1, 4);
         let entries = [FfiSelectionEntry {
             is_text_node_entry: true,
             layout_node: remainder,
             state: SELECTION_STATE_START_AND_END,
         }];
-        let states = crate::painting::selection::apply(&mut arena.paintable_rows_mut(), viewport, &entries);
+        let selection = crate::painting::selection::apply(&mut arena.paintable_rows_mut(), &entries, 0, 4);
+        let states = &selection.text_states;
         assert_eq!(states.len(), 2);
         assert_eq!(states.get(&first), Some(&SELECTION_STATE_START_AND_END));
         assert_eq!(states.get(&remainder), Some(&SELECTION_STATE_START_AND_END));

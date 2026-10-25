@@ -20,19 +20,58 @@ use super::transaction::{
     STYLE_REACTION_ANCESTOR_BECAME_VISIBLE, STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES, STYLE_REACTION_INHERITED_STYLE,
     STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES, STYLE_REACTION_RECOMPUTE_STYLE,
 };
-use super::{StyleEngineState, StyleNodeID};
+use super::{StyleEngine, StyleNodeID};
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::display::FfiDisplay;
 use crate::css::host_shared::SharedPayload;
 use smallvec::SmallVec;
 
 /// Every inherited style group, for a change that reaches all of them.
-const ALL_INHERITED_STYLE_GROUPS: u8 = (1 << 7) - 1;
+const INHERITED_STYLE_GROUP_COUNT: usize = 7;
+const ALL_INHERITED_STYLE_GROUPS: u8 = (1 << INHERITED_STYLE_GROUP_COUNT) - 1;
 
 /// What an element's installed record generates, as its children read it.
 struct InstalledRecordState {
     is_display_none: bool,
     in_display_none_subtree: bool,
+}
+
+/// The reactions and the inherited style groups that a reaction C++ applied to an element, with `reaction`,
+/// `inherited_style_groups_changed` and `facts` as it reports them, may derive for any of the element's children, as
+/// [`StyleEngine::note_style_reaction_applied`] derives them from what else the engine knows.
+pub(crate) fn derivable_child_reactions(reaction: u8, inherited_style_groups_changed: u8, facts: u32) -> (u8, u8) {
+    let has = |bit: u32| facts & bit != 0;
+    let custom_properties =
+        has(fact::DID_CHANGE_CUSTOM_PROPERTIES) || reaction & STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES != 0;
+    let became_visible = reaction & STYLE_REACTION_ANCESTOR_BECAME_VISIBLE != 0 || has(fact::WAS_DISPLAY_NONE);
+    let mut derived = 0;
+    let mut groups = inherited_style_groups_changed;
+    if custom_properties {
+        derived |= STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES;
+    }
+    // A slot's assigned elements, an unstyled display:none element's children, and a rebuilt box's children recompute.
+    if !has(fact::INVALIDATION_IS_NONE)
+        || custom_properties
+        || became_visible
+        || has(fact::WAS_UNSTYLED)
+        || has(fact::NEEDS_LAYOUT_TREE_REBUILD)
+    {
+        derived |= STYLE_REACTION_RECOMPUTE_STYLE;
+    }
+    if reaction & STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES != 0 || has(fact::RECOMPUTE_DESCENDANT_STYLES) {
+        derived |= STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES;
+    }
+    if became_visible {
+        derived |= STYLE_REACTION_ANCESTOR_BECAME_VISIBLE;
+    }
+    // A child that explicitly inherits a property that is not inherited takes every group.
+    if !has(fact::INVALIDATION_IS_NONE) {
+        groups = ALL_INHERITED_STYLE_GROUPS;
+    }
+    if groups != 0 {
+        derived |= STYLE_REACTION_INHERITED_STYLE;
+    }
+    (derived, groups)
 }
 
 /// One reaction a reaction applied to an element derives for a child of it, or for an element a
@@ -48,7 +87,7 @@ pub(super) struct DerivedChildReaction {
     pub(super) parent_display_moved: bool,
 }
 
-impl StyleEngineState {
+impl StyleEngine {
     /// What the element's installed record generates, or `None` for an element without style.
     fn installed_record_state(&self, node: StyleNodeID) -> Option<InstalledRecordState> {
         let record = self.retained.computed_group_sets.assigned_style_record(node)?;
@@ -75,16 +114,24 @@ impl StyleEngineState {
         node: StyleNodeID,
         reaction: u8,
         inherited_style_groups_changed: u8,
+        changed_non_inherited_style_groups: u32,
         facts: u32,
     ) {
         let mut derived = SmallVec::<[DerivedChildReaction; 8]>::new();
-        self.derive_child_reactions(node, reaction, inherited_style_groups_changed, facts, |child| {
-            derived.push(child);
-        });
+        self.derive_child_reactions(
+            node,
+            reaction,
+            inherited_style_groups_changed,
+            changed_non_inherited_style_groups,
+            facts,
+            |child| {
+                derived.push(child);
+            },
+        );
         for child in derived {
             self.record_derived_element_style_input(child.child, child.reaction, child.inherited_style_groups);
             if child.parent_display_moved {
-                self.retained.parent_inputs_moved_nodes.insert(child.child);
+                self.retained.row_inputs_moved.note_parent_display_moved(child.child);
             }
         }
     }
@@ -121,6 +168,28 @@ impl StyleEngineState {
         damages: impl IntoIterator<Item = u32>,
         sink: impl FnMut(DerivedChildReaction),
     ) {
+        let (inherited_style_groups_changed, changed_non_inherited_style_groups, facts) =
+            self.engine_row_child_reaction_facts(node, old_style_record, new_style_record, damages);
+        self.derive_child_reactions(
+            node,
+            reaction,
+            inherited_style_groups_changed,
+            changed_non_inherited_style_groups,
+            facts,
+            sink,
+        );
+    }
+
+    /// What the host's application of a row the engine settled for `node`, moving the element from `old_style_record` to
+    /// `new_style_record` with `damages`, reports of it: the inherited style groups it moved, and the facts of
+    /// [`Self::note_style_reaction_applied`].
+    pub(super) fn engine_row_child_reaction_facts(
+        &self,
+        node: StyleNodeID,
+        old_style_record: u64,
+        new_style_record: u64,
+        damages: impl IntoIterator<Item = u32>,
+    ) -> (u8, u32, u32) {
         let (inherited_style_groups_changed, mut facts) = child_reaction_facts_of_damage(damages);
         if old_style_record == 0 {
             // A first style is a full invalidation.
@@ -134,18 +203,50 @@ impl StyleEngineState {
                 facts |= fact::DISPLAY_CHANGED;
             }
         }
-        if self.retained.children_explicitly_inherit_marks.contains(&node) {
+        let changed_non_inherited_style_groups =
+            self.changed_non_inherited_style_groups(old_style_record, new_style_record);
+        let reads_changed_group = |node| {
+            self.retained
+                .children_explicitly_inherit_marks
+                .get(&node)
+                .is_some_and(|groups| groups & changed_non_inherited_style_groups != 0)
+        };
+        if reads_changed_group(node) {
             facts |= fact::CHILDREN_EXPLICITLY_INHERIT;
         }
-        if self
-            .retained
-            .tree
-            .shadow_root_of(node)
-            .is_some_and(|root| self.retained.children_explicitly_inherit_marks.contains(&root))
-        {
+        if self.retained.tree.shadow_root_of(node).is_some_and(reads_changed_group) {
             facts |= fact::SHADOW_CHILDREN_EXPLICITLY_INHERIT;
         }
-        self.derive_child_reactions(node, reaction, inherited_style_groups_changed, facts, sink);
+        (
+            inherited_style_groups_changed,
+            changed_non_inherited_style_groups,
+            facts,
+        )
+    }
+
+    /// NB: Explicit inheritance observes both the underlying style and its current composition.
+    fn changed_non_inherited_style_groups(&self, old_style_record: u64, new_style_record: u64) -> u32 {
+        let records = &self.retained.computed_group_sets;
+        let (Some(old), Some(new)) = (
+            records.style_record_view(old_style_record),
+            records.style_record_view(new_style_record),
+        ) else {
+            return u32::MAX;
+        };
+        // SAFETY: Published style-group payloads stay live while their records do.
+        let Some(groups) = (unsafe {
+            crate::css::computed_values::changed_style_groups(
+                [old.base_payloads, old.payloads],
+                [new.base_payloads, new.payloads],
+                INHERITED_STYLE_GROUP_COUNT..old.payloads.len(),
+            )
+        }) else {
+            return u32::MAX;
+        };
+        let (Some(old_table), Some(new_table)) = (old.longhand_table, new.longhand_table) else {
+            return u32::MAX;
+        };
+        groups | old_table.non_inherited_inheritance_changes(new_table)
     }
 
     /// The reactions a reaction applied to `node` derives for its children, given to `sink`.
@@ -154,6 +255,7 @@ impl StyleEngineState {
         node: StyleNodeID,
         reaction: u8,
         inherited_style_groups_changed: u8,
+        changed_non_inherited_style_groups: u32,
         facts: u32,
         mut sink: impl FnMut(DerivedChildReaction),
     ) {
@@ -170,8 +272,8 @@ impl StyleEngineState {
             });
         };
 
-        // A slot's assigned elements take their style from the slot, and a slot that moved at all
-        // recomputes them.
+        // Assigned elements inherit from the slot. A change confined to non-inherited
+        // properties reaches only those that explicitly inherit such properties.
         if self.retained.facts.is_slot(node)
             && (!invalidation_is_none || did_change_custom_properties || ancestor_became_visible)
         {
@@ -180,7 +282,35 @@ impl StyleEngineState {
                 if assigned.text_index().is_some() {
                     continue;
                 }
-                derive(assigned, STYLE_REACTION_RECOMPUTE_STYLE, 0, false);
+                let needs_broad_recomputation = did_change_custom_properties
+                    || ancestor_became_visible
+                    || reaction
+                        & (STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES | STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES)
+                        != 0
+                    || has(fact::WAS_UNSTYLED)
+                    || has(fact::WAS_DISPLAY_NONE)
+                    || has(fact::DISPLAY_CHANGED)
+                    || has(fact::NEEDS_LAYOUT_TREE_REBUILD)
+                    || has(fact::RECOMPUTE_DESCENDANT_STYLES);
+                // The host records inheritance after substitution on the DOM parent, which
+                // may differ from the slot. Keep that mark for values such as var(--x, inherit).
+                let explicitly_inherits = self
+                    .tree
+                    .parent(assigned)
+                    .and_then(|parent| self.retained.children_explicitly_inherit_marks.get(&parent))
+                    .is_some_and(|groups| groups & changed_non_inherited_style_groups != 0)
+                    || self.retained.node_explicitly_inherited_groups(assigned) & changed_non_inherited_style_groups
+                        != 0;
+                if needs_broad_recomputation || explicitly_inherits {
+                    derive(assigned, STYLE_REACTION_RECOMPUTE_STYLE, 0, false);
+                } else if inherited_style_groups_changed != 0 {
+                    derive(
+                        assigned,
+                        STYLE_REACTION_INHERITED_STYLE,
+                        inherited_style_groups_changed,
+                        false,
+                    );
+                }
             }
         }
 
@@ -256,7 +386,8 @@ impl StyleEngineState {
             let (light_reaction, light_groups) = child_reaction(
                 !invalidation_is_none
                     && (has(fact::CHILDREN_EXPLICITLY_INHERIT)
-                        || self.node_explicitly_inherits_non_inherited_property(child)),
+                        || self.retained.node_explicitly_inherited_groups(child) & changed_non_inherited_style_groups
+                            != 0),
             );
             derive(child, light_reaction, light_groups, display_changed);
         }
@@ -269,7 +400,8 @@ impl StyleEngineState {
             let (shadow_reaction, shadow_groups) = child_reaction(
                 !invalidation_is_none
                     && (has(fact::SHADOW_CHILDREN_EXPLICITLY_INHERIT)
-                        || self.node_explicitly_inherits_non_inherited_property(child)),
+                        || self.retained.node_explicitly_inherited_groups(child) & changed_non_inherited_style_groups
+                            != 0),
             );
             derive(child, shadow_reaction, shadow_groups, display_changed);
         }

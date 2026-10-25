@@ -88,7 +88,8 @@ Web::CSS::PreferredMotion PageHost::preferred_motion() const
     return Web::CSS::PreferredMotion::Auto;
 }
 
-HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(URL::URL const& url, HTTP::Cookie::Source source)
+// NB: A worker process hosts one environment, which the UI process knows to be the requesting one.
+HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL const& url, HTTP::Cookie::Source source)
 {
     return m_client.did_request_cookie(url, source);
 }
@@ -101,6 +102,11 @@ bool PageHost::page_did_is_known_hsts_host(String const& domain)
 void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno)
 {
     m_client.async_did_report_worker_exception(message, filename, lineno, colno);
+}
+
+void PageHost::did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
+{
+    m_client.async_did_report_outside_settings_content_security_policy_violation(policy_index, effective_directive, resource);
 }
 
 void PageHost::page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message)

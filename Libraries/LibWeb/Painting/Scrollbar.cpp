@@ -72,27 +72,6 @@ MouseAction Scrollbar::handle_pointer_event(Utf16FlyString const& type, unsigned
     return MouseAction::CaptureInput;
 }
 
-MouseAction Scrollbar::mouse_move(CSSPixelPoint position)
-{
-    if (m_thumb_grab_position.has_value()) {
-        auto* node = layout_node();
-        if (!node)
-            return MouseAction::None;
-        position = Painting::transform_to_local_coordinates(*node, position);
-        scroll_to_mouse_position(position);
-        return MouseAction::SwallowEvent;
-    }
-    return MouseAction::None;
-}
-
-MouseAction Scrollbar::mouse_up(CSSPixelPoint, unsigned)
-{
-    release_thumb_grab();
-    if (auto* node = layout_node())
-        Painting::set_needs_repaint(*node, InvalidateDisplayList::PaintCommands);
-    return MouseAction::None;
-}
-
 void Scrollbar::release_thumb_grab()
 {
     m_drag_is_driven_by_compositor = false;
@@ -135,7 +114,7 @@ bool Scrollbar::scroll_to_mouse_position(CSSPixelPoint position)
     auto* node = layout_node();
     if (!node)
         return false;
-    ChromeMetrics metrics = node->document().page().chrome_metrics();
+    ChromeMetrics metrics = node->document().page().chrome_metrics(node->document());
 
     auto const& scroll_state = node->document().scroll_state_snapshot();
     auto scrollbar_data = compute_scrollbar_data(*node, m_direction, metrics, &scroll_state,

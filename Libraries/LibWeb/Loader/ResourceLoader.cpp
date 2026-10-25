@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/Debug.h>
 #include <LibCore/Directory.h>
 #include <LibCore/MimeData.h>
@@ -16,8 +17,9 @@
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/LoadRequest.h>
@@ -33,6 +35,22 @@ static RefPtr<ResourceLoader>& resource_loader()
 {
     static RefPtr<ResourceLoader>& resource_loader = *new RefPtr<ResourceLoader>;
     return resource_loader;
+}
+
+static Optional<URL::URL>& proxy_autoconfig_url_storage()
+{
+    static Optional<URL::URL>& proxy_autoconfig_url = *new Optional<URL::URL>;
+    return proxy_autoconfig_url;
+}
+
+void ResourceLoader::set_proxy_autoconfig_url(URL::URL url)
+{
+    proxy_autoconfig_url_storage() = move(url);
+}
+
+Optional<URL::URL> const& ResourceLoader::proxy_autoconfig_url()
+{
+    return proxy_autoconfig_url_storage();
 }
 
 void ResourceLoader::initialize(GC::Heap& heap, NonnullRefPtr<Requests::RequestClient> request_client)
@@ -58,10 +76,24 @@ ResourceLoader::ResourceLoader(GC::Heap& heap, NonnullRefPtr<Requests::RequestCl
     : m_heap(heap)
     , m_user_agent(MUST(String::from_utf8(default_user_agent)))
     , m_platform(MUST(String::from_utf8(default_platform)))
-    , m_preferred_languages({ "en-US"_string })
-    , m_navigator_compatibility_mode(default_navigator_compatibility_mode)
+    , m_preferred_languages(default_preferred_languages())
 {
     set_client(move(request_client));
+}
+
+NavigatorCompatibilityMode ResourceLoader::s_navigator_compatibility_mode = default_navigator_compatibility_mode;
+
+void ResourceLoader::set_navigator_compatibility_mode(NavigatorCompatibilityMode mode)
+{
+    s_navigator_compatibility_mode = mode;
+
+    // A script reads two strings to tell engines apart that no navigator attribute covers: the frames of an error's
+    // stack, and the source text of a built-in function. Both follow the engine the navigator claims.
+    auto& vm = Bindings::main_thread_vm();
+    if (mode == NavigatorCompatibilityMode::Chrome)
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::Indented, JS::VM::NativeFunctionSourceSyntax::SingleLine);
+    else
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::AtSign, JS::VM::NativeFunctionSourceSyntax::MultiLine);
 }
 
 void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_client)
@@ -73,30 +105,42 @@ void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_c
     };
 }
 
-void ResourceLoader::prefetch_dns(URL::URL const& url, URL::URL const& source_url)
+void ResourceLoader::prefetch_dns(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
+
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
 
     // FIXME: We could put this request in a queue until the client connection is re-established.
     if (m_request_client)
         m_request_client->ensure_connection(url, RequestServer::CacheLevel::ResolveOnly);
 }
 
-void ResourceLoader::preconnect(URL::URL const& url, URL::URL const& source_url)
+void ResourceLoader::preconnect(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
+
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
 
     // FIXME: We could put this request in a queue until the client connection is re-established.
     if (m_request_client)
@@ -186,10 +230,14 @@ static bool should_block_request(LoadRequest const& request)
         return true;
     }
 
-    auto source_url = request.source_url().value_or(url);
-    if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
-        log_filtered_request(request);
-        return true;
+    if (auto page = request.page(); !page || page->content_blocking_enabled_for_url(request.top_level_creation_url())) {
+        auto source_url = request.source_url().value_or(url);
+        if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
+            log_filtered_request(request);
+            if (page)
+                page->client().page_did_block_resource();
+            return true;
+        }
     }
 
     return false;
@@ -408,6 +456,15 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         return nullptr;
     }
 
+    // We cannot evaluate PAC files yet, and connecting directly would ignore the proxy that was asked for.
+    if (proxy_autoconfig_url().has_value()) {
+        dbgln("FIXME: Evaluate the PAC file to find the proxy for {}; failing the request", url);
+        auto error = "PAC proxy configurations are not supported"sv;
+        log_failure(request, error);
+        on_complete->function()(false, {}, error);
+        return nullptr;
+    }
+
     auto protocol_request = start_network_request(request, transfer_lease);
     if (!protocol_request) {
         on_complete->function()(false, {}, "Failed to start network request"sv);
@@ -456,6 +513,17 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
     return protocol_request;
 }
 
+static NonnullRefPtr<HTTP::HeaderList const> headers_with_normalized_values(HTTP::HeaderList const& headers)
+{
+    if (all_of(headers, [](auto const& header) { return HTTP::is_header_value(header.value); }))
+        return headers;
+
+    auto normalized_headers = HTTP::HeaderList::create();
+    for (auto const& header : headers)
+        normalized_headers->append_with_normalized_name({ header.name, HTTP::normalize_header_value(header.value) });
+    return normalized_headers;
+}
+
 RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest const& request, Requests::RequestClient::TransferLease transfer_lease)
 {
     // FIXME: We could put this request in a queue until the client connection is re-established.
@@ -470,15 +538,12 @@ RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest cons
     // NB: Workers have a Page shim without a navigable or a browser page ID. Their
     //     requests are attributed through the worker process's browser-level owners.
     auto originating_page_id = request.page() && request.page()->has_top_level_traversable() ? request.page()->client().id().value() : 0;
-    auto protocol_request = m_request_client->start_request(request.method(), request.url().value(), request.headers(), request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id);
+    auto headers = headers_with_normalized_values(request.headers());
+    auto protocol_request = m_request_client->start_request(request.method(), request.url().value(), *headers, request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id, request.network_isolation_key());
     if (!protocol_request) {
         log_failure(request, "Failed to initiate load"sv);
         return nullptr;
     }
-
-    protocol_request->on_certificate_requested = []() -> Requests::Request::CertificateAndKey {
-        return {};
-    };
 
     if (auto page = request.page()) {
         Optional<String> initiator_type_string;

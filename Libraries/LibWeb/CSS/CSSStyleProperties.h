@@ -55,17 +55,6 @@ public:
     u64 identity() const { return m_declarations.identity(); }
     u64 revision() const { return m_declarations.revision(); }
 
-    // Every custom property a var() in this block's values refers to, and whether each reference
-    // names its property with a plain identifier. A reference that substitutes its name can read
-    // anything, so no list of names stands for it.
-    struct CustomPropertyReferences {
-        AK_ALLOC_WITH_KMALLOC;
-
-        Vector<Utf16FlyString> names;
-        bool all_references_visible { true };
-    };
-    CustomPropertyReferences const& custom_property_references() const;
-
     virtual bool has_property(PropertyNameAndID const&) const override;
     bool has_property(PropertyID) const;
 
@@ -85,9 +74,10 @@ public:
     // Takes `source`'s declarations as they are, sharing them until either side changes.
     void set_declarations_from(CSSStyleProperties const& source);
 
-private:
+protected:
     CSSStyleProperties(Computed, Readonly, RustDeclarationBlock, Optional<DOM::AbstractElement>);
 
+private:
     virtual size_t external_memory_size() const override;
 
     RefPtr<StyleValue const> style_value_for_computed_property(Layout::NodeWithStyle const&, PropertyID) const;
@@ -101,8 +91,6 @@ private:
     void invalidate_owners();
 
     RustDeclarationBlock m_declarations;
-    mutable OwnPtr<CustomPropertyReferences> m_custom_property_references;
-    mutable u64 m_custom_property_references_revision { 0 };
 };
 
 #undef ENUMERATE_GENERATED_CSS_STYLE_PROPERTIES

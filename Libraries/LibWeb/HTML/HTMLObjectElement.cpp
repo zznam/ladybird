@@ -37,17 +37,12 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/MimeSniff/Resource.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
+#include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLObjectElement);
-
-Layout::Node const* HTMLObjectElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
 {
@@ -150,10 +145,8 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
             // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
             // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
             // vertical middle of the element with the parent element's baseline.
-            // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
-            //        as Firefox and Chrome do with engine-specific legacy values.
             if (value.equals_ignoring_ascii_case(u"center"sv) || value.equals_ignoring_ascii_case(u"middle"sv))
-                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
+                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::LibwebBaselineMiddle) });
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
                 auto width_style_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
@@ -233,9 +226,12 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
 
     // This task being queued or actively running must delay the load event of the element's node document.
     m_document_load_event_delayer_for_object_representation_task.empend(document());
+    auto release_load_event_delay = GC::create_function(GC::Heap::the(), [this] {
+        m_document_load_event_delayer_for_object_representation_task.take_last();
+    });
 
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [this]() {
-        ScopeGuard guard { [&]() { m_document_load_event_delayer_for_object_representation_task.take_last(); } };
+    auto steps = [this, release_load_event_delay]() {
+        ScopeGuard guard { [&] { release_load_event_delay->function()(); } };
 
         auto& realm = HTML::relevant_realm(*this);
         // FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
@@ -289,7 +285,20 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
                 auto& realm = HTML::relevant_realm(*this);
                 auto& global = document().relevant_settings_object().realm().global_object();
 
-                if (response->is_network_error() || !Fetch::Infrastructure::is_ok_status(response->status())) {
+                if (response->is_network_error()) {
+                    resource_did_fail();
+                    return;
+                }
+
+                if (!Fetch::Infrastructure::is_ok_status(response->status())) {
+                    // NB: Fetch only reports the response's timing once its body has been fully read, so read it without
+                    //     holding back the failure.
+                    if (auto body = response->body()) {
+                        auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
+                        auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
+                        auto ignore_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
+                        (void)body->incrementally_read(realm, ignore_chunk, ignore_end_of_body, ignore_body_error, GC::Ref { global });
+                    }
                     resource_did_fail();
                     return;
                 }
@@ -327,7 +336,9 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             //       response callback to invoke the fallback steps. This prevents the fallback layout from flashing very
             //       briefly between here and the resource loading.
         }
-    });
+    };
+
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, move(steps), release_load_event_delay);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:concept-event-fire-2
@@ -432,6 +443,21 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
 
     // -> If the resource type is an XML MIME type, or if the resource type does not start with "image/"
     if (can_load_document_with_type(resource_type) && (resource_type.is_xml() || !resource_type.is_image())) {
+        // AD-HOC: The spec does not stop an object from embedding the document that contains it, so the nesting never
+        //         ends and the load event never fires. Matching other engines, allow one level of self-reference and
+        //         show the fallback content at the second.
+        if (response.url().has_value() && !url_matches_about_blank(*response.url())) {
+            size_t navigables_with_same_url = 0;
+            for (auto const& navigable : document().inclusive_ancestor_navigables()) {
+                if (auto url = navigable->active_document_url(); url.has_value() && url->equals(*response.url(), URL::ExcludeFragment::Yes))
+                    ++navigables_with_same_url;
+            }
+            if (navigables_with_same_url >= 2) {
+                run_object_representation_fallback_steps();
+                return;
+            }
+        }
+
         // If the object element's content navigable is null, then create a new child navigable for the element.
         if (!m_content_navigable && in_a_document_tree()) {
             create_new_child_navigable();
@@ -536,6 +562,9 @@ void HTMLObjectElement::load_image()
         },
         [this] {
             run_object_representation_fallback_steps();
+            m_document_load_event_delayer_for_resource_load.take_last();
+        },
+        [this] {
             m_document_load_event_delayer_for_resource_load.take_last();
         });
 
