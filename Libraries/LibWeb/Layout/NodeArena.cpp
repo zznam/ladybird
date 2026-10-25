@@ -17,47 +17,25 @@ namespace Web::Layout {
 
 NodeArena::NodeArena(RenderDocument& render_document)
     : m_render_document(render_document)
-    , m_handle(RustFFI::render_state_arena_for_unconverted_entry(render_document.host()))
 {
-    VERIFY(m_handle);
     Painting::register_geometry_host(*this);
 }
 
 NodeArena::~NodeArena() = default;
 
-void NodeArena::free_subtree(Compositing::RustFFI::NodeSlotId root)
+void NodeArena::free_subtree(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId root)
 {
-    RustFFI::render_state_drop_subtree(host(), root);
+    RustFFI::render_state_drop_subtree(host(), &read, root);
 }
 
-Node* NodeArena::node_if_live(Compositing::RustFFI::NodeSlotId slot) const
+Node* NodeArena::node_if_live(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId slot) const
 {
-    return static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(m_handle, slot));
-}
-
-u64 NodeArena::table_cell_measurement_cache_miss_count() const
-{
-    return RustFFI::render_state_layout_counts(host()).table_cell_measurement_cache_misses;
-}
-
-u64 NodeArena::intrinsic_measurement_count() const
-{
-    return RustFFI::render_state_layout_counts(host()).intrinsic_measurements;
-}
-
-u64 NodeArena::intrinsic_inline_measurement_count() const
-{
-    return RustFFI::render_state_layout_counts(host()).intrinsic_inline_measurements;
-}
-
-bool destroy_layout_subtree(Node& node)
-{
-    return RustFFI::render_state_drop_subtree(node.document_host(), Node::slot_id(&node));
+    return static_cast<Node*>(RustFFI::render_state_node_shell_if_live(host(), &read, slot));
 }
 
 void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
 {
-    RustFFI::layout_arena_set_box_presence_host(m_handle, this, [](void* context, u32 style_node, u8 bits) {
+    RustFFI::render_state_set_box_presence_host(host(), this, [](void* context, u32 style_node, u8 bits) {
         auto& document = *static_cast<NodeArena*>(context)->m_document;
         // The document has no StyleNodeID; it is named by 0.
         GC::Ptr<DOM::Node> node = &document;
@@ -70,18 +48,14 @@ void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
 
 void NodeArena::stop_reporting_box_presence(Badge<DOM::Document>)
 {
-    RustFFI::layout_arena_clear_box_presence_host(m_handle);
+    RustFFI::render_state_clear_box_presence_host(host());
 }
 
 void NodeArena::commit_box_presence(DOM::Node& node)
 {
-    auto const* layout_node = node.unsafe_layout_node();
+    Layout::ForcedReadScope read { node.document() };
+    auto const* layout_node = node.unsafe_layout_node(read);
     node.set_box_presence({}, layout_node, layout_node && Painting::has_committed_box(*layout_node));
-}
-
-void NodeArena::sync_enrolled_content_for_layout()
-{
-    RustFFI::layout_arena_sync_enrolled_content_for_layout(m_handle);
 }
 
 }

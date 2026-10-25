@@ -8,15 +8,16 @@
 //! a node by its slot or its identity and queues the change on the document's host; it does not reach the arena.
 
 use super::LayoutNodeArena;
+use super::math_formatting_context::FfiMathAttributeFacts;
 use super::node_data::{NodeFlag, NodeSlotId};
 use super::svg_formatting_context::{FfiFloatPoint, FfiSvgAttributeFacts};
-use super::tree_mutation::{HostCalls, OwedHostWork};
+use super::tree_mutation::{HostCalls, HostWorkDue, OwedHostWork};
 use super::used_values::FfiCssPixelPoint;
 use crate::css::css_pixels::CssPixelPoint;
 use crate::css::style::NaturalSize;
 use crate::css::style::tree::StyleNodeID;
 use crate::painting::host::FfiNaturalSize;
-use crate::render_state::{Answer, ArenaChange, DocumentHost, LockstepProof, Query, ask};
+use crate::render_state::{ArenaChange, DocumentHost, RenderWait};
 use smallvec::SmallVec;
 
 /// One write of the host to a document's layout marks or layout facts, which the render state applies to the arena
@@ -26,35 +27,23 @@ pub(crate) enum LayoutChange {
         node: NodeSlotId,
         propagate_through_ancestors: bool,
     },
-    SetNeedsFullLayoutTreeUpdate(bool),
-    /// What the node's content is sized from changed: its fragment caches and intrinsic sizes, and those of its
-    /// ancestors, are stale.
-    ResetCachedIntrinsicSizesOfSelfAndAncestors {
-        node: NodeSlotId,
+    /// The whole layout tree is built again.
+    SetNeedsFullLayoutTreeUpdate,
+    /// The box takes `marks`.
+    MarkBox {
+        target: super::tree_update_marks::MarkedBox,
+        marks: super::tree_update_marks::FfiBoxMarks,
     },
-    /// What an insertion under `parent` invalidates depends on the boxes it attaches, which only the layout tree build
-    /// knows.
-    DeferChildListInsertionLayoutUpdate {
-        parent: NodeSlotId,
-    },
-    /// The text node's data changed.
-    InvalidateTextContent {
-        node: NodeSlotId,
-    },
-    /// The text under `root` renders with the language it now resolves: where any of it is cased by its language, the
-    /// root lays out again.
-    EnrollTextAfterLanguageChange {
-        root: NodeSlotId,
+    /// The DOM node `node` names, or the document for `None`, was marked for the next layout tree build to rebuild,
+    /// which its box takes as [`LayoutNodeArena::apply_layout_tree_update_mark`] says.
+    ApplyLayoutTreeUpdateMark {
+        node: Option<StyleNodeID>,
+        mark: super::tree_update_marks::FfiLayoutTreeUpdateMark,
     },
     RecordPartialRelayoutEscape,
-    /// The absolutely positioned `child`, whose containing block is `parent`, is about to be removed.
-    NoteContainedAbsposChildRemoval {
-        parent: NodeSlotId,
-        child: NodeSlotId,
-    },
     /// The DOM node identified by `old` took `new`. Its rows, and those of the pseudo-elements `generated_for` lists,
-    /// take the new identity along with their bindings; the old one leaves every row carrying it, and the new one
-    /// leaves the layout tree update marks its previous holder left.
+    /// take the new identity along with their bindings, and the old one leaves every row carrying it. The host clears the
+    /// layout tree update marks the new one's previous holder left as it queues the change.
     StyleNodeChanged {
         old: Option<StyleNodeID>,
         new: Option<StyleNodeID>,
@@ -89,6 +78,11 @@ pub(crate) enum LayoutChange {
         facts: Box<FfiSvgAttributeFacts>,
         points: Box<[FfiFloatPoint]>,
     },
+    /// The parsed MathML attributes a MathML element published, which its layout reads.
+    MathAttributeFacts {
+        element: StyleNodeID,
+        facts: Box<FfiMathAttributeFacts>,
+    },
     /// The resources an SVG graphics element's style names: its mask, clip path, fill and stroke.
     SvgStyleReferences {
         element: StyleNodeID,
@@ -102,6 +96,10 @@ pub(crate) enum LayoutChange {
         flag: NodeFlag,
         value: bool,
     },
+    /// The host hands the image box the provider of the image it shows, which the box waited for.
+    HandOverOwnedProvider {
+        node: NodeSlotId,
+    },
     /// The image the image box's own provider shows is of this natural size now.
     SetOwnedImageNaturalSize {
         node: NodeSlotId,
@@ -114,32 +112,110 @@ pub(crate) enum LayoutChange {
     RestampTableSpans {
         node: NodeSlotId,
     },
+    /// Whether the row needs a frame of the compositor's animation of `kind`.
+    SetNodeNeedsCompositorAnimationFrame {
+        node: NodeSlotId,
+        kind: super::node_data::CompositorAnimationFrameKind,
+        value: bool,
+    },
+    /// The row takes the style record `record`, whose payloads `payloads` holds. Where the move changes what layout reads
+    /// of the row's style, the sizes the row and its ancestors cached are measured again.
+    SetNodeStyle {
+        node: NodeSlotId,
+        record: u64,
+        payloads: super::node_data::StylePayloadsRef,
+    },
+    /// The style record of the box the node `style_node` is bound to, or of the box of its pseudo-element
+    /// `generated_for`, stays readable once the node has left the document.
+    PinBoundBoxStyleRecordForDetachment {
+        style_node: StyleNodeID,
+        generated_for: u8,
+    },
+    /// The host's readers of the row hold the style record `record` until the host releases it or the row is freed.
+    PinNodeStyleRecordForHost {
+        node: NodeSlotId,
+        record: u64,
+    },
+    /// The host's readers of the row let go of the style record they held.
+    ReleaseNodeStyleRecordPinForHost {
+        node: NodeSlotId,
+    },
+    /// How the host learns what boxes a DOM node has, or none.
+    SetBoxPresenceHost(Option<super::layout_node_arena::BoxPresenceHost>),
+    /// The document's layout passes are traced from now on.
+    BeginLayoutTrace,
+    /// The boxes of the traced events at these lines are named so.
+    NameLayoutTraceOwners(Vec<(usize, String)>),
+    /// The tree scope registers these counter styles now.
+    CounterStyles {
+        tree_scope: u32,
+        scope: crate::css::counter_representation::CounterStyleScope,
+    },
 }
 
 impl LayoutChange {
-    /// Whether applying the change can alter the published rows: their shape and flags, the style nodes they carry, or
-    /// the text they paint. Marks for the next layout and what layout alone reads alter none.
-    pub(crate) fn alters_published_rows(&self) -> bool {
+    /// How far the change may write the rows. Most write what a row holds alone, but for its style record: installing a
+    /// style changes none of the flags that say what a row stands for. Mapping the text find in page searches again
+    /// writes no row.
+    pub(crate) fn row_write(&self) -> crate::render_state::RowWrite {
+        use crate::render_state::RowWrite;
         match self {
-            Self::InvalidateTextContent { .. } | Self::StyleNodeChanged { .. } | Self::SetNodeFlag { .. } => true,
+            Self::InvalidateSearchableText => RowWrite::None,
+            Self::StyleNodeChanged { .. } => RowWrite::Identities,
+            Self::SetNodeFlag { flag, .. } if *flag as u32 & NodeFlag::IDENTITY != 0 => RowWrite::Identities,
+            Self::SetNodeStyle { .. } => RowWrite::NamedStyles,
             Self::SetNeedsLayoutUpdate { .. }
-            | Self::SetNeedsFullLayoutTreeUpdate(_)
-            | Self::ResetCachedIntrinsicSizesOfSelfAndAncestors { .. }
-            | Self::DeferChildListInsertionLayoutUpdate { .. }
-            | Self::EnrollTextAfterLanguageChange { .. }
+            | Self::SetNeedsFullLayoutTreeUpdate
+            | Self::MarkBox { .. }
+            | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
-            | Self::NoteContainedAbsposChildRemoval { .. }
             | Self::SetAnchorNameElements { .. }
             | Self::SetElementScrollOffset { .. }
             | Self::SetPseudoElementScrollOffset { .. }
             | Self::SetIdentityInFocusedTextControl { .. }
             | Self::SvgAttributeFacts { .. }
+            | Self::MathAttributeFacts { .. }
             | Self::SvgStyleReferences { .. }
             | Self::SetDocumentIsDecodedSvg(_)
+            | Self::SetNodeFlag { .. }
+            | Self::HandOverOwnedProvider { .. }
             | Self::SetOwnedImageNaturalSize { .. }
-            | Self::InvalidateSearchableText
-            | Self::RestampTableSpans { .. } => false,
+            | Self::RestampTableSpans { .. }
+            | Self::SetNodeNeedsCompositorAnimationFrame { .. }
+            | Self::PinBoundBoxStyleRecordForDetachment { .. }
+            | Self::PinNodeStyleRecordForHost { .. }
+            | Self::ReleaseNodeStyleRecordPinForHost { .. }
+            | Self::SetBoxPresenceHost(_)
+            | Self::BeginLayoutTrace
+            | Self::NameLayoutTraceOwners(_)
+            | Self::CounterStyles { .. } => RowWrite::Rows,
         }
+    }
+
+    /// Whether the change may move a fact the host knows of the render state (see
+    /// [`crate::render_state::StateFacts`]). Noting which nodes sit in a focused text control, pinning a row's style
+    /// record and tracing the layout never do.
+    pub(crate) fn may_move_facts(&self) -> bool {
+        match self {
+            Self::MarkBox { marks, .. } => marks.may_lay_out(),
+            Self::SetIdentityInFocusedTextControl { .. }
+            | Self::InvalidateSearchableText
+            | Self::PinBoundBoxStyleRecordForDetachment { .. }
+            | Self::PinNodeStyleRecordForHost { .. }
+            | Self::ReleaseNodeStyleRecordPinForHost { .. }
+            | Self::BeginLayoutTrace
+            | Self::NameLayoutTraceOwners(_) => false,
+            _ => true,
+        }
+    }
+
+    /// Applies the change to `arena` as [`Self::apply`] does, owing the host what it hears of the boxes the change binds
+    /// a node to, or unbinds it from, rather than telling it: a change streamed to the render state runs beside the
+    /// host's task, whose tables are not safe to read beside it.
+    pub(crate) fn apply_owing(self, arena: &mut LayoutNodeArena) -> HostWorkDue {
+        arena.queue_box_presence();
+        self.apply(arena);
+        OwedHostWork::default().resolve(arena)
     }
 
     /// Applies the change to `arena`, the arena of the document it was queued for. A node freed since then has nothing
@@ -154,34 +230,10 @@ impl LayoutChange {
                     arena.set_needs_layout_update(node, propagate_through_ancestors);
                 }
             }
-            Self::SetNeedsFullLayoutTreeUpdate(value) => arena.set_needs_full_layout_tree_update(value),
-            Self::ResetCachedIntrinsicSizesOfSelfAndAncestors { node } => {
-                if arena.slot_is_live(node) {
-                    arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
-                    arena.reset_cached_intrinsic_sizes_of_self_and_ancestors(node);
-                }
-            }
-            Self::DeferChildListInsertionLayoutUpdate { parent } => {
-                if arena.slot_is_live(parent) {
-                    arena.defer_child_list_insertion_layout_update(parent);
-                }
-            }
-            Self::InvalidateTextContent { node } => {
-                if arena.slot_is_live(node) {
-                    arena.invalidate_text_content(node);
-                }
-            }
-            Self::EnrollTextAfterLanguageChange { root } => {
-                if arena.slot_is_live(root) && super::rendered_text::enroll_text_after_language_change(arena, root) {
-                    arena.set_needs_layout_update(root, true);
-                }
-            }
+            Self::SetNeedsFullLayoutTreeUpdate => arena.set_needs_full_layout_tree_update(true),
+            Self::MarkBox { target, marks } => marks.apply(arena, target),
+            Self::ApplyLayoutTreeUpdateMark { node, mark } => arena.apply_layout_tree_update_mark(node, mark),
             Self::RecordPartialRelayoutEscape => arena.record_partial_relayout_escape(),
-            Self::NoteContainedAbsposChildRemoval { parent, child } => {
-                if arena.slot_is_live(parent) && arena.slot_is_live(child) {
-                    arena.note_contained_abspos_child_removal(parent, child);
-                }
-            }
             Self::StyleNodeChanged {
                 old,
                 new,
@@ -196,7 +248,6 @@ impl LayoutChange {
                 if let Some(old) = old {
                     arena.forget_style_node(old);
                 }
-                arena.clear_layout_tree_update_marks(new);
             }
             Self::SetAnchorNameElements {
                 scope_host,
@@ -215,6 +266,7 @@ impl LayoutChange {
             Self::SvgAttributeFacts { element, facts, points } => {
                 arena.set_style_node_svg_attribute_facts(element, *facts, &points);
             }
+            Self::MathAttributeFacts { element, facts } => arena.set_style_node_math_attribute_facts(element, *facts),
             Self::SvgStyleReferences { element, references } => {
                 arena.set_style_node_svg_style_references(element, references);
             }
@@ -224,6 +276,7 @@ impl LayoutChange {
                     arena.set_node_flag(node, flag, value);
                 }
             }
+            Self::HandOverOwnedProvider { node } => arena.note_owned_provider_handed_over(node),
             Self::SetOwnedImageNaturalSize { node, natural_size } => {
                 if arena.slot_is_live(node) {
                     arena.set_owned_image_natural_size(node, natural_size);
@@ -235,39 +288,90 @@ impl LayoutChange {
                     arena.set_needs_layout_update(node, true);
                 }
             }
+            Self::SetNodeNeedsCompositorAnimationFrame { node, kind, value } => {
+                arena.set_node_needs_compositor_animation_frame(node, kind, value);
+            }
+            Self::SetNodeStyle { node, record, payloads } => {
+                // A style the arena derived is replaced only to be derived again, which decides the relayout itself.
+                let previous_payloads = (arena.slot_is_live(node) && !arena.node_style_record_is_derived(node))
+                    .then(|| arena.data(node).style.get());
+                if arena.set_node_style(node, record, payloads) {
+                    arena.refresh_style_flags(node);
+                }
+                arena.publish_new_size_container_geometry(node);
+                arena.enroll_node_for_svg_paint_resources_sync(node);
+                if previous_payloads
+                    .is_some_and(|previous| !arena.style_move_keeps_layout_inputs(node, previous, payloads))
+                {
+                    arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+                    arena.reset_cached_intrinsic_sizes_of_self_and_ancestors(node);
+                }
+            }
+            Self::PinBoundBoxStyleRecordForDetachment {
+                style_node,
+                generated_for,
+            } => {
+                let row = if generated_for == 0 {
+                    arena.bound_row(style_node)
+                } else {
+                    arena.bound_pseudo_element_row(style_node, generated_for)
+                };
+                if !row.is_invalid() {
+                    arena.pin_style_record_for_detachment(row);
+                }
+            }
+            Self::PinNodeStyleRecordForHost { node, record } => arena.pin_node_style_record_for_host(node, record),
+            Self::ReleaseNodeStyleRecordPinForHost { node } => arena.release_node_style_record_pin_for_host(node),
+            Self::SetBoxPresenceHost(host) => arena.set_box_presence_host(host),
+            Self::BeginLayoutTrace => arena.layout_trace.begin(),
+            Self::NameLayoutTraceOwners(names) => arena.name_layout_trace_owners(names),
+            Self::CounterStyles { tree_scope, scope } => arena.publish_counter_styles(tree_scope, scope),
         }
     }
 }
 
 /// A write the host waits for the render state to make, as it pays what the write owes it before it goes on.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum LayoutWrite {
+pub(crate) enum LayoutWrite<'a> {
     /// Detaches the layout subtree `root` heads from its parent, if it has one, and frees it. The host prepared its rows
     /// for leaving the tree before.
     DropSubtree { root: NodeSlotId },
     /// Detaches the layout placement of the top layer element and clears every stale projected subtree of it.
     DetachTopLayerElement(StyleNodeID),
+    /// Detaches what is left of the boxes of each node the style node identities name as the nodes leave the document,
+    /// while the identities still name them: their synthetic pseudo-elements' boxes and their boxes' top layer
+    /// placements go, and their boxes are cleared for the parent's rebuild to free. An identity of 0 names no node.
+    DetachRemainingRowsForRemoval(&'a [u32]),
+    /// The row takes the derived style record `record` its layout node made.
+    AdoptDerivedNodeStyle { node: NodeSlotId, record: u64 },
+    /// The anonymous rows below the row inherit its style again.
+    ReinheritAnonymousDescendants { node: NodeSlotId },
+    /// The viewport and the boxes of the root element and its body take the styles viewport propagation gives them.
+    PropagateRootStylesToViewport,
+    /// Prepares every row of the subtree the row heads for leaving the layout tree.
+    PrepareSubtreeForDetach { root: NodeSlotId },
+    /// Clears the committed box of every row of the subtree the row heads, and prepares each for leaving the layout
+    /// tree, as a removal does before it drops the subtree.
+    PrepareSubtreeForRemoval { root: NodeSlotId },
 }
 
 /// What a write answers: whether the subtree it dropped was attached, and what it owes the host.
 #[derive(Default)]
 pub(crate) struct LayoutWritten {
     pub(crate) was_attached: bool,
-    pub(crate) host_work: OwedHostWork,
+    pub(crate) host_work: HostWorkDue,
 }
 
-impl LayoutWrite {
+impl LayoutWrite<'_> {
     /// Makes the write to the arena `arena` names, owing the host what it would have paid on its thread.
-    pub(crate) fn apply(self, arena: *mut LayoutNodeArena) -> LayoutWritten {
+    pub(crate) fn apply(self, arena: &mut LayoutNodeArena) -> LayoutWritten {
         let host_work = OwedHostWork::default();
-        let host_calls = HostCalls::Owed(&host_work);
-        // SAFETY: The render state holds the arena, and nothing else reaches it while the write runs.
-        let arena_ref = unsafe { &*arena };
-        arena_ref.queue_box_presence();
+        let host_calls = HostCalls(&host_work);
+        arena.queue_box_presence();
         let was_attached = match self {
             Self::DropSubtree { root } => {
-                if arena_ref.slot_is_live(root) {
-                    let was_attached = arena_ref.detach_from_parent(root);
+                if arena.slot_is_live(root) {
+                    let was_attached = arena.detach_from_parent(root);
                     host_calls.free_subtree(arena, root);
                     was_attached
                 } else {
@@ -278,215 +382,158 @@ impl LayoutWrite {
                 super::tree_builder::detach_top_layer_element_layout_subtree(host_calls, arena, element);
                 false
             }
+            Self::DetachRemainingRowsForRemoval(nodes) => {
+                for node in nodes.iter().filter_map(|&node| StyleNodeID::from_raw(node)) {
+                    super::tree_builder::detach_remaining_rows_for_removal(host_calls, arena, node);
+                }
+                false
+            }
+            Self::AdoptDerivedNodeStyle { node, record } => {
+                let derived = arena.with_style_engine(|engine| {
+                    crate::css::style::layout_style::DerivedStyleRecord::pin(engine, record)
+                });
+                arena.apply_reinherited_style_record(host_calls, node, derived);
+                false
+            }
+            Self::ReinheritAnonymousDescendants { node } => {
+                arena.reinherit_anonymous_descendants(host_calls, node);
+                false
+            }
+            Self::PropagateRootStylesToViewport => {
+                let viewport = arena.bound_viewport_row();
+                if !viewport.is_invalid() {
+                    super::viewport_propagation::propagate_root_styles_to_viewport(
+                        host_calls,
+                        arena,
+                        viewport,
+                        &super::viewport_propagation::viewport_propagation_facts(arena),
+                    );
+                }
+                false
+            }
+            Self::PrepareSubtreeForDetach { root } => {
+                super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena, root);
+                false
+            }
+            Self::PrepareSubtreeForRemoval { root } => {
+                let mut rows = Vec::new();
+                arena.for_each_node_in_layout_subtree_in_pre_order(root, |row| rows.push(row));
+                for &row in &rows {
+                    crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row);
+                }
+                for row in rows {
+                    super::layout_node_arena::prepare_row_for_detach(host_calls, arena, row);
+                }
+                false
+            }
         };
         LayoutWritten {
             was_attached,
-            host_work,
+            host_work: host_work.resolve(arena),
         }
     }
 }
 
-/// The reason a host waits for a layout write: it pays what the write owes it before it goes on.
-pub(crate) struct HostPaysTheWrite {
-    _private: (),
-}
-
-const HOST_PAYS_THE_WRITE: HostPaysTheWrite = HostPaysTheWrite { _private: () };
-
-/// Has the render state of `host`'s document make `write`, and answers what the write owes the host.
-pub(crate) fn write(host: &DocumentHost, write: LayoutWrite) -> LayoutWritten {
-    let Answer::Written(written) = ask(
-        LockstepProof::for_reason(&HOST_PAYS_THE_WRITE),
-        host,
-        Query::Write(write),
-    ) else {
-        unreachable!("a write is answered with what it wrote");
-    };
-    written
+/// Has the render state of `host`'s document make `write`, spending `wait`, and answers what the write owes the host,
+/// which the host pays before it goes on.
+pub(crate) fn write(wait: impl RenderWait, host: &DocumentHost, write: LayoutWrite<'_>) -> LayoutWritten {
+    host.run(wait, true, |state| write.apply(state.arena_mut()))
 }
 
 /// Queues `change` for the render state of `host`'s document.
-///
-/// # Safety
-///
-/// `host` must come from `document_host_create` and not be destroyed yet, on the document's thread.
-unsafe fn queue(host: *const DocumentHost, change: LayoutChange) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.queue_change(ArenaChange::Layout(change));
+pub(crate) fn queue(host: &DocumentHost, change: LayoutChange) {
+    host.queue_change(ArenaChange::Layout(change));
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_needs_layout_update(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_needs_layout_update(
+    host: &DocumentHost,
     node: NodeSlotId,
     propagate_through_ancestors: bool,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        queue(
-            host,
-            LayoutChange::SetNeedsLayoutUpdate {
-                node,
-                propagate_through_ancestors,
-            },
-        );
+    queue(
+        host,
+        LayoutChange::SetNeedsLayoutUpdate {
+            node,
+            propagate_through_ancestors,
+        },
+    );
+}
+
+/// Detaches what is left of the boxes of the `count` nodes `style_nodes` names as they leave the document (see
+/// [`super::tree_builder::detach_remaining_rows_for_removal`]), as a write queued for the render state: the host pays what it owes
+/// once the job that applies it is done. An identity of 0 names no node.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_detach_remaining_rows_for_removal(host: &DocumentHost, style_nodes: ak::Span<'_, u32>) {
+    let style_nodes = style_nodes.as_slice();
+    if style_nodes.is_empty() {
+        return;
+    }
+    host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_needs_full_layout_tree_update(host: &DocumentHost) {
+    queue(host, LayoutChange::SetNeedsFullLayoutTreeUpdate);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_record_partial_relayout_escape(host: &DocumentHost) {
+    queue(host, LayoutChange::RecordPartialRelayoutEscape);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_style_node_changed(
+    host: &DocumentHost,
+    old: u32,
+    new: u32,
+    generated_for: ak::Span<'_, u8>,
+) {
+    let generated_for = SmallVec::from_slice(generated_for.as_slice());
+    let new = StyleNodeID::from_raw(new);
+    let change = LayoutChange::StyleNodeChanged {
+        old: StyleNodeID::from_raw(old),
+        new,
+        generated_for,
+    };
+    queue(host, change);
+    if let Some(new) = new {
+        host.write_marks(super::tree_update_marks::LayoutTreeUpdateMarkWrite::Clear(new));
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_needs_full_layout_tree_update(host: *const DocumentHost, value: bool) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetNeedsFullLayoutTreeUpdate(value)) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_reset_cached_intrinsic_sizes_of_self_and_ancestors(
-    host: *const DocumentHost,
-    node: NodeSlotId,
-) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::ResetCachedIntrinsicSizesOfSelfAndAncestors { node }) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_defer_child_list_insertion_layout_update(
-    host: *const DocumentHost,
-    parent: NodeSlotId,
-) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::DeferChildListInsertionLayoutUpdate { parent }) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_invalidate_text_content(host: *const DocumentHost, node: NodeSlotId) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::InvalidateTextContent { node }) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_enroll_text_after_language_change(host: *const DocumentHost, root: NodeSlotId) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::EnrollTextAfterLanguageChange { root }) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_record_partial_relayout_escape(host: *const DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::RecordPartialRelayoutEscape) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_note_contained_abspos_child_removal(
-    host: *const DocumentHost,
-    parent: NodeSlotId,
-    child: NodeSlotId,
-) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::NoteContainedAbsposChildRemoval { parent, child }) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `generated_for` must point at `count` readable
-/// pseudo-element kinds.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_style_node_changed(
-    host: *const DocumentHost,
-    old: u32,
-    new: u32,
-    generated_for: *const u8,
-    count: usize,
-) {
-    let generated_for = if count == 0 {
-        SmallVec::new()
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        SmallVec::from_slice(unsafe { std::slice::from_raw_parts(generated_for, count) })
-    };
-    let change = LayoutChange::StyleNodeChanged {
-        old: StyleNodeID::from_raw(old),
-        new: StyleNodeID::from_raw(new),
-        generated_for,
-    };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `elements` must point at `count` readable
-/// element identities.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_anchor_name_elements(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_anchor_name_elements(
+    host: &DocumentHost,
     scope_host: u32,
     anchor_name: usize,
-    elements: *const u32,
-    count: usize,
+    elements: ak::Span<'_, u32>,
 ) {
-    let elements: &[u32] = if count == 0 {
-        &[]
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { std::slice::from_raw_parts(elements, count) }
-    };
     let change = LayoutChange::SetAnchorNameElements {
         scope_host: StyleNodeID::from_raw(scope_host),
         anchor_name,
-        elements: elements.iter().copied().filter_map(StyleNodeID::from_raw).collect(),
+        elements: elements
+            .as_slice()
+            .iter()
+            .copied()
+            .filter_map(StyleNodeID::from_raw)
+            .collect(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_element_scroll_offset(
-    host: *const DocumentHost,
-    element: u32,
-    offset: FfiCssPixelPoint,
-) {
+pub extern "C" fn render_state_set_element_scroll_offset(host: &DocumentHost, element: u32, offset: FfiCssPixelPoint) {
     let Some(element) = StyleNodeID::from_raw(element) else {
         return;
     };
     let offset = offset.into();
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetElementScrollOffset { element, offset }) };
+    queue(host, LayoutChange::SetElementScrollOffset { element, offset });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_pseudo_element_scroll_offset(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_pseudo_element_scroll_offset(
+    host: &DocumentHost,
     generator: u32,
     generated_for: u8,
     offset: FfiCssPixelPoint,
@@ -499,68 +546,43 @@ pub unsafe extern "C" fn render_state_set_pseudo_element_scroll_offset(
         generated_for,
         offset: offset.into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_identity_in_focused_text_control(
-    host: *const DocumentHost,
-    node: u32,
-    value: bool,
-) {
+pub extern "C" fn render_state_set_identity_in_focused_text_control(host: &DocumentHost, node: u32, value: bool) {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetIdentityInFocusedTextControl { node, value }) };
+    queue(host, LayoutChange::SetIdentityInFocusedTextControl { node, value });
 }
 
 /// Publishes what the SVG element `element` names parses to. A `<polyline>` or `<polygon>` passes its `points` list
 /// beside the facts, since it is the one geometry attribute that is not a fixed number of values.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `points` must point at `count` readable points.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_svg_attribute_facts(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_svg_attribute_facts(
+    host: &DocumentHost,
     element: u32,
     facts: FfiSvgAttributeFacts,
-    points: *const FfiFloatPoint,
-    count: usize,
+    points: ak::Span<'_, FfiFloatPoint>,
 ) {
     let Some(element) = StyleNodeID::from_raw(element) else {
         return;
     };
-    let points = if count == 0 {
-        &[][..]
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { std::slice::from_raw_parts(points, count) }
-    };
     let change = LayoutChange::SvgAttributeFacts {
         element,
         facts: Box::new(facts),
-        points: points.into(),
+        points: points.as_slice().into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
 /// Publishes only the resources a graphics element's style names, leaving what its attributes parse to alone. Style
 /// records are replaced far more often than an SVG attribute changes, and parsing every presentation attribute again
 /// to carry four names would make every style change pay for it.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_svg_style_references(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_svg_style_references(
+    host: &DocumentHost,
     element: u32,
     mask: u32,
     clip_path: u32,
@@ -574,39 +596,41 @@ pub unsafe extern "C" fn render_state_set_svg_style_references(
         element,
         references: [mask, clip_path, fill, stroke],
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
+/// Publishes the MathML attributes an element parsed, which the layout of its box reads.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_document_is_decoded_svg(host: *const DocumentHost, is_decoded_svg: bool) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetDocumentIsDecodedSvg(is_decoded_svg)) };
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_node_flag(
-    host: *const DocumentHost,
-    node: NodeSlotId,
-    flag: NodeFlag,
-    value: bool,
+pub extern "C" fn render_state_set_math_attribute_facts(
+    host: &DocumentHost,
+    element: u32,
+    facts: FfiMathAttributeFacts,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetNodeFlag { node, flag, value }) };
+    let Some(element) = StyleNodeID::from_raw(element) else {
+        return;
+    };
+    queue(
+        host,
+        LayoutChange::MathAttributeFacts {
+            element,
+            facts: Box::new(facts),
+        },
+    );
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_owned_image_natural_size(
-    host: *const DocumentHost,
+pub extern "C" fn render_state_set_document_is_decoded_svg(host: &DocumentHost, is_decoded_svg: bool) {
+    queue(host, LayoutChange::SetDocumentIsDecodedSvg(is_decoded_svg));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_node_flag(host: &DocumentHost, node: NodeSlotId, flag: NodeFlag, value: bool) {
+    queue(host, LayoutChange::SetNodeFlag { node, flag, value });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_owned_image_natural_size(
+    host: &DocumentHost,
     node: NodeSlotId,
     natural_size: FfiNaturalSize,
 ) {
@@ -614,26 +638,17 @@ pub unsafe extern "C" fn render_state_set_owned_image_natural_size(
         node,
         natural_size: natural_size.into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_invalidate_searchable_text(host: *const DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::InvalidateSearchableText) };
+pub extern "C" fn render_state_invalidate_searchable_text(host: &DocumentHost) {
+    queue(host, LayoutChange::InvalidateSearchableText);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_restamp_table_spans(host: *const DocumentHost, node: NodeSlotId) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::RestampTableSpans { node }) };
+pub extern "C" fn render_state_restamp_table_spans(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::RestampTableSpans { node });
 }
 
 #[cfg(test)]
@@ -682,13 +697,13 @@ mod tests {
         let parent = arena.allocate_for_test().slot;
         let child = arena.allocate_for_test().slot;
         arena.insert_child(parent, child, NodeSlotId::INVALID);
-        let written = LayoutWrite::DropSubtree { root: child }.apply(&raw mut arena);
+        let written = LayoutWrite::DropSubtree { root: child }.apply(&mut arena);
         assert!(written.was_attached);
         assert!(!arena.slot_is_live(child));
-        written.host_work.apply(&crate::stage::MainThread::for_test(), &arena);
-        let written = LayoutWrite::DropSubtree { root: parent }.apply(&raw mut arena);
+        written.host_work.pay(&crate::stage::MainThread::for_test());
+        let written = LayoutWrite::DropSubtree { root: parent }.apply(&mut arena);
         assert!(!written.was_attached);
-        written.host_work.apply(&crate::stage::MainThread::for_test(), &arena);
+        written.host_work.pay(&crate::stage::MainThread::for_test());
         assert_eq!(arena.live_slot_count(), 0);
     }
 }

@@ -5,13 +5,10 @@
  */
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::css::ffi_support::FfiStringView;
-use crate::css::ffi_support::ascii_lowercase;
+use crate::css::ffi_support::{OwnedBox, ascii_lowercase};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
-
-static NEXT_SELECTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type SelectorString = crate::css::css_string::CssString;
 pub type SelectorList = Box<[Arc<CompiledSelector>]>;
@@ -19,7 +16,6 @@ pub type SelectorList = Box<[Arc<CompiledSelector>]>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 // NB: Some variants are only constructed by C++ through the FFI.
-#[allow(dead_code)]
 pub enum Combinator {
     None,
     ImmediateChild,
@@ -33,7 +29,6 @@ pub enum Combinator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 // NB: The numeric values are part of the C++ FFI.
-#[allow(dead_code)]
 pub enum NamespaceType {
     Default,
     None,
@@ -87,7 +82,6 @@ impl NameSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum AttributeMatchType {
     HasAttribute,
     ExactValue,
@@ -100,7 +94,6 @@ pub enum AttributeMatchType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum AttributeCaseType {
     Default,
     Sensitive,
@@ -122,17 +115,6 @@ pub struct AnPlusBPattern {
     pub offset: i32,
 }
 
-impl AnPlusBPattern {
-    pub fn matches(self, index: i32) -> bool {
-        if self.step_size == 0 {
-            return index == self.offset;
-        }
-        let delta = i64::from(index) - i64::from(self.offset);
-        let step_size = i64::from(self.step_size);
-        delta % step_size == 0 && delta / step_size >= 0
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     LeftToRight,
@@ -140,7 +122,6 @@ pub enum Direction {
     Other,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PseudoClassParameterType {
     None,
@@ -148,7 +129,6 @@ pub(crate) enum PseudoClassParameterType {
     AnPlusBOf,
     CompoundSelector,
     ForgivingSelectorList,
-    ForgivingRelativeSelectorList,
     Ident,
     LanguageRanges,
     LevelList,
@@ -156,7 +136,6 @@ pub(crate) enum PseudoClassParameterType {
     SelectorList,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PseudoClassMetadata {
     pub parameter_type: PseudoClassParameterType,
@@ -164,16 +143,15 @@ pub(crate) struct PseudoClassMetadata {
     pub is_valid_as_identifier: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PseudoElementParameterType {
     None,
     CompoundSelector,
+    HighlightNameSelector,
     IdentList,
-    PTNameSelector,
+    PTNameAndClassSelector,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PseudoElementMetadata {
     pub parameter_type: PseudoElementParameterType,
@@ -181,7 +159,6 @@ pub(crate) struct PseudoElementMetadata {
     pub is_valid_as_identifier: bool,
 }
 
-#[allow(dead_code)]
 fn equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
     value.len() == expected.len()
         && value
@@ -217,7 +194,21 @@ pub enum PseudoElementValue {
     None,
     CompoundSelector(Arc<CompiledSelector>),
     Identifiers(Box<[SelectorString]>),
-    TransitionName { is_universal: bool, value: SelectorString },
+    TransitionName(Box<TransitionNameAndClassSelector>),
+}
+
+// https://drafts.csswg.org/css-view-transitions-1/#typedef-pt-name-selector
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionNameSelector {
+    Universal,
+    Name(SelectorString),
+}
+
+// https://drafts.csswg.org/css-view-transitions-2/#typedef-pt-name-and-class-selector
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionNameAndClassSelector {
+    pub name: Option<TransitionNameSelector>,
+    pub classes: Box<[SelectorString]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,16 +251,11 @@ pub struct CompoundSelector {
 ///
 /// Compounds retain their parsed left-to-right order. Matching starts at the final compound and
 /// follows each compound's combinator toward the beginning of this slice.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CompiledSelector {
-    /// Process-local identity used for `:has()` cache keys. Equality deliberately ignores it.
-    id: u64,
     pub compound_selectors: Box<[CompoundSelector]>,
     /// The pseudo-element required on the initial match target, if this selector ends in one.
     pub target_pseudo_element: Option<PseudoElementType>,
-    /// Whether matching needs only light-tree parent traversal and the simple selectors accepted
-    /// by `fast_matches()`.
-    pub can_use_fast_matches: bool,
 }
 
 /// Selector specificity, compared component by component.
@@ -298,20 +284,42 @@ impl Specificity {
     }
 }
 
-impl PartialEq for CompiledSelector {
-    fn eq(&self, other: &Self) -> bool {
-        self.compound_selectors == other.compound_selectors
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchTextMatchFilter {
+    Current,
+    NotCurrent,
+}
+
+pub fn search_text_match_filter_of_pseudo_class(pseudo_class: &PseudoClassSelector) -> Option<SearchTextMatchFilter> {
+    match pseudo_class.pseudo_class {
+        PseudoClassType::Current => Some(SearchTextMatchFilter::Current),
+        PseudoClassType::Not => {
+            let [argument] = &*pseudo_class.argument_selector_list else {
+                return None;
+            };
+            let [compound] = &*argument.compound_selectors else {
+                return None;
+            };
+            matches!(
+                &*compound.simple_selectors,
+                [SimpleSelector::PseudoClass(inner)] if inner.pseudo_class == PseudoClassType::Current
+            )
+            .then_some(SearchTextMatchFilter::NotCurrent)
+        }
+        _ => None,
     }
 }
 
-impl Eq for CompiledSelector {}
+pub fn search_text_match_filter(simple: &SimpleSelector) -> Option<SearchTextMatchFilter> {
+    match simple {
+        SimpleSelector::PseudoClass(pseudo_class) => search_text_match_filter_of_pseudo_class(pseudo_class),
+        _ => None,
+    }
+}
 
 impl CompiledSelector {
     #[allow(clippy::arc_with_non_send_sync)] // Bound selectors retain document-thread atoms.
     pub(crate) fn new(compound_selectors: Box<[CompoundSelector]>) -> Arc<Self> {
-        let id = NEXT_SELECTOR_ID.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, 0, "selector IDs must not wrap");
-
         let target_pseudo_element = compound_selectors
             .last()
             .and_then(|compound| compound.simple_selectors.first())
@@ -325,28 +333,36 @@ impl CompiledSelector {
                     Some(selector.pseudo_element)
                 }
                 _ => None,
+            })
+            .map(|pseudo_element| {
+                let names_current_match = pseudo_element == PseudoElementType::SearchText
+                    && compound_selectors.last().is_some_and(|compound| {
+                        compound
+                            .simple_selectors
+                            .iter()
+                            .any(|simple| search_text_match_filter(simple) == Some(SearchTextMatchFilter::Current))
+                    });
+                if names_current_match {
+                    PseudoElementType::SearchTextCurrent
+                } else {
+                    pseudo_element
+                }
             });
 
-        let can_use_fast_matches = compound_selectors.iter().all(|compound| {
-            matches!(
-                compound.combinator,
-                Combinator::None | Combinator::Descendant | Combinator::ImmediateChild
-            ) && compound
-                .simple_selectors
-                .iter()
-                .all(can_simple_selector_use_fast_matches)
-        });
-
         Arc::new(Self {
-            id,
             compound_selectors,
             target_pseudo_element,
-            can_use_fast_matches,
         })
     }
 
-    pub fn id(&self) -> u64 {
-        self.id
+    pub fn styles_every_search_text_match(&self) -> bool {
+        self.target_pseudo_element == Some(PseudoElementType::SearchText)
+            && self.compound_selectors.last().is_some_and(|compound| {
+                compound
+                    .simple_selectors
+                    .iter()
+                    .all(|simple| search_text_match_filter(simple).is_none())
+            })
     }
 
     /// https://www.w3.org/TR/selectors-4/#specificity-rules
@@ -397,16 +413,13 @@ impl CompiledSelector {
                         },
                     },
                     SimpleSelector::PseudoElement(pseudo_element) => {
-                        if matches!(
-                            pseudo_element.pseudo_element,
-                            PseudoElementType::ViewTransitionGroup
-                                | PseudoElementType::ViewTransitionImagePair
-                                | PseudoElementType::ViewTransitionNew
-                                | PseudoElementType::ViewTransitionOld
-                        ) && matches!(
-                            pseudo_element.value,
-                            PseudoElementValue::TransitionName { is_universal: true, .. }
-                        ) {
+                        // https://drafts.csswg.org/css-view-transitions-2/#pseudo-element-class-additions
+                        // The specificity of a named view transition pseudo-element selector with a * argument and with
+                        // an empty <pt-class-selector> is zero.
+                        if let PseudoElementValue::TransitionName(argument) = &pseudo_element.value
+                            && argument.name == Some(TransitionNameSelector::Universal)
+                            && argument.classes.is_empty()
+                        {
                             Specificity::default()
                         } else {
                             let pseudo_specificity = Specificity {
@@ -631,26 +644,9 @@ pub fn is_ascii_case_insensitive_html_attribute(name: &RetainedUtf16FlyString) -
     })
 }
 
-/// # Safety
-/// `selector` must be an owned selector handle that has not already been destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_destroy(selector: *mut RustSelector) {
-    if !selector.is_null() {
-        // SAFETY: The caller guarantees that this is an owned handle returned by
-        // a selector-producing FFI function and that it has not already been destroyed.
-        drop(unsafe { Box::from_raw(selector) });
-    }
-}
-
-/// # Safety
-/// `selector` must point to a live selector handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_target_pseudo_element(selector: *const RustSelector) -> u8 {
-    assert!(!selector.is_null());
-    // SAFETY: The caller guarantees that `selector` points to a live selector handle.
-    unsafe { &(*selector).selector }
-        .target_pseudo_element
-        .map_or(u8::MAX, |pseudo_element| pseudo_element as u8)
+pub extern "C" fn rust_selector_destroy(selector: OwnedBox<RustSelector>) {
+    drop(selector);
 }
 
 /// Returns the selector's specificity in the packed representation used by the DevTools protocol.
@@ -662,38 +658,4 @@ pub unsafe extern "C" fn rust_selector_specificity(selector: *const RustSelector
     assert!(!selector.is_null());
     // SAFETY: The caller guarantees that the selector handle remains valid for this call.
     unsafe { &(*selector).selector }.specificity().packed()
-}
-
-fn can_simple_selector_use_fast_matches(simple_selector: &SimpleSelector) -> bool {
-    match simple_selector {
-        SimpleSelector::Universal(_)
-        | SimpleSelector::TagName(_)
-        | SimpleSelector::Id(_)
-        | SimpleSelector::Class(_)
-        | SimpleSelector::Attribute(_) => true,
-        SimpleSelector::PseudoClass(selector) => matches!(
-            selector.pseudo_class,
-            PseudoClassType::Active
-                | PseudoClassType::AnyLink
-                | PseudoClassType::Autofill
-                | PseudoClassType::Checked
-                | PseudoClassType::Disabled
-                | PseudoClassType::Empty
-                | PseudoClassType::Enabled
-                | PseudoClassType::FirstChild
-                | PseudoClassType::Focus
-                | PseudoClassType::FocusVisible
-                | PseudoClassType::FocusWithin
-                | PseudoClassType::Hover
-                | PseudoClassType::LastChild
-                | PseudoClassType::Link
-                | PseudoClassType::LocalLink
-                | PseudoClassType::OnlyChild
-                | PseudoClassType::Root
-                | PseudoClassType::State
-                | PseudoClassType::Unchecked
-                | PseudoClassType::Visited
-        ),
-        SimpleSelector::PseudoElement(_) | SimpleSelector::Nesting | SimpleSelector::Invalid(_) => false,
-    }
 }

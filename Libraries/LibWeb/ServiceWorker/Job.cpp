@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/NonnullOwnPtr.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibURL/URL.h>
@@ -20,10 +22,10 @@
 #include <LibWeb/HTML/Scripting/ModuleScript.h>
 #include <LibWeb/HTML/Scripting/Script.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/SecureContexts/AbstractOperations.h>
 #include <LibWeb/ServiceWorker/Job.h>
 #include <LibWeb/ServiceWorker/Registration.h>
 #include <LibWeb/WebIDL/Promise.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 
 namespace Web::ServiceWorker {
 
@@ -71,9 +73,9 @@ void Job::visit_edges(JS::Cell::Visitor& visitor)
 
 // FIXME: Does this need to be a 'user agent' level thing? Or can we have one per renderer process?
 // https://w3c.github.io/ServiceWorker/#dfn-scope-to-job-queue-map
-static HashMap<ByteString, JobQueue>& scope_to_job_queue_map()
+static HashMap<ByteString, NonnullOwnPtr<JobQueue>>& scope_to_job_queue_map()
 {
-    static NeverDestroyed<HashMap<ByteString, JobQueue>> map;
+    static NeverDestroyed<HashMap<ByteString, NonnullOwnPtr<JobQueue>>> map;
     return *map;
 }
 
@@ -611,8 +613,8 @@ void schedule_job(JS::VM& vm, GC::Ref<Job> job)
 
     // 3. If scope to job queue map[jobScope] does not exist, set scope to job queue map[jobScope] to a new job queue.
     // 4. Set jobQueue to scope to job queue map[jobScope].
-    auto& job_queue = scope_to_job_queue_map().ensure(job_scope, [] {
-        return JobQueue {};
+    auto& job_queue = *scope_to_job_queue_map().ensure(job_scope, [] {
+        return make<JobQueue>();
     });
 
     // 5. If jobQueue is empty, then:

@@ -108,11 +108,10 @@ runs:
             ccache \
             coreutils \
             libtool \
-            llvm@21 \
+            llvm@22 \
             nasm \
             ninja \
             pkg-config \
-            qt \
             unzip
 
     - name: 'Install Rust toolchain'
@@ -120,7 +119,7 @@ runs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: 'Warm up the Rust toolchain'
-      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
+      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' || inputs.os == 'Windows' }}
       shell: bash
       run: |
         if rustup toolchain install ; then

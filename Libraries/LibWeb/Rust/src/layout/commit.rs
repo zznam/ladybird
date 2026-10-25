@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::style::tree::StyleNodeID;
 
 /// What a commit message tells the document.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14,8 +15,6 @@ pub enum FfiCommitMessageKind {
     ContentSizeChangedForContainerQueries,
     /// The node is a navigable container whose viewport committed.
     NavigableContainerViewportCommitted,
-    /// The node is an inline box that reached atomic inline layout without line box fragments.
-    UnexpectedFragmentedInline,
     /// The node is the element a box escaped its rebuild root under, so its layout tree has to be
     /// built again.
     LayoutTreeRebuildRequested,
@@ -29,6 +28,10 @@ pub enum FfiCommitMessageKind {
     /// tree build laid out under the graphics element `other_style_node` names. The resource
     /// outlives that box, so removing it has to rebuild the subtree the box sits in.
     SvgResourceReferenced,
+    /// The node is an element a bypass path reached without a style, which no style update
+    /// settled. The tree build built no box for it: the document styles it and builds its box
+    /// again.
+    UnstyledElementReached,
 }
 
 /// One thing layout has to tell the document. The node it is about is named by the style node the
@@ -60,37 +63,101 @@ pub(crate) struct CommitNotifications {
 }
 
 impl CommitNotifications {
-    /// # Safety
-    ///
-    /// The host must keep the document and node shells alive until these synchronous
-    /// notifications return. No mutable arena borrow may be active.
-    pub(crate) unsafe fn notify_host(self, main_thread: &crate::stage::MainThread, host: &FfiLayoutHostCallbacks) {
+    /// The size query containers whose content size the commit changed.
+    pub(crate) fn resized_size_containers(&self) -> impl Iterator<Item = StyleNodeID> + '_ {
+        self.messages
+            .iter()
+            .filter(|message| message.kind == FfiCommitMessageKind::ContentSizeChangedForContainerQueries)
+            .filter_map(|message| StyleNodeID::from_raw(message.style_node))
+    }
+
+    /// Tells the host of the resets and messages of the commit, which it answers synchronously, while no mutable arena
+    /// borrow is active.
+    pub(crate) fn notify_host(
+        self,
+        main_thread: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
+        host: &FfiLayoutHostCallbacks,
+    ) {
         for reset in self.row_resets {
             reset.tell(main_thread);
         }
-        // SAFETY: Guaranteed by the caller.
-        unsafe { host.deliver_commit_messages(main_thread, &self.messages) };
+        host.deliver_commit_messages(main_thread, read, &self.messages);
     }
+}
+
+/// A box without children whose new fragment is the one it committed last has nothing a recommit would write, so it is
+/// committed like the root of a reused subtree. Its committed geometry must still be current: a layout-affecting change
+/// since that commit can keep the fragment while changing the facts a recommit gathers, such as its paint order inputs.
+fn keeps_committed_childless_box(arena: &LayoutNodeArena, node: Node, link: &FragmentLink) -> bool {
+    let data = arena.data(node);
+    data.first_child.get().is_invalid()
+        && node_facts::kind_is_box(data.kind.get())
+        && arena.paintable_row_is_populated(node)
+        && arena
+            .with_current_committed_fragment(node, |committed| std::sync::Arc::ptr_eq(committed, &link.fragment))
+            .unwrap_or(false)
 }
 
 fn commit_subtree(
     node: Node,
     messages: &mut Vec<FfiCommitMessage>,
     paintables: &mut crate::painting::paintable_build::PaintableCommit<'_>,
-    links_by_slot: &HashMap<u32, &FragmentLink>,
+    links_by_slot: &fragment_tree::LinksBySlot<'_>,
     pass_fragments: &fragment_tree::CompletedPassFragments,
     enclosing_line_root_changes: crate::painting::paintable_build::LineRootChanges,
 ) {
     let slot_index = node.slot_index();
-    let entry = links_by_slot.get(&slot_index).copied();
-    let reuses_committed_subtree = pass_fragments.subtree_was_reused(slot_index);
+    let fragments = links_by_slot.fragments(slot_index);
+    let fragments = fragments.as_slice();
+    let link_with_merged_line_index;
+    let entry = match fragments.first() {
+        Some(fragment)
+            if fragment.containing_block_line_index_offset != 0
+                && fragment.link.containing_line_box_index.is_some() =>
+        {
+            link_with_merged_line_index = fragment_tree::FragmentLink {
+                containing_line_box_index: fragment
+                    .link
+                    .containing_line_box_index
+                    .map(|index| index + fragment.containing_block_line_index_offset),
+                ..fragment.link.clone()
+            };
+            Some(&link_with_merged_line_index)
+        }
+        first => first.map(|fragment| fragment.link),
+    };
+    let has_more_fragments = fragments.len() > 1;
+    let reuses_committed_subtree = !has_more_fragments
+        && (pass_fragments.subtree_was_reused(slot_index)
+            || entry.is_some_and(|link| keeps_committed_childless_box(paintables.arena(), node, link)));
     debug_assert!(!reuses_committed_subtree || entry.is_some());
+    // A reused subtree whose root committed this very link already, in geometry that is still current, has nothing left
+    // to commit. A box placing an absolutely positioned box, or a navigable's viewport, notes itself on every commit, and
+    // a link without a containing block leaves the commit to find it among ancestors that may have changed.
+    if reuses_committed_subtree
+        && let Some(link) = entry
+        && link.abspos_layout_inputs.is_none()
+        && !link.containing_block.is_invalid()
+        && paintables.arena().data(node).kind.get() != NodeKind::NavigableContainerViewport
+        && paintables.arena().holds_current_committed_fragment_link(node, link)
+        && fragments
+            .first()
+            .and_then(|fragment| fragment.containing_block_fragment)
+            .is_none_or(|fragment| paintables.arena().committed_side_data(node).containing_block_fragment == fragment)
+    {
+        return;
+    }
     if !reuses_committed_subtree {
         paintables.arena().forget_committed_out_of_flow_facts(node);
     }
     if let Some(inputs) = entry.and_then(|link| link.abspos_layout_inputs.as_ref()) {
         paintables.arena().note_committed_out_of_flow_box(node, inputs);
     }
+    let previous_fragmented_content = (paintables.arena().paintable_row_is_populated(node)
+        && (has_more_fragments || !paintables.arena().committed_side_data(node).box_fragments().is_empty()))
+    .then(|| paintables.arena().committed_side_data(node).inline_content.clone())
+    .flatten();
     let prepared = paintables.prepare_node(
         node,
         entry.is_some(),
@@ -106,10 +173,7 @@ fn commit_subtree(
         let fragment = &link.fragment;
         debug_assert!(
             fragment.computed_svg_path.is_some()
-                || !matches!(
-                    paintables.arena().data(node).kind.get(),
-                    NodeKind::SVGGeometryBox | NodeKind::SVGTextBox | NodeKind::SVGTextPathBox
-                ),
+                || !crate::painting::node_painting::is_svg_path(paintables.arena().data(node).kind.get()),
             "committed path-like fragment carries no computed SVG path"
         );
         let replaced = paintables.replace_committed_fragment_link(
@@ -119,6 +183,7 @@ fn commit_subtree(
             enclosing_line_root_changes,
             prepared.previous_offset,
         );
+        paintables.set_box_fragments(node, fragments);
         if fragment.line_data.is_some() {
             line_root_changes_for_children = replaced.line_root_changes;
         }
@@ -135,12 +200,27 @@ fn commit_subtree(
             ));
         }
 
-        if !reuses_committed_subtree && let Some(line_data) = &fragment.line_data {
-            has_pending_inline_box_geometry = paintables.set_line_data(node, line_data);
+        if !reuses_committed_subtree {
+            let merged_line_data = has_more_fragments
+                .then(|| {
+                    inline_content::InlineContent::merge_box_fragments(
+                        fragments
+                            .iter()
+                            .map(|fragment| fragment.link.fragment.line_data.as_deref()),
+                    )
+                })
+                .flatten();
+            if let Some(line_data) = merged_line_data.as_ref().or(fragment.line_data.as_ref()) {
+                let change = paintables.set_line_data(node, line_data, previous_fragmented_content);
+                has_pending_inline_box_geometry = change.has_pieces;
+                line_root_changes_for_children.fragment_changed |= change.content_changed;
+                line_root_changes_for_children.inline_content_changed |= change.content_changed;
+                line_root_changes_for_children.inline_item_order_changed |= change.item_order_changed;
+            }
         }
     }
-
     if entry.is_none() && prepared.has_paintable_row {
+        paintables.set_box_fragments(node, fragments);
         paintables.schedule_scrollable_overflow_recalculation(node);
     }
 
@@ -201,8 +281,7 @@ pub(crate) fn commit_replacing(
     let links_by_slot = pass_fragments.links_by_slot();
     let mut paintables = crate::painting::paintable_build::PaintableCommit::new(arena, root);
     paintables.begin_commit();
-    // What the pass itself found out comes before what committing it finds out.
-    let mut messages = paintables.arena().take_messages_reported_during_pass();
+    let mut messages = Vec::new();
     commit_subtree(
         root,
         &mut messages,

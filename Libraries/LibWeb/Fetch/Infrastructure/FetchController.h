@@ -77,6 +77,7 @@ public:
 
     void stop_fetch();
     void stop_request();
+    void set_stop_steps(GC::Ref<GC::Function<void()>> stop_steps) { m_stop_steps = stop_steps; }
 
     u64 next_fetch_task_id() { return m_next_fetch_task_id++; }
     void fetch_task_queued(u64 fetch_task_id, HTML::TaskID event_id);
@@ -86,6 +87,7 @@ private:
     FetchController();
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void finalize() override;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-state
     // state (default "ongoing")
@@ -124,6 +126,9 @@ private:
 
     HashMap<u64, HTML::TaskID> m_ongoing_fetch_tasks;
     u64 m_next_fetch_task_id { 0 };
+
+    // AD-HOC: Run when the fetch is stopped, for whatever was waiting on its response.
+    GC::Ptr<GC::Function<void()>> m_stop_steps;
 };
 
 class FetchControllerHolder : public JS::Cell {

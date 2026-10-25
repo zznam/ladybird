@@ -20,6 +20,7 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -74,6 +75,8 @@ void HTMLTextAreaElement::did_receive_focus()
 
 void HTMLTextAreaElement::did_lose_focus()
 {
+    reveal_cursor_if_pending();
+
     if (m_text_node)
         m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
@@ -171,6 +174,14 @@ Utf16String HTMLTextAreaElement::value() const
     return api_value();
 }
 
+void HTMLTextAreaElement::set_value_binding(Utf16View value)
+{
+    // INTEROP: Browsers forget the undo history of a text control when a script sets its value.
+    if (auto history = document().editing_history_if_exists())
+        history->forget_steps_for(*this);
+    set_value(value);
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
 void HTMLTextAreaElement::set_value(Utf16View value)
 {
@@ -192,9 +203,11 @@ void HTMLTextAreaElement::set_value(Utf16View value)
         if (m_text_node) {
             MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
             update_placeholder_visibility();
-
-            set_the_selection_range(m_text_node->length(), m_text_node->length());
         }
+
+        // NB: A textarea without a text node still has a selection, so this also applies to it.
+        auto end_of_text_control = m_text_node ? m_text_node->length() : api_value().length_in_code_units();
+        set_the_selection_range(end_of_text_control, end_of_text_control);
 
         CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
     }

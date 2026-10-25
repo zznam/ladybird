@@ -6,6 +6,7 @@
 
 import http.server
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -76,7 +77,8 @@ with tempfile.TemporaryDirectory() as directory:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = helpers["unused_port"]()
     process = subprocess.Popen(
-        [sys.argv[1], "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory]
+        [sys.argv[1], "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory],
+        env={**os.environ, "LADYBIRD_CONTENT_BLOCKER_LIST_UPDATE_TIMEOUT_MS": "1000"},
     )
     session = None
     try:
@@ -96,6 +98,8 @@ with tempfile.TemporaryDirectory() as directory:
                 const [name, data, waitForIdle, done] = arguments;
                 const receive = event => {
                     if (event.detail.name !== 'loadSettings') return;
+                    // Wait for the requested full snapshot rather than a partial broadcast.
+                    if (!Object.hasOwn(event.detail.data, 'firstRunComplete')) return;
                     if (waitForIdle && event.detail.data.contentBlockerListUpdateInProgress) {
                         setTimeout(() => ladybird.sendMessage('loadCurrentSettings'), 50);
                         return;
@@ -105,6 +109,7 @@ with tempfile.TemporaryDirectory() as directory:
                 };
                 document.addEventListener('WebUIMessage', receive);
                 ladybird.sendMessage(name, data);
+                if (name !== 'loadCurrentSettings') ladybird.sendMessage('loadCurrentSettings');
             """,
                     "args": [name, data, wait_for_idle],
                 },
@@ -139,6 +144,32 @@ with tempfile.TemporaryDirectory() as directory:
         assert command("execute/sync", {"script": "return location.href", "args": []}) == "about:about"
         command("url", {"url": "about:blocking"})
         state = settings()
+        assert state["contentBlockers"]["showBlockedCount"] is False
+        features = command(
+            "execute/async",
+            {
+                "script": """
+                const done = arguments[arguments.length - 1];
+                document.addEventListener('WebUIMessage', function receive(event) {
+                    if (event.detail.name !== 'loadFeatures') return;
+                    document.removeEventListener('WebUIMessage', receive);
+                    done(event.detail.data);
+                });
+                ladybird.sendMessage('loadFeatures');
+                """,
+                "args": [],
+            },
+        )
+        display = command(
+            "execute/sync",
+            {
+                "script": "return getComputedStyle(document.querySelector('#show-content-blocker-count-setting')).display",
+                "args": [],
+            },
+        )
+        assert (display != "none") == features["contentBlockingControls"]
+        command("execute/sync", {"script": "ladybird.sendMessage('setShowContentBlockerCount', false)", "args": []})
+        assert settings()["contentBlockers"]["showBlockedCount"] == (not features["contentBlockingControls"])
         assert command(
             "execute/sync",
             {
@@ -171,10 +202,10 @@ with tempfile.TemporaryDirectory() as directory:
                 {
                     "script": """
                     const toggle = document.querySelector('#filter-list-updates');
-                    const style = getComputedStyle(toggle.parentElement);
+                    const label = document.querySelector('label[for="filter-list-updates"]');
                     return toggle.disabled === !arguments[0]
-                        && style.opacity === (arguments[0] ? '1' : '0.5')
-                        && (arguments[0] || style.filter === 'grayscale(1)');
+                        && getComputedStyle(label).opacity === (arguments[0] ? '1' : '0.5')
+                        && getComputedStyle(toggle).opacity === '1';
                 """,
                     "args": [enabled],
                 },

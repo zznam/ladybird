@@ -17,9 +17,9 @@
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/MediaStream.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media {
 
@@ -45,7 +45,7 @@ public:
     void close();
     virtual bool is_closed() const override;
 
-    virtual Vector<ByteRange> available_byte_ranges() const override;
+    virtual Availability availability() const override;
 
     virtual void set_available_ranges_change_observer(Function<void()>) override;
 
@@ -68,8 +68,8 @@ public:
         virtual size_t blocking_size() const override { return m_stream->size(); }
 
         virtual void abort() override;
-        virtual void reset_abort() override { m_aborted = false; }
-        virtual bool is_aborted() const override { return m_aborted; }
+        virtual void reset_abort() override { m_aborted.store(false, AK::MemoryOrder::memory_order_relaxed); }
+        virtual bool is_aborted() const override { return m_aborted.load(AK::MemoryOrder::memory_order_relaxed); }
 
         virtual void set_blocked_change_handler(ReadBlockedChangeHandler) override;
 
@@ -81,10 +81,17 @@ public:
         NonnullRefPtr<IncrementallyPopulatedStream> m_stream;
         bool m_is_blocking { true };
         size_t m_position { 0 };
-        bool m_aborted { false };
+        // Set from any thread under the stream's mutex, which orders it against the blocked read; only the reading
+        // thread clears it, between its reads.
+        Atomic<bool> m_aborted { false };
         bool m_blocked { false };
         ReadBlockedChangeHandler m_read_blocked_change_handler;
-        MonotonicTime m_active_timeout { MonotonicTime::now_coarse() };
+        MonotonicTime m_active_timeout;
+
+        // The chunk and stream state that this cursor last chose a request position for. Reads within that chunk are
+        // skipped until the state changes, since the choice would be the same.
+        Optional<u64> m_request_decided_chunk_offset;
+        u64 m_request_decided_generation { 0 };
     };
 
 private:
@@ -125,6 +132,7 @@ private:
     bool check_if_data_is_available_or_begin_request_while_locked(Cursor&, u64 position, u64 length);
     size_t read_from_chunks_while_locked(u64 position, Bytes& bytes) const;
     void notify_available_ranges_changed_while_locked();
+    void note_request_state_changed_while_locked() { m_request_state_generation++; }
 
     mutable Mutex m_mutex;
     Vector<Cursor&> m_cursors;
@@ -142,6 +150,8 @@ private:
     u64 m_current_append_head { 0 };
     u64 m_last_appended_chunk_end { 0 };
     bool m_may_idle { false };
+    // Changes whenever anything that the choice of request position depends on changes.
+    u64 m_request_state_generation { 1 };
 };
 
 }

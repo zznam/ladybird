@@ -103,7 +103,7 @@ void MutationLog::note_key_generator_changed(u64 old_value)
     m_entries.append(KeyGeneratorChanged { old_value });
 }
 
-void MutationLog::note_records_deleted(Vector<ObjectStoreRecord> records)
+void MutationLog::note_records_deleted(Vector<ObjectStoreRecord>&& records)
 {
     m_entries.append(RecordsDeleted { move(records) });
 }
@@ -113,7 +113,7 @@ void MutationLog::note_record_stored(GC::Ref<Key> key)
     m_entries.append(RecordStored { key });
 }
 
-void MutationLog::note_index_records_deleted(GC::Ref<Index> index, Vector<IndexRecord> records)
+void MutationLog::note_index_records_deleted(GC::Ref<Index> index, Vector<IndexRecord>&& records)
 {
     m_entries.append(IndexRecordsDeleted { index, move(records) });
 }
@@ -125,9 +125,9 @@ void MutationLog::note_index_record_stored(GC::Ref<Index> index, IndexRecord rec
 
 void MutationLog::append_changes(Utf16String const& database_name, Utf16String const& object_store_name, TransactionChanges& changes) const
 {
-    Vector<GC::Ref<Key>> stored_keys;
-    Vector<GC::Ref<Key>> changed_keys;
-    Vector<GC::Ref<Key>> deleted_keys;
+    GC::RootVector<GC::Ref<Key>> stored_keys;
+    GC::RootVector<GC::Ref<Key>> changed_keys;
+    GC::RootVector<GC::Ref<Key>> deleted_keys;
 
     auto remove_key = [](Vector<GC::Ref<Key>>& keys, Key& key) {
         return keys.remove_first_matching([&](auto const& existing) {
@@ -162,9 +162,9 @@ void MutationLog::append_changes(Utf16String const& database_name, Utf16String c
                 changes.deleted.append({ database_name, e.old_name });
                 changes.added.append({ database_name, object_store_name });
             },
-            [&](IndexCreated const&) {},
-            [&](IndexDeleted const&) {},
-            [&](IndexRenamed const&) {},
+            [&](IndexCreated const&) { },
+            [&](IndexDeleted const&) { },
+            [&](IndexRenamed const&) { },
             [&](KeyGeneratorChanged const&) {
             },
             [&](RecordsDeleted const& e) {
@@ -174,8 +174,8 @@ void MutationLog::append_changes(Utf16String const& database_name, Utf16String c
             [&](RecordStored const& e) {
                 append_stored_key(*e.key);
             },
-            [&](IndexRecordsDeleted const&) {},
-            [&](IndexRecordStored const&) {});
+            [&](IndexRecordsDeleted const&) { },
+            [&](IndexRecordStored const&) { });
     }
 
     for (auto const& key : stored_keys)

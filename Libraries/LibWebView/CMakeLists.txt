@@ -1,6 +1,8 @@
 set(SOURCES
+    AccessibilityTreeManager.cpp
     Application.cpp
     ApplyHistoryStep.cpp
+    AudioServerControlClient.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
     AutocompleteRanker.cpp
@@ -18,6 +20,7 @@ set(SOURCES
     CanonicalWindow.cpp
     BrowserProcess.cpp
     CompositorClient.cpp
+    CompositorPresentationClient.cpp
     CookieJar.cpp
     CrashReport.cpp
     CrashReportDiagnostics.cpp
@@ -31,7 +34,8 @@ set(SOURCES
     FaviconStore.cpp
     FileDownloader.cpp
     FontService.cpp
-    FontServiceConnection.cpp
+    FontServiceHost.cpp
+    GamepadManager.cpp
     HeadlessWebView.cpp
     HelperProcess.cpp
     HistoryDebug.cpp
@@ -41,12 +45,18 @@ set(SOURCES
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
+    PictureInPictureManager.cpp
+    PictureInPictureWindow.cpp
     Process.cpp
     ProcessManager.cpp
+    ProcessSnapshot.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp
     ProcessMonitor.cpp
     Profile.cpp
+    ReportSubmission.cpp
+    RequestServerManager.cpp
+    RequestServerSiteBindings.cpp
     SearchEngine.cpp
     SessionHistory.cpp
     SessionHistorySnapshotStorage.cpp
@@ -54,11 +64,15 @@ set(SOURCES
     SessionStore.cpp
     Settings.cpp
     SiteCompatibility.cpp
+    StorageAreaRegistry.cpp
     StorageJar.cpp
+    TestSpellChecker.cpp
     URL.cpp
     UserAgent.cpp
     Utilities.cpp
+    VideoDecoderServerControlClient.cpp
     ViewImplementation.cpp
+    WebCompatReport.cpp
     WebContentClient.cpp
     WebContentPage.cpp
     WebContentTestClient.cpp
@@ -81,7 +95,7 @@ if (APPLE)
         ProcessReaper.cpp
     )
 elseif (LINUX)
-    list(APPEND SOURCES CrashReportPOSIX.cpp)
+    list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
 endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
@@ -91,8 +105,12 @@ compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
 
 set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
+    ../../Services/AudioServer/AudioServerControlClientEndpoint.h
+    ../../Services/AudioServer/AudioServerControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlEndpoint.h
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )
@@ -127,11 +145,15 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
 target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
-target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading SDL3::SDL3)
 
-if (ENABLE_CRANELIFT_JIT)
-    target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)
-    target_compile_definitions(LibWebView PUBLIC HAVE_WASM_COMPILER_SERVICE=1)
+if (LINUX)
+    # The connect broker asks the audio library where the daemon is before connecting a helper to it.
+    include(audio)
+    if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+        target_compile_definitions(LibWebView PRIVATE HAVE_PULSEAUDIO=1)
+        target_link_libraries(LibWebView PRIVATE PkgConfig::PULSEAUDIO)
+    endif()
 endif()
 
 if (APPLE)

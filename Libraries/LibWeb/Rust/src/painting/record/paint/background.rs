@@ -13,6 +13,7 @@ use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::border_radii::BorderRadii;
+use crate::painting::corner_shape::{CornerShapes, Insets, border_contour_path};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::Repeat;
 use crate::painting::display_list::commands::{ContextRef, VISUAL_VIEWPORT_NODE_INDEX};
@@ -27,7 +28,9 @@ use crate::painting::record::paint::background_resolution::{
 use crate::painting::record::paint::gradient_resolution::{gradient_paint_value, record_gradient_fill};
 use crate::painting::record::paint::table_backgrounds;
 use crate::painting::visual_context::SpatialData;
-use libgfx_rust::{CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize, MaskKind, ScalingMode};
+use libgfx_rust::{
+    CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize, MaskKind, ScalingMode, WindingRule,
+};
 
 const MAX_DIRECT_GRADIENT_TILES: f64 = 1000.0;
 
@@ -80,6 +83,8 @@ pub(crate) fn paint_background_within<O: Observer>(
     paintable: NodeSlotId,
     background_rect: CssPixelRect,
     border_radii: BorderRadii,
+    edges: Option<(FfiPixelBox, FfiPixelBox)>,
+    visible_rect: Option<CssPixelRect>,
 ) {
     let layout_arena = recorder.source;
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
@@ -94,12 +99,14 @@ pub(crate) fn paint_background_within<O: Observer>(
         style.background().background_color_clip,
         background_rect,
         border_radii,
+        edges,
     );
     let inputs = BackgroundPaintInputs {
         resolved,
         border_radii,
         image_rendering: style.image_rendering(),
         is_root_element: false,
+        visible_device_rect: visible_rect.map(|rect| recorder.converter.rounded_device_rect(rect)),
     };
     paint_resolved_background(recorder, paintable, &inputs);
 }
@@ -192,8 +199,43 @@ fn paint_background_layers<O: Observer>(
         rect: background_rect,
         radii: inputs.border_radii,
     };
-    let padding = crate::painting::paintable_geometry::committed_padding(recorder.source, paintable);
-    let border = crate::painting::paintable_geometry::committed_border_box_edges(recorder.source, paintable);
+    let padding = resolved.padding;
+    let border = resolved.border;
+
+    // https://drafts.csswg.org/css-borders-4/#corner-shape-rendering
+    // Shaped corners clip each background box to the border contour path inset to that box.
+    let border_box_device_rect = converter.rounded_device_rect(border_box.rect).to_float();
+    let border_box_corner_radii = border_box.radii.as_corners(&converter);
+    let corner_shapes = recorder
+        .source
+        .node_style_if_live(paintable)
+        .map(CornerShapes::of)
+        .filter(|shapes| !is_root_element && shapes.needs_contour(border_box_corner_radii));
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // The inner border shape clips the background, and the border radii are ignored.
+    let border_shape_clip = (!is_root_element)
+        .then(|| crate::painting::border_shape::BorderShape::for_paintable(recorder.source, paintable, &converter))
+        .flatten()
+        .map(|border_shape| {
+            let (path, fill_rule) = border_shape.background_clip_path();
+            PendingInlineClip::intersecting_path(path, fill_rule)
+        });
+    let contour_clip = |css_rect: CssPixelRect| {
+        if let Some(clip) = &border_shape_clip {
+            return Some(clip.clone());
+        }
+        corner_shapes.map(|shapes| {
+            let rect = converter.rounded_device_rect(css_rect).to_float();
+            let insets = Insets {
+                top: f64::from(rect.y - border_box_device_rect.y),
+                right: f64::from((border_box_device_rect.x + border_box_device_rect.width) - (rect.x + rect.width)),
+                bottom: f64::from((border_box_device_rect.y + border_box_device_rect.height) - (rect.y + rect.height)),
+                left: f64::from(rect.x - border_box_device_rect.x),
+            };
+            let contour = border_contour_path(border_box_device_rect, border_box_corner_radii, shapes, insets);
+            PendingInlineClip::intersecting_path(&contour, WindingRule::Nonzero)
+        })
+    };
 
     if is_root_element {
         recorder.recorder.fill_animated_background_color(
@@ -203,6 +245,16 @@ fn paint_background_layers<O: Observer>(
             background_color_animation_effect,
             ForceDarkRole::Background,
         );
+    } else if let Some(clip) = contour_clip(color_box.rect) {
+        recorder.recorder.record_with_inline_clips(&[clip], |painter| {
+            painter.fill_animated_background_color(
+                converter.rounded_device_rect(color_box.rect),
+                color,
+                libgfx_rust::CornerRadii::default(),
+                background_color_animation_effect,
+                ForceDarkRole::Background,
+            );
+        });
     } else {
         recorder.recorder.fill_animated_background_color(
             converter.rounded_device_rect(color_box.rect),
@@ -296,6 +348,7 @@ fn paint_background_layers<O: Observer>(
                         clip_rect,
                         CompositingAndBlendingOperator::Normal,
                         backdrop,
+                        inputs.visible_device_rect,
                     );
                 }
             });
@@ -319,6 +372,7 @@ fn paint_background_layers<O: Observer>(
                     clip_rect,
                     compositing_and_blending_operator,
                     backdrop,
+                    inputs.visible_device_rect,
                 );
             }
         };
@@ -329,7 +383,9 @@ fn paint_background_layers<O: Observer>(
             let unshrunken_clip_float_rect = unshrunken_clip_rect.to_float();
             let corner_radii = clip_box.radii.corners_unconditionally(&converter);
             let mut layer_inline_clips = Vec::new();
-            if corner_radii.has_any_radius() {
+            if let Some(clip) = contour_clip(css_clip_rect) {
+                layer_inline_clips.push(clip);
+            } else if corner_radii.has_any_radius() {
                 layer_inline_clips.push(PendingInlineClip::intersecting_rounded_rect(
                     unshrunken_clip_float_rect,
                     corner_radii,
@@ -426,9 +482,11 @@ pub(crate) fn paint_image_content<O: Observer>(
             ForceDarkRole::Background,
         ),
         ImageContent::Vector {
-            has_active_view_box, ..
+            content_identity,
+            has_active_view_box,
         } => recorder.paint_vector_image(
             source,
+            *content_identity,
             *has_active_view_box,
             dest_rect,
             accumulated_scale,
@@ -448,6 +506,7 @@ fn paint_image_layer<O: Observer>(
     clip_rect: IntRect,
     compositing_and_blending_operator: CompositingAndBlendingOperator,
     backdrop: LayerBackdrop,
+    visible_device_rect: Option<IntRect>,
 ) {
     let converter = recorder.converter;
     let image = layer.image.expect("an imageless layer never reaches the image paint");
@@ -599,7 +658,9 @@ fn paint_image_layer<O: Observer>(
                 if image_device_rect.height == 0 {
                     image_device_rect.height = 1;
                 }
-                rects.push(image_device_rect);
+                if visible_device_rect.is_none_or(|visible| !visible.intersected(image_device_rect).is_empty()) {
+                    rects.push(image_device_rect);
+                }
                 if !repeat_x {
                     break;
                 }
@@ -669,7 +730,7 @@ fn paint_image_layer<O: Observer>(
         if dest_rect.height == 0 {
             dest_rect.height = 1;
         }
-        if let crate::painting::image_content::ImageContent::Vector { .. } = &facts.content {
+        if let crate::painting::image_content::ImageContent::Vector { content_identity, .. } = &facts.content {
             if clip_rect.is_empty() {
                 return;
             }
@@ -684,6 +745,8 @@ fn paint_image_layer<O: Observer>(
                     CssPixels::from_integer(i64::from(dest_rect.width)),
                     CssPixels::from_integer(i64::from(dest_rect.height)),
                     1.0,
+                    *content_identity,
+                    recorder.vector_image_color_scheme(vector_image_source.owner()),
                 ),
             );
             let tile_size = IntSize {
@@ -981,7 +1044,7 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
     };
 
     let data = recorder.data(paintable);
-    if node_painting::is_inline(recorder.source, paintable) {
+    if node_painting::is_fragmented_inline(recorder.source, paintable) {
         let root = data.containing_block;
         if !root.is_invalid()
             && recorder.source.paintable_row_is_populated(root)

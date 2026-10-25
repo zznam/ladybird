@@ -51,7 +51,7 @@ static ErrorOr<NonnullRefPtr<WebUIType>> create_web_ui(WebContentClient& client,
     auto paired = TRY(IPC::Transport::create_paired());
     auto handle = move(paired.remote_handle);
 
-    auto web_ui = WebUIType::create(client, move(paired.local), move(host));
+    auto web_ui = WebUIType::create(client, page_id, move(paired.local), move(host));
     client.async_connect_to_web_ui(page_id, move(handle));
 
     return web_ui;
@@ -82,9 +82,10 @@ ErrorOr<RefPtr<WebUI>> WebUI::create(WebContentClient& client, Web::PageId page_
     return web_ui;
 }
 
-WebUI::WebUI(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host)
+WebUI::WebUI(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)
     : IPC::ConnectionToServer<WebUIClientEndpoint, WebUIServerEndpoint>(*this, move(transport))
     , m_client(client)
+    , m_page_id(page_id)
     , m_host(move(host))
 {
 }
@@ -93,7 +94,8 @@ WebUI::~WebUI() = default;
 
 void WebUI::die()
 {
-    m_client.web_ui_disconnected({});
+    if (auto client = m_client.strong_ref())
+        client->web_ui_disconnected({});
 }
 
 void WebUI::register_interface(StringView name, Interface interface)
@@ -104,6 +106,9 @@ void WebUI::register_interface(StringView name, Interface interface)
 
 void WebUI::received_message(String name, JsonValue data)
 {
+    if (!has_client())
+        return;
+
     auto interface = m_interfaces.get(name);
     if (!interface.has_value()) {
         warnln("Received message from WebUI for unrecognized interface: {}", name);

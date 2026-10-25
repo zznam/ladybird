@@ -32,18 +32,27 @@ pub(crate) fn containing_block_paintable(
 }
 
 pub(crate) fn absolute_rect(layout_arena: &impl PaintRead, fragment: &FragmentRecord) -> CssPixelRect {
+    let rect = rect_in_containing_block(fragment);
+    match containing_block_paintable(layout_arena, fragment) {
+        Some(block) => rect.translated_by(paintable_geometry::absolute_line_root_position(
+            layout_arena,
+            block,
+            fragment.line_index as usize,
+        )),
+        None => rect,
+    }
+}
+
+/// The fragment's rect relative to its containing block, which is the box whose line boxes hold it.
+pub(crate) fn rect_in_containing_block(fragment: &FragmentRecord) -> CssPixelRect {
     let (x, y) = fragment.offset();
     let (width, height) = fragment.size();
-    let mut rect = CssPixelRect {
+    CssPixelRect {
         x: x + fragment.relpos_delta.x,
         y: y + fragment.relpos_delta.y,
         width,
         height,
-    };
-    if let Some(block) = containing_block_paintable(layout_arena, fragment) {
-        rect = rect.translated_by(paintable_geometry::absolute_position(layout_arena, block));
     }
-    rect
 }
 
 pub(crate) fn absolute_line_box_rect(
@@ -58,12 +67,16 @@ pub(crate) fn absolute_line_box_rect(
     };
     let mut rect = CssPixelRect::from(line.rect);
     if let Some(block) = containing_block_paintable(layout_arena, fragment) {
-        rect = rect.translated_by(paintable_geometry::absolute_position(layout_arena, block));
+        rect = rect.translated_by(paintable_geometry::absolute_line_root_position(
+            layout_arena,
+            block,
+            fragment.line_index as usize,
+        ));
     }
     rect
 }
 
-fn is_horizontal(fragment: &FragmentRecord) -> bool {
+pub(crate) fn is_horizontal(fragment: &FragmentRecord) -> bool {
     fragment.writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB
 }
 
@@ -411,6 +424,58 @@ impl GraphemeEdgeTracker {
         }
         self.right_edge
     }
+}
+
+pub(crate) fn physical_edge_offset(
+    arena: &impl PaintRead,
+    fragment: &FragmentRecord,
+    left: bool,
+) -> Option<(usize, bool)> {
+    let run = fragment.glyph_run.as_ref()?;
+    let glyph = run
+        .glyphs
+        .iter()
+        .filter(|glyph| glyph.length_in_code_units > 0 && glyph.glyph_width > 0.0)
+        .min_by(|a, b| {
+            if left {
+                a.x.total_cmp(&b.x)
+            } else {
+                (b.x + b.glyph_width).total_cmp(&(a.x + a.glyph_width))
+            }
+        })?;
+    let boundary = glyph.cluster_start as usize
+        + if left == glyph.is_rtl {
+            glyph.length_in_code_units
+        } else {
+            0
+        };
+    Some((
+        arena.dom_offset_for_rendered_text_offset(
+            fragment.layout_node,
+            fragment.start + boundary,
+            crate::layout::RenderedTextBoundary::End,
+        ),
+        left == glyph.is_rtl,
+    ))
+}
+
+pub(crate) fn caret_inline_offset(fragment: &FragmentRecord, offset: usize, downstream: bool) -> Option<f32> {
+    let run = fragment.glyph_run.as_ref()?;
+    let mut fallback = None;
+    for glyph in run.glyphs.iter().filter(|glyph| glyph.length_in_code_units > 0) {
+        let start = glyph.cluster_start as usize;
+        let end = start + glyph.length_in_code_units;
+        if offset < start || offset > end {
+            continue;
+        }
+        let fraction = (offset - start) as f32 / glyph.length_in_code_units as f32;
+        let coordinate = glyph.x + glyph.glyph_width * if glyph.is_rtl { 1.0 - fraction } else { fraction };
+        if (offset > start && offset < end) || (downstream && offset == start) || (!downstream && offset == end) {
+            return Some(coordinate);
+        }
+        fallback = Some(coordinate);
+    }
+    fallback
 }
 
 pub(crate) fn index_in_node_for_point(

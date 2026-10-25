@@ -5,7 +5,7 @@
  */
 
 use super::builder::{
-    CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE, OpenGroup, PendingInlineClip, RecordedDisplayList,
+    CommandRange, DisplayListBuilder, HEADER_SIZE, OpenGroup, PendingInlineClip, RecordedDisplayList,
 };
 use super::commands::*;
 use crate::painting::display_list::ffi_bytes::FfiBytes;
@@ -210,7 +210,7 @@ pub enum PaintStyleOrColor {
 
 pub struct FillPathParams<'a> {
     pub force_dark_role: ForceDarkRole,
-    pub path: &'a libgfx_rust::path::OwnedPath,
+    pub path: &'a libgfx_rust::path::Path,
     pub opacity: f32,
     pub paint_style_or_color: PaintStyleOrColor,
     pub winding_rule: WindingRule,
@@ -224,7 +224,7 @@ pub struct StrokePathParams<'a> {
     pub miter_limit: f32,
     pub dash_array: Vec<f32>,
     pub dash_offset: f32,
-    pub path: &'a libgfx_rust::path::OwnedPath,
+    pub path: &'a libgfx_rust::path::Path,
     pub opacity: f32,
     pub paint_style_or_color: PaintStyleOrColor,
     pub thickness: f32,
@@ -238,7 +238,7 @@ pub struct GlyphRunForRecording<'a> {
 }
 
 pub struct IsolatedGroupEffects {
-    pub clip_rect: Option<FloatRect>,
+    pub clip_rect: FloatRect,
     pub opacity: f32,
     pub filter: Option<std::sync::Arc<Vec<u8>>>,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
@@ -406,10 +406,6 @@ impl DisplayListRecorder {
         })
     }
 
-    pub fn builder(&self) -> &DisplayListBuilder {
-        &self.builder
-    }
-
     pub fn into_builder(self) -> DisplayListBuilder {
         debug_assert!(self.ambient_inline_clips.is_empty());
         self.builder
@@ -442,38 +438,16 @@ impl DisplayListRecorder {
         );
     }
 
-    pub fn append_cached_command_range(
-        &mut self,
-        source: &RecordedDisplayList,
-        range: CommandRange,
-        recorded_context: ContextRef,
-    ) -> CommandRange {
-        let offset = self.builder.append_command_range(
+    /// Copies the commands in `bytes` of `source` as they were recorded. The caller must establish
+    /// that their visual-context indices are still valid for the current visual context tree.
+    pub fn append_cached_commands(&mut self, source: &RecordedDisplayList, bytes: std::ops::Range<u32>) {
+        self.builder.append_command_range(
             source,
-            range,
-            Some(ContextRewrite {
-                recorded_context,
-                current_context: self.context,
-            }),
+            CommandRange {
+                offset: bytes.start,
+                size: bytes.end - bytes.start,
+            },
         );
-        CommandRange {
-            offset,
-            size: range.size,
-        }
-    }
-
-    /// Copies a cached command range without rewriting visual-context indices. The caller must
-    /// establish that the recorded indices are still valid for the current visual context tree.
-    pub fn append_cached_command_range_verbatim(
-        &mut self,
-        source: &RecordedDisplayList,
-        range: CommandRange,
-    ) -> CommandRange {
-        let offset = self.builder.append_command_range(source, range, None);
-        CommandRange {
-            offset,
-            size: range.size,
-        }
     }
 
     pub fn fill_rect(&mut self, rect: IntRect, color: Color, force_dark_role: ForceDarkRole) {
@@ -937,7 +911,7 @@ impl DisplayListRecorder {
         self.finish_group_with_effects(
             group,
             IsolatedGroupEffects {
-                clip_rect: Some(clip_rect),
+                clip_rect,
                 opacity: 1.0,
                 filter: None,
                 compositing_and_blending_operator,
@@ -955,7 +929,7 @@ impl DisplayListRecorder {
             None => DisplayListDataSpan::default(),
         };
         let command = DrawIsolatedGroup {
-            clip_rect: effects.clip_rect.into(),
+            clip_rect: effects.clip_rect,
             content,
             mask,
             filter,
@@ -1105,6 +1079,33 @@ impl DisplayListRecorder {
         self.append_command(&shadow, &[]);
     }
 
+    /// Paints a box shadow cast from the shape `shape_path`, outside the shape, or inside it when `inner`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_path_box_shadow(
+        &mut self,
+        color: Color,
+        blur_radius: i32,
+        spread_distance: f32,
+        offset: FloatPoint,
+        shape_path: &libgfx_rust::path::Path,
+        inner: bool,
+        force_dark_role: ForceDarkRole,
+    ) {
+        let color = self.resolve_color(color, force_dark_role);
+        let mut payload = CommandPayloadBuilder::new::<PaintPathBoxShadow>(&self.builder);
+        let shape_path_data = payload.append_data(&shape_path.serialize_to_bytes(), std::mem::align_of::<u32>());
+        let command = PaintPathBoxShadow {
+            color,
+            blur_radius,
+            spread_distance,
+            offset,
+            shape_path_bounding_rect: FloatRect::from_array(shape_path.bounding_box()),
+            shape_path_data,
+            inner,
+        };
+        self.append_command(&command, payload.inline_data());
+    }
+
     pub fn paint_inner_box_shadow(&mut self, mut shadow: PaintInnerBoxShadow, force_dark_role: ForceDarkRole) {
         shadow.color = self.resolve_color(shadow.color, force_dark_role);
         self.append_command(&shadow, &[]);
@@ -1113,29 +1114,34 @@ impl DisplayListRecorder {
     #[allow(clippy::too_many_arguments)]
     pub fn paint_text_shadow(
         &mut self,
-        blur_radius: i32,
-        shadow_bounding_rect: IntRect,
+        layers: &[TextShadowLayer],
+        shadows_bounding_rect: IntRect,
         rect: IntRect,
         translation: FloatPoint,
         run: GlyphRunForRecording<'_>,
         glyph_run_scale: f64,
-        color: Color,
         orientation: Orientation,
         force_dark_role: ForceDarkRole,
     ) {
-        let color = self.resolve_color(color, force_dark_role);
+        let resolved_layers: Vec<TextShadowLayer> = layers
+            .iter()
+            .map(|layer| TextShadowLayer {
+                color: self.resolve_color(layer.color, force_dark_role),
+                ..*layer
+            })
+            .collect();
         let mut payload = CommandPayloadBuilder::new::<PaintTextShadow>(&self.builder);
         let glyphs = payload.append_objects(run.glyphs);
+        let layers = payload.append_objects(&resolved_layers);
         let command = PaintTextShadow {
             font_smoothing: run.font_smoothing,
             font_id: run.font_id,
             glyphs,
-            shadow_bounding_rect,
+            layers,
+            shadows_bounding_rect,
             rect,
             translation,
             scale: glyph_run_scale as f32,
-            blur_radius,
-            color,
             orientation,
         };
         self.append_command(&command, payload.inline_data());
@@ -1306,6 +1312,14 @@ impl DisplayListRecorder {
     }
 
     pub fn compositor_main_thread_wheel_event_region(&mut self, region: CompositorMainThreadWheelEventRegion) {
+        self.append_command(&region, &[]);
+    }
+
+    pub fn compositor_scroll_chaining_barrier(&mut self, barrier: CompositorScrollChainingBarrier) {
+        self.append_command(&barrier, &[]);
+    }
+
+    pub fn compositor_nested_context_wheel_region(&mut self, region: CompositorNestedContextWheelRegion) {
         self.append_command(&region, &[]);
     }
 

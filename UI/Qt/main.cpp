@@ -6,7 +6,6 @@
 
 #include <LibCore/GeolocationProvider.h>
 #include <LibMain/Main.h>
-#include <LibURL/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowserProcess.h>
 #include <LibWebView/CrashReportStore.h>
@@ -17,7 +16,6 @@
 #if defined(LADYBIRD_QT_HAVE_POSITIONING)
 #    include <UI/Qt/GeolocationProviderQt.h>
 #endif
-#include <UI/Qt/Settings.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QCoreApplication>
@@ -29,6 +27,7 @@
 #    include <QSurfaceFormat>
 #    include <UI/Qt/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
+#    include <UI/Qt/SpellCheckerMac.h>
 #endif
 
 namespace Ladybird {
@@ -76,6 +75,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
+#if defined(AK_OS_MACOS)
+    app->set_spell_checker(Ladybird::create_platform_spell_checker());
+#endif
     if (app->should_exit_after_profile_coordination()) {
         outln("Opening in existing process");
         return 0;
@@ -129,29 +131,19 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             app->new_window(urls, app->configuration_for_new_window());
         };
 
-        auto last_size = Ladybird::Settings::the()->last_size();
-        Ladybird::WindowConfiguration configuration {
-            .width = last_size.width(),
-            .height = last_size.height(),
-            .maximized = Ladybird::Settings::the()->is_maximized(),
-        };
-        if (auto last_position = Ladybird::Settings::the()->last_position(); last_position.has_value()) {
-            configuration.x = last_position->x();
-            configuration.y = last_position->y();
+        auto configuration = app->configuration_for_new_window();
+        if (auto* restored_window = app->restore_previous_session(configuration)) {
+            // A whole restored session replaces the usual startup tab, so only the URLs the user passed open with it.
+            // With only pinned tabs restored, the usual startup tabs open after them.
+            auto restored_everything = app->launch_restore_policy() == WebView::SessionLaunchPolicy::Everything;
+            if (!restored_everything || !browser_options.raw_urls.is_empty())
+                app->open_startup_tabs(*restored_window, browser_options.urls);
+        } else {
+            auto& window = app->new_window(browser_options.urls, configuration);
+            window.setWindowTitle("Ladybird");
         }
-        auto& window = app->new_window(browser_options.urls, configuration);
-        window.setWindowTitle("Ladybird");
 
-        if (!browser_options.webdriver_browser_endpoint.has_value() && WebView::CrashReportStore::the().has_pending_reports()) {
-            // A window that opened only the new tab page shows the reports there. Otherwise, they wait in a tab of their
-            // own, which does not take the page the user asked for out of view.
-            auto opened_only_new_tab_page = browser_options.urls.size() == 1
-                && browser_options.urls.first() == WebView::Application::settings().new_tab_page_url();
-            auto& tab = opened_only_new_tab_page && window.current_tab()
-                ? *window.current_tab()
-                : window.new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::No, Ladybird::BrowserWindow::TabLocation::end());
-            tab.view().show_earlier_crash_reports();
-        }
+        app->offer_newest_pending_crash_report();
     }
 
     return app->execute();

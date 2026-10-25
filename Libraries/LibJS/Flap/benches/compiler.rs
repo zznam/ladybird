@@ -55,6 +55,8 @@ fn compiler() -> Compiler {
         },
         has_jscvt: false,
         enable_assertions: false,
+        profiling: false,
+        profile: flapc::Profile::JavaScript,
     })
 }
 

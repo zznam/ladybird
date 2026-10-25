@@ -21,6 +21,8 @@ ALLOWED_EXTENDED_ATTRIBUTES = frozenset(
         "AllowShared",
         "AttributeCallbackName",
         "CEReactions",
+        # Cache the immutable getter result in an engine-private receiver slot.
+        "CachedAccessor",
         "CachedAttribute",
         "Clamp",
         "CreatesPromise",
@@ -37,6 +39,7 @@ ALLOWED_EXTENDED_ATTRIBUTES = frozenset(
         "Global",
         "HTMLConstructor",
         "ImplementedAs",
+        "ImplementedIn",
         "ImplementedInBindings",
         "InvalidValueDefault",
         "LegacyFactoryFunction",
@@ -51,6 +54,8 @@ ALLOWED_EXTENDED_ATTRIBUTES = frozenset(
         "LegacyUnforgeable",
         "LegacyWindowAlias",
         "MissingValueDefault",
+        # The construct exists only while the navigator claims the named engine, which alone has it.
+        "NavigatorCompatibilityMode",
         "NeedsArgumentCount",
         "NeedsCallerRealm",
         "NewObject",

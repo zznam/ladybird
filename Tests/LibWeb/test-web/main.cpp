@@ -361,8 +361,8 @@ static ErrorOr<void> generate_result_files(ReadonlySpan<Test> tests, ReadonlySpa
         auto base_path = TRY(prepare_output_path(test));
         bool has_std_logs = FileSystem::exists(ByteString::formatted("{}.logs.html", base_path));
 
-        js.appendff("    {{ \"name\": \"{}\", \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
-            test.safe_relative_path,
+        js.appendff("    {{ \"name\": {}, \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
+            JsonValue(test.safe_relative_path.view()).serialized(),
             test_result_to_string(result.result),
             test_mode_to_string(test.mode),
             has_std_logs ? "true" : "false");
@@ -528,7 +528,19 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             view.on_test_complete({ test_index, result.value() });
     };
 
-    if (test.mode == TestMode::Layout) {
+    if (test.mode == TestMode::Accessibility) {
+        view.on_load_finish = [&view, &context, test_index, url, on_test_complete = move(on_test_complete)](auto const& loaded_url) {
+            if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
+                return;
+
+            auto promise = view.request_internal_page_info(WebView::PageInfoType::AccessibilityTree);
+
+            promise->when_resolved([&context, test_index, on_test_complete = move(on_test_complete)](auto const& text) {
+                context.tests[test_index].text = text;
+                on_test_complete();
+            });
+        };
+    } else if (test.mode == TestMode::Layout) {
         view.on_load_finish = [&view, &context, test_index, url](auto const& loaded_url) {
             // We don't want subframe loads to trigger the test finish.
             if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
@@ -819,7 +831,7 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
             auto optipng_or_error = Core::Process::spawn({
                 .executable = "optipng"sv,
                 .search_for_executable_in_path = true,
-                .arguments = { "-strip"sv, "all"sv, test.expectation_path },
+                .arguments = Vector<ByteString> { "-strip"sv, "all"sv, test.expectation_path },
             });
             if (optipng_or_error.is_error()) {
                 warnln("Warning: Failed to run optipng: {}", optipng_or_error.error());
@@ -905,7 +917,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     test_run_capture.begin_test_output_capture(view, test);
     auto timeout_in_milliseconds = app.per_test_timeout_in_seconds * 1000;
 
-    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, &context, test_index]() {
+    test.timeout_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(timeout_in_milliseconds), [&view, &context, test_index]() {
         auto& test = context.tests[test_index];
         if (!test.did_start_test)
             dbgln("Timeout during pre-navigation for {}, WebContent process may be unresponsive", test.relative_path);
@@ -918,7 +930,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
         auto& test = context.tests[test_index];
         if (milliseconds <= 0)
             return;
-        test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
+        test.timeout_timer->restart(AK::Duration::from_milliseconds(AK::clamp_to<int>(milliseconds)));
     };
 
     // Clear the current document.
@@ -964,6 +976,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
             switch (test.mode) {
             case TestMode::Crash:
             case TestMode::Text:
+            case TestMode::Accessibility:
             case TestMode::Layout:
                 run_dump_test(view, context, test, *url);
                 return;
@@ -993,7 +1006,7 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
 
         for (auto const& filter : accepted_file_types.filters) {
             filter.visit(
-                [](Web::HTML::FileFilter::FileType) {},
+                [](Web::HTML::FileFilter::FileType) { },
                 [&](Web::HTML::FileFilter::MimeType const& mime_type) {
                     if (mime_type.value == "text/plain"sv)
                         add_txt_files = true;
@@ -1049,6 +1062,11 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
     };
 }
 
+static bool test_run_was_stopped()
+{
+    return s_all_tests_complete && s_all_tests_complete->is_rejected();
+}
+
 static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePixelSize window_size)
 {
     auto& app = Application::the();
@@ -1075,6 +1093,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     if (app.test_globs.is_empty())
         app.test_globs.append("*"sv);
 
+    TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Accessibility", app.test_root_path), "."sv, TestMode::Accessibility));
     TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Layout", app.test_root_path), "."sv, TestMode::Layout));
     TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Text", app.test_root_path), "."sv, TestMode::Text));
     TRY(collect_ref_tests(app, tests, ByteString::formatted("{}/Ref", app.test_root_path), "."sv));
@@ -1089,11 +1108,9 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             "*/wpt-import/common/*"sv,
             "*/wpt-import/images/*"sv,
         };
-        auto normalize_path = [](ByteString const& path) { return path.replace("\\"sv, "/"sv); };
-        auto const test_input_path = normalize_path(test.input_path);
-        auto const test_relative_path = normalize_path(test.relative_path);
+        auto const test_input_path = test.input_path.replace("\\"sv, "/"sv);
         bool is_support_file = any_of(support_file_patterns, [&](auto pattern) { return test_input_path.matches(pattern); });
-        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test_relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
+        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test.relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
         return is_support_file || !match_glob;
     });
 
@@ -1138,7 +1155,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                 Test test = base_test;
                 test.run_index = run_index;
                 test.total_runs = app.repeat_count;
-                test.safe_relative_path = LexicalPath::join(ByteString::formatted("run-{}", run_index), test.safe_relative_path).string();
+                test.safe_relative_path = ByteString::formatted("run-{}/{}", run_index, test.safe_relative_path);
                 tests.append(move(test));
             }
         }
@@ -1168,7 +1185,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     // test URL before the about:blank load completes. WebContent currently cannot handle this, and will drop the test URL.
     // Nothing else bounds this wait, so it gets the per-test timeout.
     bool initial_load_timed_out = false;
-    auto initial_load_timer = Core::Timer::create_single_shot(app.per_test_timeout_in_seconds * 1000, [&] {
+    auto initial_load_timer = Core::Timer::create_single_shot(AK::Duration::from_seconds(app.per_test_timeout_in_seconds), [&] {
         initial_load_timed_out = true;
     });
     initial_load_timer->start();
@@ -1233,12 +1250,16 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             view->disconnect_child_crash_handlers();
             view->close_child_web_views();
 
+            // A test's ignored and learned words live in this process, so they outlive a crashed WebContent.
+            view->reset_spell_checking();
+
             // Don't try to reset state if WebContent crashed - it's gone
             if (test_result != TestResult::Crashed) {
                 view->clear_content_blockers();
                 view->reset_zoom();
                 view->reset_force_dark();
                 view->reset_line_box_borders();
+                view->reset_user_style();
                 view->reset_geolocation_emulated_position();
                 view->reset_viewport_size(window_size);
             }
@@ -1259,7 +1280,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
         // run_next_test handles: reset promise, attach callback, pick test, run test
         auto run_next_test = [&, view = view.ptr(), cleanup_test, view_id]() {
-            if (app.fail_fast && fail_fast_triggered) {
+            if (test_run_was_stopped()) {
                 if (view_id < s_view_display_states.size())
                     s_view_display_states[view_id].active = false;
                 return;
@@ -1342,6 +1363,8 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             });
 
             Core::deferred_invoke([&, index]() mutable {
+                if (test_run_was_stopped())
+                    return;
                 if (s_skipped_tests.contains_slow(tests[index].input_path))
                     view->on_test_complete({ index, TestResult::Skipped });
                 else

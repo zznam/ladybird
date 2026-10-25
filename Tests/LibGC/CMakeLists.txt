@@ -2,8 +2,10 @@ set(TEST_SOURCES
     TestBlockAllocator.cpp
     TestExternalEntityTable.cpp
     TestGCContainers.cpp
+    TestGCFreeList.cpp
     TestGCHeapGroup.cpp
     TestGCIdleCollection.cpp
+    TestGCIncrementalSweep.cpp
     TestPrimitiveStorage.cpp
     TestGCVisitor.cpp
     TestNanBoxedValue.cpp

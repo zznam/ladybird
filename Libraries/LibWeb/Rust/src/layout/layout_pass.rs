@@ -14,8 +14,13 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(crate) struct ContainerLengthBasesQuery {
     context: *mut c_void,
-    query: unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases,
+    /// The query, or none for a pass that runs beside the host and cannot ask it.
+    query: Option<unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases>,
 }
+
+// SAFETY: A layout job calls the query while the host waits for the job's answer, so the document the C++ side reads
+// changes under neither of them.
+unsafe impl Send for ContainerLengthBasesQuery {}
 
 impl ContainerLengthBasesQuery {
     /// Only the layout host makes one, for a caller holding the main thread token.
@@ -23,21 +28,37 @@ impl ContainerLengthBasesQuery {
         context: *mut c_void,
         query: unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases,
     ) -> Self {
-        Self { context, query }
+        Self {
+            context,
+            query: Some(query),
+        }
     }
 
-    /// What `cqw` and `cqh` are 100 of for `element`.
+    /// The query for a pass that runs beside the host, which answers nothing.
+    pub(crate) fn sealed(self) -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            query: None,
+        }
+    }
+
+    /// What `cqw` and `cqh` are 100 of for `element`, where the pass can ask the host.
     pub(crate) fn bases(
         self,
         element: crate::css::style::tree::StyleNodeID,
-    ) -> svg_formatting_context::FfiContainerLengthBases {
-        // SAFETY: The document registered the query with the arena and outlives the pass.
-        unsafe { (self.query)(self.context, element.raw()) }
+    ) -> Option<svg_formatting_context::FfiContainerLengthBases> {
+        // SAFETY: The document registered the query with the arena and outlives the pass, which the host waits for.
+        self.query.map(|query| unsafe { query(self.context, element.raw()) })
     }
 }
 
 /// Arena inputs borrowed while computing a layout result. The pass ends before commit takes a
 /// mutable arena borrow, so its text and style views cannot survive commit.
+///
+/// A layout run reads only the subtree it lays out. Whatever it needs from above arrives through
+/// its layout input, its root's used values and its records, or was derived onto the subtree
+/// before the pass, like ancestor facts. That is what lets partial relayout, the formatting context
+/// run cache and the intrinsic size caches reuse a subtree's layout without looking outside it.
 #[derive(Clone, Copy)]
 pub(crate) struct LayoutPass<'arena> {
     arena: &'arena LayoutNodeArena,
@@ -46,6 +67,8 @@ pub(crate) struct LayoutPass<'arena> {
     pub(crate) initial_containing_block_inline_size: CssPixels,
     pub(crate) initial_containing_block_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
+    /// The frame of the formatting context the pass is laying out, in which style reads see sizes and box sides.
+    pub(crate) frame: super::geometry::Frame,
 }
 
 impl<'arena> LayoutPass<'arena> {
@@ -64,7 +87,15 @@ impl<'arena> LayoutPass<'arena> {
             initial_containing_block_inline_size,
             initial_containing_block_block_size,
             document_in_quirks_mode,
+            frame: super::geometry::Frame::PHYSICAL,
         }
+    }
+
+    /// This pass, laying out in the frame of `writing_mode`.
+    #[inline]
+    pub(crate) fn in_frame_of(mut self, writing_mode: u8) -> Self {
+        self.frame = super::geometry::Frame::of(writing_mode);
+        self
     }
 
     pub(crate) fn arena(&self) -> &'arena LayoutNodeArena {
@@ -83,36 +114,30 @@ impl<'arena> LayoutPass<'arena> {
 
     /// What an intrinsic size cache entry measured for `node` now is valid for.
     pub(crate) fn intrinsic_size_cache_stamp(&self, node: Node) -> super::layout_node_arena::IntrinsicSizeCacheStamp {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena.intrinsic_size_cache_stamp(node)
     }
 
     pub(crate) fn node_data(&self, node: Node) -> &'arena NodeData {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena().data(node)
     }
 
     pub(crate) fn text_content(&self, node: Node) -> &'arena super::rendered_text::TextContent {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .text_content(node)
             .expect("text node content must be synced to the arena before layout")
     }
 
     pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .style_payloads(node)
             .expect("styled node must publish its style container before layout")
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<FfiReplacedContentFacts> {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena.replaced_content_facts(node)
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .style_payloads(node)
             .map(|payloads| ComputedValuesView::new(&payloads.groups))
@@ -181,6 +206,32 @@ impl<'arena> LayoutPass<'arena> {
         self.node_data(node).previous_sibling.get()
     }
 
+    /// The children of `node`, in tree order.
+    pub(crate) fn children(self, node: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(self.first_child(node)), move |&child| {
+            link(self.next_sibling(child))
+        })
+    }
+
+    pub(crate) fn siblings_from(self, first: Node, last: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(first), move |&child| {
+            (child != last).then(|| link(self.next_sibling(child))).flatten()
+        })
+    }
+
+    pub(crate) fn siblings_from_rev(self, last: Node, first: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(last), move |&child| {
+            (child != first).then(|| link(self.previous_sibling(child))).flatten()
+        })
+    }
+
+    /// The children of `node`, last first.
+    pub(crate) fn children_rev(self, node: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(self.last_child(node)), move |&child| {
+            link(self.previous_sibling(child))
+        })
+    }
+
     pub(crate) fn in_flow_containing_block(&self, node: Node) -> Node {
         let (innermost_root, innermost_root_containing_block) = self.arena.innermost_run.get();
         if node == innermost_root {
@@ -225,4 +276,9 @@ impl<'arena> LayoutPass<'arena> {
         }
         false
     }
+}
+
+/// A node's link to another, which is none for an invalid slot.
+fn link(node: Node) -> Option<Node> {
+    (!node.is_invalid()).then_some(node)
 }

@@ -141,12 +141,6 @@ static ReportFrame frame_for_address(FlatPtr address)
     return frame;
 }
 
-static bool write_frame(FlatPtr address, size_t index)
-{
-    auto frame = frame_for_address(address);
-    return write_record(&frame, sizeof(frame), sizeof(ReportHeader) + index * sizeof(frame));
-}
-
 static void capture_assertion_backtrace(ReadonlySpan<AK::AssertionBacktraceFrame> frames)
 {
     if (!s_owns_assertion || frames.is_empty())
@@ -193,17 +187,28 @@ static u32 capture_native_stack(void* context)
     program_counter = registers.pc;
     frame_pointer = registers.regs[29];
     stack_pointer = registers.sp;
+#elif defined(AK_OS_LINUX) && ARCH(RISCV64)
+    auto const& registers = static_cast<ucontext_t*>(context)->uc_mcontext;
+    program_counter = registers.__gregs[REG_PC];
+    frame_pointer = registers.__gregs[REG_S0];
+    stack_pointer = registers.__gregs[REG_SP];
 #else
     (void)context;
 #endif
 
+    // On RISC-V, the frame pointer points just past the saved frame pointer and return address.
+    constexpr FlatPtr saved_frame_offset = ARCH(RISCV64) ? 2 * sizeof(FlatPtr) : 0;
+
     u32 frame_count = 0;
+    [[maybe_unused]] bool has_binary_identity = false;
     for (; frame_count < maximum_frames && program_counter;) {
-        if (!write_frame(program_counter, frame_count))
+        auto frame = frame_for_address(program_counter);
+        if (!write_record(&frame, sizeof(frame), sizeof(ReportHeader) + frame_count * sizeof(frame)))
             break;
+        has_binary_identity |= frame.binary.size != 0;
         ++frame_count;
         FlatPtr saved_frame[2];
-        if (!frame_pointer || frame_pointer % alignof(FlatPtr) || !read_stack_frame(frame_pointer, saved_frame))
+        if (!frame_pointer || frame_pointer % alignof(FlatPtr) || !read_stack_frame(frame_pointer - saved_frame_offset, saved_frame))
             break;
         // Stacks grow downwards on the supported architectures. Bound both the
         // depth and each step, and stop at corrupt/cyclic frame chains.
@@ -220,21 +225,23 @@ static u32 capture_native_stack(void* context)
     }
 
 #if defined(AK_OS_LINUX)
-    // Without frame pointers, retain bounded candidate code addresses from the stack.
-    if (frame_count < 2 && stack_pointer && stack_pointer % alignof(FlatPtr) == 0) {
+    // Without a usable frame chain, retain bounded candidate code addresses from the stack.
+    if ((frame_count < 2 || !has_binary_identity) && stack_pointer && stack_pointer % alignof(FlatPtr) == 0) {
         Array<FlatPtr, 1024> stack_words;
         auto bytes_read = pread(s_memory_fd, stack_words.data(), sizeof(stack_words), stack_pointer);
         if (bytes_read >= static_cast<ssize_t>(sizeof(FlatPtr))) {
             auto words_read = static_cast<size_t>(bytes_read) / sizeof(FlatPtr);
             for (auto address : stack_words.span().slice(0, words_read)) {
-                if (frame_count == maximum_frames)
-                    break;
                 auto frame = frame_for_address(address);
                 if (frame.binary.size == 0)
                     continue;
-                if (!write_record(&frame, sizeof(frame), sizeof(ReportHeader) + frame_count * sizeof(frame)))
+                // A full chain of unavailable frames must still leave room for binary identity.
+                auto index = min(static_cast<size_t>(frame_count), maximum_frames - 1);
+                if (!write_record(&frame, sizeof(frame), sizeof(ReportHeader) + index * sizeof(frame)))
                     break;
-                ++frame_count;
+                frame_count = index + 1;
+                if (frame_count == maximum_frames)
+                    break;
             }
         }
     }
@@ -243,7 +250,7 @@ static u32 capture_native_stack(void* context)
     return frame_count;
 }
 
-static void crash_signal_handler(int signal, siginfo_t* info, void* context)
+void CrashHandler::handle_fatal_signal(int signal, siginfo_t* info, void* context)
 {
     if (__atomic_exchange_n(&s_crashing, 1, __ATOMIC_RELAXED))
         _exit(128 + signal);
@@ -305,7 +312,7 @@ ErrorOr<void> CrashHandler::initialize(int fd)
     if (sigaltstack(&stack, nullptr) < 0)
         return Error::from_errno(errno);
     struct sigaction action {};
-    action.sa_sigaction = crash_signal_handler;
+    action.sa_sigaction = CrashHandler::handle_fatal_signal;
     sigfillset(&action.sa_mask);
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int signal : { SIGSEGV, SIGBUS, SIGFPE, SIGABRT, SIGILL, SIGTRAP }) {

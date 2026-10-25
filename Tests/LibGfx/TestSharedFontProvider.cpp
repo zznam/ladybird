@@ -18,9 +18,7 @@
 #include <LibGfx/Font/FontCatalog.h>
 #include <LibGfx/Font/PathFontProvider.h>
 #include <LibGfx/Font/SharedFontProvider.h>
-#include <LibGfx/Font/TypefaceSkia.h>
 #include <LibTest/TestCase.h>
-#include <LibThreading/Thread.h>
 
 namespace {
 
@@ -73,26 +71,11 @@ static Gfx::BrokeredFont open_test_font(u64 face_id)
     };
 }
 
-static void run_on_another_thread(Function<void()> function)
-{
-    auto thread = Threading::Thread::construct("FontQuestion"sv, [function = move(function)] {
-        function();
-        return 0;
-    });
-    thread->start();
-    (void)thread->join();
-}
-
-static Gfx::BrokeredFont reference_test_font(u64 face_id, String family)
+static Gfx::BrokeredFont platform_test_font(u64 face_id, String postscript_name)
 {
     return {
         .face_id = face_id,
-        .source = Gfx::SystemFontReference {
-            .family = move(family),
-            .weight = 400,
-            .width = Gfx::FontWidth::Normal,
-            .slope = 0,
-        },
+        .source = Gfx::PlatformFontName { move(postscript_name) },
     };
 }
 
@@ -226,25 +209,6 @@ TEST_CASE(catalog_file_factory_handles_mapping_failure)
     EXPECT_EQ(match_count, 1u);
 }
 
-TEST_CASE(rejecting_replacement_preserves_current_catalog)
-{
-    auto catalog = make_catalog();
-    size_t open_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.open_font = [&](u64, u64 face_id) {
-        ++open_count;
-        return open_test_font(face_id);
-    };
-
-    auto provider = MUST(Gfx::SharedFontProvider::create(map_bytes(catalog), 9, move(callbacks)));
-    auto malformed = MUST(ByteBuffer::copy("not a font catalog"sv.bytes()));
-    auto file = copy_bytes_to_file(malformed);
-    EXPECT(provider->replace_catalog(move(file), malformed.size(), 9).is_error());
-
-    EXPECT(provider->get_font("Brokered Test"_fly_string, 12, 400, Gfx::FontWidth::Normal, 0));
-    EXPECT_EQ(open_count, 1u);
-}
-
 TEST_CASE(unknown_width_uses_normal_variation_width)
 {
     Gfx::SharedFontProviderCallbacks callbacks;
@@ -286,134 +250,21 @@ TEST_CASE(caches_code_point_fallback_matches_and_misses)
     EXPECT_EQ(match_count, 4u);
 }
 
-TEST_CASE(code_point_fallback_from_another_thread_asks_on_its_own_callbacks)
+#ifdef AK_OS_MACOS
+TEST_CASE(opens_platform_fonts_by_name_in_process)
 {
-    size_t own_match_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
-        ++own_match_count;
-        return open_test_font(94);
-    };
-    auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
-
-    size_t other_thread_match_count = 0;
-    Gfx::SharedFontProviderCallbacks other_thread_callbacks;
-    other_thread_callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
-        ++other_thread_match_count;
-        return open_test_font(94);
-    };
-    provider->set_callbacks_for_other_threads(move(other_thread_callbacks));
-
-    RefPtr<Gfx::Font> font;
-    run_on_another_thread([&] {
-        font = provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false);
-    });
-    EXPECT(font);
-    EXPECT_EQ(other_thread_match_count, 1u);
-    EXPECT_EQ(own_match_count, 0u);
-
-    // The answer is the provider's, whichever thread asked for it.
-    EXPECT_EQ(&provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false)->typeface(), &font->typeface());
-    EXPECT(provider->get_font_for_code_point('B', 12, 400, Gfx::FontWidth::Normal, 0, false));
-    EXPECT_EQ(other_thread_match_count, 1u);
-    EXPECT_EQ(own_match_count, 1u);
-}
-
-TEST_CASE(family_matching_from_another_thread_asks_on_its_own_callbacks)
-{
-    auto catalog = make_catalog();
-    size_t own_question_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.open_font = [&](u64, u64) {
-        ++own_question_count;
-        return Gfx::BrokeredFont {};
-    };
-    callbacks.match_font = [&](String const&, u16, u16, u8) {
-        ++own_question_count;
-        return Gfx::BrokeredFont {};
-    };
-    callbacks.resolve_generic_family = [&](String const&, u16, u8) -> Optional<FlyString> {
-        ++own_question_count;
-        return {};
-    };
-    auto provider = MUST(Gfx::SharedFontProvider::create(map_bytes(catalog), 9, move(callbacks)));
-
-    size_t open_count = 0;
-    size_t match_count = 0;
-    Gfx::SharedFontProviderCallbacks other_thread_callbacks;
-    other_thread_callbacks.open_font = [&](u64 generation, u64 face_id) {
-        EXPECT_EQ(generation, 9u);
-        ++open_count;
-        return open_test_font(face_id);
-    };
-    other_thread_callbacks.match_font = [&](String const&, u16, u16, u8) {
-        ++match_count;
-        return Gfx::BrokeredFont {};
-    };
-    other_thread_callbacks.resolve_generic_family = [](String const&, u16, u8) -> Optional<FlyString> {
-        return "Brokered Test"_fly_string;
-    };
-    provider->set_callbacks_for_other_threads(move(other_thread_callbacks));
-
-    RefPtr<Gfx::Font> catalog_font;
-    RefPtr<Gfx::Font> missing_font;
-    Optional<FlyString> generic_family;
-    run_on_another_thread([&] {
-        catalog_font = provider->get_font("Brokered Test"_fly_string, 12, 400, Gfx::FontWidth::Normal, 0);
-        missing_font = provider->get_font("Missing Family"_fly_string, 12, 400, Gfx::FontWidth::Normal, 0);
-        generic_family = provider->resolve_generic_family("serif"sv, 400, 0);
-    });
-    EXPECT(catalog_font);
-    EXPECT(!missing_font);
-    EXPECT_EQ(generic_family, "Brokered Test"_fly_string);
-    EXPECT_EQ(open_count, 1u);
-    EXPECT_EQ(match_count, 1u);
-    EXPECT_EQ(own_question_count, 0u);
-
-    // The face opened for the other thread is the provider's, so this thread finds it without asking.
-    EXPECT(provider->get_font("Brokered Test"_fly_string, 16, 400, Gfx::FontWidth::Normal, 0));
-    EXPECT_EQ(own_question_count, 0u);
-}
-
-TEST_CASE(replacing_catalog_clears_code_point_fallback_cache)
-{
+    // A platform font is opened by its PostScript name in the client, and every Mac has Helvetica.
     size_t match_count = 0;
     Gfx::SharedFontProviderCallbacks callbacks;
     callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
         ++match_count;
-        return open_test_font(95);
-    };
-
-    auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
-    EXPECT(provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false));
-    EXPECT_EQ(match_count, 1u);
-
-    auto replacement = make_catalog();
-    MUST(provider->replace_catalog(map_bytes(replacement), 9));
-    EXPECT(provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false));
-    EXPECT_EQ(match_count, 2u);
-}
-
-TEST_CASE(matches_referenced_system_fonts_in_process)
-{
-    // Referenced fonts are re-matched locally, so this needs a family the platform can resolve: whichever one it
-    // would pick for a plain letter.
-    auto platform_typeface = Gfx::TypefaceSkia::find_typeface_for_code_point('A', 400, Gfx::FontWidth::Normal, 0, false);
-    if (platform_typeface.is_error() || !platform_typeface.value())
-        return;
-    auto family = platform_typeface.value()->family();
-
-    size_t match_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
-        ++match_count;
-        return reference_test_font(96, family.to_string());
+        return platform_test_font(96, "Helvetica"_string);
     };
 
     auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
     auto font = provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false);
     EXPECT(font);
-    EXPECT_EQ(font->typeface().family(), family);
+    EXPECT_EQ(font->typeface().postscript_name(), "Helvetica"_string);
     auto identifier = font->typeface().system_font_identifier();
     EXPECT(identifier.has_value());
     EXPECT_EQ(identifier->face_id, 96u);
@@ -422,14 +273,15 @@ TEST_CASE(matches_referenced_system_fonts_in_process)
     EXPECT(provider->get_typeface_by_id(9, 96));
     EXPECT_EQ(match_count, 1u);
 }
+#endif
 
-TEST_CASE(negatively_caches_unresolvable_system_font_references)
+TEST_CASE(negatively_caches_platform_fonts_that_do_not_open)
 {
     size_t match_count = 0;
     Gfx::SharedFontProviderCallbacks callbacks;
     callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
         ++match_count;
-        return reference_test_font(97, "Ladybird No Such Family"_string);
+        return platform_test_font(97, "Ladybird-NoSuchFont"_string);
     };
 
     auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
@@ -480,6 +332,6 @@ TEST_CASE(file_collection_faces_share_the_same_mapping)
         EXPECT_EQ(typeface->slope(), index == 2 ? 1u : 0u);
         if (!faces.is_empty())
             EXPECT_EQ(typeface->font_data().data(), faces.first()->font_data().data());
-        faces.append(move(typeface)); }, Gfx::PathFontProvider::FontDataSource::SharedMapping);
+        faces.append(move(typeface)); });
     EXPECT_EQ(faces.size(), 3u);
 }

@@ -12,11 +12,9 @@
 #include <ImageDecoder/ImageDecoderClientEndpoint.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
-#include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/ImageDecoder.h>
 #include <LibGfx/ImageFormats/TIFFMetadata.h>
-#include <LibIPC/TransportHandle.h>
 #include <LibThreading/ThreadPool.h>
 
 namespace ImageDecoder {
@@ -48,41 +46,6 @@ void ConnectionFromClient::die()
     if (s_connections.is_empty()) {
         Core::Process::terminate_immediately(0);
     }
-}
-
-Messages::ImageDecoderServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#endif
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<IPC::TransportHandle> ConnectionFromClient::connect_new_client()
-{
-    auto paired = TRY(IPC::Transport::create_paired());
-    auto handle = move(paired.remote_handle);
-
-    // Note: A ref is stored in the static s_connections map
-    auto client = adopt_ref(*new ConnectionFromClient(move(paired.local)));
-
-    return handle;
-}
-
-Messages::ImageDecoderServer::ConnectNewClientsResponse ConnectionFromClient::connect_new_clients(size_t count)
-{
-    Vector<IPC::TransportHandle> handles;
-    handles.ensure_capacity(count);
-    for (size_t i = 0; i < count; ++i) {
-        auto handle_or_error = connect_new_client();
-        if (handle_or_error.is_error()) {
-            dbgln("Failed to connect new client: {}", handle_or_error.error());
-            return Vector<IPC::TransportHandle> {};
-        }
-        handles.unchecked_append(handle_or_error.release_value());
-    }
-    return handles;
 }
 
 static void decode_image_to_bitmaps_and_durations_with_decoder(Gfx::ImageDecoder const& decoder, Optional<Gfx::IntSize> ideal_size, Vector<RefPtr<Gfx::Bitmap>>& bitmaps, Vector<u32>& durations)

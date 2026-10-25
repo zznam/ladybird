@@ -42,6 +42,10 @@ impl VisualContextTree {
         }
     }
 
+    pub fn shared_visual_animations(&self) -> std::sync::Arc<[VisualAnimation]> {
+        self.visual_animations.clone()
+    }
+
     fn effects_mut(&mut self, node_index: u32) -> Option<&mut EffectsData> {
         match self
             .effect_nodes
@@ -209,6 +213,7 @@ mod tests {
 
     fn opacity_effect() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,

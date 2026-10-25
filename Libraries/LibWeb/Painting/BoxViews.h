@@ -25,15 +25,18 @@ bool should_paint_viewport_scrollbars();
 WEB_API GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const&);
 
 Compositing::RustFFI::NodeSlotId committed_row_slot(Layout::Node const&);
-Compositing::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const&);
-Layout::RustFFI::PaintableData const* committed_row(Layout::Node const&);
+Compositing::RustFFI::NodeSlotId viewport_row_slot(Layout::BegunRead const&, DOM::Document const&);
+Optional<Layout::RustFFI::PaintableData> committed_row(Layout::Node const&);
 
 WEB_API bool has_committed_box(Layout::Node const&);
-WEB_API Layout::Node* layout_node_for_committed_slot(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
+WEB_API Layout::Node* layout_node_for_committed_slot(Layout::BegunRead const&, Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
 
 WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_border_box_rect(Layout::Node const&);
+WEB_API CSSPixelRect border_box_rect_of_fragments(Layout::Node const&);
+WEB_API CSSPixelSize unbroken_border_box_size(Layout::Node const&);
+WEB_API size_t box_fragment_count(Layout::Node const&);
 WEB_API CSSPixelPoint absolute_position(Layout::Node const&);
 WEB_API CSSPixelSize content_size(Layout::Node const&);
 WEB_API CSSPixels content_width(Layout::Node const&);
@@ -41,7 +44,7 @@ WEB_API CSSPixels content_height(Layout::Node const&);
 WEB_API CSSPixels border_box_width(Layout::Node const&);
 WEB_API CSSPixels border_box_height(Layout::Node const&);
 WEB_API BoxModelMetrics box_model(Layout::Node const&);
-WEB_API Optional<CSS::BorderData> outline_data(Layout::Node const&, CSS::ComputedValues const&);
+WEB_API Optional<CSSPixels> anchor_resolved_size(Layout::Node const&, CSS::PropertyID);
 WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
@@ -55,65 +58,51 @@ WEB_API CSS::StyleRecordID style_record_identity(Layout::Node const&);
 WEB_API bool is_navigable_container_viewport_paintable(Layout::Node const&);
 WEB_API bool is_viewport_paintable(Layout::Node const&);
 WEB_API bool is_paintable_with_lines(Layout::Node const&);
-WEB_API bool is_inline_paintable(Layout::Node const&);
 WEB_API bool is_svg_svg_paintable(Layout::Node const&);
 
 WEB_API CSSPixelRect transform_rect_to_viewport(Layout::Node const&, CSSPixelRect const&, Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform = Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
-WEB_API Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint inverse_transform_point(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint transform_to_local_coordinates(Layout::Node const&, CSSPixelPoint);
 
 WEB_API bool has_accumulated_visual_context(Layout::Node const&);
 WEB_API Compositing::ContextRef accumulated_visual_context(Layout::Node const&);
 WEB_API Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node const&);
-WEB_API Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const&);
 WEB_API Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const&);
 
-WEB_API Gfx::Path const* committed_svg_path(Layout::Node const&);
+WEB_API Optional<Gfx::FloatRect> committed_svg_path_bounding_box(Layout::Node const&);
+WEB_API Vector<Layout::RustFFI::FfiSvgTextCharacterCell> svg_text_character_cells(Layout::Node const&);
 WEB_API CSSPixelSize svg_viewport_size(Layout::Node const&);
 WEB_API Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const&);
+WEB_API Gfx::AffineTransform svg_element_transform(Layout::Node const&);
 WEB_API CSS::RustStyleValueHandle used_value_for_grid_template(Layout::Node const&, CSS::PropertyID);
 WEB_API Optional<String> grid_layout_json(Layout::Node const&, UniqueNodeID);
 WEB_API Optional<String> flex_layout_json(Layout::Node const&, UniqueNodeID);
 
 WEB_API CSSPixelPoint box_type_agnostic_position(Layout::Node const&);
-WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::Node const&, size_t offset);
+WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const&, Layout::Node const&, size_t offset);
 
 // Per-document paint facts the recording inputs carry, resolved once per recording.
-WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(DOM::Document&);
-WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(DOM::Document const&);
-WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(DOM::Document const&, Vector<u8>& path_bytes);
-WEB_API void push_selection_pseudo_style(DOM::Element const&);
+WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(Layout::BegunRead const&, DOM::Document&);
+WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(Layout::BegunRead const&, DOM::Document const&);
+WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const&, DOM::Document const&, Vector<u8>& path_bytes);
+WEB_API void push_highlight_pseudo_styles(DOM::Element const&);
 
 // The node a layout row stands for, as the arena names it.
 WEB_API DOM::NodeIdentity node_identity_of(Layout::RustFFI::FfiNodeIdentity);
 
-// The identity a mark on this box goes into the document's invalidation journal under: its node's, if the box is the one
-// the layout node arena binds to that node. Any other box (anonymous, generated for a pseudo-element, or one of several
-// built for one node) has nothing an entry could name, so a mark on it is applied at once.
-WEB_API DOM::NodeIdentity journal_identity_of(Layout::Node const&);
+// Marks the box by its row, which asks the render state nothing, so a box held beside a frame in flight is marked
+// without taking the frame in.
+WEB_API void mark_box(Layout::Node const&, Layout::RustFFI::FfiBoxMarks);
+WEB_API Layout::RustFFI::FfiBoxMarks repaint_marks(InvalidateDisplayList);
+// The display lists `marks` leave stale.
+WEB_API InvalidateDisplayList display_list_invalidation_of(Layout::RustFFI::FfiBoxMarks);
 
-// These note the mark in the invalidation journal, which applies it with the apply_* functions below when it drains.
 WEB_API void set_needs_repaint(Layout::Node const&, InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
 WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
-WEB_API void apply_repaint_damage(Layout::Node const&, InvalidateDisplayList);
-WEB_API void apply_text_repaint_damage(Layout::TextNode const&, InvalidateDisplayList);
-WEB_API void apply_subtree_repaint_damage(Layout::Node const&);
 // Records the document's display list again without damaging any row, for a change that pushes the damage of the rows it
 // changes itself.
-WEB_API void request_document_repaint(Layout::Node const&, InvalidateDisplayList);
+WEB_API void request_document_repaint(DOM::Document const&, InvalidateDisplayList);
 
-enum class PaintCacheInvalidation : u8 {
-    PaintAndHitTest,
-    PropagatedTextDecorations,
-};
-
-// Notes the invalidation in the invalidation journal, which applies it when it drains.
-WEB_API void invalidate_propagated_text_decoration_caches(Layout::Node const&);
-// Invalidates the box's cached paint commands at once. This is for the journal's drain and for invalidations made where
-// nothing drains before the cache is read again: while a box is detached, and while paint facts are reconciled right
-// before recording.
-WEB_API void apply_paint_cache_invalidation(Layout::Node const&, PaintCacheInvalidation);
 WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvalidationAfterStyleChange const&);
 
 WEB_API Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform();

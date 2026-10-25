@@ -5,9 +5,9 @@
  */
 
 #include <LibCore/EventLoop.h>
-#include <LibCore/System.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/TransportHandle.h>
+#include <RequestServer/AlternativeServices.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
@@ -16,12 +16,11 @@ namespace RequestServer {
 
 static ControlConnectionFromClient* s_control_connection = nullptr;
 
-ControlConnectionFromClient::ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RequestServer::ConnectionFromClient::ConnectionMap& connections, RequestServer::ConnectionFromClient::RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
+ControlConnectionFromClient::ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RequestServer::ConnectionFromClient::ConnectionMap& connections, RequestServer::ConnectionFromClient::RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache)
     : IPC::ConnectionFromClient<RequestServerControlClientEndpoint, RequestServerControlEndpoint>(*this, move(transport), 0)
     , m_connections(connections)
     , m_request_transfer_leases(request_transfer_leases)
     , m_disk_cache(disk_cache)
-    , m_alt_svc_cache_path(move(alt_svc_cache_path))
     , m_resolver(Resolver::default_resolver())
 {
     VERIFY(s_control_connection == nullptr);
@@ -53,30 +52,31 @@ void ControlConnectionFromClient::die()
         Core::EventLoop::current().quit(0);
 }
 
-Messages::RequestServerControl::InitTransportResponse ControlConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#endif
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<ControlConnectionFromClient::ClientSocket> ControlConnectionFromClient::create_client_socket(IsPrivate is_private)
+ErrorOr<ControlConnectionFromClient::ClientSocket> ControlConnectionFromClient::create_client_socket(IsPrivate is_private, SiteBinding site_binding)
 {
     auto paired = TRY(IPC::Transport::create_paired());
     auto handle = move(paired.remote_handle);
     auto disk_cache = is_private == IsPrivate::Yes ? Optional<HTTP::DiskCache&> {} : m_disk_cache;
 
     // Note: A ref is stored in the m_connections map
-    auto client = adopt_ref(*new RequestServer::ConnectionFromClient(move(paired.local), is_private, m_connections, m_request_transfer_leases, disk_cache, m_alt_svc_cache_path));
+    auto client = adopt_ref(*new RequestServer::ConnectionFromClient(move(paired.local), is_private, site_binding, m_connections, m_request_transfer_leases, disk_cache));
 
     return ClientSocket { .handle = move(handle), .client_id = client->client_id() };
 }
 
-Messages::RequestServerControl::ConnectNewClientResponse ControlConnectionFromClient::connect_new_client(IsPrivate is_private)
+static bool is_valid_site_binding(SiteBinding site_binding)
 {
-    auto client_socket = create_client_socket(is_private);
+    return site_binding == SiteBinding::Unrestricted || site_binding == SiteBinding::Bound;
+}
+
+Messages::RequestServerControl::ConnectNewClientResponse ControlConnectionFromClient::connect_new_client(IsPrivate is_private, SiteBinding site_binding)
+{
+    if (!is_valid_site_binding(site_binding)) {
+        did_misbehave("connect_new_client: invalid site binding");
+        return { IPC::TransportHandle {}, -1 };
+    }
+
+    auto client_socket = create_client_socket(is_private, site_binding);
     if (client_socket.is_error()) {
         dbgln("Failed to create client socket: {}", client_socket.error());
         return { IPC::TransportHandle {}, -1 };
@@ -85,15 +85,20 @@ Messages::RequestServerControl::ConnectNewClientResponse ControlConnectionFromCl
     return { move(client_socket.value().handle), client_socket.value().client_id };
 }
 
-Messages::RequestServerControl::ConnectNewClientsResponse ControlConnectionFromClient::connect_new_clients(size_t count, IsPrivate is_private)
+Messages::RequestServerControl::ConnectNewClientsResponse ControlConnectionFromClient::connect_new_clients(size_t count, IsPrivate is_private, SiteBinding site_binding)
 {
+    if (!is_valid_site_binding(site_binding)) {
+        did_misbehave("connect_new_clients: invalid site binding");
+        return { Vector<IPC::TransportHandle> {}, Vector<int> {} };
+    }
+
     Vector<IPC::TransportHandle> handles;
     Vector<int> client_ids;
     handles.ensure_capacity(count);
     client_ids.ensure_capacity(count);
 
     for (size_t i = 0; i < count; ++i) {
-        auto client_socket = create_client_socket(is_private);
+        auto client_socket = create_client_socket(is_private, site_binding);
         if (client_socket.is_error()) {
             dbgln("Failed to create client socket: {}", client_socket.error());
             return { Vector<IPC::TransportHandle> {}, Vector<int> {} };
@@ -104,6 +109,13 @@ Messages::RequestServerControl::ConnectNewClientsResponse ControlConnectionFromC
     }
 
     return { move(handles), move(client_ids) };
+}
+
+void ControlConnectionFromClient::bind_client_to_site(int client_id, Utf16String top_level_site, Optional<Utf16String> frame_site)
+{
+    // A client that has disconnected meanwhile needs no binding.
+    if (auto connection = m_connections.get(client_id); connection.has_value())
+        connection.value()->bind_to_site({}, top_level_site, frame_site);
 }
 
 void ControlConnectionFromClient::set_disk_cache_settings(HTTP::DiskCacheSettings disk_cache_settings)
@@ -131,7 +143,7 @@ void ControlConnectionFromClient::set_dns_server(ByteString host_or_address, u16
     dns_info.use_dns_over_tls = use_tls;
     dns_info.validate_dnssec_locally = validate_dnssec_locally;
 
-    m_resolver->dns.reset_connection();
+    Resolver::reset_connections();
 }
 
 void ControlConnectionFromClient::set_use_system_dns()
@@ -140,7 +152,12 @@ void ControlConnectionFromClient::set_use_system_dns()
     dns_info.server_hostname = {};
     dns_info.server_address = {};
 
-    m_resolver->dns.reset_connection();
+    Resolver::reset_connections();
+}
+
+void ControlConnectionFromClient::set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration)
+{
+    RequestServer::set_proxy_configuration(move(proxy_configuration));
 }
 
 void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)
@@ -154,7 +171,7 @@ void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)
                     request.value->sample_network_usage();
             }
             m_last_performance_push = MonotonicTime::now();
-            m_performance_timer = Core::Timer::create_repeating(500, [this] { push_network_usage(); });
+            m_performance_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(500), [this] { push_network_usage(); });
             m_performance_timer->start();
         }
     } else {
@@ -187,6 +204,7 @@ void ControlConnectionFromClient::remove_cache_entries_accessed_since(u64 clear_
 {
     if (m_disk_cache.has_value())
         m_disk_cache->remove_entries_accessed_since(since);
+    AlternativeServiceCache::the().remove_entries_received_since(since);
 
     async_removed_cache_entries(clear_cache_request_id);
 }
@@ -205,6 +223,7 @@ void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 reque
         auto request = [&]() {
             switch (request_type) {
             case RequestType::Fetch:
+            case RequestType::Imported:
                 return (*connection)->m_active_requests.get(request_id);
             case RequestType::BackgroundRevalidation:
                 return (*connection)->m_active_revalidation_requests.get(request_id);
@@ -224,9 +243,14 @@ void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 reque
 void ControlConnectionFromClient::stored_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id)
 {
     if (auto connection = m_connections.get(client_id); connection.has_value()) {
-        if (auto request = (*connection)->m_active_requests.get(request_id); request.has_value()) {
-            if (!(*request)->notify_stored_response_cookies_and_hsts_policy({}, store_request_id))
-                did_misbehave("Duplicate or unexpected response cookie storage acknowledgement");
+        // Request IDs can collide with background revalidations; the storage request ID disambiguates acknowledgements.
+        for (auto* requests : { &(*connection)->m_active_requests, &(*connection)->m_active_revalidation_requests }) {
+            if (auto request = requests->get(request_id); request.has_value()) {
+                if (!(*request)->notify_stored_response_cookies_and_hsts_policy({}, store_request_id)) {
+                    did_misbehave("Duplicate or unexpected response cookie storage acknowledgement");
+                    return;
+                }
+            }
         }
     }
 }

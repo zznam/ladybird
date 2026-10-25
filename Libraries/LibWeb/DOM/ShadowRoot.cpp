@@ -51,6 +51,7 @@ void ShadowRoot::finalize()
 {
     Base::finalize();
     document().unregister_shadow_root({}, *this);
+    document().remove_shadow_root_needing_slot_assignment({}, *this);
 }
 
 void ShadowRoot::adopted_from(Document& old_document)
@@ -61,6 +62,10 @@ void ShadowRoot::adopted_from(Document& old_document)
     // tree-scoped name lookups), so adoption has to move this shadow root to the new document's list.
     old_document.unregister_shadow_root({}, *this);
     document().register_shadow_root({}, *this);
+    if (!m_slots_needing_assignment.is_empty()) {
+        old_document.remove_shadow_root_needing_slot_assignment({}, *this);
+        document().add_shadow_root_needing_slot_assignment({}, *this);
+    }
 
     // Identities belong to one document's engine, so the root and its scope have to be minted
     // again in the new one. Its sheets are re-adopted through the CSSOM, which is what attaches
@@ -77,7 +82,7 @@ void ShadowRoot::set_style_node_id(CSS::StyleNodeID style_node_id)
     // The layout arena keys layout tree update marks by identity alone, so one handed to this root holds none, whatever
     // the node that held it before left behind.
     if (auto* arena = document().layout_node_arena_if_created(); arena && style_node_id != 0)
-        Layout::RustFFI::layout_arena_clear_layout_tree_update_marks(arena->handle(), style_node_id.value());
+        Layout::RustFFI::render_state_clear_layout_tree_update_marks(arena->host(), style_node_id.value());
     // The style engine keeps the mark of the children that explicitly inherit by identity too.
     if (style_node_id != 0)
         publish_children_explicitly_inherit_mark();
@@ -100,6 +105,27 @@ GC::Ptr<Element> ShadowRoot::retargeted_fullscreen_element() const
     // 3. If candidate and this are in the same tree, then return candidate.
     if (auto* retargeted_element = as<Element>(candidate); &retargeted_element->root() == &root())
         return retargeted_element;
+
+    // 4. Return null.
+    return nullptr;
+}
+
+// https://w3c.github.io/picture-in-picture/#dom-documentorshadowroot-pictureinpictureelement
+GC::Ptr<Element> ShadowRoot::retargeted_picture_in_picture_element() const
+{
+    // 1. If this is a shadow root and its host is not connected, return null and abort these steps.
+    if (!host() || !host()->is_connected())
+        return nullptr;
+
+    // 2. Let candidate be the result of retargeting Picture-in-Picture element against this.
+    // NB: Only a document has its Picture-in-Picture element set, so this retargets the one of this' document.
+    auto* candidate = as_if<Element>(retarget(document().picture_in_picture_element().ptr(), const_cast<ShadowRoot*>(this)));
+    if (!candidate)
+        return nullptr;
+
+    // 3. If candidate and this are in the same tree, return candidate and abort these steps.
+    if (&candidate->root() == &root())
+        return candidate;
 
     // 4. Return null.
     return nullptr;
@@ -214,6 +240,7 @@ void ShadowRoot::visit_edges(Visitor& visitor)
     }
     visitor.visit(m_custom_element_registry);
     visitor.visit(m_radio_button_group_registry);
+    visitor.visit(m_slots_needing_assignment);
 }
 
 HTML::RadioButtonGroupRegistry& ShadowRoot::ensure_radio_button_group_registry()
@@ -257,7 +284,7 @@ void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetSt
     }
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> ShadowRoot::get_animations()
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> ShadowRoot::get_animations()
 {
     document().update_style();
     return calculate_get_animations(*this);
@@ -288,6 +315,23 @@ GC::Ptr<HTML::HTMLSlotElement> ShadowRoot::first_slot_with_name(Utf16View name) 
     if (!m_slot_registry)
         return nullptr;
     return m_slot_registry->first_slot_with_name(name);
+}
+
+void ShadowRoot::set_needs_slot_assignment(HTML::HTMLSlotElement& slot)
+{
+    if (m_slots_needing_assignment.contains_slow(GC::Ref { slot }))
+        return;
+    if (m_slots_needing_assignment.is_empty())
+        document().add_shadow_root_needing_slot_assignment({}, *this);
+    m_slots_needing_assignment.append(slot);
+}
+
+void ShadowRoot::assign_slottables_if_needed()
+{
+    document().remove_shadow_root_needing_slot_assignment({}, *this);
+    GC::RootVector slots { move(m_slots_needing_assignment) };
+    for (auto slot : slots)
+        assign_slottables(slot, SignalSlotChange::No);
 }
 
 // https://drafts.csswg.org/css-shadow-1/#shadow-root-part-element-map
@@ -401,7 +445,7 @@ GC::Ref<CSS::StyleSheetList> style_sheets(DOM::ShadowRoot& shadow_root)
 
 JS::Value adopted_style_sheets(DOM::ShadowRoot& shadow_root)
 {
-    return DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(shadow_root).ptr();
+    return DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(shadow_root)->array_object();
 }
 
 WebIDL::ExceptionOr<void> set_adopted_style_sheets(DOM::ShadowRoot& shadow_root, JS::Value new_value)

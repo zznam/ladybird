@@ -70,16 +70,12 @@
 
             .inline-container > label,
             .filter-list-row label {
+                max-width: 60ch;
                 margin-bottom: 0;
             }
 
-            .inline-container:has(> input[type="checkbox"]:disabled) {
+            .inline-container:has(> input[type="checkbox"]:disabled) > label {
                 opacity: 0.5;
-                filter: grayscale(1);
-            }
-
-            input[type="checkbox"][switch]:disabled {
-                cursor: default;
             }
 
             .button-container {
@@ -109,15 +105,6 @@
 
             .forcibly-enabled {
                 opacity: 0.6;
-            }
-
-            .description {
-                margin-top: 4px;
-                opacity: 0.7;
-            }
-
-            .description:empty {
-                display: none;
             }
 
             .card-body > .description:first-child {
@@ -203,7 +190,7 @@
                 margin: auto;
                 padding: 0;
 
-                border: none;
+                border: 1px solid var(--border-color);
                 border-radius: 8px;
                 outline: none;
             }
@@ -378,7 +365,7 @@
             }
 
             .tab-button.active {
-                border-bottom-color: var(--violet-100);
+                border-bottom-color: var(--accent);
                 opacity: 1;
             }
 
@@ -395,16 +382,9 @@
                 margin-bottom: 20px;
             }
 
-            button:focus-visible,
-            summary:focus-visible,
-            input[type="checkbox"]:focus-visible {
-                outline: 2px solid var(--violet-100);
-                outline-offset: 2px;
-            }
-
             textarea:focus {
-                border-color: var(--violet-100);
-                outline: 2px solid var(--violet-100);
+                border-color: var(--accent);
+                outline: 2px solid var(--accent);
                 outline-offset: 1px;
             }
 
@@ -447,21 +427,21 @@
         </div>
 
         <div class="tab-panel active" id="tab-general">
+            <h3 class="card-title">Startup</h3>
             <div class="card">
                 <div class="card-body">
                     <div class="card-group inline-container">
-                        <label for="new-tab-page-url">New Tab Page URL</label>
+                        <label for="restore-previous-session">Restore previous windows and tabs</label>
+                        <input id="restore-previous-session" type="checkbox" switch />
+                    </div>
+                    <div class="card-group inline-container">
+                        <label for="new-tab-page-url">New tab page URL</label>
                         <div class="input-with-reset">
                             <input id="new-tab-page-url" type="url" placeholder="about:newtab" />
                             <button id="new-tab-page-url-reset" class="input-reset-button" title="Restore default">
                                 &times;
                             </button>
                         </div>
-                    </div>
-
-                    <div class="card-group inline-container">
-                        <label for="languages-settings">Languages</label>
-                        <button id="languages-settings" class="secondary-button">Settings...</button>
                     </div>
                 </div>
             </div>
@@ -475,36 +455,12 @@
                     </div>
                     <div class="card-group inline-container">
                         <label for="show-bookmarks-bar">Show bookmarks bar</label>
-                        <input id="show-bookmarks-bar" type="checkbox" switch />
+                        <select id="show-bookmarks-bar">
+                            <option value="always">Always</option>
+                            <option value="never">Never</option>
+                            <option value="onHover">Only when hovering the navigation toolbar</option>
+                        </select>
                     </div>
-                </div>
-            </div>
-
-            <h3 class="card-title">Content</h3>
-            <div class="card">
-                <div class="card-body">
-                    <div class="card-group card-separator inline-container">
-                        <label for="default-zoom-level">Default zoom level</label>
-                        <select id="default-zoom-level"></select>
-                    </div>
-                    <div class="card-group card-separator">
-                        <div class="inline-container">
-                            <label for="enable-force-dark">
-                                Force dark mode
-                                <p class="description">
-                                    Darken web pages that don’t provide a dark theme of their own. Photos are left as
-                                    they are; icons and line art are darkened along with the page.
-                                </p>
-                            </label>
-                            <input id="enable-force-dark" type="checkbox" switch />
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <h3 class="card-title">Tabs</h3>
-            <div class="card">
-                <div class="card-body">
                     <div class="card-group inline-container">
                         <label for="enable-vertical-tabs">Use vertical tabs</label>
                         <input id="enable-vertical-tabs" type="checkbox" switch />
@@ -523,30 +479,50 @@
                 </div>
             </div>
 
-            <h3 class="card-title">Browsing Behavior</h3>
+            <h3 class="card-title">Content</h3>
             <div class="card">
                 <div class="card-body">
-                    <div class="card-group card-separator">
-                        <div class="inline-container">
-                            <label for="enable-autoscroll">
-                                Enable autoscrolling
-                                <p class="description">
-                                    Scroll pages by pressing the middle mouse button and moving the mouse.
-                                </p>
-                            </label>
-                            <input id="enable-autoscroll" type="checkbox" switch />
-                        </div>
+                    <div class="card-group inline-container">
+                        <label for="default-zoom-level">Default zoom level</label>
+                        <select id="default-zoom-level"></select>
                     </div>
-                    <div class="card-group card-separator" id="enable-primary-paste-group">
-                        <div class="inline-container">
-                            <label for="enable-primary-paste">
-                                Enable primary pasting
-                                <p class="description">
-                                    Paste text from the clipboard when the middle mouse button is clicked.
-                                </p>
-                            </label>
-                            <input id="enable-primary-paste" type="checkbox" switch />
-                        </div>
+                    <div class="card-group inline-container">
+                        <label for="enable-force-dark">
+                            Force dark mode
+                            <p class="description">
+                                Darken web pages that don’t provide a dark theme of their own. Photos are left as they
+                                are; icons and line art are darkened along with the page.
+                            </p>
+                        </label>
+                        <input id="enable-force-dark" type="checkbox" switch />
+                    </div>
+                    <div class="card-group inline-container">
+                        <label for="languages-settings">Languages</label>
+                        <button id="languages-settings" class="secondary-button">Settings...</button>
+                    </div>
+                </div>
+            </div>
+
+            <h3 class="card-title">Browsing behavior</h3>
+            <div class="card">
+                <div class="card-body">
+                    <div class="card-group inline-container">
+                        <label for="enable-autoscroll">
+                            Enable autoscrolling
+                            <p class="description">
+                                Scroll pages by pressing the middle mouse button and moving the mouse.
+                            </p>
+                        </label>
+                        <input id="enable-autoscroll" type="checkbox" switch />
+                    </div>
+                    <div class="card-group inline-container" id="enable-primary-paste-group">
+                        <label for="enable-primary-paste">
+                            Enable primary pasting
+                            <p class="description">
+                                Paste text from the clipboard when the middle mouse button is clicked.
+                            </p>
+                        </label>
+                        <input id="enable-primary-paste" type="checkbox" switch />
                     </div>
                 </div>
             </div>
@@ -568,7 +544,7 @@
                 <div class="card-body">
                     <div class="card-group">
                         <label>
-                            Default Search Engine
+                            Default search engine
                             <p class="description">Select the search engine to use in the address bar.</p>
                         </label>
                         <div class="inline-container">
@@ -622,7 +598,7 @@
         </div>
 
         <div class="tab-panel" id="tab-privacy">
-            <h3 class="card-title">Browsing Data</h3>
+            <h3 class="card-title">Browsing data</h3>
             <div class="card">
                 <div class="card-body">
                     <p id="browsing-data-total-size" class="card-group"></p>
@@ -655,7 +631,7 @@
             <div class="card">
                 <div class="card-body">
                     <div class="card-group inline-container">
-                        <span>Clear Browsing Data</span>
+                        <span>Clear browsing data</span>
                         <button id="browsing-data-settings" class="secondary-button">Clear...</button>
                     </div>
                 </div>
@@ -679,17 +655,27 @@
 
         <div class="tab-panel" id="tab-blocking">
             <div class="card card-body">
-                <div class="inline-container">
-                    <label for="enable-content-blocking">Enable ad blocking</label>
+                <div class="card-group inline-container">
+                    <label for="enable-content-blocking">
+                        Enable ad blocking
+                        <p class="description">Use filter lists to block ads, trackers, and other unwanted content.</p>
+                    </label>
                     <input id="enable-content-blocking" type="checkbox" switch />
                 </div>
-                <p class="description">Use filter lists to block ads, trackers, and other unwanted content.</p>
+                <div class="card-group inline-container hidden" id="show-content-blocker-count-setting">
+                    <label for="show-content-blocker-count">
+                        Show the number of blocked requests on the ad blocking icon
+                    </label>
+                    <input id="show-content-blocker-count" type="checkbox" switch />
+                </div>
             </div>
             <template id="filter-list-row">
-                <div class="card-group card-separator inline-container filter-list-row">
+                <div class="card-group inline-container filter-list-row">
                     <div>
-                        <label></label>
-                        <p class="description"></p>
+                        <label>
+                            <span class="label"></span>
+                            <p class="description"></p>
+                        </label>
                         <p class="description filter-list-metadata"></p>
                     </div>
                     <div class="input-field-container">
@@ -773,12 +759,13 @@
         </div>
 
         <div class="tab-panel" id="tab-network">
-            <h3 class="card-title">DNS Settings</h3>
+            <h3 class="card-title">DNS settings</h3>
             <div class="card">
                 <div class="card-body">
                     <span id="dns-forcibly-enabled" class="forcibly-enabled hidden">
                         This setting is controlled via the command line
                     </span>
+                    <p id="dns-proxy-note" class="description hidden"></p>
 
                     <div class="card-group inline-container" id="dns-settings-container">
                         <label for="dns-upstream">DNS Upstream</label>
@@ -916,7 +903,7 @@
 
         <dialog id="browsing-data-settings-dialog" closedby="any">
             <div class="dialog-header">
-                <h3 class="dialog-title">Clear Browsing Data</h3>
+                <h3 class="dialog-title">Clear browsing data</h3>
                 <button id="browsing-data-settings-close" class="close-button dialog-button">&times;</button>
             </div>
             <div class="dialog-body" style="height: auto">
@@ -984,11 +971,11 @@
         <script src="resource://ladybird/about-pages/settings/geolocation.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/languages.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/network.js" type="module"></script>
-        <script src="resource://ladybird/about-pages/settings/new-tab-page.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/permissions.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/privacy.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/search.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/services.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/startup.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/tabs.js" type="module"></script>
 
         <script type="module">

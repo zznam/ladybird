@@ -72,7 +72,7 @@ pub struct ClipData {
 
 #[derive(Clone)]
 pub struct ClipPathData {
-    pub path: std::sync::Arc<libgfx_rust::path::OwnedPath>,
+    pub path: std::sync::Arc<libgfx_rust::path::Path>,
     pub bounding_rect: IntRect,
     pub fill_rule: WindingRule,
 }
@@ -88,6 +88,7 @@ pub struct BackdropFilterData {
 
 #[derive(Clone)]
 pub struct EffectsData {
+    pub isolation: bool,
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
     pub filter: Option<std::sync::Arc<Vec<u8>>>,
@@ -97,6 +98,7 @@ pub struct EffectsData {
 impl EffectNodeData {
     pub fn layer_blending_with(blend_mode: CompositingAndBlendingOperator) -> Self {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode,
             filter: None,
@@ -117,7 +119,8 @@ impl ClipNodeData {
 
 impl EffectsData {
     pub fn needs_layer(&self) -> bool {
-        self.opacity < 1.0
+        self.isolation
+            || self.opacity < 1.0
             || self.blend_mode != CompositingAndBlendingOperator::Normal
             || self.filter.is_some()
             || self.backdrop_filter.is_some()
@@ -137,6 +140,9 @@ pub struct MaskData {
     pub rect: IntRect,
     pub kind: MaskKind,
     pub origin: MaskLayerOrigin,
+    /// Whether the mask belongs to a box with a backdrop filter, whose effects node then sits
+    /// under the box's masks so that they mask the filtered backdrop along with the content.
+    pub masks_backdrop: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +165,9 @@ pub struct StickyData {
     pub scrollport_size: FloatSize,
     pub containing_block_region: FloatRect,
     pub needs_parent_offset_adjustment: bool,
+    // The nearest scroll container of the box when it has no scrollable overflow, and so no scroll node. Its
+    // scrollport never moves, and the geometry above is relative to it rather than to the scroller.
+    pub non_scrolling_scroll_container: NodeSlotId,
     pub inset_top: Option<f32>,
     pub inset_right: Option<f32>,
     pub inset_bottom: Option<f32>,
@@ -184,6 +193,7 @@ impl StickyData {
             scrollport_size: FloatSize::default(),
             containing_block_region: FloatRect::default(),
             needs_parent_offset_adjustment: false,
+            non_scrolling_scroll_container: NodeSlotId::INVALID,
             inset_top: None,
             inset_right: None,
             inset_bottom: None,
@@ -1452,6 +1462,7 @@ mod tests {
 
     fn effects() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,

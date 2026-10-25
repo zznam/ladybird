@@ -45,6 +45,7 @@ public:
 
     virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual void post_connection() override;
+    virtual bool has_post_connection_steps() const override { return true; }
 
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-supports
     static bool supports(Utf16String const& type)
@@ -53,9 +54,6 @@ public:
     }
 
     void set_source_line_number(Badge<HTMLParser>, size_t source_line_number) { m_source_line_number = source_line_number; }
-
-    void unmark_as_already_started(Badge<DOM::Range>);
-    void unmark_as_parser_inserted(Badge<DOM::Range>);
 
     TrustedTypes::TrustedScriptOrString text() const { return child_text_content(); }
     WebIDL::ExceptionOr<void> set_text(TrustedTypes::TrustedScriptOrString);

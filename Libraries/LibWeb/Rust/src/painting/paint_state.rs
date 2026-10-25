@@ -5,11 +5,16 @@
  */
 
 use crate::layout::node_data::NodeSlotId;
+use crate::painting::paint_read::GeometryRead;
+use crate::painting::record::paint::text::SelectionStyleAnswer;
+use crate::painting::selection::{
+    HighlightPseudoElement, SearchTextHighlights, SelectionRange, SpellingErrorHighlights,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) struct PendingRecording {
     pub(crate) recording: crate::painting::record::RecordingResult,
-    pub(crate) recording_from_scratch: Option<crate::painting::record::RecordingResult>,
     pub(crate) publishes_recording: bool,
     /// The SVG paint resources the recording's frame was published with, whose filter images
     /// its publication hands to the host.
@@ -21,7 +26,7 @@ pub(crate) struct PendingRecordingTrace {
     pub(crate) should_paint_overlay: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintState {
     pub(crate) trace_recordings: bool,
     pub(crate) visual_context: crate::painting::visual_context::VisualContextState,
@@ -29,17 +34,38 @@ pub struct PaintState {
     pub(crate) hit_test_list_generation: u64,
     pub(crate) last_recording: Option<Arc<crate::painting::record::RecordingOutput>>,
     /// The selection, shared with the frames published while it holds.
-    pub(crate) selection: Option<Arc<crate::painting::selection::SelectionRange>>,
+    pub(crate) selection: Option<Arc<SelectionRange>>,
     /// The `::selection` styles, shared with the frames published while they hold, so a write
     /// copies the table only while a frame still holds it.
     pub(crate) selection_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The find-in-page matches, shared with the frames published while they hold.
+    pub(crate) search_text: Arc<SearchTextHighlights>,
+    /// The `::search-text` styles, shared as the `::selection` styles are.
+    pub(crate) search_text_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The `::search-text:current` styles, shared as the `::selection` styles are.
+    pub(crate) search_text_current_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The misspelled runs, shared with the frames published while they hold.
+    pub(crate) spelling_errors: Arc<SpellingErrorHighlights>,
+    /// The `::spelling-error` styles, shared as the `::selection` styles are.
+    pub(crate) spelling_error_pseudo_styles: Arc<SelectionPseudoStyles>,
 }
 
-/// Each row's committed `::selection` style.
-pub(crate) type SelectionPseudoStyles =
-    std::collections::HashMap<NodeSlotId, Arc<crate::painting::record::paint::text::SelectionStyleAnswer>>;
+/// Each row's committed style for one highlight pseudo-element.
+pub(crate) type SelectionPseudoStyles = HashMap<NodeSlotId, Arc<SelectionStyleAnswer>>;
 
 impl PaintState {
+    pub(crate) fn highlight_pseudo_styles_mut(
+        &mut self,
+        highlight: HighlightPseudoElement,
+    ) -> &mut Arc<SelectionPseudoStyles> {
+        match highlight {
+            HighlightPseudoElement::Selection => &mut self.selection_pseudo_styles,
+            HighlightPseudoElement::SearchText => &mut self.search_text_pseudo_styles,
+            HighlightPseudoElement::SearchTextCurrent => &mut self.search_text_current_pseudo_styles,
+            HighlightPseudoElement::SpellingError => &mut self.spelling_error_pseudo_styles,
+        }
+    }
+
     pub(crate) fn update_root_background_source(
         &mut self,
         arena: &crate::layout::LayoutNodeArena,
@@ -73,6 +99,6 @@ impl PaintState {
         };
         self.visual_context
             .dirty_boxes
-            .request_full_rebuild(crate::painting::visual_context::dirty::VisualContextGlobalRebuildReason::FirstBuild);
+            .request_full_rebuild(crate::painting::visual_context::dirty::VisualContextUpdateScope::FreshTree);
     }
 }

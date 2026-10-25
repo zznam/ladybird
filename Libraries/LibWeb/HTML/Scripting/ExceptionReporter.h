@@ -6,18 +6,27 @@
 
 #pragma once
 
+#include <LibGC/Ptr.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Export.h>
 
 namespace Web::HTML {
+
+class Script;
 
 enum class ErrorInPromise {
     No,
     Yes,
 };
 
+enum class OmitError {
+    No,
+    Yes,
+};
+
 void report_exception_to_console(JS::Value, JS::Realm&, ErrorInPromise);
 WEB_API void report_exception(JS::Completion const&, JS::Realm&);
+void report_an_exception(JS::Object& global, JS::Value exception, OmitError = OmitError::No, GC::Ptr<Script> = {});
 
 template<typename T>
 inline void report_exception(JS::ThrowCompletionOr<T> const& result, JS::Realm& realm)

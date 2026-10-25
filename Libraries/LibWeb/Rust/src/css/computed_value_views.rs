@@ -36,8 +36,7 @@ pub(crate) fn px_calc_resolution_context(percentage_basis: CssPixels) -> calc::F
         basis_value: percentage_basis.to_double(),
         basis_unit: crate::css::style_compute::px_length_unit(),
         length_resolution_context: std::ptr::null(),
-        external_resolutions: std::ptr::null(),
-        external_resolution_count: 0,
+        element_facts: std::ptr::null(),
     }
 }
 
@@ -45,8 +44,14 @@ pub(crate) fn resolve_calc_to_px_without_rounding(calculated: *const c_void, per
     assert!(!calculated.is_null());
     // SAFETY: The style value stays alive for the pass.
     let value = unsafe { &*calculated.cast::<StyleValueData>() };
-    crate::css::calc::resolve_calculated_length_without_context(value, percentage_basis.to_double())
-        .expect("computed length-percentage calc failed to resolve")
+    crate::css::calc::resolve_calculated_length_without_context(value, percentage_basis.to_double()).unwrap_or_else(|| {
+        assert!(
+            matches!(value, StyleValueData::Calculated { rust_calculation, .. } if rust_calculation.node().contains_anchor_function()),
+            "computed length-percentage calc failed to resolve"
+        );
+        // NB: The abspos engine resolves the anchor functions it can itself, so these are unresolvable.
+        crate::layout::style_values::resolve_calc_with_unresolvable_anchor_functions(calculated, percentage_basis)
+    })
 }
 
 pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: CssPixels) -> CssPixels {
@@ -100,21 +105,22 @@ impl LengthPercentageRef<'_> {
         match self.value {
             StyleValueData::Length { .. } => false,
             StyleValueData::Percentage { .. } => true,
-            StyleValueData::Calculated { .. } => {
-                // SAFETY: The calculated style value outlives this borrowed
-                // view, and the root query takes no other state.
-                let root = unsafe { calc::rust_calc_root_from_calculated(self.calculated_pointer()) };
-                assert!(!root.is_null());
-                // SAFETY: The root borrows the same retained calculation.
-                unsafe { calc::rust_calc_node_contains_percentage(root) }
+            StyleValueData::Calculated { rust_calculation, .. } => rust_calculation.node().contains_percentage(),
+            // A calc-size() whose basis is any or a calculation acts like a calculation.
+            value @ StyleValueData::Function { .. } => {
+                crate::css::calc_size::calc_size_arguments(value).is_some_and(|(basis, calculation)| {
+                    [basis, calculation].into_iter().any(|argument| {
+                        !matches!(argument, StyleValueData::Keyword { .. })
+                            && LengthPercentageRef::over(argument).contains_percentage()
+                    })
+                })
             }
             _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
         }
     }
 
     pub(crate) fn contains_anchor_function(self) -> bool {
-        // SAFETY: The calculated style value outlives this borrowed view.
-        self.is_calculated() && unsafe { calc::rust_calc_contains_anchor(self.calculated_pointer()) }
+        matches!(self.value, StyleValueData::Calculated { rust_calculation, .. } if rust_calculation.node().contains_anchor_function())
     }
 
     pub(crate) fn to_px(self, reference: CssPixels) -> CssPixels {
@@ -124,6 +130,10 @@ impl LengthPercentageRef<'_> {
                 CssPixels::truncated_value_for(reference.to_double() * self.as_fraction())
             }
             StyleValueData::Calculated { .. } => resolve_calc_to_px(self.calculated_pointer(), reference),
+            // NB: A calc-size() that does not resolve is invalid at computed-value time, and resolves to zero.
+            value @ StyleValueData::Function { .. } => CssPixels::nearest_value_for(
+                crate::css::calc_size::resolve_calc_size(value, Some(reference.to_double()), &|_| 0.0).unwrap_or(0.0),
+            ),
             _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
         }
     }
@@ -176,8 +186,21 @@ impl ComputedSize {
         self.kind == ComputedSizeKind::FitContent
     }
 
+    pub(crate) fn is_stretch(&self) -> bool {
+        self.kind == ComputedSizeKind::Stretch
+    }
+
     pub(crate) fn is_none(&self) -> bool {
         self.kind == ComputedSizeKind::None
+    }
+
+    /// The calc-size() function this size was given as, if any. It acts as its basis for all purposes other
+    /// than resolving the size.
+    /// https://drafts.csswg.org/css-values-5/#calc-size
+    pub(crate) fn calc_size(&self) -> Option<&StyleValueData> {
+        self.value
+            .style_value()
+            .filter(|value| crate::css::calc_size::calc_size_arguments(value).is_some())
     }
 
     pub(crate) fn is_length_percentage(&self) -> bool {
@@ -205,6 +228,9 @@ impl ComputedSize {
     /// The fit-content argument; None for the keyword-only form.
     pub(crate) fn fit_content_available_space(&self) -> Option<LengthPercentageRef<'_>> {
         debug_assert!(self.is_fit_content());
+        if self.calc_size().is_some() {
+            return None;
+        }
         self.value.length_percentage()
     }
 
@@ -213,6 +239,7 @@ impl ComputedSize {
             ComputedSizeKind::Auto
             | ComputedSizeKind::MinContent
             | ComputedSizeKind::MaxContent
+            | ComputedSizeKind::Stretch
             | ComputedSizeKind::None => CssPixels::default(),
             ComputedSizeKind::Calculated | ComputedSizeKind::Length | ComputedSizeKind::Percentage => {
                 self.length_percentage().to_px(reference)
@@ -229,6 +256,10 @@ impl ComputedSize {
             | ComputedSizeKind::MinContent
             | ComputedSizeKind::MaxContent
             | ComputedSizeKind::None => false,
+            // NB: A stretch size depends on the size of the containing block, and behaves as auto, zero or none
+            //     wherever a percentage of it would not resolve.
+            // https://drafts.csswg.org/css-sizing-3/#stretch-fit-sizing
+            ComputedSizeKind::Stretch => true,
             ComputedSizeKind::Calculated | ComputedSizeKind::Length | ComputedSizeKind::Percentage => {
                 self.length_percentage().contains_percentage()
             }
@@ -307,6 +338,19 @@ pub(crate) fn auto_computed_size() -> &'static ComputedSize {
     &AUTO_COMPUTED_SIZE.0
 }
 
+static NONE_COMPUTED_SIZE: SyncComputedSize = SyncComputedSize(ComputedSize {
+    kind: ComputedSizeKind::None,
+    value: ComputedStyleValueHandle {
+        pointer: std::ptr::null(),
+    },
+});
+
+/// A shared computed `none` size for readers that substitute none for a
+/// stored size.
+pub(crate) fn none_computed_size() -> &'static ComputedSize {
+    &NONE_COMPUTED_SIZE.0
+}
+
 fn counter_definitions(handle: &ComputedStyleValueHandle) -> &[crate::css::style_value::RetainedCounterDefinition] {
     match handle.data() {
         Some(StyleValueData::CounterDefinitions { counter_definitions }) => counter_definitions.as_slice(),
@@ -376,6 +420,7 @@ scalar_accessors! {
         float_: u8 => float_,
         clear: u8 => clear,
         box_sizing: u8 => box_sizing,
+        field_sizing: u8 => field_sizing,
         overflow_x: u8 => overflow_x,
         overflow_y: u8 => overflow_y,
         text_overflow: u8 => text_overflow,
@@ -394,9 +439,19 @@ scalar_accessors! {
         is_size_container: bool => is_size_container,
         is_inline_size_container: bool => is_inline_size_container,
         aspect_ratio_uses_natural_when_available: bool => aspect_ratio.use_natural_aspect_ratio_if_available,
+        has_column_count: bool => column_count_has_value,
+        column_count: i32 => column_count,
     }
     misc_reset: {
         appearance: u8 => appearance,
+        column_fill: u8 => column_fill,
+        column_span: u8 => column_span,
+        column_rule_style: u8 => column_rule_style,
+        column_rule_width: CssPixels => column_rule_width,
+        column_rule_color: u32 => column_rule_color,
+        break_before: u8 => break_before,
+        break_after: u8 => break_after,
+        break_inside: u8 => break_inside,
     }
     border_facts: {
         border_top_width: CssPixels => border_top.width,
@@ -412,8 +467,13 @@ scalar_accessors! {
         border_bottom_color: u32 => border_bottom.color,
         border_left_color: u32 => border_left.color,
     }
+    inherited_text: {
+        orphans: u64 => orphans,
+        widows: u64 => widows,
+    }
     inherited_box: {
         writing_mode: u8 => writing_mode,
+        text_orientation: u8 => text_orientation,
         direction: u8 => direction,
         visibility: u8 => visibility,
     }
@@ -443,6 +503,7 @@ scalar_accessors! {
         font_descent: f32 => font_descent,
         font_x_height: f32 => font_x_height,
         font_zero_advance: f32 => font_zero_advance,
+        math_style: u8 => math_style,
     }
     alignment: {
         webkit_box_orient: u8 => webkit_box_orient,
@@ -457,6 +518,8 @@ scalar_accessors! {
         justify_content: u8 => justify_content,
         justify_items: u8 => justify_items,
         justify_self: u8 => justify_self,
+        align_self_overflow: u8 => align_self_overflow,
+        justify_self_overflow: u8 => justify_self_overflow,
         flex_basis_is_content: bool => flex_basis.is_content,
     }
 }
@@ -482,6 +545,9 @@ reference_accessors! {
         min_height: ComputedSize => min_height,
         max_width: ComputedSize => max_width,
         max_height: ComputedSize => max_height,
+    }
+    box_values: {
+        column_width: ComputedSize => column_width,
     }
     surround: {
         margin_top: ComputedLengthPercentageOrAuto => margin.top,
@@ -711,19 +777,16 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn empty_cells(self) -> u8 {
         self.inherited_table().empty_cells
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn border(self) -> &'a BorderValues {
         self.native_group(STYLE_GROUP_INDEX_BORDER)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_list(self) -> &'a InheritedListValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
     }
@@ -751,6 +814,35 @@ impl<'a> ComputedValuesView<'a> {
         self.inherited_list().list_style_position == crate::css::css_enums::list_style_position::INSIDE
     }
 
+    /// Whether the style names an image its box paints only once the host loads it: one in its background, mask, border
+    /// image or list marker, but a gradient, which paints from the style alone.
+    pub(crate) fn names_loaded_images(self) -> bool {
+        fn names_loaded_image(value: Option<&StyleValueData>) -> bool {
+            match value {
+                None
+                | Some(
+                    StyleValueData::Keyword { .. }
+                    | StyleValueData::LinearGradient { .. }
+                    | StyleValueData::ConicGradient { .. }
+                    | StyleValueData::RadialGradient { .. },
+                ) => false,
+                Some(StyleValueData::ValueList { values, .. }) => values
+                    .as_slice()
+                    .iter()
+                    .any(|value| names_loaded_image(value.optional_data())),
+                Some(_) => true,
+            }
+        }
+        [
+            &self.background().background_image,
+            &self.mask().mask_image,
+            &self.border().border_image_source,
+            &self.inherited_list().list_style_image,
+        ]
+        .into_iter()
+        .any(|image| names_loaded_image(image.data()))
+    }
+
     /// Whether `list-style-image` names an image, which a list marker then shows instead of its
     /// marker string.
     pub(crate) fn list_style_image_is_set(self) -> bool {
@@ -767,19 +859,16 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_ui(self) -> &'a InheritedUIValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_UI)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_svg(self) -> &'a InheritedSVGValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_SVG)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_text(self) -> &'a InheritedTextValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_TEXT)
     }
@@ -790,31 +879,26 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn effects(self) -> &'a EffectsValues {
         self.native_group(STYLE_GROUP_INDEX_EFFECTS)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn mask(self) -> &'a MaskValues {
         self.native_group(STYLE_GROUP_INDEX_MASK)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn text_reset(self) -> &'a TextResetValues {
         self.native_group(STYLE_GROUP_INDEX_TEXT_RESET)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn transform(self) -> &'a TransformValues {
         self.native_group(STYLE_GROUP_INDEX_TRANSFORM)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn background(self) -> &'a BackgroundValues {
         self.native_group(STYLE_GROUP_INDEX_BACKGROUND)
     }
@@ -950,7 +1034,14 @@ impl<'a> ComputedValuesView<'a> {
     // multi-column layout.
     pub(crate) fn establishes_multi_column_container(self) -> bool {
         let box_values = self.box_values();
-        box_values.column_width.kind != ComputedSizeKind::Auto || box_values.column_count_has_value
+        if box_values.column_width.kind == ComputedSizeKind::Auto && !box_values.column_count_has_value {
+            return false;
+        }
+        let display = box_values.display;
+        (display.is_flow_inside() && !display.is_inline_outside())
+            || display.is_flow_root_inside()
+            || display.is_table_cell()
+            || display.is_table_caption()
     }
 
     pub(crate) fn x(self) -> LengthPercentageRef<'a> {
@@ -1047,7 +1138,8 @@ impl<'a> ComputedValuesView<'a> {
 
     pub(crate) fn flex_basis(self) -> &'a ComputedSize {
         let flex_basis = &self.alignment().flex_basis;
-        if flex_basis.is_content {
+        // NB: A calc-size() based on content keeps its function for resolving the size.
+        if flex_basis.is_content && flex_basis.size.calc_size().is_none() {
             auto_computed_size()
         } else {
             &flex_basis.size

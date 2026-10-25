@@ -69,10 +69,47 @@ if (APPLE OR LINUX)
     target_sources(TestCrashReportReviewWidget PRIVATE
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/CrashReportReviewWidget.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/ReportReview.cpp"
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
     )
     deploy_qt_offscreen_platform_plugin(TestCrashReportReviewWidget)
 endif()
+
+ladybird_test("TestScreenshotSelectionOverlay.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestScreenshotSelectionOverlay PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Popover.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotSelectionOverlay.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestScreenshotSelectionOverlay)
+
+ladybird_test("TestScreenshotViewer.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestScreenshotViewer PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotViewer.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestScreenshotViewer)
+
+ladybird_test("TestWebCompatReportReview.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL LibWebView Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestWebCompatReportReview PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Icon.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ReportReview.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/WebCompatReportReview.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestWebCompatReportReview)
 
 ladybird_test("TestHiddenPageSizing.cpp" UI/Qt
     CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
@@ -105,6 +142,21 @@ target_sources(TestProcessManagerWindow PRIVATE
 target_compile_definitions(TestProcessManagerWindow PRIVATE TEST_RESOURCE_ROOT="${LADYBIRD_SOURCE_DIR}/Base/res")
 deploy_qt_offscreen_platform_plugin(TestProcessManagerWindow)
 
+
+ladybird_test("TestNativeTextEditingLineEdit.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestNativeTextEditingLineEdit PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeTextEditingLineEdit.cpp")
+if (APPLE)
+    target_sources(TestNativeTextEditingLineEdit PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeTextEditingBindings.mm" "${LADYBIRD_SOURCE_DIR}/UI/Qt/MacWindowFocus.mm")
+    target_link_libraries(TestNativeTextEditingLineEdit PRIVATE "-framework AppKit")
+endif()
+deploy_qt_offscreen_platform_plugin(TestNativeTextEditingLineEdit)
+
+ladybird_test("TestWebContentViewInputMethod.cpp" UI/Qt LIBS LibWebView LibWeb LibGfx LibIPC LibURL Qt::Core Qt::Gui Qt::Widgets)
+target_sources(TestWebContentViewInputMethod PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/InputMethodUtils.cpp" "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp")
+
 if (NOT LINUX)
     return()
 endif()
@@ -119,11 +171,12 @@ ladybird_test("TestJavaScriptDialog.cpp" UI/Qt
 target_sources(TestJavaScriptDialog PRIVATE
     "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
     "${LADYBIRD_SOURCE_DIR}/UI/Qt/JavaScriptDialog.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeTextEditingLineEdit.cpp"
     "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
 )
 
+ladybird_test("TestWindowCloseCoordinator.cpp" UI/Qt LIBS Qt::Core)
+target_sources(TestWindowCloseCoordinator PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/WindowCloseCoordinator.cpp")
+
 ladybird_test("TestStringUtils.cpp" UI/Qt NAME TestQtStringUtils LIBS LibURL Qt::Core)
 target_sources(TestQtStringUtils PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp")
-
-ladybird_test("TestWebContentViewInputMethod.cpp" UI/Qt LIBS LibWebView LibWeb LibGfx LibIPC LibURL Qt::Core Qt::Gui Qt::Widgets)
-target_sources(TestWebContentViewInputMethod PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/InputMethodUtils.cpp" "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp")

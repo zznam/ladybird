@@ -8,13 +8,19 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibGC/WeakInlines.h>
 #include <LibURL/InternalURLs.h>
 #include <LibWeb/Bindings/HostDefined.h>
+#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
+#include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/PolicyContainers.h>
@@ -29,11 +35,11 @@
 #include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/SecureContexts/AbstractOperations.h>
 #include <LibWeb/ServiceWorker/ServiceWorker.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerRegistration.h>
 #include <LibWeb/StorageAPI/StorageManager.h>
 #include <LibWeb/WebLocks/LockManager.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 
 namespace Web::HTML {
 
@@ -45,13 +51,16 @@ GC::Ref<Environment> Environment::create(EnvironmentId id, URL::URL creation_url
     return GC::Heap::the().allocate<Environment>(move(id), move(creation_url), move(top_level_creation_url), move(top_level_origin), move(target_browsing_context));
 }
 
-Environment::~Environment() = default;
-
-void Environment::visit_edges(Cell::Visitor& visitor)
+Environment::Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
+    : id(move(id))
+    , creation_url(move(creation_url))
+    , top_level_creation_url(move(top_level_creation_url))
+    , top_level_origin(move(top_level_origin))
+    , target_browsing_context(target_browsing_context)
 {
-    Base::visit_edges(visitor);
-    visitor.visit(target_browsing_context);
 }
+
+Environment::~Environment() = default;
 
 EnvironmentSettingsObject::EnvironmentSettingsObject(NonnullOwnPtr<JS::ExecutionContext> realm_execution_context)
     : m_realm_execution_context(move(realm_execution_context))
@@ -79,6 +88,18 @@ void EnvironmentSettingsObject::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_service_worker_registration_object_map);
     visitor.visit(m_service_worker_object_map);
     visitor.visit(m_owned_worker_agents);
+
+    // Keep the fetch records of the fetches that are still under way, since aborting the document or terminating its
+    // fetch group has to reach them. A record whose fetch is over is left to the collector, and leaves the group as
+    // it's finalized.
+    for (auto& fetch_record : m_fetch_group) {
+        auto controller = fetch_record.fetch_controller();
+        if (fetch_record.request()->done())
+            continue;
+        if (controller && controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
+            continue;
+        visitor.visit(fetch_record);
+    }
 }
 
 void EnvironmentSettingsObject::discard_environment()
@@ -104,7 +125,7 @@ void EnvironmentSettingsObject::remove_owned_worker_agent(WorkerAgentParent& wor
 
 void EnvironmentSettingsObject::release_owned_worker_agents()
 {
-    auto owned_worker_agents = move(m_owned_worker_agents);
+    GC::RootVector owned_worker_agents { move(m_owned_worker_agents) };
     for (auto& worker_agent : owned_worker_agents)
         worker_agent->terminate();
 }
@@ -130,6 +151,11 @@ ModuleMap& EnvironmentSettingsObject::module_map()
 JS::Realm& EnvironmentSettingsObject::realm()
 {
     // An environment settings object's realm execution context's Realm component is the environment settings object's Realm.
+    return *realm_execution_context().realm;
+}
+
+JS::Realm const& EnvironmentSettingsObject::realm() const
+{
     return *realm_execution_context().realm;
 }
 
@@ -328,13 +354,15 @@ bool is_scripting_disabled(EnvironmentSettingsObject const& settings)
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#module-type-allowed
-bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type)
+bool module_type_allowed(EnvironmentSettingsObject const& settings, Utf16View module_type)
 {
     // 1. If moduleType is not "javascript-or-wasm", "css", "json", or "text", then return false.
     if (module_type != "javascript-or-wasm"sv && module_type != "css"sv && module_type != "json"sv && module_type != "text"sv)
         return false;
 
-    // FIXME: 2. If moduleType is "css" and the CSSStyleSheet interface is not exposed in settings's realm, then return false.
+    // 2. If moduleType is "css" and the CSSStyleSheet interface is not exposed in settings's realm, then return false.
+    if (module_type == "css"sv && !Bindings::is_exposed(Bindings::InterfaceName::CSSStyleSheet, settings.realm()))
+        return false;
 
     // 3. Return true.
     return true;
@@ -414,10 +442,10 @@ Window& incumbent_window()
 EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm& realm)
 {
     // A principal realm has a [[HostDefined]] field, which contains the principal realm's settings object.
-    if (realm.host_defined()->is_principal_host_defined())
+    auto& host_defined = Bindings::host_defined_of(realm);
+    if (host_defined.is_principal_host_defined())
         return Bindings::principal_host_defined_environment_settings_object(realm);
 
-    auto& host_defined = static_cast<Bindings::HostDefined&>(*realm.host_defined());
     return Bindings::principal_host_defined_environment_settings_object(*host_defined.principal_realm);
 }
 
@@ -659,11 +687,15 @@ bool is_secure_context(Environment const& environment)
             return true;
     }
 
-    // 2. If the result of Is url potentially trustworthy? given environment's top-level creation URL is "Potentially Trustworthy", then return true.
+    // 2. If environment's top-level creation URL's scheme is "data", then return false.
+    if (environment.top_level_creation_url.value().scheme() == "data"sv)
+        return false;
+
+    // 3. If the result of Is url potentially trustworthy? given environment's top-level creation URL is "Potentially Trustworthy", then return true.
     if (SecureContexts::is_url_potentially_trustworthy(environment.top_level_creation_url.value()) == SecureContexts::Trustworthiness::PotentiallyTrustworthy)
         return true;
 
-    // 3. Return false.
+    // 4. Return false.
     return false;
 }
 
@@ -678,12 +710,14 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
 {
     auto serialized_global = [this]() -> SerializedGlobal {
         bool relevant_settings_object_is_secure_context = is_secure_context(*this);
+        auto relevant_settings_object_policy_container = policy_container()->serialize();
         auto& global = global_object();
         if (auto const* window = window_from_global_object(global)) {
             return SerializedWindow {
                 .associated_document {
                     .url = window->associated_document().url(),
                     .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
+                    .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
                 }
             };
         }
@@ -693,6 +727,7 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         auto supported_animation_frame_provider = dedicated_worker_global_scope && dedicated_worker_global_scope->is_supported();
         return SerializedWorkerGlobalScope {
             .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
+            .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
             .is_supported_animation_frame_provider = supported_animation_frame_provider,
         };
     }();
@@ -708,9 +743,56 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         .policy_container = policy_container()->serialize(),
         .cross_origin_isolated_capability = cross_origin_isolated_capability(),
         .agent_cluster_id = agent_cluster_id(),
+        .agent_cluster_cross_origin_isolation_mode = agent_cluster_cross_origin_isolation_mode(),
         .time_origin = this->time_origin(),
+        .insecure_requests_policy = insecure_requests_policy(),
+        .upgrade_insecure_navigations_set = upgrade_insecure_navigations_set(),
         .global = move(serialized_global),
     };
+}
+
+// https://w3c.github.io/webappsec-upgrade-insecure-requests/#delivery
+// AD-HOC: Enforcing the upgrade-insecure-requests directive sets the protected resource's settings' insecure requests
+//         policy to "Upgrade", and inserts a tuple of the protected resource's URL's host and port into settings'
+//         upgrade insecure navigations set. We instead derive both from the policies enforced in settings' policy
+//         container's CSP list, whether they were delivered with a response or by a meta element, and use each
+//         policy's self-origin as the protected resource's URL. Monitoring the directive has no effect, so only
+//         enforced policies count. The stored values hold what settings inherited.
+template<typename Callback>
+static void for_each_enforced_policy_with_upgrade_insecure_requests(EnvironmentSettingsObject const& settings, Callback callback)
+{
+    for (auto const& policy : settings.policy_container()->csp_list->policies()) {
+        if (policy->disposition() != ContentSecurityPolicy::Policy::Disposition::Enforce)
+            continue;
+        if (!policy->contains_directive_with_name(ContentSecurityPolicy::Directives::Names::UpgradeInsecureRequests))
+            continue;
+        if (callback(*policy) == IterationDecision::Break)
+            return;
+    }
+}
+
+UpgradeInsecureRequests::InsecureRequestsPolicy EnvironmentSettingsObject::insecure_requests_policy() const
+{
+    auto result = m_insecure_requests_policy;
+    if (result == UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade)
+        return result;
+    for_each_enforced_policy_with_upgrade_insecure_requests(*this, [&](auto const&) {
+        result = UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade;
+        return IterationDecision::Break;
+    });
+    return result;
+}
+
+UpgradeInsecureRequests::UpgradeInsecureNavigationsSet EnvironmentSettingsObject::upgrade_insecure_navigations_set() const
+{
+    auto result = m_upgrade_insecure_navigations_set;
+    for_each_enforced_policy_with_upgrade_insecure_requests(*this, [&](ContentSecurityPolicy::Policy const& policy) {
+        auto const& self_origin = policy.self_origin();
+        if (!self_origin.is_opaque())
+            result.insert({ self_origin.host(), self_origin.port() });
+        return IterationDecision::Continue;
+    });
+    return result;
 }
 
 GC::Ref<StorageAPI::StorageManager> EnvironmentSettingsObject::storage_manager()

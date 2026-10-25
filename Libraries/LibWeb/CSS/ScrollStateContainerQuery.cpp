@@ -30,11 +30,11 @@ static bool is_scroll_state_container(DOM::Element const& element)
 
 // The scrolling box a scroll-state(scrollable) or scroll-state(scrolled) query asks about. The root element's is the
 // viewport's.
-static Layout::Node* scrolling_box_of(DOM::Document& document, DOM::Element& element)
+static Layout::Node* scrolling_box_of(Layout::BegunRead const& read, DOM::Document& document, DOM::Element& element)
 {
     if (&element == document.document_element())
-        return document.unsafe_layout_node();
-    auto* layout_node = element.unsafe_layout_node();
+        return document.unsafe_layout_node(read);
+    auto* layout_node = element.unsafe_layout_node(read);
     if (!layout_node || !layout_node->is_scroll_container())
         return nullptr;
     return layout_node;
@@ -46,7 +46,7 @@ static u8 stuck_edges(DOM::Document& document, Layout::Node const& layout_node)
     auto const* node_with_style = as_if<Layout::NodeWithStyle>(layout_node);
     if (!node_with_style || !node_with_style->is_sticky_position())
         return 0;
-    auto sticky_node_index = Layout::RustFFI::layout_arena_sticky_spatial_node_index(layout_node.arena_handle(), Painting::committed_row_slot(layout_node));
+    auto sticky_node_index = Layout::RustFFI::render_state_sticky_spatial_node_index(layout_node.document_host(), Painting::committed_row_slot(layout_node));
     if (sticky_node_index == NumericLimits<u32>::max())
         return 0;
 
@@ -123,7 +123,7 @@ static StyleNodeID publish_scroll_state(DOM::Element& element, ScrollStateSnapsh
 {
     if (element.style_node_id() == 0)
         return {};
-    element.document().style_computer().style_engine().set_element_scroll_state(element.style_node_id(), snapshot.stuck, snapshot.snapped, snapshot.scrollable, snapshot.scrolled);
+    StyleEngineFFI::style_engine_set_element_scroll_state(element.document().style_computer().style_engine().host(), element.style_node_id(), snapshot.stuck, snapshot.snapped, snapshot.scrollable, snapshot.scrolled);
     return element.style_node_id();
 }
 
@@ -163,7 +163,7 @@ void ScrollStateQueryContainers::did_scroll_relatively(Layout::Node const& scrol
         m_viewport_last_relative_scroll_direction = direction;
 }
 
-bool ScrollStateQueryContainers::snapshot_post_layout_state(DOM::Document& document, Snapshot which)
+bool ScrollStateQueryContainers::snapshot_post_layout_state(Layout::BegunRead const& read, DOM::Document& document, Snapshot which)
 {
     if (m_containers.is_empty())
         return false;
@@ -173,7 +173,7 @@ bool ScrollStateQueryContainers::snapshot_post_layout_state(DOM::Document& docum
     // Sticky offsets are resolved with the scroll state of the settled visual context tree.
     document.update_paint_and_hit_testing_properties_if_needed();
 
-    Vector<GC::Ref<DOM::Element>> containers_to_forget;
+    GC::RootVector<GC::Ref<DOM::Element>> containers_to_forget;
     bool any_state_changed = false;
     for (auto& [element, container] : m_containers) {
         if (which == Snapshot::NewContainersOnly && container.has_been_snapshotted)
@@ -185,11 +185,11 @@ bool ScrollStateQueryContainers::snapshot_post_layout_state(DOM::Document& docum
         }
 
         ScrollStateSnapshot snapshot;
-        if (auto* layout_node = element->unsafe_layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+        if (auto* layout_node = element->unsafe_layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
             snapshot.stuck = stuck_edges(document, *layout_node);
             snapshot.snapped = snapped_axes(document, element, *layout_node);
         }
-        if (auto* scrolling_box = scrolling_box_of(document, element)) {
+        if (auto* scrolling_box = scrolling_box_of(read, document, element)) {
             snapshot.scrollable = scrollable_edges(*scrolling_box);
             snapshot.scrolled = scrolling_box->is_viewport() ? m_viewport_last_relative_scroll_direction : element->last_relative_scroll_direction();
         }

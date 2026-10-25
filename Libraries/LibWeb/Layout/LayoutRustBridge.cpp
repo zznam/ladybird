@@ -15,9 +15,11 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/LengthBox.h>
+#include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
+#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/CommitMessages.h>
@@ -37,6 +39,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/MathML/AttributeNames.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -137,13 +140,6 @@ static CSS::StyleAtomID svg_style_reference_fragment_atom(DOM::Element& element,
     return element.document().style_computer().style_engine().intern_atom(Utf16FlyString::from_utf16(fragment.utf16_view()));
 }
 
-static Optional<CSS::URL> svg_paint_url(Optional<CSS::SVGPaint> const& paint)
-{
-    if (!paint.has_value() || !paint->is_url())
-        return {};
-    return paint->as_url();
-}
-
 // The four resources `mask`, `clip-path`, `fill` and `stroke` name. Read from the record's group payloads rather than
 // through a materialized view: this runs for every SVG graphics element whose style record is replaced, and pinning a
 // record to look at four properties is most of the cost of looking at them.
@@ -158,13 +154,46 @@ static Array<CSS::StyleAtomID, 4> svg_style_reference_atoms(DOM::Element& elemen
     auto const* svg_payload = static_cast<CSS::ComputedValues::InheritedSVGValues const*>(payloads[CSS::ComputedValues::InheritedSVGValues::style_group_index]);
     if (!mask_payload || !svg_payload)
         return {};
-    auto const& mask = mask_payload->mask_value();
     return {
-        svg_style_reference_fragment_atom(element, mask.has_value() ? Optional<CSS::URL> { mask->url() } : OptionalNone {}),
+        svg_style_reference_fragment_atom(element, mask_payload->mask_url_value()),
         svg_style_reference_fragment_atom(element, mask_payload->clip_path_value()),
-        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->fill_value())),
-        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->stroke_value())),
+        svg_style_reference_fragment_atom(element, svg_payload->fill_url_value()),
+        svg_style_reference_fragment_atom(element, svg_payload->stroke_url_value()),
     };
+}
+
+RustFFI::FfiSvgAttributeFacts svg_geometry_facts(DOM::Element const& element)
+{
+    RustFFI::FfiSvgAttributeFacts facts {};
+    if (is<SVG::SVGPathElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_PATH;
+    else if (is<SVG::SVGRectElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_RECT;
+    else if (is<SVG::SVGCircleElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_CIRCLE;
+    else if (is<SVG::SVGEllipseElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_ELLIPSE;
+    else if (is<SVG::SVGPolylineElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYLINE;
+    else if (is<SVG::SVGPolygonElement>(element))
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYGON;
+    else if (auto const* line_element = as_if<SVG::SVGLineElement>(element)) {
+        facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_LINE;
+        facts.line_x1 = to_ffi_number_percentage(line_element->x1_value());
+        facts.line_y1 = to_ffi_number_percentage(line_element->y1_value());
+        facts.line_x2 = to_ffi_number_percentage(line_element->x2_value());
+        facts.line_y2 = to_ffi_number_percentage(line_element->y2_value());
+    }
+    return facts;
+}
+
+ReadonlySpan<Gfx::FloatPoint> svg_shape_points(DOM::Element const& element)
+{
+    if (auto const* polygon = as_if<SVG::SVGPolygonElement>(element))
+        return polygon->points();
+    if (auto const* polyline = as_if<SVG::SVGPolylineElement>(element))
+        return polyline->points();
+    return {};
 }
 
 // The SVG attributes an element parses, as the layout stage reads them.
@@ -212,31 +241,7 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
         pattern_height = pattern_element->pattern_height();
     }
 
-    auto geometry_kind = RustFFI::SVG_GEOMETRY_KIND_NONE;
-    if (is<SVG::SVGPathElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_PATH;
-    else if (is<SVG::SVGRectElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_RECT;
-    else if (is<SVG::SVGCircleElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_CIRCLE;
-    else if (is<SVG::SVGEllipseElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_ELLIPSE;
-    else if (is<SVG::SVGPolylineElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYLINE;
-    else if (is<SVG::SVGPolygonElement>(dom_node))
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYGON;
-
-    SVG::NumberPercentage line_x1 = SVG::NumberPercentage::create_number(0);
-    SVG::NumberPercentage line_y1 = SVG::NumberPercentage::create_number(0);
-    SVG::NumberPercentage line_x2 = SVG::NumberPercentage::create_number(0);
-    SVG::NumberPercentage line_y2 = SVG::NumberPercentage::create_number(0);
-    if (auto const* line_element = as_if<SVG::SVGLineElement>(dom_node)) {
-        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_LINE;
-        line_x1 = line_element->x1_value();
-        line_y1 = line_element->y1_value();
-        line_x2 = line_element->x2_value();
-        line_y2 = line_element->y2_value();
-    }
+    auto geometry = svg_geometry_facts(dom_node);
 
     SVG::SVGTextPositioningElement::ParsedTextPositioning text_positioning;
     if (auto const* text_positioning_element = as_if<SVG::SVGTextPositioningElement>(dom_node))
@@ -296,11 +301,11 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
         .mask_y = to_ffi_number_percentage(mask_y),
         .mask_width = to_ffi_number_percentage(mask_width),
         .mask_height = to_ffi_number_percentage(mask_height),
-        .geometry_kind = geometry_kind,
-        .line_x1 = to_ffi_number_percentage(line_x1),
-        .line_y1 = to_ffi_number_percentage(line_y1),
-        .line_x2 = to_ffi_number_percentage(line_x2),
-        .line_y2 = to_ffi_number_percentage(line_y2),
+        .geometry_kind = geometry.geometry_kind,
+        .line_x1 = geometry.line_x1,
+        .line_y1 = geometry.line_y1,
+        .line_x2 = geometry.line_x2,
+        .line_y2 = geometry.line_y2,
         .text_x = to_ffi_svg_length_value(text_positioning.x),
         .text_y = to_ffi_svg_length_value(text_positioning.y),
         .text_dx = to_ffi_svg_length_value(text_positioning.dx),
@@ -370,7 +375,7 @@ void publish_table_spans(DOM::Element const& element)
     } else {
         return;
     }
-    const_cast<DOM::Document&>(element.document()).style_computer().style_engine().set_element_table_spans(element.style_node_id(), column_span, row_span, raw_column_span);
+    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span, raw_column_span);
 }
 
 // The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
@@ -378,18 +383,108 @@ void publish_table_spans(DOM::Element const& element)
 void publish_svg_attribute_facts(DOM::Element& element)
 {
     VERIFY(element.style_node_id() != 0);
-    ReadonlySpan<Gfx::FloatPoint> points;
-    if (auto const* polygon = as_if<SVG::SVGPolygonElement>(element))
-        points = polygon->points();
-    else if (auto const* polyline = as_if<SVG::SVGPolylineElement>(element))
-        points = polyline->points();
+    auto points = svg_shape_points(element);
     static_assert(sizeof(Gfx::FloatPoint) == sizeof(RustFFI::FfiFloatPoint));
     RustFFI::render_state_set_svg_attribute_facts(
         element.document().layout_node_arena().host(),
         element.style_node_id().value(),
         build_svg_attribute_facts(element),
-        reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()),
-        points.size());
+        ReadonlySpan<RustFFI::FfiFloatPoint> { reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()), points.size() });
+}
+
+// The unit of a published MathML length. Mirrors Rust `math_length_unit`.
+enum class MathLengthUnit : u8 {
+    Absent,
+    Px,
+    Em,
+    Ex,
+    Percentage,
+};
+
+// The value of a published MathML boolean attribute. Mirrors Rust `math_boolean`.
+enum class MathBoolean : u8 {
+    Absent,
+    True,
+    False,
+};
+
+static RustFFI::FfiMathLength math_length_attribute(DOM::Element const& element, Utf16FlyString const& name)
+{
+    auto value = element.attribute(name);
+    if (!value.has_value())
+        return {};
+    auto style_value = parse_css_type(CSS::Parser::ParsingParams { element.document() }, value->utf16_view(), CSS::ValueType::LengthPercentage);
+    if (!style_value)
+        return {};
+    if (style_value->is_percentage())
+        return { to_underlying(MathLengthUnit::Percentage), static_cast<float>(style_value->as_percentage().percentage().value()) };
+    if (!style_value->is_length())
+        return {};
+    auto const& length = style_value->as_length().length();
+    if (length.is_absolute())
+        return { to_underlying(MathLengthUnit::Px), static_cast<float>(length.absolute_length_to_px_without_rounding()) };
+    if (length.unit() == CSS::LengthUnit::Em)
+        return { to_underlying(MathLengthUnit::Em), static_cast<float>(length.raw_value()) };
+    if (length.unit() == CSS::LengthUnit::Ex)
+        return { to_underlying(MathLengthUnit::Ex), static_cast<float>(length.raw_value()) };
+    // FIXME: Publish the other relative lengths, which resolve against the box that reads them.
+    return {};
+}
+
+static u8 math_boolean_attribute(DOM::Element const& element, Utf16FlyString const& name)
+{
+    auto value = element.attribute(name);
+    if (!value.has_value())
+        return to_underlying(MathBoolean::Absent);
+    if (value->equals_ignoring_ascii_case("true"sv))
+        return to_underlying(MathBoolean::True);
+    if (value->equals_ignoring_ascii_case("false"sv))
+        return to_underlying(MathBoolean::False);
+    return to_underlying(MathBoolean::Absent);
+}
+
+// https://w3c.github.io/mathml-core/#dfn-form
+static u8 math_form_attribute(DOM::Element const& element)
+{
+    auto value = element.attribute(MathML::AttributeNames::form);
+    if (!value.has_value())
+        return 0;
+    // The corresponding form attribute on the <mo> element, if present, must be an ASCII case-insensitive match to
+    // one of these values.
+    // NB: The published form is one plus Rust's `OperatorForm`.
+    if (value->equals_ignoring_ascii_case("infix"sv))
+        return 1;
+    if (value->equals_ignoring_ascii_case("prefix"sv))
+        return 2;
+    if (value->equals_ignoring_ascii_case("postfix"sv))
+        return 3;
+    return 0;
+}
+
+void publish_math_attribute_facts(DOM::Element const& element)
+{
+    if (element.style_node_id().value() == 0)
+        return;
+    namespace AttributeNames = MathML::AttributeNames;
+    RustFFI::FfiMathAttributeFacts facts {
+        .width = math_length_attribute(element, AttributeNames::width),
+        .height = math_length_attribute(element, AttributeNames::height),
+        .depth = math_length_attribute(element, AttributeNames::depth),
+        .lspace = math_length_attribute(element, AttributeNames::lspace),
+        .rspace = math_length_attribute(element, AttributeNames::rspace),
+        .voffset = math_length_attribute(element, AttributeNames::voffset),
+        .linethickness = math_length_attribute(element, AttributeNames::linethickness),
+        .minsize = math_length_attribute(element, AttributeNames::minsize),
+        .maxsize = math_length_attribute(element, AttributeNames::maxsize),
+        .form = math_form_attribute(element),
+        .stretchy = math_boolean_attribute(element, AttributeNames::stretchy),
+        .symmetric = math_boolean_attribute(element, AttributeNames::symmetric),
+        .largeop = math_boolean_attribute(element, AttributeNames::largeop),
+        .movablelimits = math_boolean_attribute(element, AttributeNames::movablelimits),
+        .accent = math_boolean_attribute(element, AttributeNames::accent),
+        .accentunder = math_boolean_attribute(element, AttributeNames::accentunder),
+    };
+    RustFFI::render_state_set_math_attribute_facts(const_cast<DOM::Document&>(element.document()).layout_node_arena().host(), element.style_node_id().value(), facts);
 }
 
 // Republished on its own when an element's style record is replaced: the presentation attributes it sits beside are
@@ -426,12 +521,12 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     static_assert(to_underlying(SVG::SVGUnits::UserSpaceOnUse) == 1);
     RustFFI::FfiLayoutHostCallbacks callbacks {
         .context = &document,
-        .deliver_commit_messages = [](void* context, RustFFI::FfiCommitMessage const* messages, size_t count) {
+        .deliver_commit_messages = [](void* context, BegunRead const* read, RustFFI::FfiCommitMessage const* messages, size_t count) {
             auto& commit_messages = static_cast<DOM::Document*>(context)->commit_messages();
             for (size_t index = 0; index < count; ++index)
-                commit_messages.append(messages[index]);
+                commit_messages.append(*read, messages[index]);
             // The pass that produced them reads back what they change before it ends.
-            commit_messages.apply(); },
+            commit_messages.apply(*read); },
         .container_length_bases = [](void* document_pointer, u32 style_node) -> RustFFI::FfiContainerLengthBases {
             auto& document = *static_cast<DOM::Document*>(document_pointer);
             auto element = document.style_computer().element_for_style_node(style_node);
@@ -441,48 +536,15 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
                 .width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context),
                 .height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context),
             }; },
-        .take_built_scroll_containers = [](void* context, RustFFI::FfiBuiltScrollContainer const* built, size_t count) {
+        .take_built_scroll_containers = [](void* context, BegunRead const* read, RustFFI::FfiBuiltScrollContainer const* built, size_t count) {
             auto& document = *static_cast<DOM::Document*>(context);
             for (auto const& scroll_container : ReadonlySpan<RustFFI::FfiBuiltScrollContainer> { built, count })
-                Painting::take_built_scroll_container(document, scroll_container.slot, scroll_container.is_scroll_snap_container); },
+                Painting::take_built_scroll_container(*read, document, scroll_container.slot, scroll_container.is_scroll_snap_container); },
     };
-    RustFFI::layout_arena_set_layout_host_callbacks(arena.handle(), callbacks);
+    RustFFI::document_host_set_layout_host_callbacks(arena.host(), callbacks);
     RustFFI::render_state_set_document_is_decoded_svg(arena.host(), document.is_decoded_svg());
 }
 
-}
-
-extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32 code_point)
-{
-    return static_cast<u8>(to_underlying(Web::Layout::text_type_for_code_point(code_point)));
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::ComplexContext,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::Ambiguous,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32 code_point)
-{
-    return Unicode::line_break_class(code_point) == Unicode::LineBreakClass::CombiningMark;
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32 code_point)
-{
-    return Unicode::code_point_has_emoji_property(code_point);
 }
 
 extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32 code_point)

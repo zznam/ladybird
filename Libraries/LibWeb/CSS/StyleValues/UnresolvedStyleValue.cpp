@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/ConservativeVector.h>
 #include <LibWeb/CSS/CSSUnparsedValue.h>
 #include <LibWeb/CSS/CSSVariableReferenceValue.h>
 #include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
@@ -63,23 +64,6 @@ ValueComparingNonnullRefPtr<UnresolvedStyleValue const> UnresolvedStyleValue::cr
     return create_internal(move(token_source), substitution_presence, move(original_source_text), source_text_mode, true, move(parsed_value));
 }
 
-Utf16String UnresolvedStyleValue::serialize_components(u8 mode) const
-{
-    auto text = StyleValueFFI::rust_unresolved_style_value_serialize_components(rust_style_value_data(), mode);
-    VERIFY(text);
-    return Utf16String::adopt_raw(text);
-}
-
-Utf16String UnresolvedStyleValue::serialized_components() const
-{
-    return serialize_components(0);
-}
-
-Utf16String UnresolvedStyleValue::token_source() const
-{
-    return serialize_components(2);
-}
-
 bool UnresolvedStyleValue::equals(StyleValue const& other) const
 {
     if (type() != other.type())
@@ -96,7 +80,7 @@ GC::Ref<CSSStyleValue> UnresolvedStyleValue::reify(Utf16FlyString const&) const
     struct Frame {
         Optional<Utf16FlyString> variable;
         bool has_fallback { false };
-        Vector<CSSUnparsedSegment> segments;
+        GC::ConservativeVector<CSSUnparsedSegment> segments;
     };
     Vector<Frame> frames;
     frames.empend();

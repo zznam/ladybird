@@ -10,6 +10,7 @@
 #include <AK/NumericLimits.h>
 #include <AK/Utf16String.h>
 #include <AK/kmalloc.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibCrypto/Hash/SHA2.h>
@@ -17,10 +18,8 @@
 #include <LibGC/Heap.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
-#include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Runtime/ModuleRequest.h>
-#include <LibJS/Runtime/SharedFunctionInstanceData.h>
-#include <LibJS/RustIntegration.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibJS/SourceCode.h>
 #include <LibRequests/RequestClient.h>
 #include <LibTextCodec/Decoder.h>
@@ -35,7 +34,6 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
@@ -47,37 +45,16 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/WebAssembly/WebAssemblyModule.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 
 namespace Web::HTML {
 
-class ParsedProgramForCache {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit ParsedProgramForCache(JS::FFI::ParsedProgram* program)
-        : m_program(program)
-    {
-    }
-
-    ~ParsedProgramForCache()
-    {
-        if (m_program)
-            JS::RustIntegration::free_parsed_program(m_program);
-    }
-
-    JS::FFI::ParsedProgram* release() { return exchange(m_program, nullptr); }
-
-private:
-    JS::FFI::ParsedProgram* m_program;
-};
-
 struct OffThreadCompiledProgram {
-    JS::FFI::ParsedProgram* parsed { nullptr };
-    JS::FFI::CompiledProgram* compiled { nullptr };
-    OwnPtr<ParsedProgramForCache> cache_parse {};
+    JS::ParsedProgram parsed {};
+    JS::CompiledProgram compiled {};
+    JS::ParsedProgram cache_parse {};
 };
 
 struct BytecodeCacheContext {
@@ -86,7 +63,7 @@ struct BytecodeCacheContext {
     NonnullRefPtr<HTTP::HeaderList> request_headers;
     RefPtr<HTTP::HeaderList> memory_cache_request_headers;
     u64 vary_key { 0 };
-    Optional<Fetch::Infrastructure::NetworkPartitionKey> memory_cache_partition_key;
+    Optional<HTTP::NetworkIsolationKey> network_isolation_key;
 };
 
 using BytecodeCacheSourceHash = ::Crypto::Hash::Digest<::Crypto::Hash::SHA256::DigestSize * 8>;
@@ -111,19 +88,19 @@ struct BytecodeCacheInstallTarget {
             module_record->finish_bytecode_cache_generation_without_install();
     }
 
-    void install_generated_bytecode_cache(JS::RustIntegration::ProgramType type, NonnullRefPtr<JS::SourceCode const> source_code, ::Crypto::Hash::Digest<::Crypto::Hash::SHA256::DigestSize * 8> const& source_hash, Core::ImmutableBytes blob)
+    void install_generated_bytecode_cache(JS::ProgramType type, NonnullRefPtr<JS::SourceCode const> source_code, ::Crypto::Hash::Digest<::Crypto::Hash::SHA256::DigestSize * 8> const& source_hash, Core::ImmutableBytes blob)
     {
         switch (type) {
-        case JS::RustIntegration::ProgramType::Script:
+        case JS::ProgramType::Script:
             if (auto script_record = script.ptr()) {
-                auto bytecode_cache = JS::RustIntegration::DecodedBytecodeCache::create(move(blob), type, source_hash.bytes());
+                auto bytecode_cache = JS::DecodedBytecodeCache::create(move(blob), type, source_hash.bytes());
                 VERIFY(bytecode_cache);
                 script_record->install_generated_bytecode_cache(bytecode_cache.release_nonnull(), move(source_code));
             }
             return;
-        case JS::RustIntegration::ProgramType::Module:
+        case JS::ProgramType::Module:
             if (auto module_record = module.ptr()) {
-                auto bytecode_cache = JS::RustIntegration::DecodedBytecodeCache::create(move(blob), type, source_hash.bytes());
+                auto bytecode_cache = JS::DecodedBytecodeCache::create(move(blob), type, source_hash.bytes());
                 VERIFY(bytecode_cache);
                 module_record->install_generated_bytecode_cache(bytecode_cache.release_nonnull(), move(source_code));
             }
@@ -149,16 +126,6 @@ static BytecodeCacheSourceHash bytecode_cache_source_hash(ReadonlyBytes source_b
     hasher->update(encoded_length.span());
     hasher->update(standardized_encoding);
     return hasher->digest();
-}
-
-static ErrorOr<Utf16String> decode_source_text_to_utf16(TextCodec::Decoder& fallback_decoder, StringView input)
-{
-    return TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(fallback_decoder, input);
-}
-
-static ErrorOr<Utf16String> decode_source_text_to_utf16(TextCodec::Decoder& fallback_decoder, ReadonlyBytes bytes)
-{
-    return decode_source_text_to_utf16(fallback_decoder, StringView { bytes });
 }
 
 static ReadonlyBytes body_bytes_view(Fetch::Infrastructure::FetchAlgorithms::BodyBytes const& body_bytes)
@@ -193,7 +160,7 @@ static Optional<BytecodeCacheContext> bytecode_cache_context_for_request(Fetch::
         .request_headers = HTTP::HeaderList::create(request.header_list()->headers()),
         .memory_cache_request_headers = move(memory_cache_request_headers),
         .vary_key = *vary_key,
-        .memory_cache_partition_key = Fetch::Infrastructure::determine_the_network_partition_key(request),
+        .network_isolation_key = Fetch::Infrastructure::determine_the_network_partition_key(request),
     };
 }
 
@@ -202,35 +169,68 @@ static Optional<BytecodeCacheContext> bytecode_cache_context_for_request(Fetch::
 // entirely on a background thread and never blocks the main thread on cache generation.
 // NB: The execution-path compile only eagerly generates top-level bytecode plus direct IIFEs. Retain a parse snapshot
 //     for the cache compilation, which compiles every nested function, instead of parsing the same source again. Once
-//     the blob is back on the main thread, try to install it into the live script/module before storing it.
-static void schedule_bytecode_cache_generation(OwnPtr<ParsedProgramForCache> cache_parse, NonnullRefPtr<JS::SourceCode const> original_source_code, JS::RustIntegration::ProgramType type, BytecodeCacheContext cache_context, BytecodeCacheInstallTarget install_target, BytecodeCacheSourceHash source_hash)
+//     the blob is back on the main thread, store it, and install the cache's mapping of it into the live script/module.
+static void schedule_bytecode_cache_generation(JS::ParsedProgram cache_parse, NonnullRefPtr<JS::SourceCode const> original_source_code, JS::ProgramType type, BytecodeCacheContext cache_context, BytecodeCacheInstallTarget install_target, BytecodeCacheSourceHash source_hash)
 {
     VERIFY(cache_parse);
-    auto source_length = original_source_code->length_in_code_units();
     auto& main_thread_event_loop = Core::EventLoop::current();
-    auto* callback = new Function<void(ByteBuffer, BytecodeCacheSourceHash)>(
-        [cache_context = move(cache_context), install_target = move(install_target), original_source_code = move(original_source_code), type](ByteBuffer blob, auto source_hash) mutable {
-            if (blob.is_empty()) {
+    auto* callback = new Function<void(Optional<Core::AnonymousBuffer>, BytecodeCacheSourceHash)>(
+        [cache_context = move(cache_context), install_target = move(install_target), original_source_code = move(original_source_code), type](Optional<Core::AnonymousBuffer> blob, auto source_hash) mutable {
+            if (!blob.has_value()) {
                 install_target.finish_generation_without_install();
                 return;
             }
 
-            auto immutable_blob = Core::ImmutableBytes::adopt(move(blob));
-            install_target.install_generated_bytecode_cache(type, original_source_code, source_hash, immutable_blob);
+            // The cache didn't take the blob (an uncacheable response, the cache disabled, or no RequestServer at all),
+            // so the script keeps a heap copy of it as the only copy there is.
+            auto install_heap_copy = [&]() -> Core::ImmutableBytes {
+                auto copy = ByteBuffer::copy(blob->bytes());
+                if (copy.is_error()) {
+                    install_target.finish_generation_without_install();
+                    return {};
+                }
+                auto heap_blob = Core::ImmutableBytes::adopt(copy.release_value());
+                install_target.install_generated_bytecode_cache(type, original_source_code, source_hash, heap_blob);
+                return heap_blob;
+            };
 
-            if (!ResourceLoader::is_initialized() || !ResourceLoader::the().request_client())
+            if (!ResourceLoader::is_initialized() || !ResourceLoader::the().request_client()) {
+                install_heap_copy();
                 return;
-            (void)ResourceLoader::the().request_client()->store_cache_associated_data(cache_context.url, cache_context.method, *cache_context.request_headers, cache_context.vary_key, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, immutable_blob.bytes());
-            if (cache_context.memory_cache_partition_key.has_value() && cache_context.memory_cache_request_headers)
-                Fetch::Fetching::update_javascript_bytecode_cache_in_http_memory_cache(*cache_context.memory_cache_partition_key, cache_context.url, cache_context.method, *cache_context.memory_cache_request_headers, cache_context.vary_key, immutable_blob);
+            }
+
+            // Store the blob before installing it, and install the stored copy: that copy is a read-only mapping of the
+            // cache's file, so the bytes backing the script's executables are file-backed and reclaimable for the life
+            // of the script, exactly as they are when a later load reads the blob back from the cache. The shared
+            // buffer the blob arrived in goes to RequestServer as it is, and is unmapped once the store returns.
+            Core::ImmutableBytes installed_blob;
+            auto stored_blob = ResourceLoader::the().request_client()->store_cache_associated_data(cache_context.network_isolation_key, cache_context.url, cache_context.method, *cache_context.request_headers, cache_context.vary_key, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, *blob);
+            if (!stored_blob.is_error() && stored_blob.value().has_value()) {
+                installed_blob = stored_blob.release_value().release_value();
+                install_target.install_generated_bytecode_cache(type, original_source_code, source_hash, installed_blob);
+            } else {
+                installed_blob = install_heap_copy();
+            }
+            if (!installed_blob.is_valid())
+                return;
+
+            auto memory_cache_partition = cache_context.network_isolation_key.has_value() ? cache_context.network_isolation_key->disk_cache_partition() : OptionalNone {};
+            if (memory_cache_partition.has_value() && cache_context.memory_cache_request_headers)
+                Fetch::Fetching::update_javascript_bytecode_cache_in_http_memory_cache(*memory_cache_partition, cache_context.url, cache_context.method, *cache_context.memory_cache_request_headers, cache_context.vary_key, installed_blob);
         });
 
-    Threading::ThreadPool::the().submit([cache_parse = move(cache_parse), source_length, type, callback, &main_thread_event_loop, source_hash]() mutable {
-        ByteBuffer blob;
-        auto* compiled = JS::RustIntegration::compile_parsed_program_fully_off_thread(cache_parse->release(), source_length);
-        if (compiled) {
-            blob = JS::RustIntegration::serialize_compiled_program_for_bytecode_cache(*compiled, type, source_hash.bytes());
-            JS::RustIntegration::free_compiled_program(compiled);
+    Threading::ThreadPool::the().submit([cache_parse = move(cache_parse), type, callback, &main_thread_event_loop, source_hash]() mutable {
+        // The serialized blob crosses to the main thread in shared memory, which RequestServer then maps as it is, and
+        // the heap buffer it was serialized into dies here, on the thread that allocated it.
+        Optional<Core::AnonymousBuffer> blob;
+        if (auto compiled = JS::CompiledProgram::compile_all_functions(move(cache_parse))) {
+            auto serialized = compiled.serialize_for_bytecode_cache(type, source_hash.bytes());
+            if (!serialized.is_empty()) {
+                if (auto buffer = Core::AnonymousBuffer::create_with_size(serialized.size()); !buffer.is_error()) {
+                    memcpy(buffer.value().data<void>(), serialized.data(), serialized.size());
+                    blob = buffer.release_value();
+                }
+            }
         }
 
         main_thread_event_loop.deferred_invoke([blob = move(blob), source_hash, callback]() mutable {
@@ -240,87 +240,23 @@ static void schedule_bytecode_cache_generation(OwnPtr<ParsedProgramForCache> cac
     });
 }
 
-static void compile_remaining_functions_off_thread(JS::Bytecode::Executable& executable, NonnullRefPtr<JS::SourceCode const> source_code)
+static JS::OffThreadCompilationCallbacks thread_pool_compilation_callbacks()
 {
-    Vector<GC::Root<JS::SharedFunctionInstanceData>> shared_data_roots;
-    Vector<void*> function_asts;
-
-    for (auto& shared_data : executable.shared_function_data) {
-        if (!shared_data || shared_data->m_executable || !shared_data->m_rust_function_ast)
-            continue;
-
-        auto* cloned_ast = JS::RustIntegration::clone_function_ast(shared_data->m_rust_function_ast);
-        if (!cloned_ast)
-            continue;
-
-        shared_data_roots.append(GC::make_root(*shared_data));
-        function_asts.append(cloned_ast);
-    }
-
-    if (function_asts.is_empty())
-        return;
-
-    auto length = source_code->length_in_code_units();
-    auto* callback = new Function<void(Vector<JS::FFI::CompiledFunction*>)>(
-        [shared_data_roots = move(shared_data_roots), source_code = move(source_code)](Vector<JS::FFI::CompiledFunction*> compiled_functions) mutable {
-            VERIFY(compiled_functions.size() == shared_data_roots.size());
-            auto& vm = Bindings::main_thread_vm();
-            for (size_t i = 0; i < compiled_functions.size(); ++i) {
-                auto* compiled_function = compiled_functions[i];
-                if (!compiled_function)
-                    continue;
-
-                auto& shared_data = *shared_data_roots[i];
-                if (shared_data.m_executable) {
-                    compile_remaining_functions_off_thread(*shared_data.m_executable, source_code);
-                    JS::RustIntegration::free_compiled_function(compiled_function);
-                    continue;
-                }
-
-                // Bytecode-cache installation may have cleared this while the worker compiled an AST clone.
-                if (!shared_data.m_rust_function_ast) {
-                    JS::RustIntegration::free_compiled_function(compiled_function);
-                    continue;
-                }
-
-                JS::RustIntegration::materialize_compiled_function(compiled_function, vm, *source_code, shared_data);
-            }
-        });
-
     auto& main_thread_event_loop = Core::EventLoop::current();
-
-    Threading::ThreadPool::the().submit([function_asts = move(function_asts), length,
-                                            callback,
-                                            &main_thread_event_loop]() mutable {
-        Vector<JS::FFI::CompiledFunction*> compiled_functions;
-        compiled_functions.ensure_capacity(function_asts.size());
-        for (auto* function_ast : function_asts)
-            compiled_functions.append(JS::RustIntegration::compile_function_off_thread(function_ast, length, false));
-
-        main_thread_event_loop.deferred_invoke([compiled_functions = move(compiled_functions), callback]() mutable {
-            (*callback)(move(compiled_functions));
-            delete callback;
-        });
-    });
+    return {
+        .submit_work = [](Function<void()> work) { Threading::ThreadPool::the().submit(move(work)); },
+        .post_to_main_thread = [&main_thread_event_loop](Function<void()> task) { main_thread_event_loop.deferred_invoke(move(task)); },
+    };
 }
 
 static void compile_remaining_module_functions_off_thread(ModuleScript& module_script, NonnullRefPtr<JS::SourceCode const> source_code)
 {
     module_script.record().visit(
-        [](Empty) {},
-        [](GC::Ref<JS::SyntheticModule>) {},
-        [](GC::Ref<WebAssembly::WebAssemblyModule>) {},
+        [](Empty) { },
+        [](GC::Ref<JS::SyntheticModule>) { },
+        [](GC::Ref<JS::HostModule>) { },
         [source_code = move(source_code)](GC::Ref<JS::SourceTextModule> module) mutable {
-            if (auto* executable = module->cached_executable()) {
-                compile_remaining_functions_off_thread(*executable, source_code);
-                return;
-            }
-
-            auto* top_level_await_shared_data = module->top_level_await_shared_data();
-            if (!top_level_await_shared_data || !top_level_await_shared_data->m_executable)
-                return;
-
-            compile_remaining_functions_off_thread(*top_level_await_shared_data->m_executable, source_code);
+            JS::compile_remaining_functions_off_thread(*module, move(source_code), thread_pool_compilation_callbacks());
         });
 }
 
@@ -328,71 +264,75 @@ struct BytecodeCachePreparation {
     AK_ALLOC_WITH_KMALLOC;
 
     Core::ImmutableBytes bytecode;
-    Function<void(RefPtr<JS::RustIntegration::DecodedBytecodeCache>)> on_prepared;
+    Function<void(RefPtr<JS::DecodedBytecodeCache>)> on_prepared;
 };
 
-static void prepare_bytecode_cache_off_thread(Core::ImmutableBytes bytecode, JS::RustIntegration::ProgramType type, size_t source_length, BytecodeCacheSourceHash source_hash, Function<void(RefPtr<JS::RustIntegration::DecodedBytecodeCache>)> on_prepared)
+static void prepare_bytecode_cache_off_thread(EnvironmentSettingsObject& settings_object, Core::ImmutableBytes bytecode, JS::ProgramType type, size_t source_length, BytecodeCacheSourceHash source_hash, Function<void(RefPtr<JS::DecodedBytecodeCache>)> on_prepared)
 {
-    auto* preparation = new BytecodeCachePreparation { move(bytecode), move(on_prepared) };
+    // The script runs in a task of the settings object's global, so never beside a rendering update in flight that holds
+    // back the tasks of its document.
+    auto* preparation = new BytecodeCachePreparation { move(bytecode),
+        [settings_object = GC::make_root(settings_object), on_prepared = move(on_prepared)](RefPtr<JS::DecodedBytecodeCache> bytecode_cache) mutable {
+            queue_global_task(Task::Source::Networking, settings_object->global_object(), GC::create_function(GC::Heap::the(), [on_prepared = move(on_prepared), bytecode_cache = move(bytecode_cache)]() mutable {
+                // NB: The callback holds GC roots. Release them as the task runs: the roots of a function that died
+                //     would keep what they root alive through the collection that finds it dead.
+                auto steps = move(on_prepared);
+                steps(move(bytecode_cache));
+            }));
+        } };
     auto& main_thread_event_loop = Core::EventLoop::current();
 
     Threading::ThreadPool::the().submit([preparation, type, source_length, source_hash, &main_thread_event_loop]() mutable {
-        auto* bytecode_cache_blob = JS::RustIntegration::decode_bytecode_cache_blob(move(preparation->bytecode), type, source_hash.bytes(), main_thread_event_loop);
-        if (bytecode_cache_blob && !JS::RustIntegration::validate_decoded_bytecode_cache_blob(bytecode_cache_blob, source_length)) {
-            JS::RustIntegration::free_decoded_bytecode_cache_blob(bytecode_cache_blob);
-            bytecode_cache_blob = nullptr;
-        }
+        auto bytecode_cache = JS::decode_and_validate_bytecode_cache(move(preparation->bytecode), type, source_hash.bytes(), source_length, main_thread_event_loop);
 
-        main_thread_event_loop.deferred_invoke([bytecode_cache_blob, preparation]() mutable {
-            RefPtr<JS::RustIntegration::DecodedBytecodeCache> bytecode_cache;
-            if (bytecode_cache_blob)
-                bytecode_cache = JS::RustIntegration::DecodedBytecodeCache::create(bytecode_cache_blob);
+        main_thread_event_loop.deferred_invoke([bytecode_cache = move(bytecode_cache), preparation]() mutable {
             preparation->on_prepared(move(bytecode_cache));
             delete preparation;
-            perform_a_microtask_checkpoint();
         });
     });
 }
 
 // Submit parsing and top-level bytecode generation to the thread pool, then bounce back to the main thread via
-// deferred_invoke once the worker is done. Syntax errors still come back as a ParsedProgram so the main thread can
-// report them through the same Script/ModuleScript construction paths; successful programs come back as CompiledProgram
-// artifacts whose GC-backed Executable materialization must still happen on the main thread.
+// deferred_invoke once the worker is done, and on to a task of the settings object's global there. Syntax errors still
+// come back as a ParsedProgram so the main thread can report them through the same Script/ModuleScript construction
+// paths; successful programs come back as CompiledProgram artifacts whose GC-backed Executable materialization must
+// still happen on the main thread.
 // NB: The SourceCode stays on the main thread inside the heap-allocated callback. The worker thread only receives raw
 //     UTF-16 data pointers.
-static void compile_off_thread(NonnullRefPtr<JS::SourceCode const> source_code, JS::RustIntegration::ProgramType type, size_t line_number_offset, bool retain_parse_for_cache, Function<void(OffThreadCompiledProgram, NonnullRefPtr<JS::SourceCode const>)> on_compiled)
+static void compile_off_thread(EnvironmentSettingsObject& settings_object, NonnullRefPtr<JS::SourceCode const> source_code, JS::ProgramType type, size_t line_number_offset, bool retain_parse_for_cache, Function<void(OffThreadCompiledProgram, NonnullRefPtr<JS::SourceCode const>)> on_compiled)
 {
     // Extract the raw data the parser needs while still on the main thread.
-    auto const* utf16_data = source_code->utf16_data();
-    auto length = source_code->length_in_code_units();
+    ReadonlySpan<u16> source_text { source_code->utf16_data(), source_code->length_in_code_units() };
 
     // Capture source_code in the callback so it stays alive on the main thread and is available for materialization.
+    // The script runs in a task of the settings object's global, so never beside a rendering update in flight that holds
+    // back the tasks of its document, and the microtasks it queues (e.g. promise reactions from react_to_promise during
+    // module linking) are drained after it.
     auto* callback = new Function<void(OffThreadCompiledProgram)>(
-        [on_compiled = move(on_compiled), source_code = move(source_code)](OffThreadCompiledProgram result) mutable {
-            on_compiled(move(result), move(source_code));
+        [settings_object = GC::make_root(settings_object), on_compiled = move(on_compiled), source_code = move(source_code)](OffThreadCompiledProgram result) mutable {
+            queue_global_task(Task::Source::Networking, settings_object->global_object(), GC::create_function(GC::Heap::the(), [on_compiled = move(on_compiled), source_code = move(source_code), result = move(result)]() mutable {
+                // NB: The callback holds GC roots. Release them as the task runs: the roots of a function that died
+                //     would keep what they root alive through the collection that finds it dead.
+                auto steps = move(on_compiled);
+                steps(move(result), move(source_code));
+            }));
         });
 
     auto& main_thread_event_loop = Core::EventLoop::current();
 
-    Threading::ThreadPool::the().submit([utf16_data, length, type, line_number_offset, retain_parse_for_cache,
+    Threading::ThreadPool::the().submit([source_text, type, line_number_offset, retain_parse_for_cache,
                                             callback,
                                             &main_thread_event_loop]() {
-        auto* parsed = JS::RustIntegration::parse_program(utf16_data, length, type, line_number_offset);
-        OffThreadCompiledProgram result { .parsed = parsed };
-        if (parsed && !JS::RustIntegration::parsed_program_has_errors(parsed)) {
+        OffThreadCompiledProgram result { .parsed = JS::ParsedProgram::parse(source_text, type, line_number_offset) };
+        if (result.parsed && !result.parsed.has_errors()) {
             if (retain_parse_for_cache)
-                result.cache_parse = make<ParsedProgramForCache>(JS::RustIntegration::clone_parsed_program(parsed));
-            result.compiled = JS::RustIntegration::compile_parsed_program_off_thread(parsed, length);
-            result.parsed = nullptr;
+                result.cache_parse = result.parsed.clone();
+            result.compiled = JS::CompiledProgram::compile(move(result.parsed));
         }
 
         main_thread_event_loop.deferred_invoke([result = move(result), callback]() mutable {
             (*callback)(move(result));
             delete callback;
-            // AD-HOC: Perform a microtask checkpoint so that any microtasks queued by the callback (e.g. promise
-            //         reactions from react_to_promise during module linking) are drained. Without this, module worker
-            //         scripts would stall because their promise chains never resolve.
-            perform_a_microtask_checkpoint();
         });
     });
 }
@@ -685,11 +625,14 @@ ScriptFetchOptions get_descendant_script_fetch_options(ScriptFetchOptions const&
 Utf16String resolve_a_module_integrity_metadata(URL::URL const& url, EnvironmentSettingsObject& settings_object)
 {
     // 1. Let map be settingsObject's global object's import map.
-    auto map = relevant_window_or_worker_global_scope(settings_object.global_object()).import_map();
+    // NB: Only a Window's import map is ever modified from the initial empty one.
+    auto const* window = window_from_global_object(settings_object.global_object());
+    if (!window)
+        return {};
 
     // 2. If map's integrity[url] does not exist, then return the empty string.
     // 3. Return map's integrity[url].
-    return map.integrity().get(url).value_or(""_utf16);
+    return window->import_map().integrity().get(url).value_or(""_utf16);
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#fetch-a-classic-script
@@ -706,6 +649,14 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
 
     // 4. Set up the classic script request given request and options.
     set_up_classic_script_request(*request, options);
+
+    // NB: The script is created in several places below. They all hand it to onComplete, which is where we set its
+    //     fetch options to options.
+    on_complete = create_on_fetch_script_complete(GC::Heap::the(), [options, on_complete](GC::Ptr<Script> script) {
+        if (script)
+            script->set_fetch_options(options);
+        on_complete->function()(script);
+    });
 
     // 5. Fetch request with the following processResponseConsumeBody steps given response response and null, failure,
     //    or a byte sequence bodyBytes:
@@ -742,7 +693,6 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
 
         // 7. Let script be the result of creating a classic script given source text, settings object's realm, response's URL,
         //    options, and muted errors.
-        // FIXME: Pass options.
         auto response_url = response->url().value_or({});
 
         auto on_complete_root = GC::make_root(on_complete);
@@ -761,8 +711,8 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
         // materialize a script straight from the validated cached bytecode without parsing or compiling.
         if (bytecode.has_value()) {
             auto source_encoding = ByteString { extracted_character_encoding };
-            auto source_length = TextCodec::convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(*fallback_decoder, StringView { source_bytes }).release_value_but_fixme_should_propagate_errors();
-            prepare_bytecode_cache_off_thread(*bytecode, JS::RustIntegration::ProgramType::Script, source_length, *source_hash,
+            auto source_length = TextCodec::decoded_length_in_utf16_code_units(source_bytes, *fallback_decoder).release_value_but_fixme_should_propagate_errors();
+            prepare_bytecode_cache_off_thread(settings_object, *bytecode, JS::ProgramType::Script, source_length, *source_hash,
                 [response_url = move(response_url), response_url_string = move(response_url_string),
                     source_byte_storage = move(source_byte_storage),
                     bytecode_cache_context = move(bytecode_cache_context),
@@ -791,11 +741,12 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
                         VERIFY(fallback_decoder.has_value());
                         source_code = JS::SourceCode::create(
                             utf16_string_from_url_ascii(response_url_string.view()),
-                            decode_source_text_to_utf16(*fallback_decoder, source_byte_storage.bytes()).release_value_but_fixme_should_propagate_errors());
+                            TextCodec::decode_to_utf16(source_byte_storage.bytes(), *fallback_decoder).release_value_but_fixme_should_propagate_errors());
                     }
 
                     auto retain_parse_for_cache = bytecode_cache_context.has_value();
-                    compile_off_thread(source_code.release_value(), JS::RustIntegration::ProgramType::Script, 1, retain_parse_for_cache,
+                    auto& settings = *settings_root;
+                    compile_off_thread(settings, source_code.release_value(), JS::ProgramType::Script, 1, retain_parse_for_cache,
                         [response_url = move(response_url), response_url_string = move(response_url_string),
                             bytecode_cache_context = move(bytecode_cache_context),
                             source_hash = move(source_hash),
@@ -804,21 +755,19 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
                             auto source_code_for_cache = source_code;
                             auto should_generate_bytecode_cache = result.compiled && bytecode_cache_context.has_value();
                             auto script = result.compiled
-                                ? ClassicScript::create_from_pre_compiled(move(response_url_string), move(source_code), *settings_root, move(response_url), result.compiled, muted_errors)
-                                : ClassicScript::create_from_pre_parsed(move(response_url_string), move(source_code), *settings_root, move(response_url), result.parsed, muted_errors);
+                                ? ClassicScript::create_from_pre_compiled(move(response_url_string), move(source_code), *settings_root, move(response_url), move(result.compiled), muted_errors)
+                                : ClassicScript::create_from_pre_parsed(move(response_url_string), move(source_code), *settings_root, move(response_url), move(result.parsed), muted_errors);
                             BytecodeCacheInstallTarget install_target;
                             if (auto script_record = script->script_record()) {
                                 install_target.script = *script_record;
-                                if (!should_generate_bytecode_cache) {
-                                    if (auto* executable = script_record->cached_executable())
-                                        compile_remaining_functions_off_thread(*executable, source_code_for_cache);
-                                }
+                                if (!should_generate_bytecode_cache)
+                                    JS::compile_remaining_functions_off_thread(*script_record, source_code_for_cache, thread_pool_compilation_callbacks());
                             }
                             on_complete_root->function()(script);
                             if (should_generate_bytecode_cache) {
                                 install_target.begin_generation();
                                 VERIFY(source_hash.has_value());
-                                schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::RustIntegration::ProgramType::Script, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
+                                schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::ProgramType::Script, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
                             }
                         });
                 });
@@ -828,11 +777,11 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
         if (!source_code.has_value()) {
             source_code = JS::SourceCode::create(
                 utf16_string_from_url_ascii(response_url_string.view()),
-                decode_source_text_to_utf16(*fallback_decoder, source_bytes).release_value_but_fixme_should_propagate_errors());
+                TextCodec::decode_to_utf16(source_bytes, *fallback_decoder).release_value_but_fixme_should_propagate_errors());
         }
 
         auto retain_parse_for_cache = bytecode_cache_context.has_value();
-        compile_off_thread(source_code.release_value(), JS::RustIntegration::ProgramType::Script, 1, retain_parse_for_cache,
+        compile_off_thread(settings_object, source_code.release_value(), JS::ProgramType::Script, 1, retain_parse_for_cache,
             [response_url = move(response_url), response_url_string = move(response_url_string),
                 bytecode_cache_context = move(bytecode_cache_context),
                 source_hash = move(source_hash),
@@ -841,21 +790,19 @@ void fetch_classic_script(GC::Ref<HTMLScriptElement> element, URL::URL const& ur
                 auto source_code_for_cache = source_code;
                 auto should_generate_bytecode_cache = result.compiled && bytecode_cache_context.has_value();
                 auto script = result.compiled
-                    ? ClassicScript::create_from_pre_compiled(move(response_url_string), move(source_code), *settings_root, move(response_url), result.compiled, muted_errors)
-                    : ClassicScript::create_from_pre_parsed(move(response_url_string), move(source_code), *settings_root, move(response_url), result.parsed, muted_errors);
+                    ? ClassicScript::create_from_pre_compiled(move(response_url_string), move(source_code), *settings_root, move(response_url), move(result.compiled), muted_errors)
+                    : ClassicScript::create_from_pre_parsed(move(response_url_string), move(source_code), *settings_root, move(response_url), move(result.parsed), muted_errors);
                 BytecodeCacheInstallTarget install_target;
                 if (auto script_record = script->script_record()) {
                     install_target.script = *script_record;
-                    if (!should_generate_bytecode_cache) {
-                        if (auto* executable = script_record->cached_executable())
-                            compile_remaining_functions_off_thread(*executable, source_code_for_cache);
-                    }
+                    if (!should_generate_bytecode_cache)
+                        JS::compile_remaining_functions_off_thread(*script_record, source_code_for_cache, thread_pool_compilation_callbacks());
                 }
                 on_complete_root->function()(script);
                 if (should_generate_bytecode_cache) {
                     install_target.begin_generation();
                     VERIFY(source_hash.has_value());
-                    schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::RustIntegration::ProgramType::Script, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
+                    schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::ProgramType::Script, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
                 }
             });
     };
@@ -911,9 +858,7 @@ WebIDL::ExceptionOr<void> fetch_classic_worker_script(URL::URL const& url, Envir
         //       We might be able to tighten this in the future; see https://github.com/whatwg/html/issues/3255.
 
         // 4. Let sourceText be the result of UTF-8 decoding bodyBytes.
-        auto decoder = TextCodec::decoder_for("UTF-8"sv);
-        VERIFY(decoder.has_value());
-        auto source_text = decode_source_text_to_utf16(*decoder, body_bytes_view(body_bytes)).release_value_but_fixme_should_propagate_errors();
+        auto source_text = Utf16String::from_utf8_with_replacement_character(body_bytes_view(body_bytes));
 
         // 5. Let script be the result of creating a classic script using sourceText, settingsObject,
         //    response's URL, and the default classic script fetch options.
@@ -1000,9 +945,7 @@ WebIDL::ExceptionOr<GC::Ref<ClassicScript>> fetch_a_classic_worker_imported_scri
     }
 
     // 8. Let sourceText be the result of UTF-8 decoding bodyBytes.
-    auto decoder = TextCodec::decoder_for("UTF-8"sv);
-    VERIFY(decoder.has_value());
-    auto source_text = decode_source_text_to_utf16(*decoder, body_bytes_view(body_bytes)).release_value_but_fixme_should_propagate_errors();
+    auto source_text = Utf16String::from_utf8_with_replacement_character(body_bytes_view(body_bytes));
 
     // 9. Let mutedErrors be true if response was CORS-cross-origin, and false otherwise.
     auto muted_errors = response->is_cors_cross_origin() ? ClassicScript::MutedErrors::Yes : ClassicScript::MutedErrors::No;
@@ -1122,7 +1065,7 @@ void fetch_single_module_script(JS::Realm& realm,
     }
 
     // 7. Set moduleMap[(url, moduleType)] to « onComplete ».
-    ModuleMap::CallbackList callbacks;
+    GC::RootVector<ModuleMap::CallbackFunction> callbacks;
     callbacks.append(GC::create_function(GC::Heap::the(), [on_complete](GC::Ptr<ModuleScript> module_script) { on_complete->function()(module_script); }));
     module_map.set(url, module_type, move(callbacks));
 
@@ -1149,7 +1092,7 @@ void fetch_single_module_script(JS::Realm& realm,
     // 13. If performFetch was given, run performFetch with request, isTopLevel, and with processResponseConsumeBody as defined below.
     //     Otherwise, fetch request with processResponseConsumeBody set to processResponseConsumeBody as defined below.
     //     In both cases, let processResponseConsumeBody given response response and null, failure, or a byte sequence bodyBytes be the following algorithm:
-    auto process_response_consume_body = [request, &module_map, url, module_type, &settings_object](GC::Ref<Fetch::Infrastructure::Response> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
+    auto process_response_consume_body = [request, &module_map, url, module_type, &settings_object, options](GC::Ref<Fetch::Infrastructure::Response> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
         auto internal_response = response->unsafe_response();
 
         // 1. If any of the following are true:
@@ -1177,28 +1120,27 @@ void fetch_single_module_script(JS::Realm& realm,
         //  6. If mimeType's essence is "application/wasm" and moduleType is "javascript-or-wasm", then set moduleScript
         //     to the result of creating a WebAssembly module script given bodyBytes, settingsObject, response's URL, and
         //     options.
-        // FIXME: Pass options.
         if (mime_type.has_value() && mime_type->essence() == "application/wasm"sv && module_type == "javascript-or-wasm"sv) {
             module_script = ModuleScript::create_a_webassembly_module_script(url.to_byte_string(), take_body_bytes_as_byte_buffer(body_bytes), settings_object, response->url().value_or({})).release_value_but_fixme_should_propagate_errors();
+            if (module_script)
+                module_script->set_fetch_options(options);
         }
 
         // 7. Otherwise
         else {
             // 1. Let sourceText be the result of UTF-8 decoding bodyBytes.
-            auto decoder = TextCodec::decoder_for("UTF-8"sv);
-            VERIFY(decoder.has_value());
+            // NB: Done at each use, so a JavaScript module with a bytecode cache isn't decoded up front.
 
             // 2. If moduleType is "text", then set moduleScript to the result of creating a text module script given
             //    sourceText and settingsObject.
             if (module_type == "text"sv) {
-                auto source_text = decode_source_text_to_utf16(*decoder, body_bytes_view(body_bytes)).release_value_but_fixme_should_propagate_errors();
+                auto source_text = Utf16String::from_utf8_with_replacement_character(body_bytes_view(body_bytes));
                 module_script = ModuleScript::create_a_text_module_script(url.to_byte_string(), source_text.utf16_view(), settings_object).release_value_but_fixme_should_propagate_errors();
             }
 
             // 3. If mimeType is a JavaScript MIME type and moduleType is "javascript-or-wasm", then set moduleScript to
             //    the result of creating a JavaScript module script given sourceText, settingsObject, response's URL,
             //    and options.
-            // FIXME: Pass options.
             if (mime_type.has_value() && mime_type->is_javascript() && module_type == "javascript-or-wasm"sv) {
                 auto settings_root = GC::make_root(settings_object);
                 auto url_string = url.to_byte_string();
@@ -1213,15 +1155,17 @@ void fetch_single_module_script(JS::Realm& realm,
                 if (bytecode.has_value() || bytecode_cache_context.has_value())
                     source_hash = bytecode_cache_source_hash(source_bytes, "UTF-8"sv);
                 if (bytecode.has_value()) {
-                    auto source_length = TextCodec::convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, StringView { source_bytes }).release_value_but_fixme_should_propagate_errors();
-                    prepare_bytecode_cache_off_thread(*bytecode, JS::RustIntegration::ProgramType::Module, source_length, *source_hash,
+                    auto decoder = TextCodec::decoder_for("UTF-8"sv);
+                    VERIFY(decoder.has_value());
+                    auto source_length = TextCodec::decoded_length_in_utf16_code_units(source_bytes, *decoder).release_value_but_fixme_should_propagate_errors();
+                    prepare_bytecode_cache_off_thread(settings_object, *bytecode, JS::ProgramType::Module, source_length, *source_hash,
                         [url = move(url), url_string = move(url_string), response_url = move(response_url),
                             module_type_string = move(module_type_string),
                             source_byte_storage = move(source_byte_storage),
                             bytecode_cache_context = move(bytecode_cache_context),
                             source_hash = move(source_hash),
                             source_length,
-                            settings_root = move(settings_root)](auto bytecode_cache) mutable {
+                            options, settings_root = move(settings_root)](auto bytecode_cache) mutable {
                             Optional<NonnullRefPtr<JS::SourceCode const>> source_code;
                             if (bytecode_cache) {
                                 source_code = JS::SourceCode::create(
@@ -1231,6 +1175,7 @@ void fetch_single_module_script(JS::Realm& realm,
                                     source_byte_storage);
                                 auto module_script = ModuleScript::create_from_bytecode_cache(url_string, *source_code, *settings_root, response_url, bytecode_cache.release_nonnull()).release_value_but_fixme_should_propagate_errors();
                                 if (module_script && module_script->parse_error().is_null()) {
+                                    module_script->set_fetch_options(options);
                                     settings_root->module_map().complete_fetch(url, module_type_string, module_script);
                                     return;
                                 }
@@ -1238,32 +1183,32 @@ void fetch_single_module_script(JS::Realm& realm,
                             }
 
                             if (!source_code.has_value()) {
-                                auto fallback_decoder = TextCodec::decoder_for("UTF-8"sv);
-                                VERIFY(fallback_decoder.has_value());
                                 source_code = JS::SourceCode::create(
                                     utf16_string_from_url_ascii(url_string.view()),
-                                    decode_source_text_to_utf16(*fallback_decoder, source_byte_storage.bytes()).release_value_but_fixme_should_propagate_errors());
+                                    Utf16String::from_utf8_with_replacement_character(source_byte_storage.bytes()));
                             }
 
                             auto retain_parse_for_cache = bytecode_cache_context.has_value();
-                            compile_off_thread(source_code.release_value(), JS::RustIntegration::ProgramType::Module, 0, retain_parse_for_cache,
+                            auto& settings = *settings_root;
+                            compile_off_thread(settings, source_code.release_value(), JS::ProgramType::Module, 0, retain_parse_for_cache,
                                 [url = move(url), url_string = move(url_string), response_url = move(response_url),
                                     module_type_string = move(module_type_string),
                                     bytecode_cache_context = move(bytecode_cache_context),
                                     source_hash = move(source_hash),
-                                    settings_root = move(settings_root)](auto result, auto source_code) mutable {
+                                    options, settings_root = move(settings_root)](auto result, auto source_code) mutable {
                                     auto source_code_for_cache = source_code;
                                     auto should_generate_bytecode_cache = result.compiled && bytecode_cache_context.has_value();
                                     auto module_script = result.compiled
-                                        ? ModuleScript::create_from_pre_compiled(url_string, move(source_code), *settings_root, move(response_url), result.compiled).release_value_but_fixme_should_propagate_errors()
-                                        : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), result.parsed).release_value_but_fixme_should_propagate_errors();
+                                        ? ModuleScript::create_from_pre_compiled(url_string, move(source_code), *settings_root, move(response_url), move(result.compiled)).release_value_but_fixme_should_propagate_errors()
+                                        : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), move(result.parsed)).release_value_but_fixme_should_propagate_errors();
                                     BytecodeCacheInstallTarget install_target;
                                     if (module_script) {
+                                        module_script->set_fetch_options(options);
                                         module_script->record().visit(
-                                            [](Empty) {},
+                                            [](Empty) { },
                                             [&](GC::Ref<JS::SourceTextModule> module) { install_target.module = module; },
-                                            [](GC::Ref<JS::SyntheticModule>) {},
-                                            [](GC::Ref<WebAssembly::WebAssemblyModule>) {});
+                                            [](GC::Ref<JS::SyntheticModule>) { },
+                                            [](GC::Ref<JS::HostModule>) { });
                                         if (!should_generate_bytecode_cache)
                                             compile_remaining_module_functions_off_thread(*module_script, source_code_for_cache);
                                     }
@@ -1271,7 +1216,7 @@ void fetch_single_module_script(JS::Realm& realm,
                                     if (should_generate_bytecode_cache) {
                                         install_target.begin_generation();
                                         VERIFY(source_hash.has_value());
-                                        schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::RustIntegration::ProgramType::Module, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
+                                        schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::ProgramType::Module, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
                                     }
                                 });
                         });
@@ -1281,28 +1226,29 @@ void fetch_single_module_script(JS::Realm& realm,
                 if (!source_code.has_value()) {
                     source_code = JS::SourceCode::create(
                         utf16_string_from_url_ascii(url_string.view()),
-                        decode_source_text_to_utf16(*decoder, source_bytes).release_value_but_fixme_should_propagate_errors());
+                        Utf16String::from_utf8_with_replacement_character(source_bytes));
                 }
 
                 auto retain_parse_for_cache = bytecode_cache_context.has_value();
-                compile_off_thread(source_code.release_value(), JS::RustIntegration::ProgramType::Module, 0, retain_parse_for_cache,
+                compile_off_thread(settings_object, source_code.release_value(), JS::ProgramType::Module, 0, retain_parse_for_cache,
                     [url = move(url), url_string = move(url_string), response_url = move(response_url),
                         module_type_string = move(module_type_string),
                         bytecode_cache_context = move(bytecode_cache_context),
                         source_hash = move(source_hash),
-                        settings_root = move(settings_root)](auto result, auto source_code) mutable {
+                        options, settings_root = move(settings_root)](auto result, auto source_code) mutable {
                         auto source_code_for_cache = source_code;
                         auto should_generate_bytecode_cache = result.compiled && bytecode_cache_context.has_value();
                         auto module_script = result.compiled
-                            ? ModuleScript::create_from_pre_compiled(url_string, move(source_code), *settings_root, move(response_url), result.compiled).release_value_but_fixme_should_propagate_errors()
-                            : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), result.parsed).release_value_but_fixme_should_propagate_errors();
+                            ? ModuleScript::create_from_pre_compiled(url_string, move(source_code), *settings_root, move(response_url), move(result.compiled)).release_value_but_fixme_should_propagate_errors()
+                            : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), move(result.parsed)).release_value_but_fixme_should_propagate_errors();
                         BytecodeCacheInstallTarget install_target;
                         if (module_script) {
+                            module_script->set_fetch_options(options);
                             module_script->record().visit(
-                                [](Empty) {},
+                                [](Empty) { },
                                 [&](GC::Ref<JS::SourceTextModule> module) { install_target.module = module; },
-                                [](GC::Ref<JS::SyntheticModule>) {},
-                                [](GC::Ref<WebAssembly::WebAssemblyModule>) {});
+                                [](GC::Ref<JS::SyntheticModule>) { },
+                                [](GC::Ref<JS::HostModule>) { });
                             if (!should_generate_bytecode_cache)
                                 compile_remaining_module_functions_off_thread(*module_script, source_code_for_cache);
                         }
@@ -1310,7 +1256,7 @@ void fetch_single_module_script(JS::Realm& realm,
                         if (should_generate_bytecode_cache) {
                             install_target.begin_generation();
                             VERIFY(source_hash.has_value());
-                            schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::RustIntegration::ProgramType::Module, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
+                            schedule_bytecode_cache_generation(move(result.cache_parse), move(source_code_for_cache), JS::ProgramType::Module, bytecode_cache_context.release_value(), move(install_target), source_hash.release_value());
                         }
                     });
                 return;
@@ -1319,14 +1265,14 @@ void fetch_single_module_script(JS::Realm& realm,
             // 4. If the MIME type essence of mimeType is "text/css" and moduleType is "css", then set moduleScript to
             //    the result of creating a CSS module script given sourceText and settingsObject.
             if (mime_type.has_value() && mime_type->essence() == "text/css"sv && module_type == "css"sv) {
-                auto source_text = decode_source_text_to_utf16(*decoder, body_bytes_view(body_bytes)).release_value_but_fixme_should_propagate_errors();
+                auto source_text = Utf16String::from_utf8_with_replacement_character(body_bytes_view(body_bytes));
                 module_script = ModuleScript::create_a_css_module_script(url.to_byte_string(), source_text.utf16_view(), settings_object).release_value_but_fixme_should_propagate_errors();
             }
 
             // 5. If mimeType is a JSON MIME type and moduleType is "json", then set moduleScript to the result of
             //    creating a JSON module script given sourceText and settingsObject.
             if (mime_type.has_value() && mime_type->is_json() && module_type == "json"sv) {
-                auto source_text = decode_source_text_to_utf16(*decoder, body_bytes_view(body_bytes)).release_value_but_fixme_should_propagate_errors();
+                auto source_text = Utf16String::from_utf8_with_replacement_character(body_bytes_view(body_bytes));
                 module_script = ModuleScript::create_a_json_module_script(url.to_byte_string(), source_text.utf16_view(), settings_object).release_value_but_fixme_should_propagate_errors();
             }
         }
@@ -1407,10 +1353,11 @@ void fetch_modulepreload_module_script_graph(JS::Realm& realm, URL::URL const& u
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#fetch-an-inline-module-script-graph
-void fetch_inline_module_script_graph(JS::Realm& realm, ByteString const& filename, Utf16View source_text, URL::URL const& base_url, EnvironmentSettingsObject& settings_object, size_t source_line_number, OnFetchScriptComplete on_complete)
+void fetch_inline_module_script_graph(JS::Realm& realm, ByteString const& filename, Utf16View source_text, URL::URL const& base_url, EnvironmentSettingsObject& settings_object, ScriptFetchOptions const& options, size_t source_line_number, OnFetchScriptComplete on_complete)
 {
     // 1. Let script be the result of creating a JavaScript module script using sourceText, settingsObject, baseURL, and options.
     auto script = ModuleScript::create_a_javascript_module_script(filename, source_text, settings_object, base_url, source_line_number, ScriptRegistry::IsInlineSource::Yes).release_value_but_fixme_should_propagate_errors();
+    script->set_fetch_options(options);
 
     // 2. Fetch the descendants of and link script, given settingsObject, "script", and onComplete.
     fetch_descendants_of_and_link_a_module_script(realm, *script, settings_object, Fetch::Infrastructure::Request::Destination::Script, nullptr, on_complete);

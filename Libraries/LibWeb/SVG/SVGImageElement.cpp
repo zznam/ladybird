@@ -18,18 +18,14 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGImageElement);
-
-Layout::Node const* SVGImageElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 SVGImageElement::SVGImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, move(qualified_name))
@@ -49,6 +45,15 @@ void SVGImageElement::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     SVGURIReferenceMixin::visit_edges(visitor);
     visitor.visit(m_resource_request);
+    visitor.visit(m_preserve_aspect_ratio);
+}
+
+// https://svgwg.org/svg2-draft/embedded.html#__svg__SVGImageElement__preserveAspectRatio
+GC::Ref<SVGAnimatedPreserveAspectRatio> SVGImageElement::preserve_aspect_ratio_for_bindings()
+{
+    if (!m_preserve_aspect_ratio)
+        m_preserve_aspect_ratio = SVGAnimatedPreserveAspectRatio::create(*this);
+    return *m_preserve_aspect_ratio;
 }
 
 void SVGImageElement::adopted_from(DOM::Document& old_document)
@@ -107,8 +112,16 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
             CSS::record_element_replaced_content_input(*this);
-            image_provider_contents_changed();
+            Painting::push_replaced_image_paint_facts(*this, *this);
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
+
+            // https://w3c.github.io/paint-timing/#sec-modifications-dom
+            // When an Element element's associated image request has become completely available, run the algorithm
+            // to process an image that finished loading passing in element and its associated image request as
+            // inputs.
+            // NB: A request that finishes after href has changed is no longer the element's image request.
+            if (m_resource_request.ptr() == resource_request.ptr())
+                PaintTiming::process_an_image_that_finished_loading(*this, PaintTiming::image_request_info(Utf16String::from_utf8(resource_request->url().serialize()), resource_request->image_data()));
 
             dispatch_event(DOM::Event::create(HTML::EventNames::load,
                 HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
@@ -118,6 +131,9 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
 
             dispatch_event(DOM::Event::create(HTML::EventNames::error,
                 HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
+        },
+        [this] {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
@@ -143,7 +159,7 @@ void SVGImageElement::decoded_image_data_did_update()
 {
     // An SVG image works out its natural size again after it redraws itself or changes color scheme.
     CSS::record_element_replaced_content_input(*this);
-    image_provider_contents_changed();
+    Painting::push_replaced_image_paint_facts(*this, *this);
 }
 
 }

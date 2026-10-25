@@ -23,7 +23,7 @@
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Weakable.h>
-#include <LibCompositing/PausedDebuggerOverlay.h>
+#include <LibCompositing/UIOverlays.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
 #include <LibCore/GeolocationProvider.h>
@@ -65,15 +65,18 @@
 #include <LibWebCommon/WebView/DictionaryLookup.h>
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
+#include <LibWebCommon/WebView/ZoomLevel.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/ContentBlocking.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
+#include <LibWebView/SpellChecker.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -106,29 +109,42 @@ public:
     BrowsingSession& session() const { return *m_session; }
 
     u64 view_id() const { return m_view_id; }
+    pid_t web_content_pid() const;
+
+    // A view that shows a page on behalf of another view, such as a Picture-in-Picture window, is part of that view's
+    // tab rather than a tab or window of its own.
+    Optional<u64> owner_view_id() const { return m_owner_view_id; }
 
     CanonicalTraversable& traversable() const;
-    void display_traversable(Badge<WebContentClient>, CanonicalTraversable&);
-    bool has_display_page() const;
-    virtual void prepare_page_for_tab(WebContentPage&);
+    bool has_traversable() const { return m_top_level_traversable != nullptr; }
+    // A page that comes to host any navigable of the tab gets the tab's settings: the spoofed User-Agent and
+    // navigator compatibility mode, the preferred languages and color scheme, the window geometry, and the rest of
+    // what the UI decides for the tab. A page that displays the tab gets its viewport and focus on top of that.
+    virtual void prepare_page_for_navigable(WebContentPage&);
+    void prepare_page_for_tab(WebContentPage&);
     void did_change_display_page(Badge<CanonicalNavigable>, RefPtr<WebContentPage> previous_page);
+    void did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_navigation);
+    void did_stop_loading(Badge<CanonicalTraversable>, bool stopped_navigation);
+    void did_change_ongoing_navigation(Badge<CanonicalNavigable>);
+    void did_change_active_document(Badge<CanonicalTraversable>);
 
-    void set_url(Badge<WebContentPage>, URL::URL url) { set_url(move(url)); }
-    URL::URL const& url() const { return m_url; }
+    void set_text_fragment_indication_visibility(Badge<WebContentPage>, bool);
+    // The URL of the tab's active document.
+    URL::URL url() const;
+    URL::URL const& displayed_url() const { return m_displayed_url; }
 
-    void set_title(Badge<WebContentPage>, Utf16String title);
+    void set_title(Badge<WebContentPage>, Utf16String title) { set_title(move(title)); }
     Utf16String const& title() const { return m_title; }
 
-    void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&>);
+    void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&> favicon) { set_favicon(favicon); }
     Optional<String> const& favicon_hash() const { return m_favicon_hash; }
 
-    String const& handle() const { return m_client_state.client_handle; }
+    String const& handle() const { return m_window_handle; }
 
-    void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect);
+    void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
-    Web::HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(Web::HTML::VisibilityState);
     void set_has_system_focus(bool);
 
@@ -145,10 +161,11 @@ public:
     void load_html(StringView);
     void load_navigation_error_page(StringView);
 
-    void reload();
+    void reload(BypassCache = BypassCache::No);
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
-    void cancel_uncommitted_top_level_navigation_for_browser_traversal();
+    // Whether the most recent load ran to completion, rather than being stopped or canceled.
+    bool last_load_finished() const { return m_last_load_finished; }
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     String crash_overlay_failed_url() const;
@@ -171,8 +188,9 @@ public:
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void()> on_ready = nullptr);
     [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
+    Vector<HistoryEntry> recent_history_entries(size_t limit) const;
 
-    [[nodiscard]] Optional<SessionHistorySnapshot> session_history_snapshot() const;
+    [[nodiscard]] SessionHistorySnapshot session_history_snapshot() const;
     [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
 
     Optional<SessionTabId> session_tab_id() const { return m_session_tab_id; }
@@ -182,27 +200,68 @@ public:
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
+    // Sends the display metadata to every page hosting documents of the tab.
+    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
+    double viewport_corner_radius() const { return m_viewport_corner_radius; }
+    void set_viewport_corner_radius(double);
+
+    struct ScreenRects {
+        Vector<Web::DevicePixelRect> rects;
+        // The available rects leave out what the system keeps for itself, such as a menu bar or a dock.
+        Vector<Web::DevicePixelRect> available_rects;
+        u32 main_screen_index { 0 };
+    };
+    // Sends the screens that screen_rects() reports to every page hosting documents of the tab.
+    void update_screen_rects();
+    void set_scales_frames_to_fit(bool scales_frames_to_fit) { m_scales_frames_to_fit = scales_frames_to_fit; }
+    void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
-    void did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result);
-    void did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint);
-    void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
+    // The page reporting on an event must be the one handling it.
+    void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
+    void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
+    // Whether the page has yet to finish handling input that gives it user activation.
+    bool is_delivering_user_activation_to(WebContentPage const&) const;
+    // Consumes the activation of the earliest input giving the page activation that the page has yet to finish
+    // handling, which leaves the input queued behind it the activation it gives.
+    void consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const&);
+    // Consumes the activation of the input the page is handling, if that input gives activation.
+    void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
+    // Opening a link in a new tab takes one key or mouse press the view delivered.
+    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
+    void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
+    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
     size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
     void did_request_cursor_change(Badge<WebContentPage>, Gfx::Cursor);
+    void did_enter_tooltip_area(Badge<WebContentPage>, ByteString title);
+    void did_leave_tooltip_area(Badge<WebContentPage>);
+    void did_change_picture_in_picture_player_controls_visibility(Badge<WebContentPage>, bool shown);
+    bool picture_in_picture_controls_are_shown_for_testing() const { return picture_in_picture_controls_are_shown(); }
+    bool picture_in_picture_player_controls_are_shown_for_testing() const { return m_picture_in_picture_player_controls_shown; }
+    Gfx::Cursor const& page_cursor_for_testing() const { return m_page_cursor; }
+    Optional<ByteString> const& page_tooltip_for_testing() const { return m_page_tooltip; }
+    Optional<double> displayed_frame_device_pixel_ratio_for_testing() const
+    {
+        return displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
+    }
 
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
     void send_preferences_to_page(WebContentPage&);
+    void send_system_theme_to_page(WebContentPage&);
+    // Sends the theme to every page hosting documents of the tab, including the pages of out-of-process iframes.
+    void update_system_theme(Core::AnonymousBuffer const&);
 
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
@@ -238,18 +297,22 @@ public:
     void set_editing_history_state(bool can_undo, bool can_redo);
     bool can_undo() const { return m_can_undo; }
     bool can_redo() const { return m_can_redo; }
-    void find_in_page(Utf16String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
+    void find_in_page(Utf16String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive, bool highlight_all_matches = false);
     void find_in_page_next_match();
     void find_in_page_previous_match();
+    void find_in_page_end();
 
     void get_source();
 
+    bool can_report_website_issue() const;
+    void report_website_issue();
+
     void inspect_dom_tree();
     void inspect_storage(Web::StorageAPI::StorageEndpointType, u64 request_id);
-    Optional<StorageSetResult> set_session_storage_item(Utf16String const& key, Utf16String const& value);
-    Optional<Utf16String> remove_session_storage_item(Utf16String const& key);
-    bool clear_session_storage();
     void inspect_accessibility_tree();
+    void request_accessibility_tree();
+    void perform_accessibility_action(i64 node_id, String action);
+    void perform_accessibility_text_action(i64 node_id, String action, i32 offset_start, i32 offset_end, String text);
     void get_hovered_node_id();
     void start_node_picker(DevTools::DevToolsDelegate::OnNodePickerEvent);
     void stop_node_picker();
@@ -310,6 +373,11 @@ public:
     void list_style_sheets();
     void request_style_sheet_source(Web::CSS::StyleSheetIdentifier const&);
 
+    void did_block_resource(Badge<WebContentPage>);
+    void reset_blocked_request_count();
+    void notify_content_blocking_changed();
+    ContentBlockingSnapshot content_blocking_snapshot() const;
+
     void debug_request(ByteString const& request, ByteString const& argument = {});
 
     void run_javascript(String const&);
@@ -320,6 +388,7 @@ public:
     Web::ViewportIsFullscreen is_fullscreen() const { return m_is_fullscreen; }
 
     void alert_closed();
+    void before_unload_closed(bool accepted);
     void confirm_closed(bool accepted);
     void prompt_closed(Optional<Utf16String> const& response);
     void color_picker_update(Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state);
@@ -351,9 +420,7 @@ public:
     void did_change_audio_play_state(Badge<WebContentPage>, Web::HTML::AudioPlayState);
     Web::HTML::AudioPlayState audio_play_state() const { return m_audio_play_state; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
-    Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
-    void request_history_operation(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters);
     void did_reset_session_history_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
     bool capture_session_history_snapshot_for_testing(Badge<WebContentPage>);
     bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentPage>);
@@ -376,6 +443,7 @@ public:
     void did_close_browsing_context(Badge<WebContentPage>);
     void run_webdriver_user_prompt_handling(Function<void(Web::WebDriver::Response)> on_complete);
     void did_complete_webdriver_user_prompt_handling(Badge<WebContentPage>, u64 request_id, Web::WebDriver::Response);
+    void did_open_user_prompt(Badge<WebContentPage>);
     static Optional<ViewImplementation&> find_view_by_handle(StringView);
     void did_change_background_color(Badge<WebContentPage>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
@@ -398,9 +466,10 @@ public:
 
     ErrorOr<LexicalPath> dump_gc_graph();
 
-    void set_user_style_sheet(String const& source);
-
     void request_close();
+    void request_close_preflight(Function<void(bool)> on_complete);
+    void did_complete_close_preflight(Badge<WebContentPage>, u64 request_id, bool approved);
+    Function<void()> prepare_for_close_without_prompting();
     void force_close();
     Function<void()> prepare_for_immediate_close();
     bool needs_beforeunload_check() const;
@@ -414,7 +483,7 @@ public:
 
     Function<void()> on_ready_to_paint;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
-    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, WebContentClient& page_process, Optional<Web::PageId>)> on_new_web_view;
+    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
     Function<void(URL::URL const&)> on_link_hover;
@@ -434,13 +503,16 @@ public:
     Function<void()> on_stop_tooltip_override;
     Function<void(ByteString const&)> on_enter_tooltip_area;
     Function<void()> on_leave_tooltip_area;
+    Function<void(ContentBlockingSnapshot const&)> on_content_blocking_change;
     Function<void(Utf16String const& message)> on_request_alert;
+    Function<void(String const& source, Function<void(bool)> on_complete)> on_request_before_unload;
     Function<void(Utf16String const& message)> on_request_confirm;
     Function<void(Utf16String const& message, Utf16String const& default_)> on_request_prompt;
     Function<void(Utf16String const& message)> on_request_set_prompt_text;
     Function<void()> on_before_browser_initiated_navigation;
     Function<void(URL::URL const&, URL::Origin const&, ExternalURLHandler const&, Function<void(bool)>)> on_request_external_url_confirmation;
     Function<void()> on_request_accept_dialog;
+    Function<void()> on_request_website_issue_report;
     Function<void()> on_request_dismiss_dialog;
     Function<void(JsonObject)> on_received_dom_tree;
     Function<void(DOMNodeProperties)> on_received_dom_node_properties;
@@ -449,6 +521,8 @@ public:
     Function<void(Optional<JsonObject>)> on_received_current_grid;
     Function<void(Optional<JsonObject>)> on_received_current_flexbox;
     Function<void(JsonObject)> on_received_accessibility_tree;
+    Function<void(Vector<AccessibilityNodeData>)> on_accessibility_tree_received;
+    Function<void(i64)> on_accessibility_focus_changed;
     Function<void(Web::UniqueNodeID)> on_received_hovered_node_id;
     Function<void(Mutation)> on_dom_mutation_received;
     Function<void(Optional<Web::UniqueNodeID> const& node_id)> on_finished_editing_dom_node;
@@ -480,9 +554,12 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
+    Function<void(Utf16String const& name, URL::Origin const&, Function<void(bool granted)> on_decided)> on_request_permission;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
+    Function<void(Web::MouseEvent const&, Web::EventResult)> on_finish_handling_mouse_event;
+    Function<void(Compositing::PictureInPictureControl)> on_picture_in_picture_control_activated;
     Function<void(Web::DragEvent const&)> on_finish_handling_drag_event;
     Function<void(String const&)> on_test_finish;
     Function<void(double milliseconds)> on_set_test_timeout;
@@ -511,10 +588,15 @@ public:
     Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
 
-    void did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
-    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor);
+    void did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id);
+    void activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting, u32 guess_index);
+
+    void did_request_spell_check(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text);
+    void reset_spell_checking();
+    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
+    void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
     void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
-    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor);
+    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor>);
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -526,9 +608,6 @@ public:
     Action& toggle_bookmark_action() { return *m_toggle_bookmark_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
 
-    WebContentClient& client();
-    WebContentClient const& client() const;
-    Web::PageId page_id() const;
     WebContentPage& page() const;
 
     virtual Web::DevicePixelSize viewport_size() const = 0;
@@ -538,27 +617,34 @@ public:
 protected:
     void will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_apply_top_level_history_traversal_step(Web::HTML::CrossProcessId operation_id);
-    void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
+    void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id);
+    void did_commit_history_step();
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
-    virtual bool defer_backing_store_release(i32) { return false; }
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
     void release_backing_store(i32 bitmap_id);
+    static Gfx::IntRect rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size);
 
-    static constexpr auto ZOOM_MIN_LEVEL = 0.3;
-    static constexpr auto ZOOM_MAX_LEVEL = 5.0;
     static constexpr auto ZOOM_STEP = 0.1;
+
+    virtual Core::AnonymousBuffer system_theme() { return {}; }
+    virtual Optional<ScreenRects> screen_rects() const { return {}; }
+    void update_compositor_display_metadata(WebContentPage&);
 
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
-    void set_url(URL::URL);
-    void did_start_navigation(Optional<Utf16String> navigation_id, URL::URL const&);
-    void did_cancel_loading(Optional<Utf16String> const& navigation_id);
-    bool did_cancel_navigation(Optional<Utf16String> const& navigation_id);
+    void set_owner_view(ViewImplementation const& owner_view) { m_owner_view_id = owner_view.view_id(); }
+
+    void did_update_url();
+    void set_title(Utf16String);
+    void set_favicon(Optional<Gfx::Bitmap const&>);
+    Optional<URL::URL const&> browser_ui_load_url() const;
+    void update_displayed_url();
+    void did_start_navigation();
     void did_finish_navigation();
-    bool matches_ongoing_navigation(Optional<Utf16String> const& navigation_id) const;
+    void did_end_uncommitted_navigation(StringView reason);
     void set_loading_state(bool);
     void complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     void set_webdriver_current_browsing_context(CanonicalNavigable const&);
@@ -567,10 +653,11 @@ protected:
         Load,
         HistoryTraversal,
     };
-    u64 begin_webdriver_navigation(WebDriverNavigationCompletionSource, Optional<Web::HTML::CrossProcessId> history_operation_id = {});
-    void complete_webdriver_navigation(u64 navigation_id);
+    void begin_webdriver_navigation(WebDriverNavigationCompletionSource, Optional<Web::HTML::CrossProcessId> history_operation_id = {});
+    void complete_webdriver_navigation();
     void complete_webdriver_history_traversal(Web::HTML::CrossProcessId operation_id);
     void update_navigation_action_state();
+    void did_not_apply_reload();
     void notify_session_history_changed();
     enum class SessionHistoryDumpMode {
         IfDebuggingEnabled,
@@ -579,7 +666,6 @@ protected:
     void dump_session_history(StringView reason, SessionHistoryDumpMode = SessionHistoryDumpMode::IfDebuggingEnabled) const;
     void recover_current_session_history_entry_with_history_operation();
     void reconstruct_current_session_history_entry_with_history_operation(StringView reason);
-    bool cancel_uncommitted_top_level_navigation(StringView reason, bool stop_loading);
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history_for_testing();
 
     virtual void update_zoom();
@@ -591,17 +677,32 @@ protected:
     void handle_resize();
     void fail_pending_debugger_requests();
     void set_debugger_paused(bool);
-    void set_debugger_overlay_hovered_action(Optional<Compositing::PausedDebuggerOverlayAction>);
-    void update_paused_debugger_overlay();
+    bool handle_picture_in_picture_controls_mouse_event(Web::MouseEvent const&);
+    void set_picture_in_picture_controls_shown(bool);
+    bool picture_in_picture_controls_are_shown() const { return m_picture_in_picture_controls_shown || m_picture_in_picture_player_controls_shown; }
+    struct DisplayedFrame {
+        Gfx::IntSize size;
+        double device_pixel_ratio { 1.0 };
+    };
+    Optional<DisplayedFrame> displayed_frame() const;
+    struct UIOverlayPosition {
+        Gfx::IntPoint position;
+        Gfx::IntSize viewport_size;
+        double device_pixel_ratio { 1.0 };
+    };
+    UIOverlayPosition ui_overlay_position(Web::DevicePixelPoint) const;
+    template<typename Action, typename ButtonsForViewport>
+    Optional<Action> handle_ui_overlay_mouse_event(Compositing::OverlayPointerState<Action>&, Web::MouseEvent const&, ButtonsForViewport const&);
+    bool is_ui_overlay_hovered() const { return m_debugger_overlay_pointer_state.hovered_action().has_value() || m_picture_in_picture_controls_pointer_state.hovered_action().has_value(); }
+    void apply_cursor();
+    void apply_tooltip();
+    void update_ui_overlays();
     void set_page_background_color_to_system_canvas(bool dark);
     void set_page_background_color(Gfx::Color);
     Gfx::Color preferred_canvas_background_color() const;
 
-    enum class CreateNewClient {
-        No,
-        Yes,
-    };
-    virtual void initialize_client(CreateNewClient = CreateNewClient::Yes);
+    void initialize_tab(Web::HTML::VisibilityState, Optional<CanonicalTraversable&> = {});
+    void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
     void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
     void send_geolocation_emulated_position(WebContentPage&);
@@ -637,11 +738,14 @@ protected:
     void update_bookmark_action();
 
     void initialize_context_menus();
+    void update_report_website_issue_action();
     void handle_external_url(URL::URL, URL::Origin, bool has_transient_activation, Function<void()> on_handler_unavailable = {});
     void handle_external_url_from_user_input(URL::URL const&, Function<void()> on_handler_unavailable = {});
     void complete_external_url_request();
     void process_next_external_url_request();
     void update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position);
+    void request_text_fragment_url(Optional<u64> generation_id);
+    void set_context_menu_url_actions_enabled(bool);
     void request_context_menu_dictionary_lookup(Function<void(Optional<DictionaryLookup> const&)> on_complete);
     NonnullRefPtr<Core::Promise<bool>> select_word_for_dictionary_lookup(Gfx::IntPoint widget_position);
     void reject_pending_selection_requests();
@@ -654,20 +758,30 @@ protected:
     struct SharedBitmap {
         i32 id { -1 };
         Web::DevicePixelSize last_painted_size;
+        double last_painted_device_pixel_ratio { 1.0 };
         OwnPtr<Gfx::SharedImageBuffer> shared_image_buffer;
     };
 
-    struct ClientState {
-        String client_handle;
-        SharedBitmap front_bitmap;
-        Vector<SharedBitmap> other_bitmaps;
-        bool has_usable_bitmap { false };
-    } m_client_state;
+    String m_window_handle;
+    SharedBitmap m_front_bitmap;
+    Vector<SharedBitmap> m_other_bitmaps;
+    bool m_has_usable_bitmap { false };
+
+    // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
+    // asked for its tree too.
+    bool m_accessibility_tree_requested { false };
 
     IsPrivate m_is_private { IsPrivate::No };
     NonnullRefPtr<BrowsingSession> m_session;
 
-    URL::URL m_url { URL::about_blank() };
+    // A load the browser's UI started, whose URL the address bar shows while it is the ongoing navigation.
+    struct BrowserUILoad {
+        Utf16String navigation_id;
+        URL::URL url;
+    };
+    Optional<BrowserUILoad> m_browser_ui_load;
+    URL::URL m_displayed_url { URL::about_blank() };
+    bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
     Optional<String> m_favicon_hash;
 
@@ -683,6 +797,8 @@ protected:
     double m_device_pixel_ratio { 1.0 };
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
+    double m_viewport_corner_radius { 0 };
+    bool m_scales_frames_to_fit { false };
 
     RefPtr<Menu> m_page_context_menu;
     RefPtr<Menu> m_link_context_menu;
@@ -690,6 +806,9 @@ protected:
     RefPtr<Menu> m_image_context_menu;
     RefPtr<Menu> m_media_context_menu;
     u64 m_context_menu_request_id { 0 };
+
+    SpellChecker::DocumentTag spell_document_tag();
+    Optional<SpellChecker::DocumentTag> m_spell_document_tag;
 
     RefPtr<Menu> m_bookmarks_bar_context_menu;
     RefPtr<Menu> m_bookmark_context_menu;
@@ -707,7 +826,11 @@ protected:
     Gfx::IntPoint m_look_up_position;
 
     RefPtr<Action> m_search_selected_text_action;
+    RefPtr<Action> m_copy_link_to_highlight_action;
     Optional<String> m_search_text;
+    Optional<URL::URL> m_text_fragment_url;
+    u64 m_next_text_fragment_url_request_id { 1 };
+    Optional<u64> m_pending_text_fragment_url_request_id;
 
     u64 m_next_selection_request_id { 1 };
     HashMap<u64, NonnullRefPtr<Core::Promise<ByteString>>> m_pending_selected_text_requests;
@@ -717,6 +840,7 @@ protected:
 
     RefPtr<Action> m_take_visible_screenshot_action;
     RefPtr<Action> m_take_full_screenshot_action;
+    RefPtr<Action> m_report_website_issue_action;
 
     RefPtr<Action> m_open_in_new_tab_action;
     RefPtr<Action> m_open_in_new_window_action;
@@ -743,6 +867,8 @@ protected:
     RefPtr<Action> m_media_loop_action;
     RefPtr<Action> m_media_enter_fullscreen_action;
     RefPtr<Action> m_media_exit_fullscreen_action;
+    RefPtr<Action> m_media_enter_picture_in_picture_action;
+    RefPtr<Action> m_media_exit_picture_in_picture_action;
 
     struct PendingInputEvent {
         Web::InputEvent event;
@@ -751,17 +877,43 @@ protected:
         // navigable. A lost page never finishes the events it held.
         NonnullRefPtr<WebContentPage> endpoint;
 
+        // Unset while the event waits for the compositor to decide where an earlier key event goes.
+        bool sent { false };
+
         // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
+
+        // A key event stays routed through the compositor until it forwards the event or hands it back. Later input
+        // waits until then.
+        bool awaits_compositor_dispatch() const { return routed_through_compositor && event.has<Web::KeyEvent>(); }
+
+        // When the view delivered an event that gives user activation, until something consumes that activation.
+        Optional<MonotonicTime> user_activation_time {};
     };
     Vector<PendingInputEvent> m_pending_input_events;
+    void send_queued_input_events();
+    void send_input_event(size_t index);
+    bool may_scroll_for_key_event_in_compositor(size_t index) const;
+    Optional<size_t> index_of_input_in_flight_giving_user_activation_to(WebContentPage const&) const;
+
+    // The key and mouse presses the view delivered that have yet to open a link in a new tab.
+    struct InputToOpenLinkInNewTab {
+        u64 event_id { 0 };
+        MonotonicTime delivered_at;
+    };
+    Vector<InputToOpenLinkInNewTab> m_inputs_to_open_links_in_new_tabs;
     u64 m_next_input_event_id { 1 };
     bool m_debugger_is_attached { false };
     bool m_debugger_paused { false };
-    Compositing::PausedDebuggerOverlayPointerState m_debugger_overlay_pointer_state;
-    Optional<Compositing::PausedDebuggerOverlayAction> m_debugger_overlay_hovered_action;
+    Compositing::OverlayPointerState<Compositing::PausedDebuggerOverlayAction> m_debugger_overlay_pointer_state;
+    bool m_has_picture_in_picture_controls { false };
+    bool m_picture_in_picture_controls_shown { false };
+    bool m_picture_in_picture_player_controls_shown { false };
+    Compositing::OverlayPointerState<Compositing::PictureInPictureControl> m_picture_in_picture_controls_pointer_state;
+    RefPtr<Core::Timer> m_picture_in_picture_controls_hide_timer;
     Gfx::Cursor m_page_cursor { Gfx::StandardCursor::Arrow };
+    Optional<ByteString> m_page_tooltip;
 
     struct PendingExternalURLRequest {
         URL::URL url;
@@ -776,12 +928,17 @@ protected:
 
     OwnPtr<Gfx::SharedImageBuffer> m_backup_shared_image_buffer;
     Web::DevicePixelSize m_backup_bitmap_size;
+    double m_backup_bitmap_device_pixel_ratio { 1.0 };
     Gfx::Color m_page_background_color { 255, 255, 255 };
     Gfx::Color m_system_canvas_background_color { 255, 255, 255 };
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
+    // The geometry of the window the view sits in, as the UI last reported it. Every page the tab comes to be
+    // hosted by is told it, so a page created after the window was last resized or moved answers outerWidth,
+    // outerHeight, screenX and screenY like the pages before it.
+    Optional<Gfx::IntPoint> m_window_position;
+    Optional<Gfx::IntSize> m_window_size;
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::Auto };
     Web::CSS::PreferredMotion m_preferred_motion { Web::CSS::PreferredMotion::Auto };
-    Optional<String> m_user_style_sheet;
 
     HistoryVisitTransition m_history_visit_transition_for_current_load { HistoryVisitTransition::Link };
     HistoryVisitTransition m_history_visit_transition_for_next_load { HistoryVisitTransition::Link };
@@ -789,17 +946,16 @@ protected:
     bool m_can_undo { false };
     bool m_can_redo { false };
     bool m_is_loading { false };
+    bool m_last_load_finished { false };
     // WebDriver's observation of the top-level navigation completion state. The navigation itself is the
     // canonical traversable's ongoing navigation record.
     struct WebDriverNavigationObservation {
         WebDriverNavigationCompletionSource completion_source;
-        u64 navigation_id { 0 };
         Optional<Web::HTML::CrossProcessId> history_operation_id;
         bool history_operation_completed { false };
         bool load_completed { false };
     };
     Optional<WebDriverNavigationObservation> m_webdriver_navigation_observation;
-    u64 m_next_webdriver_navigation_id { 1 };
     Optional<NavigationToRetry> m_last_stopped_navigation;
 
     size_t m_crash_count = 0;
@@ -810,6 +966,12 @@ protected:
 
     u64 m_next_webdriver_user_prompt_request_id { 0 };
     HashMap<u64, Function<void(Web::WebDriver::Response)>> m_pending_webdriver_user_prompt_requests;
+    u64 m_next_close_preflight_request_id { 0 };
+    struct PendingClosePreflightRequest {
+        Web::PageId page_id;
+        Function<void(bool)> on_complete;
+    };
+    HashMap<u64, PendingClosePreflightRequest> m_pending_close_preflight_requests;
     struct PendingWebDriverCommand {
         NonnullRefPtr<WebContentPage> page;
         String name;
@@ -842,7 +1004,6 @@ protected:
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     CanonicalTraversable* m_top_level_traversable { nullptr };
-    Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
     Optional<SessionTabId> m_session_tab_id;
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
     RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;
@@ -866,6 +1027,20 @@ protected:
     RefPtr<WebContentPage> m_file_picker_page;
     RefPtr<WebContentPage> m_select_dropdown_page;
     RefPtr<WebContentPage> m_media_context_menu_page;
+
+    static constexpr size_t MAX_SPELLING_GUESSES = 5;
+    void update_spelling_menu_actions(Optional<Utf16String> misspelled_word);
+    void ignore_context_menu_misspelling();
+    void learn_context_menu_misspelling();
+    String describe_spelling_menu_for_testing() const;
+
+    Vector<NonnullRefPtr<Action>> m_spelling_guess_actions;
+    RefPtr<Action> m_no_spelling_guesses_action;
+    RefPtr<Action> m_ignore_spelling_action;
+    RefPtr<Action> m_learn_spelling_action;
+    Optional<Utf16String> m_context_menu_misspelled_word;
+    Vector<Utf16String> m_spelling_guesses;
+    RefPtr<WebContentPage> m_spelling_context_menu_page;
 
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::RequestId> m_geolocation_position_request_ids;
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::WatchId> m_geolocation_watch_ids;
@@ -902,9 +1077,12 @@ protected:
     // FIXME: Reconcile this ID with `page_id`. The latter is only unique per WebContent connection, whereas the view ID
     //        is required to be globally unique for Firefox DevTools.
     u64 m_view_id { 0 };
+    Optional<u64> m_owner_view_id;
 
     HashMap<u64, NavigationListener> m_navigation_listeners;
     u64 m_next_navigation_listener_id { 1 };
+
+    u64 m_blocked_request_count { 0 };
 
     enum class NodePickerRequestType : u8 {
         Hovered,

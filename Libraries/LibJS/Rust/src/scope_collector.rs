@@ -460,6 +460,15 @@ impl ScopeCollector {
             self.records[parent_index].contains_direct_call_to_eval |= eval;
             self.records[parent_index].contains_await_expression |= contains_await;
         }
+        // NB: An arrow function has no arguments object of its own, so the function it is in provides the one it uses.
+        //     A direct eval in the arrow function can also reach it.
+        else if let Some(parent_index) = self.records[index].parent
+            && self.records[index].is_arrow_function
+            && (self.records[index].contains_access_to_arguments_object_in_non_strict_mode
+                || self.records[index].contains_direct_call_to_eval)
+        {
+            self.records[parent_index].contains_access_to_arguments_object_in_non_strict_mode = true;
+        }
 
         self.current = self.records[index].parent;
     }
@@ -528,7 +537,9 @@ impl ScopeCollector {
 
         for name in bound_names {
             let flags = self.records[index].variable(name).flags;
-            if flags.intersects(VarFlags::VAR | VarFlags::FORBIDDEN_LEXICAL | VarFlags::FUNCTION | VarFlags::LEXICAL) {
+            if flags.intersects(
+                VarFlags::VAR | VarFlags::FORBIDDEN_LEXICAL | VarFlags::FUNCTION | VarFlags::LEXICAL | VarFlags::IMPORT,
+            ) {
                 self.already_declared_error(name, declaration_line, declaration_column);
             }
             self.records[index].variable(name).flags |= VarFlags::LEXICAL;
@@ -562,7 +573,9 @@ impl ScopeCollector {
             let mut scope_index = index;
             loop {
                 let existing_flags = self.records[scope_index].variable(name).flags;
-                if existing_flags.intersects(VarFlags::LEXICAL | VarFlags::FUNCTION | VarFlags::FORBIDDEN_VAR) {
+                if existing_flags
+                    .intersects(VarFlags::LEXICAL | VarFlags::FUNCTION | VarFlags::FORBIDDEN_VAR | VarFlags::IMPORT)
+                {
                     self.already_declared_error(name, declaration_line, declaration_column);
                 }
                 let var = self.records[scope_index].variable(name);
@@ -616,7 +629,7 @@ impl ScopeCollector {
                 .get(name)
                 .map_or(VarFlags::EMPTY, |v| v.flags);
 
-            if existing_flags.intersects(VarFlags::VAR | VarFlags::LEXICAL) {
+            if existing_flags.intersects(VarFlags::VAR | VarFlags::LEXICAL | VarFlags::IMPORT) {
                 self.already_declared_error(name, declaration_line, declaration_column);
             }
 
@@ -668,8 +681,15 @@ impl ScopeCollector {
 
     // https://tc39.es/ecma262/#sec-imports
     // Imported bindings live in the module environment, next to the module's own declarations.
-    pub fn add_import_binding(&mut self, name: &[u16]) {
+    // https://tc39.es/ecma262/#sec-module-semantics-static-semantics-early-errors
+    // They are lexically declared names of the module, so they must not collide with any other
+    // import, var, function, or lexical binding of the module.
+    pub fn add_import_binding(&mut self, name: &[u16], declaration_line: u32, declaration_column: u32) {
         let index = self.current.expect("no current scope");
+        let flags = self.records[index].variable(name).flags;
+        if flags.intersects(VarFlags::VAR | VarFlags::FUNCTION | VarFlags::LEXICAL | VarFlags::IMPORT) {
+            self.already_declared_error(name, declaration_line, declaration_column);
+        }
         self.records[index].variable(name).flags |= VarFlags::IMPORT;
     }
 
@@ -973,6 +993,7 @@ impl ScopeCollector {
 
         // 1. Propagate eval() flags from children to parent.
         Self::propagate_eval_poisoning(&mut self.records, index);
+        Self::note_unused_function_name(&self.records, index, scopes);
         // 2. Match identifier references to declarations; optimize as locals.
         Self::resolve_identifiers(
             &mut self.records,
@@ -1017,6 +1038,34 @@ impl ScopeCollector {
             if records[index].eval_in_current_function && records[index].scope_type != ScopeType::Function {
                 records[parent_index].eval_in_current_function = true;
             }
+        }
+    }
+
+    /// Notes in the body of a named function expression whether the function's own name is unused: nothing in the
+    /// function or the functions nested in it refers to it, and no direct eval could. References are still in the
+    /// scope's identifier groups here, where the nested scopes left the ones they did not resolve.
+    fn note_unused_function_name(records: &[ScopeRecord], index: usize, scopes: &mut crate::ast::ScopeArena) {
+        let record = &records[index];
+        if record.scope_type != ScopeType::Function
+            || record.is_function_declaration
+            || record.is_arrow_function
+            || record.contains_direct_call_to_eval
+            || record.poisoned_by_eval_in_scope_chain
+        {
+            return;
+        }
+        let Some(scope_id) = record.scope_data else {
+            return;
+        };
+        let Some((name, _)) = record
+            .variables
+            .iter()
+            .find(|(_, variable)| variable.flags.intersects(VarFlags::BOUND))
+        else {
+            return;
+        };
+        if !record.identifier_groups.contains_key(name) {
+            scopes[scope_id].function_name_is_unused = true;
         }
     }
 
@@ -1468,16 +1517,16 @@ impl ScopeCollector {
                 if records[index].has_flag(&function.name, VarFlags::FORBIDDEN_LEXICAL) {
                     continue;
                 }
-                // AnnexB.3.3.1: Skip hoisting if the function name is "arguments"
-                // and the function needs an arguments object.
-                if function.name == utf16!("arguments")
-                    && records[index].contains_access_to_arguments_object_in_non_strict_mode
-                    && !records[index].has_flag(utf16!("arguments"), VarFlags::FORBIDDEN_LEXICAL)
-                {
-                    continue;
-                }
+                // NB: FunctionDeclarationInstantiation creates no var binding for a hoisted function named
+                //     "arguments". When the function declaration is evaluated, it is stored into the arguments
+                //     object binding instead. A direct eval can reach the arguments object too.
+                let uses_existing_arguments_binding = function.name == utf16!("arguments")
+                    && (records[index].contains_access_to_arguments_object_in_non_strict_mode
+                        || (records[index].scope_type == ScopeType::Function
+                            && !records[index].is_arrow_function
+                            && records[index].contains_direct_call_to_eval));
                 // Reached function/program scope — register the hoisted function name.
-                if let Some(scope_id) = records[index].scope_data {
+                if !uses_existing_arguments_binding && let Some(scope_id) = records[index].scope_data {
                     let sd = &mut scopes[scope_id];
                     if !sd.annexb_function_names.contains(&function.name) {
                         sd.annexb_function_names.push(function.name.clone());

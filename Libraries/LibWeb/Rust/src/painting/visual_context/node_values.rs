@@ -12,12 +12,12 @@ use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
 use crate::css::style_value::StyleValueData;
 use crate::layout::node_data::NodeSlotId;
-use crate::layout::node_facts;
+use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::node_painting;
-use crate::painting::paint_read::PaintRead;
+use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
@@ -139,8 +139,8 @@ pub(crate) fn compute_transform(
     node: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<(TransformData, bool)> {
-    let style = layout_arena.node_style_if_live(node)?;
-    let node_kind = layout_arena.node_kind_if_live(node)?;
+    let row = layout_arena.node(node)?;
+    let (style, node_kind) = (row.style()?, row.kind());
 
     let additional_element_transform = if style_queries::kind_is_svg_element_box(node_kind) {
         crate::painting::paintable_geometry::committed_svg_additional_element_transform(layout_arena, node)
@@ -150,7 +150,7 @@ pub(crate) fn compute_transform(
     };
 
     let transform_values = style.transform();
-    let style_has_transform = transform_values.resolved_transforms.length != 0;
+    let style_has_transform = transform_values.resolved_transforms.length != 0 || transform_values.has_offset_path;
     let has_transform_node_input = style_has_transform
         || additional_element_transform.is_some()
         || style_queries::will_change_promotes_transform_node(style);
@@ -177,15 +177,36 @@ pub(crate) fn compute_transform(
     // 3. Translate by the computed X, Y, and Z values of translate.
     // 4. Rotate by the computed <angle> about the specified axis of rotate.
     // 5. Scale by the computed X, Y, and Z values of scale.
-    // FIXME: 6. Translate and rotate by the transform specified by offset.
+    // 6. Translate and rotate by the transform specified by offset.
     // 7. Multiply by each of the transform functions in transform from left to right.
     // NB: The resolved transform list carries translate, rotate, scale, and the
     //     transform functions pre-lowered in exactly that order.
-    let mut matrix = multiply_transform_functions(
-        translation_matrix(0.0, 0.0, origin_z),
-        transform_values.resolved_transforms.as_slice(),
-        reference_box,
-    );
+    let resolved_transforms = transform_values.resolved_transforms.as_slice();
+    let mut matrix = translation_matrix(0.0, 0.0, origin_z);
+    if transform_values.has_offset_path {
+        let individual_transform_count = [
+            &transform_values.translate,
+            &transform_values.rotate,
+            &transform_values.scale,
+        ]
+        .into_iter()
+        .filter(|handle| !handle.pointer.is_null())
+        .count();
+        let (individual_transforms, transform_functions) = resolved_transforms.split_at(individual_transform_count);
+        matrix = multiply_transform_functions(matrix, individual_transforms, reference_box);
+        if let Some(offset_transform) = super::offset_transform::compute_offset_transform(
+            style,
+            layout_arena,
+            node,
+            reference_box,
+            (origin_x.to_double(), origin_y.to_double()),
+        ) {
+            matrix = matrix.multiplied(offset_transform);
+        }
+        matrix = multiply_transform_functions(matrix, transform_functions, reference_box);
+    } else {
+        matrix = multiply_transform_functions(matrix, resolved_transforms, reference_box);
+    }
 
     // The x and y properties of <use> define an additional translation applied after any
     // transformations specified with other properties.
@@ -356,6 +377,12 @@ pub(crate) fn border_radii_data(
     slot: NodeSlotId,
 ) -> BorderRadii {
     let border = style.border();
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // When an element's computed value of 'border-shape' is not none, its 'border-radius' is ignored, as if it was set
+    // to 0.
+    if crate::painting::border_shape::has_border_shape(style) {
+        return BorderRadii::default();
+    }
     let has_noninitial_radii = !border_radius_is_initial(&border.border_bottom_left_radius)
         || !border_radius_is_initial(&border.border_bottom_right_radius)
         || !border_radius_is_initial(&border.border_top_left_radius)
@@ -402,6 +429,12 @@ pub(crate) fn piece_border_radii_data(
     present_edges: u8,
 ) -> BorderRadii {
     let border = style.border();
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // When an element's computed value of 'border-shape' is not none, its 'border-radius' is ignored, as if it was set
+    // to 0.
+    if crate::painting::border_shape::has_border_shape(style) {
+        return BorderRadii::default();
+    }
     let has_noninitial_radii = !border_radius_is_initial(&border.border_bottom_left_radius)
         || !border_radius_is_initial(&border.border_bottom_right_radius)
         || !border_radius_is_initial(&border.border_top_left_radius)
@@ -626,6 +659,34 @@ pub(crate) struct ResolvedEffects {
     pub(crate) svg_filter_bounds: Option<crate::layout::used_values::FfiCssPixelRect>,
 }
 
+// https://www.w3.org/TR/compositing-1/#csscompositingrules
+// Everything in CSS that creates a stacking context must be considered an ‘isolated’ group.
+fn stacking_context_needs_isolation(arena: &impl PaintRead, slot: NodeSlotId) -> bool {
+    // NB: The document root already paints inside the viewport's isolated group.
+    if arena
+        .node_parent_if_live(slot)
+        .is_some_and(|parent| arena.node_kind_if_live(parent) == Some(crate::layout::node_data::NodeKind::Viewport))
+        || !style_queries::establishes_stacking_context(arena, slot)
+    {
+        return false;
+    }
+    // NB: A group without blending descendants can paint directly into its backdrop.
+    let mut needs_isolation = false;
+    arena.for_each_node_in_layout_subtree_in_pre_order_with_pruning(slot, |descendant| {
+        if descendant == slot {
+            return true;
+        }
+        if arena
+            .node_style_if_live(descendant)
+            .is_some_and(|style| style.effects().mix_blend_mode != crate::css::css_enums::mix_blend_mode::NORMAL)
+        {
+            needs_isolation = true;
+        }
+        !needs_isolation && !style_queries::establishes_stacking_context(arena, descendant)
+    });
+    needs_isolation
+}
+
 /// Resolves a box's effects, or `None` for a box without style.
 pub(crate) fn resolve_effects_data(
     layout_arena: &impl PaintRead,
@@ -635,6 +696,7 @@ pub(crate) fn resolve_effects_data(
     use crate::css::css_enums::mix_blend_mode;
     let style = layout_arena.node_style_if_live(slot)?;
     let effects_values = style.effects();
+    let isolation = stacking_context_needs_isolation(layout_arena, slot);
     let mut svg_filter_bounds = None;
     let filter = if crate::painting::css_filter::contains_url(&effects_values.filter) {
         let resolved_svg_filter = published_svg_filter(
@@ -662,7 +724,8 @@ pub(crate) fn resolve_effects_data(
     let keeps_effects_node_for_later_values = layout_arena
         .node_has_compositor_animation_frame(slot, crate::layout::node_data::CompositorAnimationFrameKind::Opacity)
         || style_queries::will_change_promotes_effects_node(style);
-    if filter.is_none()
+    if !isolation
+        && filter.is_none()
         && backdrop_filter.is_none()
         && effects_values.opacity == 1.0
         && effects_values.mix_blend_mode == mix_blend_mode::NORMAL
@@ -674,6 +737,7 @@ pub(crate) fn resolve_effects_data(
         });
     }
     let effects = EffectsData {
+        isolation,
         opacity: effects_values.opacity,
         blend_mode: mix_blend_mode_to_compositing_and_blending_operator(effects_values.mix_blend_mode),
         filter,
@@ -695,6 +759,11 @@ fn compute_backdrop_filter_data(
 ) -> Option<super::BackdropFilterData> {
     let backdrop_filter = &style.effects().backdrop_filter;
     if backdrop_filter.operations.length == 0 {
+        return None;
+    }
+    // NB: The filtered backdrop is part of the box's own painting, so an invisible box shows none of it, even when
+    //     its visible descendants still paint.
+    if style.visibility() != css_enums::visibility::VISIBLE {
         return None;
     }
     let converter = DevicePixelConverter::new(device_pixels_per_css_pixel);
@@ -797,10 +866,23 @@ pub(crate) fn may_have_clip(layout_arena: &impl PaintRead, node: NodeSlotId) -> 
         || style.content_visibility() == content_visibility::AUTO
 }
 
-pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId, pixel_ratio: f64) -> Option<ClipData> {
+/// Whether a box's overflow clips in both axes, which is when its clipping region follows its corners.
+pub(crate) fn overflow_clips_both_axes(layout_arena: &impl PaintRead, slot: NodeSlotId) -> bool {
+    use crate::css::css_enums::overflow;
+    layout_arena.node_style_if_live(slot).is_some_and(|style| {
+        let (overflow_x, overflow_y) = used_overflow(layout_arena, slot, style);
+        overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE
+    })
+}
+
+/// The overflow-x and overflow-y values a box clips its content with, after paint containment.
+fn used_overflow(
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+    style: crate::css::computed_value_views::ComputedValuesView<'_>,
+) -> (u8, u8) {
     use crate::css::css_enums::{content_visibility, overflow};
     let node = slot;
-    let style = layout_arena.node_style_if_live(node)?;
     let box_values = style.box_values();
     let mut overflow_x = box_values.overflow_x;
     let mut overflow_y = box_values.overflow_y;
@@ -821,6 +903,14 @@ pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId,
         overflow_x = overflow::CLIP;
         overflow_y = overflow::CLIP;
     }
+    (overflow_x, overflow_y)
+}
+
+pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId, pixel_ratio: f64) -> Option<ClipData> {
+    use crate::css::css_enums::overflow;
+    let node = slot;
+    let style = layout_arena.node_style_if_live(node)?;
+    let (overflow_x, overflow_y) = used_overflow(layout_arena, node, style);
 
     // https://drafts.csswg.org/css-overflow-3/#propdef-overflow
     // 'clip'
@@ -832,14 +922,17 @@ pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId,
 
     let padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, slot);
     let overflow_clip_edge = overflow_clip_edge_rect(style, layout_arena, slot);
-    let extent_limit = CssPixels::from_integer(crate::css::css_pixels::MAX_INTEGER_VALUE as i64);
+    // NB: An axis that is not clipped must extend into negative coordinates too, since content can be laid out above or
+    //     to the left of the origin (e.g. inside a scroll container with flex-direction: column-reverse). Half the
+    //     range on each side keeps the rect's size from saturating.
+    let extent_limit = CssPixels::from_integer(crate::css::css_pixels::MAX_INTEGER_VALUE as i64 / 2);
     let (left, right) = match overflow_x {
-        overflow::VISIBLE => (CssPixels::from_raw(0), extent_limit),
+        overflow::VISIBLE => (-extent_limit, extent_limit),
         overflow::CLIP => (overflow_clip_edge.x, overflow_clip_edge.x + overflow_clip_edge.width),
         _ => (padding_box.x, padding_box.x + padding_box.width),
     };
     let (top, bottom) = match overflow_y {
-        overflow::VISIBLE => (CssPixels::from_raw(0), extent_limit),
+        overflow::VISIBLE => (-extent_limit, extent_limit),
         overflow::CLIP => (overflow_clip_edge.y, overflow_clip_edge.y + overflow_clip_edge.height),
         _ => (padding_box.y, padding_box.y + padding_box.height),
     };

@@ -16,7 +16,6 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
@@ -25,6 +24,7 @@
 #include <LibWeb/TrustedTypes/TrustedScript.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/WebAssembly/WebAssembly.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::ContentSecurityPolicy {
@@ -330,10 +330,8 @@ Directives::Directive::Result should_navigation_response_to_navigation_request_o
     auto result = Directives::Directive::Result::Allowed;
 
     // FIXME: File spec issue stating that the request can be null (e.g. from a srcdoc resource).
-    if (!navigation_request) {
-        dbgln("FIXME: Handle null navigation_request in navigation response Content Security Policy check.");
+    if (!navigation_request)
         return result;
-    }
 
     // 2. For each policy of response CSP list:
     for (auto policy : response_csp_list->policies()) {

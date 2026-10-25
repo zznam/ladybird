@@ -16,6 +16,7 @@
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
+#include <LibWeb/SVG/SVGStringList.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -40,28 +41,33 @@ public:
     }
 
     WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> get_b_box(Bindings::SVGBoundingBoxOptions const&);
-    GC::Ref<SVGAnimatedTransformList> transform() const;
+    GC::Ref<SVGAnimatedTransformList> transform();
 
     GC::Ptr<Geometry::DOMMatrix> get_ctm();
     GC::Ptr<Geometry::DOMMatrix> get_screen_ctm();
 
-    // The transform property carries the transform attribute through the cascade; this is the
-    // extra transformation some elements apply beyond it, such as the x/y translation of <use>.
-    virtual Gfx::AffineTransform additional_element_transform() const
-    {
-        return {};
-    }
+    GC::Ptr<DOM::Element> resolve_url_to_element(CSS::URL const& url) const;
 
-    GC::Ptr<DOM::Element> paint_server_element(Optional<CSS::SVGPaint> const&) const;
+    // https://svgwg.org/svg2-draft/types.html#InterfaceSVGTests
+    GC::Ref<SVGStringList> required_extensions_for_bindings();
+    GC::Ref<SVGStringList> system_language_for_bindings();
+
+    // https://svgwg.org/svg2-draft/struct.html#ConditionalProcessing
+    bool conditional_processing_attributes_evaluate_to_true() const;
 
 protected:
     SVGGraphicsElement(DOM::Document&, DOM::QualifiedName);
 
-    GC::Ptr<DOM::Element> resolve_url_to_element(CSS::URL const& url) const;
+    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
 private:
     virtual bool is_svg_graphics_element() const final { return true; }
     GC::Ptr<DOM::Element> resolve_fragment_identifier_to_element(Utf16String const& fragment) const;
+
+    GC::Ptr<SVGStringList> m_required_extensions;
+    GC::Ptr<SVGStringList> m_system_language;
+    GC::Ptr<SVGAnimatedTransformList> m_transform;
 };
 
 Gfx::AffineTransform transform_from_transform_list(ReadonlySpan<Transform> transform_list);

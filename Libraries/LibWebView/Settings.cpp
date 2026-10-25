@@ -16,22 +16,32 @@
 #include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/Locale.h>
+#include <LibWebCommon/Loader/ContentBlocking.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Settings.h>
-#include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
 
 namespace WebView {
 
 static constexpr auto FIRST_RUN_COMPLETE_KEY = "firstRunComplete"sv;
 static constexpr auto NEW_TAB_PAGE_URL_KEY = "newTabPageURL"sv;
+static constexpr auto RESTORE_PREVIOUS_SESSION_KEY = "restorePreviousSession"sv;
 
 static constexpr auto LANGUAGES_KEY = "languages"sv;
-static auto DEFAULT_LANGUAGE = "en"_string;
 
 static constexpr auto APPEARANCE_KEY = "appearance"sv;
 static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
 static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
+
+static constexpr auto WINDOW_SETTINGS_KEY = "window"sv;
+static constexpr auto WINDOW_POSITION_KEY = "position"sv;
+static constexpr auto WINDOW_X_KEY = "x"sv;
+static constexpr auto WINDOW_Y_KEY = "y"sv;
+static constexpr auto WINDOW_SIZE_KEY = "size"sv;
+static constexpr auto WINDOW_WIDTH_KEY = "width"sv;
+static constexpr auto WINDOW_HEIGHT_KEY = "height"sv;
+static constexpr auto WINDOW_MAXIMIZED_KEY = "maximized"sv;
 
 static constexpr auto CONTENT_SETTINGS_KEY = "content"sv;
 static constexpr auto DEFAULT_ZOOM_LEVEL_FACTOR_KEY = "defaultZoomLevelFactor"sv;
@@ -70,14 +80,14 @@ static constexpr auto DISK_CACHE_MAXIMUM_SIZE_KEY = "maxSize"sv;
 
 static constexpr auto GLOBAL_PRIVACY_CONTROL_KEY = "globalPrivacyControl"sv;
 
-static constexpr auto USER_AGENT_PRESET_KEY = "userAgentPreset"sv;
-static constexpr auto NAVIGATOR_COMPATIBILITY_MODE_KEY = "navigatorCompatibilityMode"sv;
-
 static constexpr auto BACKGROUND_NETWORKING_KEY = "backgroundNetworking"sv;
 static constexpr auto BACKGROUND_NETWORKING_ENABLED_KEY = "enabled"sv;
 static constexpr auto BACKGROUND_NETWORKING_FEATURES_KEY = "features"sv;
 
 static constexpr auto CONTENT_BLOCKERS_KEY = "contentBlockers"sv;
+static constexpr auto CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY = "contentBlockerSubscriptionUpdates"sv;
+static constexpr auto CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY = "showBlockedCount"sv;
+static constexpr auto CONTENT_BLOCKER_DISABLED_SITES_KEY = "disabledSites"sv;
 static constexpr auto CONTENT_BLOCKER_BUILT_IN_LISTS_KEY = "builtInLists"sv;
 static constexpr auto CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY = "customSubscriptions"sv;
 static constexpr auto CONTENT_BLOCKER_LOCAL_LISTS_KEY = "localLists"sv;
@@ -131,6 +141,22 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .array_element_type = {},
     },
     {
+        .id = ConfigVariableID::VerticalTabsHoverExpandDelay,
+        .name = "ui.tabs.vertical_tabs_hover_expand_delay_ms"sv,
+        .title = "Vertical tab hover expansion delay"sv,
+        .description = "Delay in milliseconds before collapsed vertical tabs begin expanding on hover. Set to 0 to expand immediately."sv,
+        .default_value = 100,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::VerticalTabsHoverExpandAnimationDuration,
+        .name = "ui.tabs.vertical_tabs_hover_expand_animation_duration_ms"sv,
+        .title = "Vertical tab hover expansion animation duration"sv,
+        .description = "Duration in milliseconds of the vertical tab hover expansion animation. Set to 0 to disable the animation."sv,
+        .default_value = 100,
+        .array_element_type = {},
+    },
+    {
         .id = ConfigVariableID::MaximumConnectionsPerDownload,
         .name = "downloads.maximum_connections_per_download"sv,
         .title = "Maximum connections per download"sv,
@@ -156,29 +182,14 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
     },
 } };
 
-ReadonlySpan<ConfigVariableDefinition const> config_variable_definitions()
+ReadonlySpan<ConfigVariableDefinition> config_variable_definitions()
 {
     return CONFIG_VARIABLE_DEFINITIONS;
 }
 
-static StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
+ConfigVariableDefinition const& config_variable_definition(ConfigVariableID id)
 {
-    switch (position) {
-    case VerticalTabsPosition::Left:
-        return "left"sv;
-    case VerticalTabsPosition::Right:
-        return "right"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
-{
-    if (position == "left"sv)
-        return VerticalTabsPosition::Left;
-    if (position == "right"sv)
-        return VerticalTabsPosition::Right;
-    return {};
+    return config_variable_definitions()[static_cast<size_t>(id)];
 }
 
 Optional<ConfigVariableID> config_variable_id_from_name(StringView name)
@@ -191,9 +202,48 @@ Optional<ConfigVariableID> config_variable_id_from_name(StringView name)
     return {};
 }
 
-static ConfigVariableDefinition const& config_variable_definition(ConfigVariableID id)
+static constexpr StringView show_bookmarks_bar_to_string(ShowBookmarksBar show_bookmarks_bar)
 {
-    return config_variable_definitions()[static_cast<size_t>(id)];
+    switch (show_bookmarks_bar) {
+    case ShowBookmarksBar::Always:
+        return "always"sv;
+    case ShowBookmarksBar::Never:
+        return "never"sv;
+    case ShowBookmarksBar::OnHover:
+        return "onHover"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static constexpr Optional<ShowBookmarksBar> bookmarks_bar_position_from_string(StringView show_bookmarks_bar)
+{
+    if (show_bookmarks_bar == "always"sv)
+        return ShowBookmarksBar::Always;
+    if (show_bookmarks_bar == "never"sv)
+        return ShowBookmarksBar::Never;
+    if (show_bookmarks_bar == "onHover"sv)
+        return ShowBookmarksBar::OnHover;
+    return {};
+}
+
+static constexpr StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
+{
+    switch (position) {
+    case VerticalTabsPosition::Left:
+        return "left"sv;
+    case VerticalTabsPosition::Right:
+        return "right"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static constexpr Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
+{
+    if (position == "left"sv)
+        return VerticalTabsPosition::Left;
+    if (position == "right"sv)
+        return VerticalTabsPosition::Right;
+    return {};
 }
 
 static bool json_value_matches_type(JsonValue const& value, JsonValue::Type type)
@@ -233,15 +283,32 @@ static bool config_variable_value_is_valid(ConfigVariableDefinition const& varia
     if (!json_value_matches_type(value, variable.default_value.type()))
         return false;
 
+    if (variable.id == ConfigVariableID::VerticalTabsHoverExpandDelay || variable.id == ConfigVariableID::VerticalTabsHoverExpandAnimationDuration) {
+        auto milliseconds = value.get_int();
+        return milliseconds.has_value() && *milliseconds >= 0 && value.get_double_with_precision_loss().value() == *milliseconds;
+    }
+
     if (variable.default_value.is_array() && variable.array_element_type.has_value())
         return json_array_contains_only_type(value.as_array(), *variable.array_element_type);
 
     return true;
 }
 
-Settings Settings::create(ByteString settings_path)
+Settings Settings::create(ByteString settings_path, Vector<String> platform_languages)
 {
     Settings settings { move(settings_path) };
+
+    // The user's first platform language, then that language alone (en-US, then en): the list a browser starts with.
+    platform_languages.remove_all_matching([](auto const& language) { return !Unicode::is_locale_available(language); });
+    if (!platform_languages.is_empty()) {
+        Vector<String> languages { platform_languages.first() };
+        if (auto separator = languages.first().find_byte_offset('-'); separator.has_value()) {
+            auto language = MUST(languages.first().substring_from_byte_offset(0, *separator));
+            if (Unicode::is_locale_available(language))
+                languages.append(move(language));
+        }
+        settings.m_languages = move(languages);
+    }
 
     auto settings_json = read_json_file(settings.m_settings_path);
     if (settings_json.is_error()) {
@@ -251,10 +318,15 @@ Settings Settings::create(ByteString settings_path)
 
     settings.m_first_run_complete = settings_json.value().get_bool(FIRST_RUN_COMPLETE_KEY).value_or(false);
 
+    if (auto window_settings = settings_json.value().get(WINDOW_SETTINGS_KEY); window_settings.has_value())
+        settings.m_window_settings = parse_window_settings(*window_settings);
+
     if (auto new_tab_page_url = settings_json.value().get_string(NEW_TAB_PAGE_URL_KEY); new_tab_page_url.has_value()) {
         if (auto parsed_new_tab_page_url = URL::Parser::basic_parse(*new_tab_page_url); parsed_new_tab_page_url.has_value())
             settings.m_new_tab_page_url = parsed_new_tab_page_url.release_value();
     }
+
+    settings.m_restore_previous_session = settings_json.value().get_bool(RESTORE_PREVIOUS_SESSION_KEY).value_or(false);
 
     if (auto languages = settings_json.value().get(LANGUAGES_KEY); languages.has_value())
         settings.m_languages = parse_json_languages(*languages);
@@ -335,25 +407,31 @@ Settings Settings::create(ByteString settings_path)
     if (auto global_privacy_control = settings_json.value().get_bool(GLOBAL_PRIVACY_CONTROL_KEY); global_privacy_control.has_value())
         settings.m_global_privacy_control = *global_privacy_control ? GlobalPrivacyControl::Yes : GlobalPrivacyControl::No;
 
-    // A preset that's since been dropped or renamed falls back to the default User-Agent.
-    if (auto user_agent_preset = settings_json.value().get_string(USER_AGENT_PRESET_KEY); user_agent_preset.has_value())
-        settings.m_user_agent_preset = normalize_user_agent_name(*user_agent_preset);
-
-    if (auto mode = settings_json.value().get_string(NAVIGATOR_COMPATIBILITY_MODE_KEY); mode.has_value()) {
-        if (auto parsed_mode = navigator_compatibility_mode_from_string(*mode); parsed_mode.has_value())
-            settings.m_navigator_compatibility_mode = *parsed_mode;
-    }
-
     if (auto background_networking = settings_json.value().get_object(BACKGROUND_NETWORKING_KEY); background_networking.has_value()) {
         if (auto enabled = background_networking->get_bool(BACKGROUND_NETWORKING_ENABLED_KEY); enabled.has_value())
             settings.m_background_networking_enabled = *enabled;
 
-        if (auto features = background_networking->get_object(BACKGROUND_NETWORKING_FEATURES_KEY); features.has_value())
-            settings.m_filter_list_updates_enabled = features->get_bool("contentBlockerSubscriptionUpdates"sv).value_or(false);
+        if (auto features = background_networking->get_object(BACKGROUND_NETWORKING_FEATURES_KEY); features.has_value()) {
+            if (auto filter_list_updates_enabled = features->get_bool(CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY); filter_list_updates_enabled.has_value())
+                settings.m_filter_list_updates_enabled = *filter_list_updates_enabled;
+        }
     }
 
     if (auto content_blockers = settings_json.value().get_object(CONTENT_BLOCKERS_KEY); content_blockers.has_value()) {
-        settings.m_content_blocker_enabled = content_blockers->get_bool(CONTENT_BLOCKER_ENABLED_KEY).value_or(false);
+        if (auto content_blocker_enabled = content_blockers->get_bool(CONTENT_BLOCKER_ENABLED_KEY); content_blocker_enabled.has_value())
+            settings.m_content_blocker_enabled = *content_blocker_enabled;
+        if (auto show_content_blocker_count = content_blockers->get_bool(CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY); show_content_blocker_count.has_value())
+            settings.m_show_content_blocker_count = *show_content_blocker_count;
+
+        if (auto sites = content_blockers->get_array(CONTENT_BLOCKER_DISABLED_SITES_KEY); sites.has_value()) {
+            sites->for_each([&](JsonValue const& entry) {
+                if (!entry.is_string())
+                    return;
+                if (auto host = Web::canonical_content_blocking_host(entry.as_string()); host.has_value())
+                    settings.m_content_blocker_disabled_sites.set(host.release_value());
+            });
+        }
+
         if (auto built_in_lists = content_blockers->get_object(CONTENT_BLOCKER_BUILT_IN_LISTS_KEY); built_in_lists.has_value()) {
             for (auto& list : settings.m_content_blocker_lists)
                 list.enabled = built_in_lists->get_bool(list.identifier).value_or(list.enabled);
@@ -403,7 +481,7 @@ Settings Settings::create(ByteString settings_path)
 Settings::Settings(ByteString settings_path)
     : m_settings_path(move(settings_path))
     , m_new_tab_page_url(URL::about_newtab())
-    , m_languages({ DEFAULT_LANGUAGE })
+    , m_languages(Web::default_preferred_languages())
 {
     for (auto const& variable : config_variable_definitions()) {
         m_config_variables[static_cast<size_t>(variable.id)] = variable.default_value;
@@ -451,6 +529,22 @@ JsonValue Settings::serialize_json() const
     JsonObject settings;
     settings.set(FIRST_RUN_COMPLETE_KEY, m_first_run_complete);
     settings.set(NEW_TAB_PAGE_URL_KEY, m_new_tab_page_url.serialize());
+    settings.set(RESTORE_PREVIOUS_SESSION_KEY, m_restore_previous_session);
+
+    JsonObject window_settings;
+    if (m_window_settings.position.has_value()) {
+        JsonObject position;
+        position.set(WINDOW_X_KEY, m_window_settings.position->x());
+        position.set(WINDOW_Y_KEY, m_window_settings.position->y());
+        window_settings.set(WINDOW_POSITION_KEY, move(position));
+    }
+
+    JsonObject window_size;
+    window_size.set(WINDOW_WIDTH_KEY, m_window_settings.size.width());
+    window_size.set(WINDOW_HEIGHT_KEY, m_window_settings.size.height());
+    window_settings.set(WINDOW_SIZE_KEY, move(window_size));
+    window_settings.set(WINDOW_MAXIMIZED_KEY, m_window_settings.maximized);
+    settings.set(WINDOW_SETTINGS_KEY, move(window_settings));
 
     JsonArray languages;
     languages.ensure_capacity(m_languages.size());
@@ -460,7 +554,7 @@ JsonValue Settings::serialize_json() const
 
     JsonObject appearance;
     appearance.set(SHOW_MENU_BAR_KEY, m_appearance.show_menu_bar);
-    appearance.set(SHOW_BOOKMARKS_BAR_KEY, m_appearance.show_bookmarks_bar);
+    appearance.set(SHOW_BOOKMARKS_BAR_KEY, show_bookmarks_bar_to_string(m_appearance.show_bookmarks_bar));
     settings.set(APPEARANCE_KEY, move(appearance));
 
     JsonObject zoom_per_host;
@@ -535,17 +629,18 @@ JsonValue Settings::serialize_json() const
 
     settings.set(GLOBAL_PRIVACY_CONTROL_KEY, m_global_privacy_control == GlobalPrivacyControl::Yes);
 
-    if (m_user_agent_preset.has_value())
-        settings.set(USER_AGENT_PRESET_KEY, *m_user_agent_preset);
-    settings.set(NAVIGATOR_COMPATIBILITY_MODE_KEY, navigator_compatibility_mode_to_string(m_navigator_compatibility_mode));
-
     JsonObject background_network_features;
-    background_network_features.set("contentBlockerSubscriptionUpdates"sv, m_filter_list_updates_enabled);
+    background_network_features.set(CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY, m_filter_list_updates_enabled);
 
     JsonObject background_networking;
     background_networking.set(BACKGROUND_NETWORKING_ENABLED_KEY, m_background_networking_enabled);
     background_networking.set(BACKGROUND_NETWORKING_FEATURES_KEY, move(background_network_features));
     settings.set(BACKGROUND_NETWORKING_KEY, move(background_networking));
+
+    JsonArray disabled_sites;
+    disabled_sites.ensure_capacity(m_content_blocker_disabled_sites.size());
+    for (auto const& host : m_content_blocker_disabled_sites)
+        disabled_sites.must_append(host);
 
     JsonObject built_in_content_blocker_lists;
     JsonArray custom_content_blocker_subscriptions;
@@ -569,13 +664,16 @@ JsonValue Settings::serialize_json() const
 
     JsonObject content_blockers;
     content_blockers.set(CONTENT_BLOCKER_ENABLED_KEY, m_content_blocker_enabled);
+    content_blockers.set(CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY, m_show_content_blocker_count);
+    content_blockers.set(CONTENT_BLOCKER_DISABLED_SITES_KEY, move(disabled_sites));
     content_blockers.set(CONTENT_BLOCKER_BUILT_IN_LISTS_KEY, move(built_in_content_blocker_lists));
     content_blockers.set(CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY, move(custom_content_blocker_subscriptions));
     content_blockers.set(CONTENT_BLOCKER_LOCAL_LISTS_KEY, move(local_content_blocker_lists));
     content_blockers.set(CONTENT_BLOCKER_CUSTOM_FILTERS_KEY, m_custom_content_blocker_filters);
     settings.set(CONTENT_BLOCKERS_KEY, move(content_blockers));
 
-    // dnsSettings :: { mode: "system" } | { mode: "custom", server: string, port: u16, type: "udp" | "tls", forciblyEnabled: bool, dnssec: bool }
+    // dnsSettings :: ({ mode: "system" } | { mode: "custom", server: string, port: u16, type: "udp" | "tls", forciblyEnabled: bool, dnssec: bool })
+    //                & { proxy?: { server: string, resolvesAllHostnames: bool } }
     JsonObject dns_settings;
     m_dns_settings.visit(
         [&](SystemDNS) {
@@ -597,6 +695,22 @@ JsonValue Settings::serialize_json() const
             dns_settings.set("dnssec"sv, dns.validate_dnssec_locally);
             dns_settings.set("forciblyEnabled"sv, m_dns_override_by_command_line);
         });
+
+    // Proxy-side resolution bypasses our DNS server and DNSSEC settings.
+    // Settings exist without an application in tests, which have no proxies to speak of.
+    HTTP::ProxyConfiguration proxy_configuration;
+    if (Application::is_initialized())
+        proxy_configuration = Application::request_server_options().proxy_configuration;
+    auto resolves_hostnames = [](Optional<HTTP::Proxy> const& proxy) { return proxy.has_value() && proxy->resolves_hostnames(); };
+    if (resolves_hostnames(proxy_configuration.http_proxy()) || resolves_hostnames(proxy_configuration.https_proxy())) {
+        auto const& proxy = resolves_hostnames(proxy_configuration.https_proxy()) ? *proxy_configuration.https_proxy() : *proxy_configuration.http_proxy();
+
+        JsonObject proxy_settings;
+        proxy_settings.set("server"sv, MUST(proxy.host.contains(':') ? String::formatted("[{}]:{}", proxy.host, proxy.port) : String::formatted("{}:{}", proxy.host, proxy.port)));
+        proxy_settings.set("resolvesAllHostnames"sv, resolves_hostnames(proxy_configuration.http_proxy()) && resolves_hostnames(proxy_configuration.https_proxy()));
+        dns_settings.set("proxy"sv, move(proxy_settings));
+    }
+
     settings.set(DNS_SETTINGS_KEY, move(dns_settings));
 
     JsonObject config_variables;
@@ -619,6 +733,39 @@ ErrorOr<void> Settings::complete_first_run()
     return {};
 }
 
+WindowSettings Settings::parse_window_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    WindowSettings window_settings;
+
+    if (auto position = settings.as_object().get_object(WINDOW_POSITION_KEY); position.has_value()) {
+        auto x = position->get_integer<i32>(WINDOW_X_KEY);
+        auto y = position->get_integer<i32>(WINDOW_Y_KEY);
+        if (x.has_value() && y.has_value())
+            window_settings.position = Gfx::IntPoint { *x, *y };
+    }
+
+    if (auto size = settings.as_object().get_object(WINDOW_SIZE_KEY); size.has_value()) {
+        auto width = size->get_integer<i32>(WINDOW_WIDTH_KEY);
+        auto height = size->get_integer<i32>(WINDOW_HEIGHT_KEY);
+        if (width.has_value() && height.has_value() && *width > 0 && *height > 0)
+            window_settings.size = Gfx::IntSize { *width, *height };
+    }
+
+    if (auto maximized = settings.as_object().get_bool(WINDOW_MAXIMIZED_KEY); maximized.has_value())
+        window_settings.maximized = *maximized;
+
+    return window_settings;
+}
+
+void Settings::set_window_settings(WindowSettings window_settings)
+{
+    m_window_settings = move(window_settings);
+    persist_settings();
+}
+
 void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
 {
     m_new_tab_page_url = move(new_tab_page_url);
@@ -628,10 +775,19 @@ void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
         observer.new_tab_page_url_changed();
 }
 
+void Settings::set_restore_previous_session(bool restore_previous_session)
+{
+    m_restore_previous_session = restore_previous_session;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.restore_previous_session_changed();
+}
+
 Vector<String> Settings::parse_json_languages(JsonValue const& languages)
 {
     if (!languages.is_array())
-        return { DEFAULT_LANGUAGE };
+        return Web::default_preferred_languages();
 
     Vector<String> parsed_languages;
     parsed_languages.ensure_capacity(languages.as_array().size());
@@ -642,7 +798,7 @@ Vector<String> Settings::parse_json_languages(JsonValue const& languages)
     });
 
     if (parsed_languages.is_empty())
-        return { DEFAULT_LANGUAGE };
+        return Web::default_preferred_languages();
 
     return parsed_languages;
 }
@@ -665,8 +821,10 @@ Appearance Settings::parse_appearance(JsonValue const& settings)
 
     if (auto show_menu_bar = settings.as_object().get_bool(SHOW_MENU_BAR_KEY); show_menu_bar.has_value())
         appearance.show_menu_bar = *show_menu_bar;
-    if (auto show_bookmarks_bar = settings.as_object().get_bool(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value())
-        appearance.show_bookmarks_bar = *show_bookmarks_bar;
+    if (auto show_bookmarks_bar = settings.as_object().get_string(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value()) {
+        if (auto parsed = bookmarks_bar_position_from_string(*show_bookmarks_bar); parsed.has_value())
+            appearance.show_bookmarks_bar = *parsed;
+    }
 
     return appearance;
 }
@@ -848,6 +1006,9 @@ void Settings::add_custom_search_engine(SearchEngine search_engine)
 
     m_custom_search_engines.append(move(search_engine));
     persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.search_engine_settings_changed();
 }
 
 void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
@@ -862,10 +1023,8 @@ void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
 
     persist_settings();
 
-    if (reset_default_search_engine) {
-        for (auto& observer : m_observers)
-            observer.search_engine_settings_changed();
-    }
+    for (auto& observer : m_observers)
+        observer.search_engine_settings_changed();
 }
 
 Optional<SearchEngine> Settings::find_search_engine_by_name(StringView name) const
@@ -962,18 +1121,6 @@ void Settings::set_global_privacy_control(GlobalPrivacyControl global_privacy_co
         observer.global_privacy_control_changed();
 }
 
-void Settings::set_user_agent_preset(Optional<StringView> user_agent_preset_name)
-{
-    m_user_agent_preset = user_agent_preset_name.has_value() ? normalize_user_agent_name(*user_agent_preset_name) : OptionalNone {};
-    persist_settings();
-}
-
-void Settings::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode navigator_compatibility_mode)
-{
-    m_navigator_compatibility_mode = navigator_compatibility_mode;
-    persist_settings();
-}
-
 DNSSettings Settings::parse_dns_settings(JsonValue const& dns_settings)
 {
     if (!dns_settings.is_object())
@@ -1037,6 +1184,32 @@ Optional<ContentBlockerList const&> Settings::content_blocker_list(StringView id
     return {};
 }
 
+bool Settings::content_blocker_enabled_for_site(StringView site) const
+{
+    auto host = Web::canonical_content_blocking_host(site);
+    return !host.has_value() || !m_content_blocker_disabled_sites.contains(*host);
+}
+
+ErrorOr<void> Settings::set_content_blocker_enabled_for_site(StringView site, bool enabled)
+{
+    auto host = Web::canonical_content_blocking_host(site);
+    if (!host.has_value())
+        return Error::from_string_literal("Invalid site hostname");
+
+    auto changed = enabled
+        ? m_content_blocker_disabled_sites.remove(*host)
+        : m_content_blocker_disabled_sites.set(*host) == HashSetResult::InsertedNewEntry;
+    if (!changed)
+        return {};
+
+    // FIXME: persist_settings should return an error so we can propagate to the UI.
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.content_blocker_settings_changed();
+    return {};
+}
+
 void Settings::set_content_blocker_enabled(bool enabled)
 {
     if (m_content_blocker_enabled == enabled)
@@ -1045,6 +1218,16 @@ void Settings::set_content_blocker_enabled(bool enabled)
     persist_settings();
     for (auto& observer : m_observers)
         observer.content_blocker_settings_changed();
+}
+
+void Settings::set_show_content_blocker_count(bool show)
+{
+    if (m_show_content_blocker_count == show)
+        return;
+    m_show_content_blocker_count = show;
+    persist_settings();
+    for (auto& observer : m_observers)
+        observer.content_blocker_count_visibility_changed();
 }
 
 void Settings::set_content_blocker_list_enabled(StringView identifier, bool enabled)
@@ -1121,15 +1304,6 @@ bool Settings::config_variable_as_bool(ConfigVariableID id) const
     return *value;
 }
 
-u32 Settings::config_variable_as_u32(ConfigVariableID id) const
-{
-    auto const& variable = config_variable_definition(id);
-    VERIFY(variable.default_value.is_number());
-
-    auto value = config_variable(id).get_u32();
-    return value.value_or_lazy_evaluated([&] { return variable.default_value.get_u32().value(); });
-}
-
 void Settings::set_config_variable(ConfigVariableID id, JsonValue value)
 {
     auto const& variable = config_variable_definition(id);
@@ -1165,25 +1339,27 @@ void Settings::persist_settings()
 
 void Settings::add_observer(Badge<SettingsObserver>, SettingsObserver& observer)
 {
-    Application::settings().m_observers.append(observer);
+    m_observers.append(observer);
 }
 
 void Settings::remove_observer(Badge<SettingsObserver>, SettingsObserver& observer)
 {
-    auto was_removed = Application::settings().m_observers.remove_first_matching([&](auto const& candidate) {
+    auto was_removed = m_observers.remove_first_matching([&](auto const& candidate) {
         return &candidate == &observer;
     });
     VERIFY(was_removed);
 }
 
 SettingsObserver::SettingsObserver()
+    : m_settings(Application::settings())
 {
-    Settings::add_observer({}, *this);
+    m_settings->add_observer({}, *this);
 }
 
 SettingsObserver::~SettingsObserver()
 {
-    Settings::remove_observer({}, *this);
+    if (m_settings)
+        m_settings->remove_observer({}, *this);
 }
 
 }

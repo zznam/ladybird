@@ -41,7 +41,7 @@ private:
     virtual void create_video_edge(VideoSinkHandle video_sink_handle, u64 edge_id) override;
     virtual void release_video_edge(u64 edge_id) override;
     virtual void request_start(u64 edge_id) override;
-    virtual void request_seek(u64 edge_id, AK::Duration timestamp) override;
+    virtual void request_seek(u64 edge_id, AK::Duration timestamp, InvalidateHeldData) override;
     virtual void release_slot(u64 edge_id, VideoFramePoolID pool_id, u32 slot_index) override;
     virtual void notify_space_available(u64 edge_id) override;
     virtual void notify_sink_status(u64 edge_id, PipelineStatus status, u32 requested_seek_id) override;
@@ -56,6 +56,7 @@ private:
     void create_registered_video_edge(VideoSinkHandle, u64 edge_id);
 
     HashMap<u64, EdgeState> m_edge_states;
+    HashMap<u64, NonnullRefPtr<RemoteVideoSink>> m_released_edge_pumps_with_lent_slots;
     HashMap<u64, VideoSinkHandle> m_pending_edge_handles_by_edge_id;
 };
 

@@ -5,6 +5,7 @@
  */
 
 #include <LibGfx/SharedImageBuffer.h>
+#include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QWindow>
@@ -16,9 +17,20 @@
 
 namespace Ladybird {
 
+static constexpr CGFloat WEB_VIEW_CORNER_RADIUS = 10;
+
 static CALayer* as_layer(void* layer)
 {
     return static_cast<CALayer*>(layer);
+}
+
+// The page layer and WebContent share one corner radius, which stays zero until a tab rounds its view.
+void WebContentView::set_has_rounded_corners(bool has_rounded_corners)
+{
+    set_viewport_corner_radius(has_rounded_corners ? WEB_VIEW_CORNER_RADIUS : 0);
+    if (m_iosurface_layer)
+        as_layer(m_iosurface_layer).cornerRadius = viewport_corner_radius();
+    update_iosurface_layer_border();
 }
 
 bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
@@ -36,8 +48,12 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
 
     if (!m_iosurface_layer) {
         auto* layer = [[CALayer alloc] init];
-        layer.opaque = YES;
+        // NB: The chrome painted behind the rounded corners shows through, so the layer is not opaque.
+        layer.opaque = NO;
         layer.masksToBounds = YES;
+        layer.cornerRadius = viewport_corner_radius();
+        // NB: The compositor clips the viewport's scrollbars to arcs concentric with circular corners.
+        layer.cornerCurve = kCACornerCurveCircular;
         // Without this every new frame would cross-fade in and geometry changes would slide.
         layer.actions = @ {
             @"contents" : NSNull.null,
@@ -48,8 +64,12 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
             @"position" : NSNull.null,
             @"hidden" : NSNull.null,
             @"backgroundColor" : NSNull.null,
+            @"cornerRadius" : NSNull.null,
+            @"borderWidth" : NSNull.null,
+            @"borderColor" : NSNull.null,
         };
         m_iosurface_layer = layer;
+        update_iosurface_layer_border();
     }
 
     auto* layer = as_layer(m_iosurface_layer);
@@ -59,8 +79,8 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
     }
     update_iosurface_layer_frame();
     update_iosurface_layer_background_color();
-    // The crash overlay is a child widget that Qt paints into the content layer, underneath this one.
-    layer.hidden = m_crash_overlay && !m_crash_overlay->isHidden();
+    // Overlays are child widgets that Qt paints into the content layer, underneath this one.
+    layer.hidden = is_page_covered_by_overlay();
     return true;
 }
 
@@ -91,10 +111,12 @@ void WebContentView::present_current_paintable_as_layer_contents()
     auto painted_unit_height = static_cast<CGFloat>(painted_height) / surface_height;
 
     // The surface can be larger than what was painted into it (a live resize pads it), so only the painted part is
-    // shown, one surface pixel per device pixel, anchored at the visual top-left. Inside Qt's flipped view the y-axis
-    // of this layer points down, which turns both the gravity constant and the unit rectangle upside down.
+    // shown: unless frames are scaled to fit, one surface pixel per device pixel, anchored at the visual top-left.
+    // Inside Qt's flipped view the y-axis of this layer points down, which turns both the top-left gravity constant
+    // and the unit rectangle upside down.
     bool y_axis_points_down = [layer contentsAreFlipped];
-    layer.contentsGravity = y_axis_points_down ? kCAGravityBottomLeft : kCAGravityTopLeft;
+    auto top_left_gravity = y_axis_points_down ? kCAGravityBottomLeft : kCAGravityTopLeft;
+    layer.contentsGravity = m_scales_frames_to_fit ? kCAGravityResizeAspect : top_left_gravity;
     layer.contentsRect = y_axis_points_down
         ? CGRectMake(0, 0, painted_unit_width, painted_unit_height)
         : CGRectMake(0, 1 - painted_unit_height, painted_unit_width, painted_unit_height);
@@ -120,6 +142,23 @@ void WebContentView::update_iosurface_layer_background_color()
     auto* background_color = CGColorCreateSRGB(color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0, 1.0);
     as_layer(m_iosurface_layer).backgroundColor = background_color;
     CGColorRelease(background_color);
+}
+
+// The rounded page is outlined like the location field, so that it stands apart from chrome of a similar color.
+void WebContentView::update_iosurface_layer_border()
+{
+    if (!m_iosurface_layer)
+        return;
+    auto* layer = as_layer(m_iosurface_layer);
+    if (viewport_corner_radius() <= 0) {
+        layer.borderWidth = 0;
+        return;
+    }
+    auto color = ChromeStyle::location_edit_border(window()->palette());
+    auto* border_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), color.alphaF());
+    layer.borderColor = border_color;
+    CGColorRelease(border_color);
+    layer.borderWidth = 1;
 }
 
 void WebContentView::detach_iosurface_layer_from_native_view()

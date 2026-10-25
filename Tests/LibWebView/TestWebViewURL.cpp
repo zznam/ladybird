@@ -360,6 +360,8 @@ TEST_CASE(location_looks_like_url)
     expect_location_does_not_look_like_url("example.org hello"sv);
     expect_location_does_not_look_like_url("example.def"sv);
     expect_location_does_not_look_like_url("javascript://alert"sv);
+    expect_location_does_not_look_like_url("f"sv);
+    expect_location_does_not_look_like_url("cafe"sv);
 
     expect_location_looks_like_url("example"sv, WebView::AppendTLD::Yes);
 }
@@ -386,7 +388,8 @@ TEST_CASE(context_menu_url_text)
 
 TEST_CASE(autocomplete_url_matching)
 {
-    expect_autocomplete_urls_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("example.com/path?q=1#fragment"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("https://example.com/page#:~:text=target"sv, "https://example.com/page#:~:text=target"sv);
 
     expect_autocomplete_urls_do_not_match("google.com"sv, "https://www.google.com/"sv);
     expect_autocomplete_urls_do_not_match("http://example.com"sv, "https://example.com/"sv);
@@ -394,6 +397,9 @@ TEST_CASE(autocomplete_url_matching)
     expect_autocomplete_urls_do_not_match("https://example.com"sv, "https://example.com:8443"sv);
     expect_autocomplete_urls_do_not_match("hello"sv, "https://hello.example/"sv);
     expect_autocomplete_urls_do_not_match("steam://launch/1536610"sv, "https://steam://launch/1536610"sv);
+    expect_autocomplete_urls_do_not_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page"sv, "https://example.com/page#:~:text=target"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page#section"sv, "https://example.com/page#section:~:text=target"sv);
 }
 
 TEST_CASE(autocomplete_url_completion)
@@ -402,6 +408,7 @@ TEST_CASE(autocomplete_url_completion)
     expect_autocomplete_url_can_complete("reddit.co"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_can_complete("https://reddit.co"sv, "https://www.reddit.com/"sv);
     expect_autocomplete_url_can_complete("www.reddit.co"sv, "https://www.reddit.com/"sv);
+    expect_autocomplete_url_can_complete("example.com/page#sec"sv, "https://example.com/page#section"sv);
 
     expect_autocomplete_url_cannot_complete("reddit.com"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_cannot_complete("reddit.co"sv, "https://reddit.co/"sv);

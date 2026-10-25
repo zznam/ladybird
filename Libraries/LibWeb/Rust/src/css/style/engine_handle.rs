@@ -15,6 +15,10 @@ use super::StyleEngine;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StyleEngineHandle(*mut StyleEngine);
 
+// SAFETY: The handle only names the engine; every borrow of the engine through it is unsafe, and its caller guarantees
+// that nothing else borrows the engine meanwhile, on whichever thread.
+unsafe impl Send for StyleEngineHandle where StyleEngine: Send {}
+
 impl StyleEngineHandle {
     /// A handle that names no engine.
     #[must_use]
@@ -27,18 +31,13 @@ impl StyleEngineHandle {
         self.0.is_null()
     }
 
-    /// The address that tells the engine apart from the others alive at the same time.
-    #[must_use]
-    pub fn address(self) -> usize {
-        self.0 as usize
-    }
-
     /// Hands `engine` over to the handle, which names it until [`Self::destroy`].
     pub(crate) fn create(engine: Box<StyleEngine>) -> Self {
         Self(Box::into_raw(engine))
     }
 
     /// A handle for an engine that its caller owns and keeps alive while the handle is used.
+    #[cfg(test)]
     pub fn from_raw(engine: *mut StyleEngine) -> Self {
         Self(engine)
     }

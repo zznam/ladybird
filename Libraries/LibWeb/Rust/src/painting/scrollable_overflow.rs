@@ -7,18 +7,17 @@
 use crate::css::css_enums::{flex_direction, flex_wrap, overflow, positioning, writing_mode};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::css::display::FfiDisplay;
+use crate::fast_hash::FastMap as HashMap;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
-use crate::painting::paint_read::PaintRead;
+use crate::layout::node_facts::{self, NodeShape};
+use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow};
 use crate::painting::paintable_data::FfiOverflowData;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 use crate::painting::visual_context::node_values;
 use crate::painting::{paintable_geometry, style_queries, text_fragment};
-use libgfx_rust::matrix::{AffineTransform, FloatMatrix4x4};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 /// Index boxes whose containing block differs from their layout parent. Direct children are
 /// enumerated from the layout tree when measuring overflow.
@@ -30,35 +29,20 @@ pub(crate) fn refill_contained_boxes_index(
     for contained_boxes in non_child_boxes_by_containing_block.values_mut() {
         contained_boxes.clear();
     }
-    if layout_arena.slot_is_live(root) {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node != root
-                && let Some(sibling) = layout_arena.node_next_sibling_if_live(node)
-            {
-                stack.push(sibling);
-            }
-            if let Some(first_child) = layout_arena.node_first_child_if_live(node) {
-                stack.push(first_child);
-            }
-            let node_is_box_kind = layout_arena
-                .node_kind_if_live(node)
-                .is_some_and(node_facts::kind_is_box);
-            if !node_is_box_kind || !layout_arena.paintable_row_is_populated(node) {
-                continue;
-            }
-            let Some(containing_block) = layout_arena.node_containing_block_if_live(node) else {
-                continue;
-            };
-            if layout_arena.node_parent_if_live(node) == Some(containing_block) {
-                continue;
-            }
+    layout_arena.for_each_node_in_layout_subtree_in_pre_order_with_pruning(root, |node| {
+        if let Some(row) = layout_arena.node(node)
+            && node_facts::kind_is_box(row.kind())
+            && layout_arena.paintable_row_is_populated(node)
+            && let Some(containing_block) = layout_arena.node_containing_block_if_live(node)
+            && row.parent() != containing_block
+        {
             non_child_boxes_by_containing_block
                 .entry(containing_block)
                 .or_default()
                 .push(node);
         }
-    }
+        true
+    });
     non_child_boxes_by_containing_block.retain(|_, contained_boxes| !contained_boxes.is_empty());
 }
 
@@ -138,63 +122,6 @@ pub(crate) fn physical_overflow_directions(
     }
 }
 
-fn extract_two_dimensional_affine_transform(matrix: &FloatMatrix4x4) -> AffineTransform {
-    let elements = &matrix.elements;
-    AffineTransform {
-        values: [
-            elements[0][0],
-            elements[1][0],
-            elements[0][1],
-            elements[1][1],
-            elements[0][3],
-            elements[1][3],
-        ],
-    }
-}
-
-fn affine_is_identity_or_translation(affine: &AffineTransform) -> bool {
-    let [a, b, c, d, _, _] = affine.values;
-    a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0
-}
-
-fn affine_map_point(affine: &AffineTransform, x: f32, y: f32) -> (f32, f32) {
-    let [a, b, c, d, e, f] = affine.values;
-    (a * x + c * y + e, b * x + d * y + f)
-}
-
-struct FloatRectEdges {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-fn affine_map_float_rect(affine: &AffineTransform, rect: FloatRectEdges) -> FloatRectEdges {
-    if affine_is_identity_or_translation(affine) {
-        let [_, _, _, _, e, f] = affine.values;
-        return FloatRectEdges {
-            x: rect.x + e,
-            y: rect.y + f,
-            width: rect.width,
-            height: rect.height,
-        };
-    }
-    let (x1, y1) = affine_map_point(affine, rect.x, rect.y);
-    let (x2, y2) = affine_map_point(affine, rect.x + rect.width, rect.y);
-    let (x3, y3) = affine_map_point(affine, rect.x + rect.width, rect.y + rect.height);
-    let (x4, y4) = affine_map_point(affine, rect.x, rect.y + rect.height);
-    let left = x1.min(x2).min(x3).min(x4);
-    let top = y1.min(y2).min(y3).min(y4);
-    let right = x1.max(x2).max(x3).max(x4);
-    let bottom = y1.max(y2).max(y3).max(y4);
-    FloatRectEdges {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    }
-}
-
 fn apply_css_transform_to_scrollable_overflow_rect(
     layout_arena: &impl PaintableRowsRead,
     box_paintable: NodeSlotId,
@@ -207,61 +134,18 @@ fn apply_css_transform_to_scrollable_overflow_rect(
     let Some((transform, _is_invertible)) = node_values::compute_transform(layout_arena, box_paintable, 1.0) else {
         return rect;
     };
-
-    let affine = extract_two_dimensional_affine_transform(&transform.matrix);
-    let transformed = affine_map_float_rect(
-        &affine,
-        FloatRectEdges {
-            x: rect.x.to_float() - transform.origin.x,
-            y: rect.y.to_float() - transform.origin.y,
-            width: rect.width.to_float(),
-            height: rect.height.to_float(),
-        },
-    );
-    CssPixelRect::new(
-        CssPixels::nearest_value_for_f32(transformed.x + transform.origin.x),
-        CssPixels::nearest_value_for_f32(transformed.y + transform.origin.y),
-        CssPixels::nearest_value_for_f32(transformed.width),
-        CssPixels::nearest_value_for_f32(transformed.height),
-    )
+    super::scroll_snap::map_rect_through_css_transform(transform.matrix, transform.origin, rect)
 }
 
 fn padding_inflated_scrollable_overflow(
     layout_arena: &impl PaintableRowsRead,
     box_paintable: NodeSlotId,
-    box_node: NodeSlotId,
     in_flow_and_floated_content_bounds: CssPixelRect,
 ) -> CssPixelRect {
-    let content_box = paintable_geometry::absolute_rect(layout_arena, box_paintable);
-    let padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, box_paintable);
+    // NB: The box's own padding surrounds its in-flow and floated content. Whatever of it falls inside the padding box,
+    //     or in the unreachable scrollable overflow region, adds nothing. This matches Blink.
     let padding = paintable_geometry::committed_padding(layout_arena, box_paintable);
-    let overflow_directions = physical_overflow_directions(layout_arena, box_node);
-
-    let mut left = in_flow_and_floated_content_bounds.left();
-    let mut top = in_flow_and_floated_content_bounds.top();
-    let mut right = in_flow_and_floated_content_bounds.right();
-    let mut bottom = in_flow_and_floated_content_bounds.bottom();
-
-    let in_flow_bounds_overflow_content_box_in_horizontal_axis =
-        left < content_box.left() || right > content_box.right();
-    if in_flow_bounds_overflow_content_box_in_horizontal_axis {
-        if overflow_directions.horizontal_axis_is_positive && right > content_box.right() {
-            right += padding.right;
-        } else if !overflow_directions.horizontal_axis_is_positive {
-            left = left.min(padding_box.left()) - padding.left;
-        }
-    }
-
-    let in_flow_bounds_overflow_content_box_in_vertical_axis = top < content_box.top() || bottom > content_box.bottom();
-    if in_flow_bounds_overflow_content_box_in_vertical_axis {
-        if overflow_directions.vertical_axis_is_positive && bottom > content_box.bottom() {
-            bottom += padding.bottom;
-        } else if !overflow_directions.vertical_axis_is_positive {
-            top = top.min(padding_box.top()) - padding.top;
-        }
-    }
-
-    CssPixelRect::new(left, top, right - left, bottom - top)
+    in_flow_and_floated_content_bounds.inflated(padding.top, padding.right, padding.bottom, padding.left)
 }
 
 #[derive(Clone, Copy)]
@@ -311,10 +195,10 @@ impl OverflowAssignment {
                 layout_arena.push_paint_damage(source.root_layout_node, PaintDamage::DRAW_BACKGROUND);
             }
         }
+        // A flip changes what rendering preparation answers even where it is the box's first measurement since it
+        // was laid out: the visual context of the box goes stale either way.
         if scrollability_flipped {
-            if previously_measured {
-                layout_arena.scrollable_overflow.scrollability_changed.set(true);
-            }
+            layout_arena.scrollable_overflow.scrollability_changed.set(true);
             layout_arena.push_paint_damage(self.box_paintable, PaintDamage::ALL_PRODUCERS);
             layout_arena.push_paint_damage_to_paint_subtree(self.box_paintable, PaintDamage::SCROLL_METADATA);
             layout_arena.note_visual_context_box_dirty(
@@ -374,21 +258,18 @@ fn measure_scrollable_overflow_impl(
             .overflow_measured_this_commit
             .get();
         if measured_this_commit && data.overflow_valid_across_recommits {
-            return CssPixelRect::from(data.overflow_relative_to_padding_box.rect)
-                .translated_by(paintable_geometry::absolute_padding_box_rect(layout_arena, box_paintable).location());
+            return CssPixelRect::from(data.overflow_relative_to_padding_box.rect).translated_by(
+                paintable_geometry::first_fragment_padding_box_rect(layout_arena, box_paintable).location(),
+            );
         }
         data.overflow_valid_across_recommits
             .then_some(data.overflow_relative_to_padding_box)
     };
 
     let box_node = box_paintable;
-    let paintable_absolute_padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, box_paintable);
+    let paintable_absolute_padding_box =
+        paintable_geometry::first_fragment_padding_box_rect(layout_arena, box_paintable);
     let paintable_absolute_content_box = paintable_geometry::absolute_rect(layout_arena, box_paintable);
-    let has_line_clamp_point = layout_arena.with_committed_fragment_link(box_node, |link| {
-        link.is_some_and(|link| link.fragment.has_line_clamp_point)
-    });
-    let line_clamp_clip = has_line_clamp_point.then(|| style_queries::line_clamp_clip_rect(layout_arena, box_node));
-    let clip_in_flow = |rect: CssPixelRect| line_clamp_clip.map_or(rect, |clip| rect.intersected(clip));
 
     if let Some(still_valid_overflow) = still_valid_overflow {
         let scrollable_overflow_rect =
@@ -399,6 +280,11 @@ fn measure_scrollable_overflow_impl(
         });
         return scrollable_overflow_rect;
     }
+
+    let line_clamp_clip = (style_queries::has_line_clamp_point(layout_arena, box_node)
+        && !style_queries::clamped_content_is_scrollable_overflow(layout_arena, box_node))
+    .then(|| style_queries::line_clamp_clip_rect(layout_arena, box_node));
+    let clip_in_flow = |rect: CssPixelRect| line_clamp_clip.map_or(rect, |clip| rect.intersected(clip));
 
     // The scrollable overflow area of a box is the union of:
 
@@ -423,14 +309,30 @@ fn measure_scrollable_overflow_impl(
     // - All line boxes it directly contains.
     if crate::painting::node_painting::has_lines(layout_arena, box_paintable) {
         let side_data = layout_arena.committed_side_data(box_paintable);
-        let absolute_position = paintable_geometry::absolute_position(layout_arena, box_paintable);
-        for line in side_data.lines() {
-            let line_rect = CssPixelRect::from(line.rect).translated_by(absolute_position);
+        let positions = paintable_geometry::LineRootPositions::new(layout_arena, box_paintable);
+        let lines = side_data.lines();
+        let line_rects = lines
+            .iter()
+            .map(|line| CssPixelRect::from(line.rect).translated_by(positions.of_fragment(line.box_fragment)));
+        let elided_content_rects = side_data.elided_content_rects().iter().map(|&(line_index, rect)| {
+            CssPixelRect::from(rect).translated_by(positions.of_fragment(lines[line_index as usize].box_fragment))
+        });
+        let lines_after_clamp_point = side_data
+            .lines_after_clamp_point_rect()
+            .map(|rect| CssPixelRect::from(rect).translated_by(positions.of_fragment(0)));
+        for line_rect in line_rects.chain(elided_content_rects).chain(lines_after_clamp_point) {
             scrollable_overflow_rect.unite(line_rect);
             in_flow_and_floated_content_bounds.unite(line_rect);
         }
         for fragment in side_data.fragments() {
-            let mut fragment_rect = text_fragment::absolute_rect(layout_arena, fragment);
+            // NB: The box holding the line boxes is the containing block of each of their fragments, and their
+            //     offsets are relative to it, also for a fragment whose node left the tree since it was laid out.
+            debug_assert!(
+                text_fragment::containing_block_paintable(layout_arena, fragment)
+                    .is_none_or(|block| block == box_paintable)
+            );
+            let mut fragment_rect = text_fragment::rect_in_containing_block(fragment)
+                .translated_by(positions.of_line(side_data.lines(), fragment.line_index as usize));
             if layout_arena.node_is_in_focused_text_control(fragment.layout_node)
                 && let Some(style_source_style) =
                     layout_arena.node_style_if_live(text_fragment::style_source(layout_arena, fragment))
@@ -457,31 +359,52 @@ fn measure_scrollable_overflow_impl(
         }
     }
 
+    // https://drafts.csswg.org/css-grid-2/#overflow
+    // The grid is also included in a grid container's scrollable overflow region.
+    // INTEROP: Blink only does this when the grid container is a scroll container, so the grid does not reach the
+    //          scrollable overflow of its ancestors.
+    if style_queries::is_scroll_container(layout_arena, box_node)
+        && let Some(tracks) = paintable_geometry::committed_used_grid_tracks(layout_arena, box_paintable)
+    {
+        let grid_area = tracks
+            .grid_area
+            .translated_by(paintable_absolute_content_box.location());
+        // NB: A grid with tracks in one axis only, e.g. columns but no rows, still reaches the overflow in that axis.
+        if grid_area.width > CssPixels::default() {
+            scrollable_overflow_rect.unite_horizontally(grid_area);
+            in_flow_and_floated_content_bounds.unite_horizontally(grid_area);
+        }
+        if grid_area.height > CssPixels::default() {
+            scrollable_overflow_rect.unite_vertically(grid_area);
+            in_flow_and_floated_content_bounds.unite_vertically(grid_area);
+        }
+    }
+
     // - The border boxes of all boxes for which it is the containing block and whose border boxes are positioned not
     //   wholly in the negative scrollable overflow region,
     //   FIXME: accounting for 3D transforms by projecting each box onto the plane of the element that establishes
     //          its 3D rendering context. [CSS3-TRANSFORMS]
     // OPTIMIZATION: The layout tree already indexes direct children. Retain only boxes whose
     //               containing block differs from their parent in the supplemental index.
-    let direct_children = std::iter::successors(layout_arena.node_first_child_if_live(box_node), |&child| {
-        layout_arena.node_next_sibling_if_live(child)
-    });
+    let box_has_line_clamp_point = style_queries::has_line_clamp_point(layout_arena, box_node);
+    let direct_children = layout_arena.children(box_node);
     let other_contained_boxes = non_child_boxes_by_containing_block
         .get(&box_node)
         .into_iter()
         .flatten()
         .copied();
     for child_node in direct_children.chain(other_contained_boxes) {
-        if !layout_arena
-            .node_kind_if_live(child_node)
-            .is_some_and(node_facts::kind_is_box)
+        let Some(child_row) = layout_arena.node(child_node) else {
+            continue;
+        };
+        if !node_facts::kind_is_box(child_row.kind())
             || !layout_arena.paintable_row_is_populated(child_node)
             || layout_arena.node_containing_block_if_live(child_node) != Some(box_node)
         {
             continue;
         }
 
-        let child_style = layout_arena.node_style_if_live(child_node);
+        let child_style = child_row.style();
         let child_position = child_style.map_or(positioning::STATIC, |style| style.position());
         let child_is_absolutely_positioned = matches!(child_position, positioning::ABSOLUTE | positioning::FIXED);
 
@@ -495,23 +418,21 @@ fn measure_scrollable_overflow_impl(
 
         let child_has_css_transform =
             child_style.is_some_and(|style| style_queries::has_css_transform(layout_arena, child_node, style));
-        let child_flags = layout_arena.node_flags_if_live(child_node);
+        let child_flags = child_row.flags();
         let child_is_flex_or_grid_item = child_flags & (NodeFlag::IsFlexItem as u32 | NodeFlag::IsGridItem as u32) != 0;
         let child_is_floating = !child_is_flex_or_grid_item && child_style.is_some_and(|style| style.is_floating());
-        if style_queries::is_invisible_for_line_clamp(layout_arena, child_node) {
-            continue;
-        }
         let child_display = child_style.map_or_else(FfiDisplay::block, |style| style.display());
 
         {
             let child_data = layout_arena.committed_side_data(child_node);
+            // NB: A line before a line clamp point can be cut short of the atomic inlines on it, so it does not
+            //     contribute their boxes.
             if child_position == positioning::STATIC
                 && child_display.is_inline_outside()
                 && !child_is_floating
                 && !child_has_css_transform
-                && layout_arena
-                    .committed_side_data(child_node)
-                    .overflow_valid_across_recommits
+                && !box_has_line_clamp_point
+                && child_data.overflow_valid_across_recommits
             {
                 let border = crate::painting::paintable_geometry::committed_border(layout_arena, child_node);
                 let zero = CssPixels::from_raw(0);
@@ -532,6 +453,9 @@ fn measure_scrollable_overflow_impl(
                     }
                 }
             }
+        }
+        if style_queries::is_excluded_from_scrollable_overflow_by_line_clamp(layout_arena, child_node) {
+            continue;
         }
 
         let untransformed_child_border_box = paintable_geometry::absolute_border_box_rect(layout_arena, child_node);
@@ -563,29 +487,41 @@ fn measure_scrollable_overflow_impl(
         if !child_border_box.is_empty() {
             scrollable_overflow_rect.unite(child_border_box);
 
-            let untransformed_child_margin_box = if child_is_flex_or_grid_item {
-                let child_margin = paintable_geometry::committed_margin(layout_arena, child_node);
-                let zero = CssPixels::from_raw(0);
-                Some(untransformed_child_border_box.inflated(
-                    child_margin.top.min(zero),
-                    child_margin.right.min(zero),
-                    child_margin.bottom.min(zero),
-                    child_margin.left.min(zero),
-                ))
-            } else {
-                None
-            };
-
             let child_is_in_flow = !(child_is_floating || child_is_absolutely_positioned);
             if child_is_in_flow || child_is_floating {
-                if let Some(child_margin_box) = untransformed_child_margin_box {
-                    // Use negative flex and grid item margin edges to determine whether the container's end
-                    // padding has already been consumed by in-flow content.
-                    in_flow_and_floated_content_bounds.unite_horizontally(child_margin_box);
-                    in_flow_and_floated_content_bounds.unite_vertically(child_margin_box);
-                } else {
-                    in_flow_and_floated_content_bounds.unite(untransformed_child_border_box);
-                }
+                // INTEROP: The edges of in-flow and floated content, after which the container's end padding comes,
+                //          are those of the margin boxes of block-level boxes, flex items and grid items, as in Blink:
+                //          with their computed margins, auto counting as zero, and where they are laid out before
+                //          relative positioning. Toward the end of the scrollable overflow a negative margin counts,
+                //          but no further than the size of the box; toward its start, it does not.
+                let child_is_block_level = child_is_flex_or_grid_item || !child_display.is_inline_outside();
+                let content_box = match child_style {
+                    Some(style) if child_is_block_level => {
+                        let mut border_box = untransformed_child_border_box;
+                        if child_position == positioning::RELATIVE {
+                            let inset = paintable_geometry::committed_inset(layout_arena, child_node);
+                            border_box = border_box.translated(-inset.left, -inset.top);
+                        }
+                        let margin = &style.surround().margin;
+                        let basis = paintable_absolute_content_box.width;
+                        let zero = CssPixels::from_raw(0);
+                        let (left, right) = (margin.left.to_px(basis), margin.right.to_px(basis));
+                        let (top, bottom) = (margin.top.to_px(basis), margin.bottom.to_px(basis));
+                        let (left, right) = if overflow_directions.horizontal_axis_is_positive {
+                            (left.max(zero), right.max(-border_box.width))
+                        } else {
+                            (left.max(-border_box.width), right.max(zero))
+                        };
+                        let (top, bottom) = if overflow_directions.vertical_axis_is_positive {
+                            (top.max(zero), bottom.max(-border_box.height))
+                        } else {
+                            (top.max(-border_box.height), bottom.max(zero))
+                        };
+                        border_box.inflated(top, right, bottom, left)
+                    }
+                    _ => untransformed_child_border_box,
+                };
+                in_flow_and_floated_content_bounds.unite(content_box);
             }
         }
 
@@ -647,7 +583,6 @@ fn measure_scrollable_overflow_impl(
         scrollable_overflow_rect.unite(padding_inflated_scrollable_overflow(
             layout_arena,
             box_paintable,
-            box_node,
             in_flow_and_floated_content_bounds,
         ));
     }
@@ -711,7 +646,7 @@ fn measure_scrollable_overflow_impl(
 
 /// Geometry caches and their pending effects belong to the arena, independently of the
 /// visual-context state temporarily borrowed or taken by painting traversals.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ScrollableOverflowState {
     pub(crate) viewport: Cell<Option<NodeSlotId>>,
     pub(crate) full_layout_commit: Cell<bool>,
@@ -720,9 +655,17 @@ pub(crate) struct ScrollableOverflowState {
     pub(crate) geometry_changed: Cell<bool>,
     pub(crate) scrollability_changed: Cell<bool>,
     pub(crate) recalculations: Cell<u64>,
+    pub(crate) contained_box_index_refills: Cell<u64>,
     /// Rows whose overflow a read could find unmeasured: new rows, and rows whose measurement was
     /// invalidated. Reading overflow never measures it, so the pass measures these first.
     pub(crate) rows_to_measure: RefCell<Vec<NodeSlotId>>,
+}
+
+impl ScrollableOverflowState {
+    /// Whether a measurement changed what rendering preparation answers, which no preparation settled since.
+    pub(crate) fn measurement_awaits_preparation(&self) -> bool {
+        self.geometry_changed.get() || self.scrollability_changed.get()
+    }
 }
 
 impl LayoutNodeArena {
@@ -742,12 +685,36 @@ impl LayoutNodeArena {
         }
     }
 
+    /// Notes that `root` is being linked into or out of the tree. The tree above a box decides its
+    /// containing block, so only boxes in this subtree can enter or leave the index, and only those
+    /// whose containing block differs from their parent are listed in it.
+    pub(crate) fn note_overflow_contained_boxes_may_move_with_subtree(&self, root: NodeSlotId) {
+        if self.scrollable_overflow.contained_boxes_dirty.get()
+            || self.scrollable_overflow.non_child_boxes.borrow().is_empty()
+        {
+            return;
+        }
+        let mut found = false;
+        self.for_each_node_in_layout_subtree_in_pre_order_with_pruning(root, |node| {
+            let data = self.data(node);
+            found = found
+                || (node_facts::kind_is_box(data.kind.get())
+                    && self.node_containing_block_if_live(node) != Some(data.parent.get()));
+            !found
+        });
+        if found {
+            self.scrollable_overflow.contained_boxes_dirty.set(true);
+        }
+    }
+
     pub(crate) fn ensure_overflow_contained_boxes(&self) {
         if !self.scrollable_overflow.contained_boxes_dirty.replace(false) {
             return;
         }
         let mut index = self.scrollable_overflow.non_child_boxes.borrow_mut();
         if let Some(viewport) = self.scrollable_overflow.viewport.get() {
+            let refills = &self.scrollable_overflow.contained_box_index_refills;
+            refills.set(refills.get() + 1);
             refill_contained_boxes_index(&self.paintable_rows(), viewport, &mut index);
         } else {
             index.clear();
@@ -964,6 +931,17 @@ impl OverflowStyle {
             && old.transform_origin_x == new.transform_origin_x
             && old.transform_origin_y == new.transform_origin_y
             && old.transform_origin_z == new.transform_origin_z
+    }
+}
+
+/// A fork's snapshot holds its own reference to the group.
+impl Clone for OverflowStyle {
+    fn clone(&self) -> Self {
+        crate::css::computed_values::retain_group_payload(
+            crate::css::computed_value_types::STYLE_GROUP_INDEX_TRANSFORM,
+            self.0.as_ptr().cast(),
+        );
+        Self(self.0)
     }
 }
 

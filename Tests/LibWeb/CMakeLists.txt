@@ -10,6 +10,9 @@ set(TEST_SOURCES
     TestDownloadReader.cpp
     TestDump.cpp
     TestEventLoop.cpp
+    TestFaviconDecoding.cpp
+    TestFetchEngineMessages.cpp
+    TestFetchExecutor.cpp
     TestFetchResponse.cpp
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
@@ -25,13 +28,13 @@ set(TEST_SOURCES
     TestSharedCompiledStyleSheet.cpp
     TestSimpleRealm.cpp
     TestSourceHighlighter.cpp
+    TestStorageAreaMirror.cpp
     TestStructuredSerializeCorpus.cpp
     TestStructuredSerializeDurability.cpp
     TestStructuredSerializeFormat.cpp
     TestStructuredSerializeHardening.cpp
     TestStructuredSerializeSharedArrayBuffer.cpp
     TestStyleEngineBridge.cpp
-    TestWebGLSpanWithStorage.cpp
     TestWebIDLBuffers.cpp
     TestWindowProxyWorld.cpp
     TestWorldCallback.cpp
@@ -61,17 +64,20 @@ endforeach()
 target_link_libraries(BenchmarkDisplayListRecording PRIVATE LibGC LibGfx LibIPC LibJS LibURL LibWebView)
 target_link_libraries(TestAudioWorkletPipe PRIVATE LibCore LibThreading)
 target_link_libraries(TestContentBlocker PRIVATE LibURL)
+target_link_libraries(TestStorageAreaMirror PRIVATE LibURL LibWebCommon)
+target_link_libraries(TestFetchEngineMessages PRIVATE LibCore LibIPC LibRequests)
+target_link_libraries(TestFetchExecutor PRIVATE LibCore LibIPC LibThreading)
 if (NOT WIN32)
     target_link_libraries(TestCSSSyntaxParser PRIVATE LibThreading)
 endif()
 target_link_libraries(TestDownloadReader PRIVATE LibGC LibJS LibURL)
+target_link_libraries(TestFaviconDecoding PRIVATE LibCore LibGC LibGfx LibJS)
 target_link_libraries(TestFetchResponse PRIVATE LibGC LibHTTP LibJS LibRequests LibURL)
 target_link_libraries(TestFetchURL PRIVATE LibURL)
 target_link_libraries(TestImageData PRIVATE LibGC LibJS)
 target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
-target_link_libraries(TestWebGLSpanWithStorage PRIVATE LibGC LibJS)
 target_link_libraries(TestStructuredSerializeCorpus PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
-target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC LibWasm)
 target_link_libraries(TestStructuredSerializeFormat PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeHardening PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeSharedArrayBuffer PRIVATE LibGC LibJS LibIPC)
@@ -93,4 +99,29 @@ target_link_libraries(TestWindowProxyWorld PRIVATE LibGC LibJS LibWeb)
 
 add_subdirectory("test-web")
 
+if (BUILD_TESTING AND NOT WIN32)
+    add_test(
+        NAME TestWebDriverHTTPErrorResponses
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-http-error-responses.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverHTTPErrorResponses PROPERTIES TIMEOUT 120)
+endif()
+
+# The check reads the symbols of the build's objects with nm, which can't see into an LTO build's bitcode objects and
+# isn't the toolchain's symbol reader on Windows.
+if (BUILD_TESTING AND NOT WIN32 AND NOT CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+    add_test(
+        NAME TestDeadRustExports
+        COMMAND ${Python3_EXECUTABLE} ${LADYBIRD_SOURCE_DIR}/Meta/check-dead-rust-exports.py
+            --nm ${CMAKE_NM}
+            --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
+            --source-root ${LADYBIRD_SOURCE_DIR}
+            $<TARGET_FILE:libweb_bindings_rust>
+            $<TARGET_FILE:libweb_content_blocker_rust>
+    )
+endif()
+
 target_link_libraries(TestInlineStyle PRIVATE LibCore LibGC LibGfx LibJS LibURL)
+
+add_subdirectory("AccessibilityBridge")
+add_subdirectory("AccessibilityBridgeMac")

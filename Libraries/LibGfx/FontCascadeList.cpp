@@ -17,6 +17,7 @@ void const* ladybird_gfx_frozen_font_list_build(void const* list);
 void ladybird_gfx_frozen_font_list_release(void const* frozen);
 void const* ladybird_gfx_frozen_font_list_font_for_code_point(void const* frozen, u32 code_point, bool is_emoji, bool forced);
 size_t ladybird_gfx_request_wanted_pending_faces();
+bool ladybird_gfx_frozen_font_lists_equal(void const*, void const*);
 }
 
 namespace Gfx {
@@ -39,13 +40,14 @@ Atomic<u64> s_next_pending_face_id { 1 };
 
 }
 
-FontCascadeList::PendingFace::PendingFace(UnicodeRange enclosing, Vector<UnicodeRange> ranges, Function<PendingFontState()> resolve, Function<RefPtr<Font const>()> resolved_font, Function<PendingFontState()> peek_state)
+FontCascadeList::PendingFace::PendingFace(UnicodeRange enclosing, Vector<UnicodeRange> ranges, Function<PendingFontState()> resolve, Function<RefPtr<Font const>()> resolved_font, Function<PendingFontState()> peek_state, u64 source_face_id)
     : m_enclosing_range(enclosing)
     , m_unicode_ranges(move(ranges))
     , m_resolve(move(resolve))
     , m_resolved_font(move(resolved_font))
     , m_peek_state(move(peek_state))
     , m_id(s_next_pending_face_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
+    , m_source_face_id(source_face_id)
 {
     MutexLocker locker(s_pending_face_registry->mutex);
     s_pending_face_registry->faces.set(m_id, this);
@@ -123,7 +125,7 @@ void FontCascadeList::add(NonnullRefPtr<Font const> font, Vector<UnicodeRange> u
         } });
 }
 
-void FontCascadeList::add_pending_face(Vector<UnicodeRange> unicode_ranges, Function<PendingFontState()> resolve, Function<RefPtr<Font const>()> resolved_font, Function<PendingFontState()> peek_state)
+void FontCascadeList::add_pending_face(Vector<UnicodeRange> unicode_ranges, Function<PendingFontState()> resolve, Function<RefPtr<Font const>()> resolved_font, Function<PendingFontState()> peek_state, u64 source_face_id)
 {
     m_ascii_cache.fill(nullptr);
     if (unicode_ranges.is_empty())
@@ -136,7 +138,7 @@ void FontCascadeList::add_pending_face(Vector<UnicodeRange> unicode_ranges, Func
         highest_code_point = max(highest_code_point, range.max_code_point());
     }
 
-    m_pending_faces.append({ m_fonts.size(), adopt_ref(*new PendingFace(UnicodeRange { lowest_code_point, highest_code_point }, move(unicode_ranges), move(resolve), move(resolved_font), move(peek_state))) });
+    m_pending_faces.append({ m_fonts.size(), adopt_ref(*new PendingFace(UnicodeRange { lowest_code_point, highest_code_point }, move(unicode_ranges), move(resolve), move(resolved_font), move(peek_state), source_face_id)) });
 }
 
 void FontCascadeList::extend(FontCascadeList const& other)
@@ -308,8 +310,9 @@ Gfx::Font const& FontCascadeList::font_for_code_point(u32 code_point, EmojiPrese
     if (m_system_font_fallback_callback) {
         if (auto fallback = m_system_font_fallback_callback(code_point, emoji_presentation.presentation, first())) {
             if (presentation_matches(*fallback) || (!author_glyph_match && !fallback_glyph_match)) {
-                m_fallback_fonts.append({ fallback.release_nonnull(), {} });
-                return cache_and_return(*m_fallback_fonts.last().font);
+                auto const& fallback_font = *fallback;
+                m_retained_system_fallback_fonts.set(fallback.release_nonnull());
+                return cache_and_return(fallback_font);
             }
         }
     }
@@ -343,6 +346,7 @@ Vector<FontCascadeList::SnapshotEntry> FontCascadeList::snapshot_entries(Vector<
                 .unicode_ranges = face->unicode_ranges(),
                 .pending_face_id = face->id(),
                 .pending_state = state,
+                .source_face_id = face->source_face_id(),
             });
         }
     };
@@ -385,6 +389,8 @@ Font const& FontCascadeList::frozen_font_for_code_point(u32 code_point, EmojiPre
 
 bool FontCascadeList::equals(FontCascadeList const& other) const
 {
+    if (m_frozen_list && other.m_frozen_list)
+        return ladybird_gfx_frozen_font_lists_equal(m_frozen_list, other.m_frozen_list);
     if (!m_pending_faces.is_empty() || !other.m_pending_faces.is_empty())
         return false;
     if (m_fonts.size() != other.m_fonts.size())
@@ -421,6 +427,7 @@ struct FfiCascadeSnapshotEntry {
     size_t range_count;
     u64 pending_face_id;
     u8 pending_state;
+    u64 source_face_id;
 };
 
 struct FfiCascadeSnapshotRange {
@@ -432,6 +439,7 @@ struct FfiCascadeSnapshotRange {
 
 extern "C" {
 void const* ladybird_gfx_font_cascade_list_font_for_code_point(void const*, u32, bool, bool);
+void const* ladybird_gfx_font_cascade_list_first(void const*);
 void ladybird_gfx_font_cascade_list_ref(void const*);
 void ladybird_gfx_font_cascade_list_unref(void const*);
 bool ladybird_gfx_font_cascade_list_equals(void const*, void const*);
@@ -452,6 +460,12 @@ extern "C" void const* ladybird_gfx_font_cascade_list_font_for_code_point(void c
         code_point,
         { emoji_presentation ? Gfx::EmojiPresentation::Emoji : Gfx::EmojiPresentation::Text,
             forced_presentation ? Gfx::ForcedPresentation::Yes : Gfx::ForcedPresentation::No });
+}
+
+extern "C" void const* ladybird_gfx_font_cascade_list_first(void const* list)
+{
+    VERIFY(list);
+    return &static_cast<Gfx::FontCascadeList const*>(list)->first();
 }
 
 extern "C" void ladybird_gfx_font_cascade_list_ref(void const* list)
@@ -531,7 +545,7 @@ extern "C" void const* ladybird_gfx_cascade_snapshot_begin(void const* list)
         auto const& reference_font = cascade_list.first();
         snapshot->system_fallback_point_size = reference_font.point_size();
         snapshot->system_fallback_weight = static_cast<u16>(reference_font.weight());
-        snapshot->system_fallback_width = reference_font.typeface().width();
+        snapshot->system_fallback_width = reference_font.width();
         snapshot->system_fallback_slope = static_cast<u8>(reference_font.slope());
     }
     return snapshot;
@@ -570,6 +584,7 @@ extern "C" void ladybird_gfx_cascade_snapshot_fill(void const* handle, bool fall
             .range_count = entry.unicode_ranges.size(),
             .pending_face_id = entry.pending_face_id,
             .pending_state = to_underlying(entry.pending_state),
+            .source_face_id = entry.source_face_id,
         };
         for (auto const& range : entry.unicode_ranges) {
             out_ranges[range_offset++] = {

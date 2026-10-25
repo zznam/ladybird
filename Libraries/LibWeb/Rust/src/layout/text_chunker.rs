@@ -20,11 +20,68 @@ unsafe extern "C" {
         start: *mut usize,
         end: *mut usize,
     );
-    fn ladybird_layout_text_type_for_code_point(code_point: u32) -> u8;
-    fn ladybird_layout_code_point_has_break_all_line_break_class(code_point: u32) -> bool;
-    fn ladybird_layout_code_point_has_keep_all_line_break_class(code_point: u32) -> bool;
-    fn ladybird_layout_code_point_has_combining_mark_line_break_class(code_point: u32) -> bool;
-    fn ladybird_layout_code_point_has_emoji_property(code_point: u32) -> bool;
+    safe fn unicode_layout_bidirectional_class(code_point: u32) -> u8;
+    safe fn unicode_layout_line_break_class(code_point: u32) -> u8;
+    safe fn unicode_layout_code_point_has_emoji_property(code_point: u32) -> bool;
+}
+
+// LibUnicode's LineBreakClass, in declaration order.
+mod line_break_class {
+    pub(super) const ALPHABETIC: u8 = 0;
+    pub(super) const NUMERIC: u8 = 1;
+    pub(super) const IDEOGRAPHIC: u8 = 2;
+    pub(super) const AMBIGUOUS: u8 = 3;
+    pub(super) const COMPLEX_CONTEXT: u8 = 4;
+    pub(super) const COMBINING_MARK: u8 = 5;
+}
+
+fn line_break_class(code_point: u32) -> u8 {
+    unicode_layout_line_break_class(code_point)
+}
+
+// Classifies a code point for direction-run splitting: strong LTR/RTL, direction-neutral Common, or ContextDependent
+// (resolved from surrounding runs).
+fn text_type_for_code_point(code_point: u32) -> u8 {
+    use line_box_fragment::{
+        GLYPH_TEXT_TYPE_COMMON as C, GLYPH_TEXT_TYPE_CONTEXT_DEPENDENT as X, GLYPH_TEXT_TYPE_LTR as L,
+        GLYPH_TEXT_TYPE_RTL as R,
+    };
+
+    // Each ASCII character has a statically known bidi class.
+    #[rustfmt::skip]
+    const ASCII_TEXT_TYPES: [u8; 128] = [
+        // 0x00-0x0F: Control characters (BN=Common, S/B/WS=ContextDependent)
+        C, C, C, C, C, C, C, C, C, X, X, X, X, X, C, C,
+        // 0x10-0x1F: Control characters
+        C, C, C, C, C, C, C, C, C, C, C, C, X, X, X, X,
+        // 0x20-0x2F: Space and punctuation
+        X, C, C, X, X, X, C, C, C, C, C, X, X, X, X, X,
+        // 0x30-0x3F: Digits and punctuation
+        X, X, X, X, X, X, X, X, X, X, X, C, C, C, C, C,
+        // 0x40-0x4F: @ and uppercase letters
+        C, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L,
+        // 0x50-0x5F: Uppercase letters and punctuation
+        L, L, L, L, L, L, L, L, L, L, L, C, C, C, C, C,
+        // 0x60-0x6F: ` and lowercase letters
+        C, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L,
+        // 0x70-0x7F: Lowercase letters and punctuation
+        L, L, L, L, L, L, L, L, L, L, L, C, C, C, C, C,
+    ];
+    if let Some(&text_type) = ASCII_TEXT_TYPES.get(code_point as usize) {
+        return text_type;
+    }
+
+    match unicode_layout_bidirectional_class(code_point) {
+        // LibUnicode's BidiClass, in declaration order: AN, B, CS, NSM, EN, ES, ET, S, WS.
+        0 | 1 | 3..=7 | 21 | 22 => X,
+        // BN, FSI, ON, PDF, PDI.
+        2 | 8 | 13..=15 => C,
+        // L, LRE, LRI, LRO.
+        9..=12 => L,
+        // R, AL, RLE, RLI, RLO.
+        16..=20 => R,
+        _ => unreachable!("invalid bidi class"),
+    }
 }
 
 // Stand-ins for the Unicode library's segmenters and the host's code point facts, which a unit test links through a
@@ -63,27 +120,24 @@ mod unicode_test_stubs {
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn ladybird_layout_text_type_for_code_point(_code_point: u32) -> u8 {
+    extern "C" fn ladybird_layout_code_point_category_facts(
+        _code_point: u32,
+    ) -> crate::layout::tree_builder::FfiCodePointCategoryFacts {
         unreachable!("no unit test segments text");
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn ladybird_layout_code_point_has_break_all_line_break_class(_code_point: u32) -> bool {
+    extern "C" fn unicode_layout_bidirectional_class(_code_point: u32) -> u8 {
         unreachable!("no unit test segments text");
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn ladybird_layout_code_point_has_keep_all_line_break_class(_code_point: u32) -> bool {
+    extern "C" fn unicode_layout_line_break_class(_code_point: u32) -> u8 {
         unreachable!("no unit test segments text");
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn ladybird_layout_code_point_has_combining_mark_line_break_class(_code_point: u32) -> bool {
-        unreachable!("no unit test segments text");
-    }
-
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_layout_code_point_has_emoji_property(_code_point: u32) -> bool {
+    extern "C" fn unicode_layout_code_point_has_emoji_property(_code_point: u32) -> bool {
         unreachable!("no unit test segments text");
     }
 }
@@ -109,6 +163,9 @@ pub(crate) struct TextChunkInputs<'text> {
     pub should_wrap_lines: bool,
     pub should_respect_linebreaks: bool,
     pub unidirectional_ltr: bool,
+    /// Whether the text is vertical text in mixed orientation, where some characters are typeset upright and others
+    /// sideways.
+    pub splits_at_orientation_changes: bool,
 }
 
 pub(crate) fn chunk_text(inputs: TextChunkInputs<'_>) -> Vec<TextChunk> {
@@ -133,6 +190,10 @@ pub(crate) struct IcuSegmenterHandle {
     raw: *mut c_void,
 }
 
+// SAFETY: The handle owns its segmenter, which shares nothing with another, so the thread that holds the handle may
+// change.
+unsafe impl Send for IcuSegmenterHandle {}
+
 impl IcuSegmenterHandle {
     fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
         // SAFETY: The handle is live until drop, and the text it references
@@ -151,22 +212,62 @@ impl Drop for IcuSegmenterHandle {
 }
 
 pub(crate) enum GraphemeSegmenter {
-    Ascii { length_in_code_units: usize },
-    Icu(IcuSegmenterHandle),
+    Ascii {
+        length_in_code_units: usize,
+    },
+    /// Text of code points below U+0300 only, where every code unit is a grapheme cluster except for CR LF.
+    Latin {
+        length_in_code_units: usize,
+        /// Where each LF that follows a CR is, in increasing order.
+        line_feeds_after_carriage_returns: Box<[usize]>,
+    },
+    Icu {
+        handle: IcuSegmenterHandle,
+        length_in_code_units: usize,
+        /// One bit per code unit: whether it is a code point below U+0300 other than CR.
+        latin_code_units: Box<[u64]>,
+    },
+}
+
+// No code point below U+0300 extends or joins a grapheme cluster, and only CR joins the code point after it (CR LF).
+fn is_latin_code_unit_outside_clusters(code_unit: u16) -> bool {
+    code_unit < 0x300 && code_unit != 0x0d
 }
 
 impl GraphemeSegmenter {
     pub(crate) fn new(text: &[u16]) -> Self {
-        if text.iter().all(|unit| *unit <= 0x7f) {
+        let Some(first_non_ascii) = text.iter().position(|unit| *unit > 0x7f) else {
             return Self::Ascii {
                 length_in_code_units: text.len(),
             };
+        };
+        if text[first_non_ascii..].iter().all(|unit| *unit < 0x300) {
+            let line_feeds_after_carriage_returns = text
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| *pair == [0x0d, 0x0a])
+                .map(|(index, _)| index + 1)
+                .collect();
+            return Self::Latin {
+                length_in_code_units: text.len(),
+                line_feeds_after_carriage_returns,
+            };
+        }
+        let mut latin_code_units = vec![0u64; text.len().div_ceil(64)].into_boxed_slice();
+        for (index, code_unit) in text.iter().enumerate() {
+            if is_latin_code_unit_outside_clusters(*code_unit) {
+                latin_code_units[index / 64] |= 1 << (index % 64);
+            }
         }
         // SAFETY: The chunker borrows the text for its whole lifetime and the
         // segmenter handle is dropped with the chunker, so the ICU segmenter
         // never outlives the buffer it references.
         let raw = unsafe { unicode_layout_grapheme_segmenter_create(text.as_ptr(), text.len()) };
-        Self::Icu(IcuSegmenterHandle { raw })
+        Self::Icu {
+            handle: IcuSegmenterHandle { raw },
+            length_in_code_units: text.len(),
+            latin_code_units,
+        }
     }
 
     /// Mirrors Unicode::AsciiGraphemeSegmenter for the ASCII case: every code
@@ -182,27 +283,85 @@ impl GraphemeSegmenter {
                 }
                 Some(index + 1)
             }
-            Self::Icu(handle) => handle.next_boundary(index, inclusive),
+            Self::Latin {
+                length_in_code_units,
+                line_feeds_after_carriage_returns,
+            } => {
+                let is_boundary = |index: usize| line_feeds_after_carriage_returns.binary_search(&index).is_err();
+                if inclusive && index <= *length_in_code_units && is_boundary(index) {
+                    return Some(index);
+                }
+                if index >= *length_in_code_units {
+                    return None;
+                }
+                (index + 1..=*length_in_code_units).find(|&boundary| is_boundary(boundary))
+            }
+            Self::Icu {
+                handle,
+                length_in_code_units,
+                latin_code_units,
+            } => {
+                // OPTIMIZATION: Two code points below U+0300 have a grapheme cluster boundary between them, unless the
+                //               first one is CR. So do such a code point and the end of the text.
+                let is_latin = |index: usize| latin_code_units[index / 64] & (1 << (index % 64)) != 0;
+                let length = *length_in_code_units;
+                let boundary = if inclusive {
+                    (index > 0 && index < length && is_latin(index - 1) && is_latin(index)).then_some(index)
+                } else {
+                    (index < length && is_latin(index) && (index + 1 == length || is_latin(index + 1)))
+                        .then_some(index + 1)
+                };
+                if boundary.is_some() {
+                    debug_assert_eq!(boundary, handle.next_boundary(index, inclusive));
+                    return boundary;
+                }
+                handle.next_boundary(index, inclusive)
+            }
         }
     }
 }
 
-struct LineSegmenter {
+struct LineSegmenter<'text> {
     handle: IcuSegmenterHandle,
+    text: &'text [u16],
+    /// Where the last search for a boundary started, and the boundary it found, so that no boundary lies before it.
+    last_search: std::cell::Cell<Option<(usize, usize)>>,
 }
 
-impl LineSegmenter {
-    fn new(text: &[u16]) -> Self {
+impl<'text> LineSegmenter<'text> {
+    fn new(text: &'text [u16]) -> Self {
         // SAFETY: See GraphemeSegmenter::new; the same lifetime contract holds,
         // and the C++ side picks the ASCII line-breaking fast path internally.
         let raw = unsafe { unicode_layout_line_segmenter_create(text.as_ptr(), text.len()) };
         Self {
             handle: IcuSegmenterHandle { raw },
+            text,
+            last_search: std::cell::Cell::new(None),
         }
     }
 
     fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
-        self.handle.next_boundary(index, inclusive)
+        // NB: The segmenter moves a search that starts inside a surrogate pair to the start of the pair, which can
+        //     find a boundary before where the search started.
+        let starts_inside_surrogate_pair = index > 0
+            && index < self.text.len()
+            && is_utf16_low_surrogate(self.text[index])
+            && is_utf16_high_surrogate(self.text[index - 1]);
+        if starts_inside_surrogate_pair {
+            return self.handle.next_boundary(index, inclusive);
+        }
+        // OPTIMIZATION: The chunker asks about every position from the start of the text to its end. A search finds
+        //               the first boundary at or after where it starts, so the boundary the last search found answers
+        //               every search that starts between the two.
+        let search_start = if inclusive { index } else { index + 1 };
+        if let Some((last_search_start, boundary)) = self.last_search.get()
+            && (last_search_start..=boundary).contains(&search_start)
+        {
+            return Some(boundary);
+        }
+        let boundary = self.handle.next_boundary(index, inclusive)?;
+        self.last_search.set(Some((search_start, boundary)));
+        Some(boundary)
     }
 }
 
@@ -214,9 +373,33 @@ fn is_utf16_low_surrogate(code_unit: u16) -> bool {
     (0xdc00..=0xdfff).contains(&code_unit)
 }
 
+/// Whether a code point is typeset upright in vertical text whose text orientation is 'mixed'.
+// FIXME: Use the Vertical_Orientation property of Unicode (UAX #50) instead of these blocks of characters, which are
+//        mostly upright.
+pub(crate) fn code_point_is_upright_in_mixed_orientation(code_point: u32) -> bool {
+    matches!(
+        code_point,
+        0x1100..=0x11FF
+            | 0x2E80..=0x303F
+            | 0x3040..=0x31FF
+            | 0x3200..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7FF
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE1F
+            | 0xFE30..=0xFE4F
+            | 0xFF01..=0xFF0C
+            | 0xFF0E..=0xFF1B
+            | 0xFF1F..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x20000..=0x3FFFF
+    )
+}
+
 /// Mirrors AK::Utf16View::code_point_at, including its lone-surrogate
 /// pass-through behavior.
-pub(super) fn code_point_at(text: &[u16], index: usize) -> u32 {
+pub(crate) fn code_point_at(text: &[u16], index: usize) -> u32 {
     let code_unit = text[index];
     let code_point = u32::from(code_unit);
     if !is_utf16_high_surrogate(code_unit) && !is_utf16_low_surrogate(code_unit) {
@@ -297,6 +480,7 @@ struct PendingChunk {
     start: usize,
     font: FontHandle,
     text_type: u8,
+    is_upright: bool,
     broken_on_tab: bool,
 }
 
@@ -311,13 +495,14 @@ struct TextChunker<'text> {
     text: &'text [u16],
     frozen_font_list: &'text FrozenFontList,
     grapheme_segmenter: GraphemeSegmenter,
-    line_segmenter: LineSegmenter,
+    line_segmenter: LineSegmenter<'text>,
     word_break: u8,
     font_variant_emoji: u8,
     should_collapse_whitespace: bool,
     should_wrap_lines: bool,
     should_respect_linebreaks: bool,
     unidirectional_ltr: bool,
+    splits_at_orientation_changes: bool,
     current_index: usize,
     last_non_whitespace_font: Option<FontHandle>,
 }
@@ -338,6 +523,7 @@ impl<'text> TextChunker<'text> {
             should_wrap_lines: inputs.should_wrap_lines,
             should_respect_linebreaks: inputs.should_respect_linebreaks,
             unidirectional_ltr: inputs.unidirectional_ltr,
+            splits_at_orientation_changes: inputs.splits_at_orientation_changes,
             current_index: 0,
             last_non_whitespace_font: None,
         }
@@ -351,8 +537,11 @@ impl<'text> TextChunker<'text> {
         if self.unidirectional_ltr {
             return line_box_fragment::GLYPH_TEXT_TYPE_LTR;
         }
-        // SAFETY: Pure Unicode table lookup.
-        unsafe { ladybird_layout_text_type_for_code_point(self.current_code_point()) }
+        text_type_for_code_point(self.current_code_point())
+    }
+
+    fn current_code_point_is_upright(&self) -> bool {
+        self.splits_at_orientation_changes && code_point_is_upright_in_mixed_orientation(self.current_code_point())
     }
 
     fn next_grapheme_boundary(&self) -> usize {
@@ -376,10 +565,7 @@ impl<'text> TextChunker<'text> {
             }
             let mut index = self.current_index;
             let mut previous_code_point = previous_code_point_at(self.text, &mut index);
-            // SAFETY: Pure Unicode table lookups.
-            while unsafe { ladybird_layout_code_point_has_combining_mark_line_break_class(previous_code_point) }
-                && index > 0
-            {
+            while line_break_class(previous_code_point) == line_break_class::COMBINING_MARK && index > 0 {
                 previous_code_point = previous_code_point_at(self.text, &mut index);
             }
             Some(previous_code_point)
@@ -400,10 +586,16 @@ impl<'text> TextChunker<'text> {
                 if self.current_index >= self.text.len() {
                     return false;
                 }
-                // SAFETY: Pure Unicode table lookups.
+                use line_break_class::*;
+                let breaks_anywhere = |code_point| {
+                    matches!(
+                        line_break_class(code_point),
+                        ALPHABETIC | NUMERIC | COMPLEX_CONTEXT | IDEOGRAPHIC
+                    )
+                };
                 if let Some(previous_code_point) = get_previous_code_point()
-                    && unsafe { ladybird_layout_code_point_has_break_all_line_break_class(previous_code_point) }
-                    && unsafe { ladybird_layout_code_point_has_break_all_line_break_class(self.current_code_point()) }
+                    && breaks_anywhere(previous_code_point)
+                    && breaks_anywhere(self.current_code_point())
                 {
                     return true;
                 }
@@ -413,10 +605,16 @@ impl<'text> TextChunker<'text> {
                 if self.current_index >= self.text.len() {
                     return false;
                 }
-                // SAFETY: Pure Unicode table lookups.
+                use line_break_class::*;
+                let keeps_together = |code_point| {
+                    matches!(
+                        line_break_class(code_point),
+                        ALPHABETIC | NUMERIC | AMBIGUOUS | IDEOGRAPHIC
+                    )
+                };
                 if let Some(previous_code_point) = get_previous_code_point()
-                    && unsafe { ladybird_layout_code_point_has_keep_all_line_break_class(previous_code_point) }
-                    && unsafe { ladybird_layout_code_point_has_keep_all_line_break_class(self.current_code_point()) }
+                    && keeps_together(previous_code_point)
+                    && keeps_together(self.current_code_point())
                 {
                     return false;
                 }
@@ -429,10 +627,32 @@ impl<'text> TextChunker<'text> {
     fn emoji_presentation_at(&self, code_unit_offset: usize, code_point: u32) -> EmojiPresentation {
         let next_offset = code_unit_offset + code_unit_length_for_code_point(code_point);
         let next_code_point = (next_offset < self.text.len()).then(|| code_point_at(self.text, next_offset));
-        let default_presentation = emoji_presentation_for_code_point(code_point, next_code_point);
-
-        // SAFETY: Pure Unicode table lookup.
-        if default_presentation.forced || !unsafe { ladybird_layout_code_point_has_emoji_property(code_point) } {
+        // OPTIMIZATION: No code point below U+0300 has the Emoji_Presentation property, so only a variation selector
+        //               can give one of them anything but the default text presentation.
+        let default_presentation = if code_point < 0x300 && !matches!(next_code_point, Some(0xfe0e | 0xfe0f)) {
+            EmojiPresentation {
+                is_emoji: false,
+                forced: false,
+            }
+        } else {
+            emoji_presentation_for_code_point(code_point, next_code_point)
+        };
+        // OPTIMIZATION: Below U+0300, only '#', '*', the ASCII digits, U+00A9 and U+00AE have the Emoji property.
+        let has_emoji_property = if code_point < 0x300 {
+            matches!(code_point, 0x23 | 0x2a | 0x30..=0x39 | 0xa9 | 0xae)
+        } else {
+            unicode_layout_code_point_has_emoji_property(code_point)
+        };
+        debug_assert!(
+            code_point >= 0x300 || {
+                let presentation = emoji_presentation_for_code_point(code_point, next_code_point);
+                let has_property = unicode_layout_code_point_has_emoji_property(code_point);
+                presentation.is_emoji == default_presentation.is_emoji
+                    && presentation.forced == default_presentation.forced
+                    && has_property == has_emoji_property
+            }
+        );
+        if default_presentation.forced || !has_emoji_property {
             return default_presentation;
         }
 
@@ -545,6 +765,7 @@ impl<'text> TextChunker<'text> {
                 start: self.current_index,
                 font: self.expected_font_for(code_point),
                 text_type: self.current_text_type(),
+                is_upright: self.current_code_point_is_upright(),
                 broken_on_tab: false,
             };
 
@@ -615,12 +836,18 @@ impl<'text> TextChunker<'text> {
                     continue 'restart;
                 }
 
-                // NB: The current index can sit past the end here after consuming trailing tabs; the retired C++
-                // iterator read the direction class through it anyway, so the bounds check turns an out-of-bounds
-                // read into a non-split.
-                if self.should_wrap_lines
-                    && self.current_index < self.text.len()
+                // Tabs can advance the cursor past the text. Split shaping runs at direction changes independently
+                // of line wrapping, while keeping the direction lookup inside the text.
+                if self.current_index < self.text.len()
                     && pending.text_type != self.current_text_type()
+                    && let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, can_break_at_current_position)
+                {
+                    return Some(chunk);
+                }
+
+                // NB: Each chunk is typeset either upright or sideways as a whole, so split it where that changes.
+                if self.current_index < self.text.len()
+                    && pending.is_upright != self.current_code_point_is_upright()
                     && let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, can_break_at_current_position)
                 {
                     return Some(chunk);
@@ -713,6 +940,10 @@ pub(crate) fn text_chunks(
         word_break: parent_style.word_break(),
         font_variant_emoji: parent_style.font_variant_emoji(),
         frozen_font_list: parent_style.frozen_font_list_ref(),
+        splits_at_orientation_changes: matches!(
+            parent_style.writing_mode(),
+            writing_mode::VERTICAL_RL | writing_mode::VERTICAL_LR
+        ) && parent_style.text_orientation() == text_orientation::MIXED,
     };
     let text = &callbacks.text_content(node).text;
     callbacks.text_content(node).text_chunks(&key, || {
@@ -725,6 +956,7 @@ pub(crate) fn text_chunks(
             should_wrap_lines,
             should_respect_linebreaks,
             unidirectional_ltr,
+            splits_at_orientation_changes: key.splits_at_orientation_changes,
         })
     })
 }

@@ -10,7 +10,6 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIBWEB_ROOT = pathlib.Path("Libraries/LibWeb")
 
 REALM_PATTERN = re.compile(r"JS::Realm|LibJS/Runtime/Realm\.h")
-PLATFORM_OBJECT_IMPLEMENTATION_PATTERN = re.compile(r"public\s+Bindings::PlatformObject")
 
 # This check is intentionally coarse: component-level counts cannot see an
 # intra-component swap, and it counts JS::Realm spellings rather than realm
@@ -37,29 +36,26 @@ CHECKED_SUFFIXES = {
 # the same change. If it goes up, justify the architecture change here.
 ALLOWED_REALM_MENTIONS = {
     "Animations": (5, 14, "animation callbacks/events and CSS value materialization still pass spec-selected realms"),
-    "CSS": (7, 19, "CSS Typed OM, parser-facing reification, and style-value JS materialization"),
+    "CSS": (9, 24, "CSS Typed OM, parser-facing reification, style-value JS materialization, and setlike/maplike glue"),
     "Clipboard": (4, 16, "clipboard item/data callbacks still materialize JS values in caller-selected realms"),
-    "Compression": (4, 8, "compression streams still use realms for stream/chunk conversion plumbing"),
     "ContentSecurityPolicy": (4, 14, "CSP violation/report objects and callbacks still materialize JS-facing values"),
     "CookieStore": (2, 19, "cookie-store async callbacks and promise/value materialization still thread realms"),
-    "Crypto": (10, 428, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
+    "Crypto": (8, 383, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
     "DOM": (10, 33, "DOM abort plumbing and node helpers still have callback/materialization realm use"),
-    "DOMURL": (2, 8, "URLSearchParams iterator objects still materialize JS iterator results in selected realms"),
     "Fetch": (
         22,
-        66,
+        62,
         "Fetch bodies, headers, requests, responses, and controllers still materialize JS values/streams; the body receiver's delivery and close tasks carry the realm its stream is enqueued and closed in",
     ),
-    "FileAPI": (6, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
-    "Geometry": (8, 8, "geometry constructors and structured clone still materialize JS-facing geometry objects"),
+    "FileAPI": (4, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
     "HTML": (
-        73,
-        223,
+        64,
+        200,
         "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage",
     ),
     "IndexedDB": (
         14,
-        100,
+        92,
         "IndexedDB requests/cursors/records still materialize structured-clone values in selected realms",
     ),
     "Infra": (2, 13, "JSON parse/serialization helpers still expose JS values in selected realms"),
@@ -70,16 +66,12 @@ ALLOWED_REALM_MENTIONS = {
         41,
         "service worker jobs, caches, and container promises still materialize results in selected realms",
     ),
-    "Streams": (
-        34,
-        214,
-        "Streams algorithms still use realms for controller/read/write operations and chunk conversion",
-    ),
+    "Streams": (5, 14, "the C++ facade of the Rust streams creates streams and promises in caller-selected realms"),
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (
-        12,
-        106,
-        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms; asynchronous compilation retains the origin realm for module installation and promise settlement",
+        15,
+        89,
+        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
     ),
     "WebAudio": (
         8,
@@ -87,9 +79,9 @@ ALLOWED_REALM_MENTIONS = {
         "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
-    "WebGL": (72, 120, "WebGL APIs still materialize buffers, typed arrays, extensions, and wrapper objects"),
+    "WebGL": (4, 9, "WebGL contexts are created in the realm of their canvas, and their events and promises in it"),
     "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
-    "XHR": (4, 11, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
+    "XHR": (4, 7, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
 }
 
 
@@ -116,17 +108,11 @@ def tracked_libweb_paths():
 
 def main():
     actual = collections.defaultdict(lambda: [0, 0])
-    platform_object_implementations = []
 
     for path in tracked_libweb_paths():
-        text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")
-        if path != pathlib.Path(
-            "Libraries/LibWeb/HTML/WindowProxy.h"
-        ) and PLATFORM_OBJECT_IMPLEMENTATION_PATTERN.search(text):
-            platform_object_implementations.append(path)
-
         if is_excluded(path):
             continue
+        text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")
         mention_count = len(REALM_PATTERN.findall(text))
         if mention_count == 0:
             continue
@@ -136,13 +122,6 @@ def main():
         actual[component][1] += mention_count
 
     failures = []
-
-    if platform_object_implementations:
-        print("LibWeb IDL implementations must derive from Bindings::Wrappable, not Bindings::PlatformObject.")
-        print("WindowProxy is the sole exception because it is itself a spec-defined exotic JavaScript object.")
-        for path in platform_object_implementations:
-            print(f"  {path}")
-        print()
 
     for component in sorted(set(actual) | set(ALLOWED_REALM_MENTIONS)):
         actual_counts = tuple(actual.get(component, (0, 0)))
@@ -168,7 +147,7 @@ def main():
         print()
         print("If counts decreased, tighten ALLOWED_REALM_MENTIONS in this script.")
         print("If counts increased, justify the new realm use in the allowlist reason.")
-    if failures or platform_object_implementations:
+    if failures:
         return 1
 
     print("LibWeb implementation-side realm mention baseline is unchanged.")

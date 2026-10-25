@@ -35,7 +35,6 @@
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
@@ -62,6 +61,7 @@
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
+#include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/DOMTokenList.h>
@@ -74,10 +74,12 @@
 #include <LibWeb/DOM/MutationObserver.h>
 #include <LibWeb/DOM/MutationType.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
+#include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
+#include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -123,6 +125,7 @@
 #include <LibWeb/HTML/HTMLUListElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -144,6 +147,7 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGAElement.h>
 #include <LibWeb/SVG/SVGElement.h>
@@ -153,6 +157,7 @@
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
+#include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -181,16 +186,16 @@ void Element::RareData::visit_edges(Cell::Visitor& visitor)
                 [&](CustomElementCallbackReaction const& callback_reaction) {
                     visitor.visit(callback_reaction.callback);
                     callback_reaction.arguments.visit(
-                        [](Empty) {},
+                        [](Empty) { },
                         [&](CustomElementAdoptedCallbackReactionArguments const& adopted_arguments) {
                             visitor.visit(adopted_arguments.old_document);
                             visitor.visit(adopted_arguments.new_document);
                         },
-                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) {},
+                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) { },
                         [&](CustomElementFormAssociatedCallbackReactionArguments const& form_associated_arguments) {
                             visitor.visit(form_associated_arguments.form);
                         },
-                        [&](CustomElementFormDisabledCallbackReactionArguments const&) {});
+                        [&](CustomElementFormDisabledCallbackReactionArguments const&) { });
                 },
                 [&](CustomElementConnectedMoveCallbackReaction const& connected_move_reaction) {
                     visitor.visit(connected_move_reaction.disconnected_callback);
@@ -282,7 +287,7 @@ static void invalidate_content_blocker_style_if_needed(Element& element)
 {
     if (!element.is_connected())
         return;
-    if (!ContentBlocker::the().filtering_enabled() || !ContentBlocker::the().has_cosmetic_rules())
+    if (!element.document().content_blocking_enabled() || !ContentBlocker::the().has_cosmetic_rules())
         return;
 
     auto const& id = element.id();
@@ -305,6 +310,53 @@ static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<
     }
 }
 
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::create(size_t capacity)
+{
+    VERIFY(capacity > 0 && capacity <= NumericLimits<u32>::max());
+    auto allocation_size = Checked<size_t>(capacity);
+    allocation_size *= sizeof(Attribute);
+    allocation_size += sizeof(AttributeList);
+    auto* memory = AttributeList::operator new(allocation_size.value());
+    return adopt_own(*new (memory) AttributeList(static_cast<u32>(capacity)));
+}
+
+Element::AttributeList::~AttributeList()
+{
+    for (auto& attribute : span())
+        attribute.~Attribute();
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::ensure_room_for_one_more(NonnullOwnPtr<AttributeList> list)
+{
+    if (list->m_size < list->m_capacity)
+        return list;
+    return list->moved_into_new_list(max(static_cast<size_t>(list->m_capacity) * 2, static_cast<size_t>(4)));
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::moved_into_new_list(size_t capacity)
+{
+    VERIFY(capacity >= m_size);
+    auto new_list = create(capacity);
+    for (auto& attribute : span())
+        new (&new_list->attributes()[new_list->m_size++]) Attribute(move(attribute));
+    return new_list;
+}
+
+void Element::AttributeList::unchecked_append(QualifiedName name, Utf16String value)
+{
+    VERIFY(m_size < m_capacity);
+    new (&attributes()[m_size++]) Attribute(move(name), move(value));
+}
+
+void Element::AttributeList::remove(size_t index)
+{
+    VERIFY(index < m_size);
+    auto* attributes = this->attributes();
+    for (size_t i = index; i + 1 < m_size; ++i)
+        attributes[i] = move(attributes[i + 1]);
+    attributes[--m_size].~Attribute();
+}
+
 Element::Element(Document& document, DOM::QualifiedName qualified_name)
     : ParentNode(document, NodeType::ELEMENT_NODE)
     , m_qualified_name(move(qualified_name))
@@ -313,17 +365,14 @@ Element::Element(Document& document, DOM::QualifiedName qualified_name)
 
 Element::~Element() = default;
 
-Element::AttributeList& Element::ensure_attribute_list()
-{
-    if (!m_attributes)
-        m_attributes = make<AttributeList>();
-    return *m_attributes;
-}
-
 void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
 {
     add_to_subtree_attribute_name_filter(attribute_name_filter_bit(name.local_name()));
-    ensure_attribute_list().empend(move(name), move(value));
+    if (!m_attributes)
+        m_attributes = AttributeList::create(1);
+    else
+        m_attributes = AttributeList::ensure_room_for_one_more(m_attributes.release_nonnull());
+    m_attributes->unchecked_append(move(name), move(value));
 }
 
 void Element::add_to_subtree_attribute_name_filter(u64 bits)
@@ -337,7 +386,10 @@ void Element::ensure_attribute_capacity(size_t capacity)
 {
     if (capacity == 0)
         return;
-    ensure_attribute_list().ensure_capacity(capacity);
+    if (!m_attributes)
+        m_attributes = AttributeList::create(capacity);
+    else if (m_attributes->capacity() < capacity)
+        m_attributes = m_attributes->moved_into_new_list(capacity);
 }
 
 void Element::synchronize_attribute(Utf16FlyString const& qualified_name) const
@@ -412,9 +464,8 @@ size_t Element::external_memory_size() const
     if (!m_attributes)
         return size;
 
-    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList));
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(*m_attributes));
-    for (auto const& attribute : *m_attributes)
+    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList) + m_attributes->capacity() * sizeof(Attribute));
+    for (auto const& attribute : m_attributes->span())
         size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(attribute.value));
     return size;
 }
@@ -609,12 +660,11 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
 
     // 11. Navigate targetNavigable to urlString using subject's node document, with referrerPolicy set to subject's
     //     hyperlink referrer policy, userInvolvement set to userInvolvement, and sourceElement set to subject.
-    // FIXME: Set sourceElement.
     auto url = url_string_with_suffix.has_value()
         ? URL::Parser::basic_parse(url_string_with_suffix->utf16_view())
         : URL::Parser::basic_parse(url_string);
     VERIFY(url.has_value());
-    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = hyperlink_referrer_policy(), .user_involvement = user_involvement }));
+    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = hyperlink_referrer_policy(), .user_involvement = user_involvement, .source_element = this }));
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy
@@ -1175,25 +1225,34 @@ Vector<Utf16FlyString> Element::get_attribute_names() const
     if (!m_attributes)
         return {};
     Vector<Utf16FlyString> names;
-    for (auto const& attribute : *m_attributes)
+    for (auto const& attribute : m_attributes->span())
         names.append(attribute.name.as_string());
     return names;
 }
 
-// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-element
-GC::Ptr<DOM::Element> Element::get_the_attribute_associated_element(Utf16FlyString const& content_attribute, GC::Ptr<DOM::Element> explicitly_set_attribute_element) const
+// Whether attrElement is a descendant of any of element's shadow-including ancestors.
+static bool is_descendant_of_any_shadow_including_ancestor(Element const& attribute_element, Element const& element)
 {
-    // 1. Let element be the result of running reflectedTarget's get the element.
-    auto const& element = *this;
+    // NB: attrElement is a descendant of its root, so this holds exactly when that root is a shadow-including ancestor
+    //     of element.
+    auto const& root = attribute_element.root();
+    return &root != &attribute_element && root.is_shadow_including_ancestor_of(element);
+}
 
-    // 2. Let contentAttributeValue be the result of running reflectedTarget's get the content attribute.
-    auto content_attribute_value = element.get_attribute(content_attribute);
+// The first element, in tree order, whose root is the same as element's root and whose ID is id.
+static GC::Ptr<Element> first_element_with_id_in_the_same_tree(Element const& element, Utf16View id)
+{
+    return as<ParentNode>(element.root()).get_element_by_id(id);
+}
 
+// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-element
+GC::Ptr<Element> get_the_attribute_associated_element(Element const& element, Optional<Utf16String> const& content_attribute_value, GC::Ptr<Element> explicitly_set_attribute_element)
+{
     // 3. If reflectedTarget's explicitly set attr-element is not null:
     if (explicitly_set_attribute_element) {
         // 1. If reflectedTarget's explicitly set attr-element is a descendant of any of element's shadow-including
         //    ancestors, then return reflectedTarget's explicitly set attr-element.
-        if (&explicitly_set_attribute_element->root() == &element.shadow_including_root())
+        if (is_descendant_of_any_shadow_including_ancestor(*explicitly_set_attribute_element, element))
             return *explicitly_set_attribute_element;
 
         // 2. Return null.
@@ -1205,29 +1264,38 @@ GC::Ptr<DOM::Element> Element::get_the_attribute_associated_element(Utf16FlyStri
     //     * candidate's root is the same as element's root;
     //     * candidate's ID is contentAttributeValue; and
     //     * candidate implements T.
+    //    If no such element exists, then return null.
     if (content_attribute_value.has_value())
-        return element.document().get_element_by_id(content_attribute_value->utf16_view());
+        return first_element_with_id_in_the_same_tree(element, content_attribute_value->utf16_view());
 
-    // 5. If no such element exists, then return null.
-    // 6. Return null.
+    // 5. Return null.
     return {};
 }
 
+// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-element
+GC::Ptr<DOM::Element> Element::get_the_attribute_associated_element(Utf16FlyString const& content_attribute, GC::Ptr<DOM::Element> explicitly_set_attribute_element) const
+{
+    // 1. Let element be the result of running reflectedTarget's get the element.
+    auto const& element = *this;
+
+    // 2. Let contentAttributeValue be the result of running reflectedTarget's get the content attribute.
+    auto content_attribute_value = element.get_attribute(content_attribute);
+
+    return DOM::get_the_attribute_associated_element(element, content_attribute_value, explicitly_set_attribute_element);
+}
+
 // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-elements
-Optional<GC::RootVector<GC::Ref<DOM::Element>>> Element::get_the_attribute_associated_elements(Utf16FlyString const& content_attribute, Optional<Vector<GC::Weak<DOM::Element>> const&> explicitly_set_attribute_elements) const
+Optional<GC::RootVector<GC::Ref<Element>>> get_the_attribute_associated_elements(Element const& element, Function<Optional<Utf16String>()> const& get_the_content_attribute, Optional<Vector<GC::Weak<Element>> const&> explicitly_set_attribute_elements)
 {
     // 1. Let elements be an empty list.
-    GC::RootVector<GC::Ref<DOM::Element>> elements;
-
-    // 2. Let element be the result of running reflectedTarget's get the element.
-    auto const& element = *this;
+    GC::RootVector<GC::Ref<Element>> elements;
 
     // 3. If reflectedTarget's explicitly set attr-elements is not null:
     if (explicitly_set_attribute_elements.has_value()) {
         // 1. For each attrElement in reflectedTarget's explicitly set attr-elements:
         for (auto const& attribute_element : *explicitly_set_attribute_elements) {
             // 1. If attrElement is not a descendant of any of element's shadow-including ancestors, then continue.
-            if (!attribute_element || &attribute_element->root() != &element.shadow_including_root())
+            if (!attribute_element || !is_descendant_of_any_shadow_including_ancestor(*attribute_element, element))
                 continue;
 
             // 2. Append attrElement to elements.
@@ -1237,26 +1305,25 @@ Optional<GC::RootVector<GC::Ref<DOM::Element>>> Element::get_the_attribute_assoc
     // 4. Otherwise:
     else {
         // 1. Let contentAttributeValue be the result of running reflectedTarget's get the content attribute.
-        auto content_attribute_value = element.get_attribute(content_attribute);
+        auto content_attribute_value = get_the_content_attribute();
 
         // 2. If contentAttributeValue is null, then return null.
         if (!content_attribute_value.has_value())
             return {};
 
         // 3. Let tokens be contentAttributeValue, split on ASCII whitespace.
+        // 4. For each id of tokens:
         for_each_ascii_whitespace_separated_token(content_attribute_value->utf16_view(), [&](auto id) {
-            // 4. For each id of tokens:
             // 1. Let candidate be the first element, in tree order, that meets the following criteria:
             //     * candidate's root is the same as element's root;
             //     * candidate's ID is id; and
             //     * candidate implements T.
-            auto candidate = element.document().get_element_by_id(id);
-
-            // 2. If no such element exists, then continue.
+            //    If no such element exists, then continue.
+            auto candidate = first_element_with_id_in_the_same_tree(element, id);
             if (!candidate)
                 return IterationDecision::Continue;
 
-            // 3. Append candidate to elements.
+            // 2. Append candidate to elements.
             elements.append(*candidate);
             return IterationDecision::Continue;
         });
@@ -1264,6 +1331,16 @@ Optional<GC::RootVector<GC::Ref<DOM::Element>>> Element::get_the_attribute_assoc
 
     // 5. Return elements.
     return elements;
+}
+
+// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-elements
+Optional<GC::RootVector<GC::Ref<DOM::Element>>> Element::get_the_attribute_associated_elements(Utf16FlyString const& content_attribute, Optional<Vector<GC::Weak<DOM::Element>> const&> explicitly_set_attribute_elements) const
+{
+    // 2. Let element be the result of running reflectedTarget's get the element.
+    auto const& element = *this;
+
+    return DOM::get_the_attribute_associated_elements(
+        element, [&] { return element.get_attribute(content_attribute); }, explicitly_set_attribute_elements);
 }
 
 CSS::ElementBoxKind Element::box_kind() const
@@ -1336,6 +1413,12 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
     if (old_value != value)
         CSS::record_element_attribute_changed(*this, local_name, namespace_, old_value, value);
 
+    if (old_value != value
+        && local_name.is_one_of(HTML::AttributeNames::spellcheck, HTML::AttributeNames::readonly, HTML::AttributeNames::disabled, HTML::AttributeNames::type, HTML::AttributeNames::contenteditable)) {
+        if (auto* controller = document().spell_check_controller_if_exists())
+            controller->did_change_checking_state(*this);
+    }
+
     if (old_value != value) {
         // An SVG element's parsed attributes are layout input, published under its style node. Published here,
         // after the change steps, rather than from SVGElement's: each SVG element runs its base class's steps before it
@@ -1344,7 +1427,8 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
             svg_element->publish_svg_attribute_facts();
         if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
             Layout::publish_table_spans(*this);
-            if (auto* layout_node = unsafe_layout_node())
+            Layout::ForcedReadScope read { document() };
+            if (auto* layout_node = unsafe_layout_node(read))
                 layout_node->synchronize_table_span_data();
         }
         if (!document().suppresses_attribute_style_invalidation()) {
@@ -1370,30 +1454,10 @@ static CSS::StyleComputer::ComputedStyleInvalidation decode_style_record_invalid
     result.any_computed_value_changed = packed & to_underlying(CSS::StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged);
     return result;
 }
-struct ElementDependentInvalidationState {
-    Layout::NodeWithStyle const* layout_node { nullptr };
-    Optional<ValueComparingRefPtr<CSS::CounterStyle const>> list_counter_style;
-    bool has_snapshot { false };
-
-    void snapshot()
-    {
-        if (!layout_node)
-            return;
-        // Only a list item renders a marker, so only its counter style can matter; a display
-        // change to or from list-item rebuilds the box regardless.
-        if (layout_node->display().is_list_item()) {
-            if (auto const& list_style_type = layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-                list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-        }
-        layout_node = nullptr;
-        has_snapshot = true;
-    }
-};
-
 // Whether the counter styles the element's generated content names now differ from the ones the box built for it
 // renders from. The build resolves them from the published record and the tree scope's registered counter styles, and
 // the arena keeps what each box was built with.
-static bool content_counter_styles_changed(DOM::AbstractElement const& abstract_element)
+static bool content_counter_styles_changed(Layout::BegunRead const& read, DOM::AbstractElement const& abstract_element, CSS::ComputedValues const& new_computed_values)
 {
     auto* arena = abstract_element.element().document().layout_node_arena_if_created();
     if (!arena)
@@ -1402,41 +1466,25 @@ static bool content_counter_styles_changed(DOM::AbstractElement const& abstract_
     auto const pseudo_element = abstract_element.pseudo_element();
     if (!pseudo_element.has_value())
         return false;
-    abstract_element.style_scope().publish_counter_style_lookup_chain();
-    return Layout::RustFFI::layout_arena_content_counter_styles_changed(arena->handle(), abstract_element.element().style_node_id().value(), Layout::Node::encode_generated_for(*pseudo_element));
+    // A box whose `content` changes is rebuilt for that alone, so only content naming a registered counter style can
+    // render one that changed beneath it. A marker whose `content` is `normal` renders its list item's counter style.
+    if (*pseudo_element != CSS::PseudoElement::Marker
+        && !CSS::ComputedValuesFFI::rust_content_reads_counter_style_environment(new_computed_values.computed_content()->rust_style_value_data()))
+        return false;
+    abstract_element.style_scope().publish_counter_style_lookup_chain(read);
+    return Layout::RustFFI::render_state_content_counter_styles_changed(arena->host(), &read, abstract_element.element().style_node_id().value(), Layout::Node::encode_generated_for(*pseudo_element));
 }
 
-static void add_element_dependent_invalidation(CSS::RequiredInvalidationAfterStyleChange& invalidation, CSS::ComputedValues const& new_computed_values, ElementDependentInvalidationState const& old_state, DOM::AbstractElement& abstract_element)
+static void add_element_dependent_invalidation(Layout::BegunRead const& read, CSS::RequiredInvalidationAfterStyleChange& invalidation, CSS::ComputedValues const& new_computed_values, bool had_layout_node, DOM::AbstractElement& abstract_element)
 {
     // NB: Even if the computed value hasn't changed the resolved counter style may have (e.g. if the relevant
     //     @counter-style rule was modified, or a new rule with the same name took precedence over the old one).
+    //     A list item's marker is a pseudo-element of its own, which answers for the list item's counter style.
     // Generated content and the marker live inside the element's own layout subtree, so, like a
     // 'content' change, they rebuild from the element rather than its parent. The rebuild moves no
     // style, so the element's children do not react to it.
-    auto compare = [&](Optional<ValueComparingRefPtr<CSS::CounterStyle const>> const& old_list_counter_style) {
-        if (content_counter_styles_changed(abstract_element))
-            invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
-
-        if (old_list_counter_style.has_value()) {
-            auto new_list_style_type = new_computed_values.list_style_type(abstract_element.style_scope());
-            if (new_list_style_type.has<RefPtr<CSS::CounterStyle const>>()) {
-                ValueComparingRefPtr<CSS::CounterStyle const> new_counter_style = new_list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-                if (*old_list_counter_style != new_counter_style)
-                    invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
-            }
-        }
-    };
-
-    if (old_state.layout_node) {
-        Optional<ValueComparingRefPtr<CSS::CounterStyle const>> old_list_counter_style;
-        if (old_state.layout_node->display().is_list_item()) {
-            if (auto const& list_style_type = old_state.layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-                old_list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-        }
-        compare(old_list_counter_style);
-    } else if (old_state.has_snapshot) {
-        compare(old_state.list_counter_style);
-    }
+    if (had_layout_node && content_counter_styles_changed(read, abstract_element, new_computed_values))
+        invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
 }
 
 static bool style_record_is_unchanged(CSS::StyleEngine::StyleRecordDelta const& delta)
@@ -1459,7 +1507,7 @@ bool Element::is_viewport_propagation_source() const
         && document_element->first_child_of_type<HTML::HTMLBodyElement>() == this;
 }
 
-static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidation_with_cache(CSS::StyleComputer& style_computer, CSS::ComputedValues const& new_computed_values, ElementDependentInvalidationState const& old_state, DOM::AbstractElement& abstract_element, CSS::StyleEngine::StyleRecordDelta const& style_record_delta, Optional<u32> answered_damage = {})
+static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidation_with_cache(Layout::BegunRead const& read, CSS::StyleComputer& style_computer, CSS::ComputedValues const& new_computed_values, bool had_layout_node, DOM::AbstractElement& abstract_element, CSS::StyleEngine::StyleRecordDelta const& style_record_delta, Optional<u32> answered_damage = {})
 {
     CSS::StyleComputer::ComputedStyleInvalidation result;
     if (style_record_is_unchanged(style_record_delta)) {
@@ -1470,12 +1518,12 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
     // and answers a record it computed with it.
     VERIFY(!abstract_element.pseudo_element().has_value());
     auto packed = answered_damage.value_or_lazy_evaluated([&] {
-        return style_computer.style_engine().element_record_damage(abstract_element.element().style_node_id(), style_record_delta.old_style_record, style_record_delta.new_style_record);
+        return CSS::StyleEngineFFI::style_engine_element_record_damage(style_computer.style_engine().host(), &read, abstract_element.element().style_node_id().value(), style_record_delta.old_style_record.value(), style_record_delta.new_style_record.value());
     });
     if (packed & to_underlying(CSS::StyleEngineFFI::FfiStyleInvalidationField::CacheHit))
         ++abstract_element.document().style_invalidation_counters().style_record_property_damage_cache_hits;
     result = decode_style_record_invalidation(packed);
-    add_element_dependent_invalidation(result.invalidation, new_computed_values, old_state, abstract_element);
+    add_element_dependent_invalidation(read, result.invalidation, new_computed_values, had_layout_node, abstract_element);
     return result;
 }
 
@@ -1493,9 +1541,9 @@ static void record_element_reference_pseudo_element_inputs(Element& element)
     }
 }
 
-static void record_engine_container_query_effects(Element&);
+static void record_engine_container_query_effects(Layout::BegunRead const&, Element&);
 
-CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styles(bool&, bool had_list_marker, CSS::ComputedValues const* old_originating_style, EnginePseudoElementRecords const* engine_pseudo_element_records, EngineRecordDamages const* engine_record_damages)
+CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styles(Layout::BegunRead const& read, bool&, bool had_list_marker, CSS::ComputedValues const* old_originating_style, EnginePseudoElementRecords const* engine_pseudo_element_records, EngineRecordDamages const* engine_record_damages)
 {
     CSS::RequiredInvalidationAfterStyleChange invalidation;
 
@@ -1504,9 +1552,6 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
 
     auto& style_computer = document().style_computer();
     auto originating_style = computed_style();
-    // A reused originating record keeps the pseudo-element inventory it was computed with; the
-    // style engine's answer says which pseudo-elements have rules now.
-    auto const engine_pseudo_element_styles = style_node_id() != 0 ? style_computer.style_engine().published_pseudo_style_mask(style_node_id()) : 0;
     // The engine settles the synthetic pseudo-elements of an element against the record the host
     // just installed or composed, as it settles them beside a record of its own, and the host
     // installs the engine's records.
@@ -1514,26 +1559,40 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     bool const settled_after_host_record = [&] {
         if (engine_pseudo_element_records || style_node_id() == 0 || !originating_style)
             return false;
+        // A reused originating record keeps the pseudo-element inventory it was computed with; the
+        // style engine's answer says which pseudo-elements have rules now.
+        auto const engine_pseudo_element_styles = CSS::StyleEngineFFI::style_engine_published_pseudo_style_mask(style_computer.style_engine().host(), &read, style_node_id().value());
+        // The transaction whose row composes the element answers which kinds with rules no settle generates or
+        // changes, as `*::before` rules styling nothing but `box-sizing` are.
+        auto const inert_pseudo_elements = CSS::StyleEngineFFI::style_engine_inert_pseudo_kinds(style_computer.style_engine().host(), style_node_id().value());
         // Most elements have no style for any of the kinds the engine settles. A marker is
         // refreshed for a list item only.
         auto may_have_style = [&](CSS::PseudoElement pseudo_element) {
+            if ((inert_pseudo_elements >> to_underlying(pseudo_element)) & 1)
+                return false;
             return ((engine_pseudo_element_styles >> to_underlying(pseudo_element)) & 1)
                 || !!style_record_identity(pseudo_element)
                 || (old_originating_style && old_originating_style->has_pseudo_element_style(pseudo_element))
                 || originating_style->has_pseudo_element_style(pseudo_element);
+        };
+        auto highlight_may_have_style = [&](CSS::PseudoElement pseudo_element) {
+            return document().highlight_styles_are_observable(pseudo_element)
+                && (may_have_style(pseudo_element)
+                    || AbstractElement { *this, pseudo_element }.highlight_inheritance_parent().has_value());
         };
         if (!had_list_marker && !originating_style->display().is_list_item()
             && !may_have_style(CSS::PseudoElement::Before)
             && !may_have_style(CSS::PseudoElement::After)
             && !may_have_style(CSS::PseudoElement::FirstLetter)
             && !(m_rendered_in_top_layer && may_have_style(CSS::PseudoElement::Backdrop))
-            && !(document().selection_styles_are_observable()
-                && (may_have_style(CSS::PseudoElement::Selection)
-                    || AbstractElement { *this, CSS::PseudoElement::Selection }.highlight_inheritance_parent().has_value())))
+            && !highlight_may_have_style(CSS::PseudoElement::Selection)
+            && !highlight_may_have_style(CSS::PseudoElement::SearchText)
+            && !highlight_may_have_style(CSS::PseudoElement::SearchTextCurrent)
+            && !highlight_may_have_style(CSS::PseudoElement::SpellingError))
             return false;
-        auto settled = style_computer.style_engine().settle_pseudo_records_after_host_record(style_node_id(), had_list_marker);
+        auto settled = CSS::StyleEngineFFI::style_engine_settle_pseudo_records_after_host_record(style_computer.style_engine().host(), &read, style_node_id().value(), had_list_marker);
         // What the settled pseudo-elements' container-relative lengths read of the element's containers.
-        record_engine_container_query_effects(*this);
+        record_engine_container_query_effects(read, *this);
         // The engine leaves the pseudo-elements alone where it cannot compute one of them: they
         // keep the records they hold.
         if (settled.refused)
@@ -1544,7 +1603,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             CSS::StyleRecordID record { settled.pseudo_records[kind] };
             records_settled_after_host_record[kind] = record;
             // What the element's dependencies record for a pseudo-element's computation.
-            if (!!record && has_flag(style_computer.style_engine().style_record_dependency_flags(record), CSS::StyleRecordDependencyFlag::DependsOnViewportMetrics))
+            if (!!record && has_flag(style_computer.style_engine().style_record_dependency_flags(read, record), CSS::StyleRecordDependencyFlag::DependsOnViewportMetrics))
                 set_style_depends_on_viewport_metrics();
         }
         if (settled.uses_substitution)
@@ -1572,14 +1631,14 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     auto recompute_pseudo_element_style = [&](CSS::PseudoElement pseudo_element) {
         // A pseudo-element the style engine settled beside the element's record takes the engine's answer. One the
         // engine left alone is unchanged, as is every pseudo-element when the engine settled none of them. Whether
-        // ::selection styles are observable at all stays the host's decision.
-        // An unobservable ::selection holds no record, whatever the engine left standing, and neither does the
-        // ::backdrop of an element outside the top layer.
+        // highlight styles are observable at all stays the host's decision.
+        // An unobservable highlight pseudo-element holds no record, whatever the engine left standing, and neither
+        // does the ::backdrop of an element outside the top layer.
         auto old_style_record = style_record_identity(pseudo_element);
-        if ((pseudo_element == CSS::PseudoElement::Selection && !document().selection_styles_are_observable())
+        if ((CSS::is_highlight_pseudo_element(pseudo_element) && !document().highlight_styles_are_observable(pseudo_element))
             || (pseudo_element == CSS::PseudoElement::Backdrop && !m_rendered_in_top_layer)) {
             if (!!old_style_record) {
-                auto delta = style_computer.style_engine().remove_computed_pseudo(style_node_id(), to_underlying(pseudo_element));
+                auto delta = style_computer.style_engine().remove_computed_pseudo(read, style_node_id(), to_underlying(pseudo_element));
                 set_computed_style(pseudo_element, delta.new_style_record);
             }
             return;
@@ -1591,22 +1650,14 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             return;
         auto pseudo_element_style = computed_style(pseudo_element);
         auto const* pseudo_element_values = pseudo_element_style ? &*pseudo_element_style : nullptr;
-        ElementDependentInvalidationState old_state {
-            .layout_node = pseudo_element_unsafe_layout_node(pseudo_element),
-            .list_counter_style = {},
-            .has_snapshot = false,
-        };
+        bool const had_layout_node = !!pseudo_element_unsafe_layout_node(read, pseudo_element);
         RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment;
-        if (pseudo_element_values && pseudo_element_values->animated_properties()) {
-            auto had_layout_node = !!old_state.layout_node;
-            old_state.snapshot();
-            if (had_layout_node)
-                style_to_preserve_for_detachment = CSS::ComputedValues::Builder { *pseudo_element_values }.build();
-        }
+        if (had_layout_node && pseudo_element_values && pseudo_element_values->animated_properties())
+            style_to_preserve_for_detachment = CSS::ComputedValues::Builder { *pseudo_element_values }.build();
 
         CSS::StyleEngine::StyleRecordDelta style_record_delta {};
         style_record_delta.new_style_record = *engine_record;
-        auto engine_pseudo_element_style = !!*engine_record ? style_computer.computed_style_record_view(*engine_record) : CSS::ComputedStyleRecordView {};
+        auto engine_pseudo_element_style = !!*engine_record ? style_computer.computed_style_record_view(read, *engine_record) : CSS::ComputedStyleRecordView {};
         CSS::ComputedValues const* new_pseudo_element_style = engine_pseudo_element_style ? &*engine_pseudo_element_style : nullptr;
         style_record_delta.old_style_record = old_style_record;
         if (style_record_is_unchanged(style_record_delta))
@@ -1616,23 +1667,23 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         // box that appears or goes away. What the pseudo-element's box was built with is the host's to compare: the
         // counter styles it resolved.
         bool counter_styles_changed = false;
-        if (pseudo_element != CSS::PseudoElement::Selection && pseudo_element_values && new_pseudo_element_style) {
+        if (!CSS::is_highlight_pseudo_element(pseudo_element) && pseudo_element_values && new_pseudo_element_style) {
             if (style_record_is_unchanged(style_record_delta)) {
                 ++document().style_invalidation_counters().style_record_property_diffs_skipped;
             } else {
                 DOM::AbstractElement abstract_element { *this, pseudo_element };
                 CSS::RequiredInvalidationAfterStyleChange counter_style_invalidation;
-                add_element_dependent_invalidation(counter_style_invalidation, *new_pseudo_element_style, old_state, abstract_element);
+                add_element_dependent_invalidation(read, counter_style_invalidation, *new_pseudo_element_style, had_layout_node, abstract_element);
                 counter_styles_changed = !counter_style_invalidation.is_none();
             }
         }
         auto record_damage = [&](bool with_counter_style_rebuild) {
-            return style_computer.style_engine().pseudo_element_record_damage(
-                style_node_id(),
-                pseudo_element,
-                style_record_delta.old_style_record,
-                style_record_delta.new_style_record,
-                style_record_identity(),
+            return CSS::StyleEngineFFI::style_engine_pseudo_element_record_damage(
+                style_computer.style_engine().host(), &read, style_node_id().value(),
+                to_underlying(pseudo_element),
+                style_record_delta.old_style_record.value(),
+                style_record_delta.new_style_record.value(),
+                style_record_identity().value(),
                 with_counter_style_rebuild);
         };
         // The engine answered its record with what the move from the pseudo-element record it names
@@ -1665,10 +1716,10 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             // away from.
             CSS::StyleRecordPin const before_change { style_computer, old_style_record };
             set_computed_style(pseudo_element, style_record_delta.new_style_record);
-            install_engine_pseudo_element_custom_property_data(pseudo_element, style_computer.style_engine().style_record_custom_property_environment(*engine_record));
-            style_computer.compose_installed_engine_record({ *this, pseudo_element }, before_change.style_record());
+            install_engine_pseudo_element_custom_property_data(read, pseudo_element, style_computer.style_engine().style_record_custom_property_environment(read, *engine_record));
+            style_computer.compose_installed_engine_record(read, { *this, pseudo_element }, before_change.style_record());
             if (!!before_change.style_record())
-                invalidation |= style_computer.run_transition_step_for_installed_record({ *this, pseudo_element }, before_change.style_record());
+                invalidation |= style_computer.run_transition_step_for_installed_record(read, { *this, pseudo_element }, before_change.style_record());
         } else if (auto existing_pseudo_element = get_synthetic_pseudo_element(pseudo_element); existing_pseudo_element.has_value())
             existing_pseudo_element->clear_computed_style(move(style_to_preserve_for_detachment));
 
@@ -1683,50 +1734,57 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     recompute_pseudo_element_style(CSS::PseudoElement::After);
     recompute_pseudo_element_style(CSS::PseudoElement::FirstLetter);
     recompute_pseudo_element_style(CSS::PseudoElement::Selection);
+    recompute_pseudo_element_style(CSS::PseudoElement::SearchText);
+    recompute_pseudo_element_style(CSS::PseudoElement::SearchTextCurrent);
+    recompute_pseudo_element_style(CSS::PseudoElement::SpellingError);
     // An element that left the top layer drops the ::backdrop it held.
     if (m_rendered_in_top_layer || !!style_record_identity(CSS::PseudoElement::Backdrop))
         recompute_pseudo_element_style(CSS::PseudoElement::Backdrop);
     recompute_pseudo_element_style(CSS::PseudoElement::Marker);
     if (settled_after_host_record)
-        style_computer.style_engine().acknowledge_engine_computed_record(style_node_id());
+        CSS::StyleEngineFFI::style_engine_acknowledge_engine_computed_record(style_computer.style_engine().host(), style_node_id());
 
     return invalidation;
 }
 
-CSS::RequiredInvalidationAfterStyleChange Element::refresh_pseudo_element_styles_over_composition(CSS::ComputedValues const* old_computed_values, bool& did_change_custom_properties)
+CSS::RequiredInvalidationAfterStyleChange Element::refresh_pseudo_element_styles_over_composition(Layout::BegunRead const& read, CSS::ComputedValues const* old_computed_values, bool& did_change_custom_properties)
 {
-    auto invalidation = recompute_pseudo_element_styles(did_change_custom_properties, old_computed_values && old_computed_values->display().is_list_item(), old_computed_values);
+    auto invalidation = recompute_pseudo_element_styles(read, did_change_custom_properties, old_computed_values && old_computed_values->display().is_list_item(), old_computed_values);
     publish_custom_property_names();
-    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(read, invalidation);
     return invalidation;
 }
 
-CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styles()
+CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styles(Layout::BegunRead const& read)
 {
     auto computed_values = this->computed_style();
     VERIFY(computed_values);
 
     bool did_change_custom_properties = false;
     record_element_reference_pseudo_element_inputs(*this);
-    auto invalidation = recompute_pseudo_element_styles(did_change_custom_properties, computed_values->display().is_list_item(), nullptr);
+    auto invalidation = recompute_pseudo_element_styles(read, did_change_custom_properties, computed_values->display().is_list_item(), nullptr);
     publish_custom_property_names();
     if (!invalidation.is_none())
         document().style_invalidation_counters().committed_style_observer_consequences++;
-    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(read, invalidation);
     return invalidation;
 }
 
-void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reason, CSS::LayoutTreeRebuildRoot rebuild_root)
+void Element::set_needs_layout_tree_rebuild(Layout::BegunRead const& read, SetNeedsLayoutTreeUpdateReason reason, CSS::LayoutTreeRebuildRoot rebuild_root)
 {
     // A self-scoped style invalidation can replace the element's principal box in place. Anonymous-parent escalation
     // in Node::set_needs_layout_tree_update() still widens the rebuild when the old box participates in an outer
     // wrapper. Other style changes rebuild from the parent. Top layer elements are handled separately because their
     // boxes are siblings of the root.
     // NB: Called outside layout tree construction.
-    auto* layout_node = unsafe_layout_node();
+    auto* layout_node = unsafe_layout_node(read);
     // An element that just left the top layer keeps its box as a viewport child until the
     // pending membership change is processed, so the parent must not be rebuilt for it either.
-    bool element_box_is_placed_in_top_layer = layout_node && layout_node->topmost_layout_node_of_top_layer_placement();
+    // Only the document element's box and the boxes placed in the top layer are viewport children,
+    // which spares every other element the walk up its box's ancestors.
+    bool element_box_is_placed_in_top_layer = layout_node
+        && (document().may_have_boxes_placed_in_top_layer() || document().document_element() == this)
+        && layout_node->topmost_layout_node_of_top_layer_placement();
     if (rendered_in_top_layer() || element_box_is_placed_in_top_layer) {
         // An attached box is replaced in its viewport slot, keeping top layer order; a fresh
         // insert of a detached member appends out of order, so it needs a zone rebuild.
@@ -1743,7 +1801,7 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
     if (!layout_node && may_reuse_layout_node_for_child_list_insertion()
         && rebuild_root != CSS::LayoutTreeRebuildRoot::BoxPresenceChange)
         return;
-    if (rebuild_root == CSS::LayoutTreeRebuildRoot::BoxPresenceChange && apply_box_presence_change_in_place(reason))
+    if (rebuild_root == CSS::LayoutTreeRebuildRoot::BoxPresenceChange && apply_box_presence_change_in_place(read, reason))
         return;
     if (rebuild_root == CSS::LayoutTreeRebuildRoot::PseudoElements) {
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::PseudoElementChange);
@@ -1789,23 +1847,7 @@ static bool element_displays_a_list_item_counter_value(Element const& element)
     }
     if (!CSS::display_from_ffi_display(element.style_group<CSS::ComputedValues::BoxValues>()->display).is_list_item())
         return false;
-    auto list_style_type = element.style_group<CSS::ComputedValues::InheritedListValues>()->list_style_type_value(element.style_scope());
-    return list_style_type.visit(
-        [](Empty const&) {
-            return false;
-        },
-        [](RefPtr<CSS::CounterStyle const> const& counter_style) {
-            return !counter_style || CSS::counter_style_representation_depends_on_value(*counter_style);
-        },
-        [](Utf16String const&) {
-            return false;
-        },
-        [](CSS::UnresolvedCounterStyleName const&) {
-            return true;
-        },
-        [](CSS::ListStyleSymbols const& symbols) {
-            return CSS::counter_style_representation_depends_on_value(*symbols.counter_style);
-        });
+    return element.style_scope().list_style_type_depends_on_counter_value(element.style_group<CSS::ComputedValues::InheritedListValues>()->list_style_type.pointer);
 }
 
 // A list item box that appears or disappears renumbers the list-item counter for everything after
@@ -1870,7 +1912,7 @@ static bool layout_subtree_contains_list_item_boxes(Layout::Node const& layout_n
 // surrounding structure is unaffected. Returns false when the parent has to be rebuilt after all.
 // NB: Only schedules; the layout tree update removes the box. Style updates must not free layout
 //     nodes, as callers keep layout node pointers across them (e.g. getComputedStyle()).
-bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason reason)
+bool Element::apply_box_presence_change_in_place(Layout::BegunRead const& read, SetNeedsLayoutTreeUpdateReason reason)
 {
     if (is_html_html_element() || is_html_body_element() || rendered_in_top_layer() || is<SVG::SVGElement>(*this))
         return false;
@@ -1878,10 +1920,10 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
     GC::Ptr<Element> parent = parent_or_shadow_host_element();
     if (!parent || (parent->shadow_root() && !is_shadow_root_child) || assigned_slot() || is<HTML::HTMLSlotElement>(*parent))
         return false;
-    auto* parent_layout_node = parent->unsafe_layout_node();
+    auto* parent_layout_node = parent->unsafe_layout_node(read);
     if (!parent_layout_node)
         return false;
-    if (first_letter_owner_for_layout_subtree_from(*parent))
+    if (first_letter_owner_for_layout_subtree_from(read, *parent))
         return false;
     if (CSS::subtree_affects_generated_content_state(*this))
         return false;
@@ -1891,7 +1933,7 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
     auto display = style->display();
 
     if (display.is_none()) {
-        auto* layout_node = unsafe_layout_node();
+        auto* layout_node = unsafe_layout_node(read);
         if (!layout_node)
             return false;
         // The box's own style already says display: none, so its level comes from where it sits: a
@@ -1901,7 +1943,7 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
         bool box_is_block_level = !parent_layout_node->children_are_inline();
         if (!box_is_block_level && layout_node->kind() == Layout::RustFFI::NodeKind::InlineNode)
             return false;
-        if (!Node::can_detach_layout_subtree_in_place(*this, *parent, box_is_block_level))
+        if (!Node::can_detach_layout_subtree_in_place(read, *this, *parent, box_is_block_level))
             return false;
         if (layout_subtree_contains_list_item_boxes(*layout_node) && list_item_box_change_is_observable(*this, *parent))
             return false;
@@ -1941,16 +1983,16 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
     return true;
 }
 
-void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
+void Element::apply_computed_style_to_layout_node_if_needed(Layout::BegunRead const& read, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
-    auto* layout_node = unsafe_layout_node();
+    auto* layout_node = unsafe_layout_node(read);
     if (auto* svg_element = as_if<SVG::SVGElement>(*this))
         svg_element->note_svg_paint_resource_description_may_have_changed();
     if (invalidation.needs_layout_tree_rebuild())
         return;
 
     if (!layout_node) {
-        apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+        apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(read, invalidation);
         return;
     }
 
@@ -1960,20 +2002,20 @@ void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalid
     if (Painting::has_committed_box(*layout_node))
         Painting::repaint_after_style_change(*layout_node, invalidation);
 
-    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(read, invalidation);
 }
 
-void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
+void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(Layout::BegunRead const& read, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
     if (invalidation.needs_layout_tree_rebuild())
         return;
 
-    if (invalidation.repaint_selection) {
-        Painting::push_selection_pseudo_style(*this);
+    if (invalidation.repaint_highlights) {
+        Painting::push_highlight_pseudo_styles(*this);
         // NB: A display:contents element has no box of its own. Invalidate the nearest
         //     painted ancestor's subtree so cached text commands take the new highlight.
         for (Node const* node = this; node; node = node->parent_or_shadow_host()) {
-            if (auto* layout_node = node->unsafe_layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+            if (auto* layout_node = node->unsafe_layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
                 Painting::set_needs_repaint_in_subtree(*layout_node);
                 break;
             }
@@ -1984,7 +2026,7 @@ void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS
         if (!has_style(pseudo_element_type))
             return;
 
-        if (auto node_with_style = pseudo_element.unsafe_layout_node()) {
+        if (auto node_with_style = pseudo_element.unsafe_layout_node(read)) {
             node_with_style->apply_style(style_record_identity(pseudo_element_type));
             if (Painting::has_committed_box(*node_with_style))
                 Painting::repaint_after_style_change(*node_with_style, invalidation);
@@ -2049,7 +2091,7 @@ void Element::publish_style_recomputes_on_environment_move()
     auto style_node = style_node_id();
     if (style_node == 0)
         return;
-    document().style_computer().style_engine().set_element_recomputes_on_environment_move(style_node, style_recomputes_on_environment_move());
+    CSS::StyleEngineFFI::style_engine_set_element_recomputes_on_environment_move(document().style_computer().style_engine().host(), style_node, style_recomputes_on_environment_move());
 }
 
 void Element::publish_size_container_query_facts()
@@ -2057,7 +2099,7 @@ void Element::publish_size_container_query_facts()
     auto style_node = style_node_id();
     if (style_node == 0)
         return;
-    document().style_computer().style_engine().set_element_size_container_query_facts(style_node, m_is_size_query_container, m_style_depends_on_size_container_query);
+    CSS::StyleEngineFFI::style_engine_set_element_size_container_query_facts(document().style_computer().style_engine().host(), style_node, m_is_size_query_container, m_style_depends_on_size_container_query);
 }
 
 void Element::set_style_depends_on_viewport_metrics()
@@ -2077,7 +2119,7 @@ void Element::publish_custom_property_names()
     };
     Vector<RefPtr<CSS::CustomPropertyData const>> published_pseudo_element_data;
     // NB: The engine names the synthetic pseudo-elements that hold an environment in one answer.
-    auto const synthetic_pseudo_elements_with_data = style_node_id() == 0 ? 0 : document().style_computer().style_engine().pseudo_elements_with_custom_property_data(style_node_id());
+    auto const synthetic_pseudo_elements_with_data = CSS::StyleEngineFFI::style_engine_pseudo_elements_with_custom_property_data(document().style_computer().style_engine().host(), style_node_id().value());
     for (auto i = 0; i < to_underlying(CSS::PseudoElement::KnownPseudoElementCount); ++i) {
         auto pseudo_element = static_cast<CSS::PseudoElement>(i);
         if (is_synthetic_pseudo_element(pseudo_element) && !((synthetic_pseudo_elements_with_data >> i) & 1))
@@ -2188,29 +2230,29 @@ void Element::update_anchor_name_registry(CSS::ComputedValues const* old_compute
         document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
 }
 
-RefPtr<CSS::CustomPropertyData const> Element::custom_property_environment_of_engine_record(CSS::StyleRecordID style_record, bool& installable) const
+RefPtr<CSS::CustomPropertyData const> Element::custom_property_environment_of_engine_record(Layout::BegunRead const& read, CSS::StyleRecordID style_record, bool& installable) const
 {
     auto& style_computer = document().style_computer();
     RefPtr<CSS::CustomPropertyData const> inherited_data;
     if (auto parent = DOM::AbstractElement { const_cast<Element&>(*this) }.element_to_inherit_style_from(); parent.has_value()) {
         if (auto parent_data = parent->custom_property_data())
-            inherited_data = parent_data->inheritable(document());
+            inherited_data = parent_data->inheritable(read, document());
     }
-    auto identity = style_computer.style_engine().style_record_custom_property_environment(style_record);
+    auto identity = style_computer.style_engine().style_record_custom_property_environment(read, style_record);
     installable = true;
     if (identity == (inherited_data ? inherited_data->identity() : 0))
         return inherited_data;
-    auto data = style_computer.engine_custom_property_environment(identity, inherited_data);
+    auto data = style_computer.engine_custom_property_environment(read, identity, inherited_data);
     installable = data != nullptr;
     return data;
 }
 
 // What the container conditions the style engine decided for the record read of the containers,
 // recorded as a C++ evaluation of the same conditions records it.
-static void record_engine_container_query_effects(Element& element)
+static void record_engine_container_query_effects(Layout::BegunRead const& read, Element& element)
 {
     auto& style_computer = element.document().style_computer();
-    auto taken = CSS::StyleEngineFFI::style_engine_take_container_effects(style_computer.style_engine().rust_handle(), element.style_node_id().value(), &element, [](void* context, CSS::StyleEngineFFI::FfiContainerEffect effect) {
+    auto taken = CSS::StyleEngineFFI::style_engine_take_container_effects(style_computer.style_engine().host(), &read, element.style_node_id().value(), &element, [](void* context, CSS::StyleEngineFFI::FfiContainerEffect effect) {
         auto& element = *static_cast<Element*>(context);
         auto& document = element.document();
         auto container = document.style_computer().element_for_style_node(CSS::StyleNodeID { effect.node });
@@ -2258,29 +2300,17 @@ static void record_engine_container_query_effects(Element& element)
 // animation it describes.
 static void update_animation_name_index(Element& element, CSS::ComputedValues const* old_style, CSS::ComputedValues const& new_style)
 {
-    auto indexable_animation_names = [](CSS::ComputedValues const& style) {
-        Vector<Utf16FlyString> animation_names;
-        for (auto const& animation_name : style.animation_names()) {
-            if (animation_name.syntax != CSS::ComputedAnimationNameSyntax::None)
-                animation_names.append(animation_name.name);
-        }
-        return animation_names;
-    };
-    auto animation_names = indexable_animation_names(new_style);
-    if (old_style ? indexable_animation_names(*old_style) != animation_names : !animation_names.is_empty())
+    auto animation_names = new_style.animation_names();
+    if (old_style ? old_style->animation_names() != animation_names : !animation_names.is_empty())
         CSS::record_element_animation_names(element, animation_names);
 }
 
-CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const& pseudo_element_records, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, DisplayNoneChange display_none_change, EngineRecordDamages const* engine_record_damages)
+CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_record(Layout::BegunRead const& read, CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const& pseudo_element_records, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, DisplayNoneChange display_none_change, EngineRecordDamages const* engine_record_damages)
 {
     VERIFY(parent());
     auto old_style_record = style_record_identity();
     auto& counters = document().style_invalidation_counters();
     auto& style_computer = document().style_computer();
-    auto recompute_started_at = MonotonicTime::now();
-    ScopeGuard record_recompute_time = [&] {
-        counters.style_recompute_microseconds += (MonotonicTime::now() - recompute_started_at).to_microseconds();
-    };
     ++counters.engine_computed_style_records;
 
     // The engine substituted custom properties into the record's winners the way a C++
@@ -2321,13 +2351,13 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
     if (explicitly_inherited_non_inherited_style_groups != 0)
         parent()->add_children_explicitly_inherited_non_inherited_style_groups(explicitly_inherited_non_inherited_style_groups == NumericLimits<u32>::max() ? CSS::ComputedValues::all_style_groups : explicitly_inherited_non_inherited_style_groups);
 
-    record_engine_container_query_effects(*this);
+    record_engine_container_query_effects(read, *this);
 
     // The environment the record was published with: what the element inherits, or what the
     // engine resolved its own custom declarations to over that.
     auto install_custom_property_environment = [&] {
         bool installable = false;
-        auto data = custom_property_environment_of_engine_record(new_style_record, installable);
+        auto data = custom_property_environment_of_engine_record(read, new_style_record, installable);
         VERIFY(installable);
         set_custom_property_data({}, data);
     };
@@ -2337,15 +2367,16 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         // with the pseudo-element styles it still computes.
         install_custom_property_environment();
         set_computed_style({}, new_style_record);
-        update_anchor_name_registry(nullptr, *computed_style());
-        update_animation_name_index(*this, nullptr, *computed_style());
+        auto new_computed_values = computed_style();
+        update_anchor_name_registry(nullptr, *new_computed_values);
+        update_animation_name_index(*this, nullptr, *new_computed_values);
         if (is_document_element())
-            style_computer.update_root_element_font_metrics(*computed_style());
+            style_computer.update_root_element_font_metrics(*new_computed_values);
         counters.element_computed_style_changes++;
         auto invalidation = CSS::RequiredInvalidationAfterStyleChange::full();
-        invalidation |= recompute_pseudo_element_styles(did_change_custom_properties, false, nullptr, &pseudo_element_records, engine_record_damages);
+        invalidation |= recompute_pseudo_element_styles(read, did_change_custom_properties, false, nullptr, &pseudo_element_records, engine_record_damages);
         publish_custom_property_names();
-        apply_computed_style_to_layout_node_if_needed(invalidation);
+        apply_computed_style_to_layout_node_if_needed(read, invalidation);
         return invalidation;
     }
     // A later pass of this style update may start the element's transitions in C++, against the
@@ -2365,17 +2396,13 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         if (current_environment && current_environment->is_animation_overlay_for({ *this }))
             current_environment = current_environment->parent();
         auto const current_identity = current_environment ? current_environment->identity() : 0;
-        if (current_identity != style_computer.style_engine().style_record_custom_property_environment(new_style_record)) {
+        if (current_identity != style_computer.style_engine().style_record_custom_property_environment(read, new_style_record)) {
             install_custom_property_environment();
             did_change_custom_properties = true;
         }
-        auto new_computed_values = style_computer.computed_style_record_view(new_style_record);
+        auto new_computed_values = style_computer.computed_style_record_view(read, new_style_record);
         VERIFY(new_computed_values);
-        ElementDependentInvalidationState old_state {
-            .layout_node = unsafe_layout_node(),
-            .list_counter_style = {},
-            .has_snapshot = false,
-        };
+        bool const had_layout_node = !!unsafe_layout_node(read);
         DOM::AbstractElement abstract_element { *this };
         CSS::StyleEngine::StyleRecordDelta style_record_delta {
             .old_style_record = old_style_record,
@@ -2384,7 +2411,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         Optional<u32> answered_damage;
         if (engine_record_damages && engine_record_damages->element.has_value() && engine_record_damages->element->answers(old_style_record, new_style_record))
             answered_damage = engine_record_damages->element->packed;
-        result = compute_required_invalidation_with_cache(style_computer, *new_computed_values, old_state, abstract_element, style_record_delta, answered_damage);
+        result = compute_required_invalidation_with_cache(read, style_computer, *new_computed_values, had_layout_node, abstract_element, style_record_delta, answered_damage);
         if (result.any_computed_value_changed)
             counters.element_computed_style_changes++;
         set_computed_style({}, new_style_record);
@@ -2403,14 +2430,14 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
             }
         }
         if (display_none_change == DisplayNoneChange::Apply)
-            apply_display_none_change(DisplayNoneState::of(*old_computed_values));
+            apply_display_none_change(read, DisplayNoneState::of(*old_computed_values));
     }
     // The pseudo-element records the engine settled beside this one install with it.
-    result.invalidation |= recompute_pseudo_element_styles(did_change_custom_properties, old_computed_values->display().is_list_item(), &*old_computed_values, &pseudo_element_records, engine_record_damages);
+    result.invalidation |= recompute_pseudo_element_styles(read, did_change_custom_properties, old_computed_values->display().is_list_item(), &*old_computed_values, &pseudo_element_records, engine_record_damages);
     publish_custom_property_names();
     if (new_style_record != old_style_record || did_change_custom_properties)
         invalidate_descendant_styles_depending_on_style_container_query();
-    apply_computed_style_to_layout_node_if_needed(result.invalidation);
+    apply_computed_style_to_layout_node_if_needed(read, result.invalidation);
     return result.invalidation;
 }
 
@@ -2427,7 +2454,7 @@ Optional<Element::DisplayNoneState> Element::display_none_state() const
     return DisplayNoneState::of(*computed_values);
 }
 
-void Element::apply_display_none_change(DisplayNoneState before)
+void Element::apply_display_none_change(Layout::BegunRead const& read, DisplayNoneState before)
 {
     auto after = display_none_state();
     VERIFY(after.has_value());
@@ -2444,12 +2471,32 @@ void Element::apply_display_none_change(DisplayNoneState before)
     //     Descendants needed by SVG resources are scheduled for recomputation; other descendants
     //     rematerialize on a CSSOM read or when the subtree becomes visible again.
     if (!before.display_is_none && after->display_is_none)
-        clear_computed_styles_from_display_none_descendants();
+        clear_computed_styles_from_display_none_descendants(read);
 }
 
-void Element::clear_computed_styles_from_display_none_descendants()
+bool Element::has_referenceable_svg_descendant() const
 {
-    for_each_shadow_including_descendant([](auto& node) {
+    bool found = false;
+    // NB: The traversal only reads the subtree.
+    const_cast<Element&>(*this).for_each_shadow_including_descendant([&found](auto const& node) {
+        auto const* element = as_if<Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+        // NB: A resource keeps its style, and so do the elements it inherits from, so an unstyled subtree holds none.
+        if (!element->has_style())
+            return TraversalDecision::SkipChildrenAndContinue;
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree()) {
+            found = true;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    return found;
+}
+
+void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunRead const& read)
+{
+    for_each_shadow_including_descendant([&read](auto& node) {
         auto* element = as_if<Element>(node);
         if (!element)
             return TraversalDecision::Continue;
@@ -2463,16 +2510,16 @@ void Element::clear_computed_styles_from_display_none_descendants()
 
         // The layout tree is torn down after the style transaction. Keep its style alive until then without
         // retaining the record as the descendant's current computed style.
-        if (auto* layout_node = element->unsafe_layout_node())
+        if (auto* layout_node = element->unsafe_layout_node(read))
             layout_node->pin_style_record_for_detachment();
-        element->m_style_record_identity = 0;
-        element->document().style_computer().style_engine().set_held_style_record(element->style_node_id(), {});
+        element->m_installed_style = {};
+        CSS::StyleEngineFFI::style_engine_set_held_style_record(element->document().style_computer().style_engine().host(), element->style_node_id(), {});
 
         // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
         //     Restore their styles in this style update, so painting never needs to materialize
         //     styles for referenced resources. The engine still holds their records and settles
         //     the reaction from them.
-        if (element->is_svg_element())
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree())
             element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
@@ -2755,12 +2802,20 @@ WebIDL::ExceptionOr<void> Element::set_inner_html(Utf16View html)
     auto* template_element = as_if<HTML::HTMLTemplateElement>(*this);
     if (template_element)
         target = template_element->content();
-    auto fragment = TRY(parse_fragment(target, html));
 
-    // 5. Replace all with fragment within target.
-    target.visit([&](auto node) {
-        node->replace_all(fragment);
-    });
+    // OPTIMIZATION: Markup the fast fragment parser supports needs no fragment. Inserting the parsed nodes directly
+    //               runs their insertion steps once and skips removing them from a fragment no one can observe.
+    GC::RootVector<GC::Ref<Node>> fast_parsed_nodes;
+    if (!template_element && HTML::HTMLParser::try_parse_html_fragment_fast_into_detached_nodes(*this, html, fast_parsed_nodes)) {
+        replace_all(move(fast_parsed_nodes));
+    } else {
+        auto fragment = TRY(parse_fragment(target, html, HTML::ParserScriptingMode::Inert, HTML::FragmentFastPath::Skip));
+
+        // 5. Replace all with fragment within target.
+        target.visit([&](auto node) {
+            node->replace_all(fragment);
+        });
+    }
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
     if (!template_element) {
@@ -2934,7 +2989,7 @@ void Element::did_update_inline_style()
     bool had_style_attribute = m_style_attribute_is_dirty;
     Optional<Utf16String> old_value;
     if (m_attributes) {
-        for (auto const& attribute : *m_attributes) {
+        for (auto const& attribute : m_attributes->span()) {
             if (!attribute.name.namespace_().has_value() && attribute.name.local_name() == HTML::AttributeNames::style) {
                 had_style_attribute = true;
                 old_value = attribute.value;
@@ -2999,13 +3054,13 @@ Utf16FlyString Element::make_html_uppercased_qualified_name() const
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-an-element-task
-HTML::TaskID Element::queue_an_element_task(HTML::Task::Source source, Function<void()> steps)
+HTML::TaskID Element::queue_an_element_task(HTML::Task::Source source, Function<void()> steps, GC::Ptr<GC::Function<void()>> discard_steps)
 {
     // 1. Let global be element's relevant global object.
     auto& global = HTML::relevant_global_object(*this);
 
     // 2. Queue a global task given source, global, and steps.
-    return HTML::queue_global_task(source, global, GC::create_function(GC::Heap::the(), move(steps)));
+    return HTML::queue_global_task(source, global, GC::create_function(GC::Heap::the(), move(steps)), HTML::Task::Priority::Normal, discard_steps);
 }
 
 // https://html.spec.whatwg.org/multipage/syntax.html#void-elements
@@ -3028,13 +3083,14 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
         return QueryResult {};
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout_if_needed_for_node(element, UpdateLayoutReason::ElementGetClientRects);
 
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
     //    object and stop this algorithm.
     // INTEROP: For a table, the spec lists the table box and its caption boxes separately. Chrome reports the table
     //          wrapper box, which is their union.
-    auto const* layout_node = element.principal_layout_node();
+    auto const* layout_node = element.principal_layout_node(read);
     if (!layout_node)
         return QueryResult {};
 
@@ -3067,14 +3123,15 @@ Vector<CSSPixelRect> Element::get_client_rects() const
 
 CSSPixelRect Element::bounding_client_rect_assuming_layout_clean() const
 {
+    Layout::ForcedReadScope read { document() };
     if (!document().navigable())
         return {};
-    return bounding_client_rect_assuming_layout_clean(document().visual_context_tree());
+    return bounding_client_rect_assuming_layout_clean(read, document().visual_context_tree());
 }
 
-CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Compositing::AccumulatedVisualContextTree const& visual_context_tree) const
+CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const& visual_context_tree) const
 {
-    auto const* layout_node = principal_layout_node();
+    auto const* layout_node = principal_layout_node(read);
     if (!layout_node)
         return {};
     return Painting::bounding_client_rect(*layout_node, Painting::rect_to_viewport_transform(document(), visual_context_tree));
@@ -3143,10 +3200,11 @@ int Element::client_width() const
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientWidth);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -3169,10 +3227,11 @@ int Element::client_height() const
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientHeight);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -3188,9 +3247,39 @@ double Element::current_css_zoom() const
     return 1.0;
 }
 
+static bool style_attribute_is_blocked_by_content_security_policy(Element& element, Utf16View value)
+{
+    if (auto shadow_root = element.containing_shadow_root(); shadow_root && shadow_root->is_user_agent_internal())
+        return false;
+    return ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(element, ContentSecurityPolicy::Directives::Directive::InlineType::StyleAttribute, value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked;
+}
+
+static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const&, Document&);
+
+void Element::clone_inline_style_from(Element const& source)
+{
+    // NB: A source whose style attribute still awaits its check leaves the copy to make that check once connected.
+    auto const* source_rare_data = source.element_rare_data();
+    if (!m_inline_style || !source.m_inline_style || (source_rare_data && source_rare_data->style_attribute_awaits_content_security_policy_check))
+        return;
+    m_inline_style->set_declarations_from(*source.m_inline_style);
+    if (auto* rare_data = element_rare_data())
+        rare_data->style_attribute_awaits_content_security_policy_check = false;
+}
+
 void Element::inserted()
 {
     Base::inserted();
+
+    if (auto* rare_data = element_rare_data(); rare_data && rare_data->style_attribute_awaits_content_security_policy_check && is_connected()) {
+        rare_data->style_attribute_awaits_content_security_policy_check = false;
+        if (auto value = attribute(HTML::AttributeNames::style); value.has_value() && m_inline_style) {
+            if (style_attribute_is_blocked_by_content_security_policy(*this, value->utf16_view()))
+                m_inline_style->set_declarations_from_text({});
+            else
+                prefetch_inline_style_image_resources(*m_inline_style, document());
+        }
+    }
 
     if (is_connected()) {
         if (m_style_attribute_is_dirty)
@@ -3262,17 +3351,12 @@ void Element::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Node::children_changed(metadata);
 
-    if (child_style_uses_tree_counting_function()) {
-        for_each_child_of_type<Element>([&](Element& element) {
-            if (!element.style_uses_tree_counting_function())
-                return IterationDecision::Continue;
-
-            // The engine recomputes the element's record against its new place among its siblings.
-            document().style_computer().style_engine().record_derived_element_style_input_change(element.style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
-
-            return IterationDecision::Continue;
-        });
-    }
+    // NB: The style transaction that flew counted the children as they were when it was sealed, and a child whose
+    //     style it found to read its place among them is known to only once its drain installs that style.
+    if (document().has_flown_style_transaction()) [[unlikely]]
+        document().style_computer().style_engine().note_children_changed_beside_flown_transaction(style_node_id());
+    if (child_style_uses_tree_counting_function())
+        document().style_computer().style_engine().restyle_children_reading_sibling_position(*this);
 }
 
 void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
@@ -3287,14 +3371,10 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     // node, and its next one takes them back.
     auto& style_engine = document().style_computer().style_engine();
     if (style_node_id == 0) {
-        RareData::RandomBaseValues values;
-        style_engine.element_random_base_values(old_style_node_id, values.name_lengths, values.name_units, values.value_bits);
-        if (!values.value_bits.is_empty())
+        if (auto values = style_engine.park_element_random_base_values(old_style_node_id))
             ensure_element_rare_data().random_base_values_without_style_node = move(values);
-    } else if (auto* rare_data = element_rare_data(); rare_data && !rare_data->random_base_values_without_style_node.value_bits.is_empty()) {
-        auto values = move(rare_data->random_base_values_without_style_node);
-        rare_data->random_base_values_without_style_node = {};
-        style_engine.set_element_random_base_values(style_node_id, values.name_lengths, values.name_units, values.value_bits);
+    } else if (auto* rare_data = element_rare_data(); rare_data && rare_data->random_base_values_without_style_node) {
+        style_engine.unpark_element_random_base_values(style_node_id, move(rare_data->random_base_values_without_style_node));
     }
     // What the element and its pseudo-elements have scrolled to is held against its identity for the rows a build
     // stamps for them, so it arrives with the identity, as the element connects or its identity changes.
@@ -3306,9 +3386,14 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
                 pseudo_element.publish_scroll_offset();
         });
     }
-    // A newly minted identity holds none of what the element held under its previous one.
-    if (style_node_id != 0 && !!m_style_record_identity) {
-        style_engine.set_held_style_record(style_node_id, m_style_record_identity);
+    // A newly minted identity holds none of what the element and its pseudo-elements held under its previous one.
+    if (style_node_id != 0) {
+        if (!!m_installed_style.record())
+            CSS::StyleEngineFFI::style_engine_set_held_style_record(style_engine.host(), style_node_id, m_installed_style.record().value());
+        for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement const& pseudo_element) {
+            if (auto style_record = pseudo_element.style_record_identity(); !!style_record)
+                CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_engine.host(), style_node_id, to_underlying(type), style_record.value());
+        });
     }
     if (style_node_id != 0)
         publish_children_explicitly_inherit_mark();
@@ -3324,16 +3409,16 @@ void Element::set_rendered_in_top_layer(bool rendered_in_top_layer)
     CSS::record_element_adjustment_facts(*this);
 }
 
-Layout::NodeWithStyle* Element::pseudo_element_layout_node(CSS::PseudoElement pseudo_element) const
+Layout::NodeWithStyle* Element::pseudo_element_layout_node(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element) const
 {
     if (CSS::is_synthetic_pseudo_element(pseudo_element))
-        return pseudo_element_unsafe_layout_node(pseudo_element);
+        return pseudo_element_unsafe_layout_node(read, pseudo_element);
     if (auto element_data = get_pseudo_element(pseudo_element); element_data.has_value())
-        return element_data->layout_node();
+        return element_data->layout_node(read);
     return nullptr;
 }
 
-Layout::NodeWithStyle* Element::pseudo_element_unsafe_layout_node(CSS::PseudoElement pseudo_element) const
+Layout::NodeWithStyle* Element::pseudo_element_unsafe_layout_node(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element) const
 {
     // A synthetic pseudo-element has no StyleNodeID of its own: its box is the row the arena binds to this element's
     // StyleNodeID and the pseudo-element's type. The generated content inside the box carries the same pair, so only
@@ -3343,10 +3428,10 @@ Layout::NodeWithStyle* Element::pseudo_element_unsafe_layout_node(CSS::PseudoEle
         auto* arena = const_cast<Document&>(document()).layout_node_arena_if_created();
         if (!arena)
             return nullptr;
-        return static_cast<Layout::NodeWithStyle*>(Layout::RustFFI::layout_row_bound_pseudo_element_shell(arena->host(), style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
+        return static_cast<Layout::NodeWithStyle*>(Layout::RustFFI::layout_row_bound_pseudo_element_shell(arena->host(), &read, style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
     }
     if (auto element_data = get_pseudo_element(pseudo_element); element_data.has_value())
-        return element_data->unsafe_layout_node();
+        return element_data->unsafe_layout_node(read);
     return nullptr;
 }
 
@@ -3492,13 +3577,13 @@ bool Element::matches_focus_within_pseudo_class() const
     return false;
 }
 
-bool Element::has_synthetic_pseudo_elements() const
+bool Element::has_synthetic_pseudo_elements(Layout::BegunRead const& read) const
 {
     if (pseudo_element_data()) {
         bool has_any_synthetic_pseudo_elements = false;
 
         for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
-            if (pseudo_element.layout_node()) {
+            if (pseudo_element.layout_node(read)) {
                 has_any_synthetic_pseudo_elements = true;
                 return IterationDecision::Break;
             }
@@ -3511,9 +3596,9 @@ bool Element::has_synthetic_pseudo_elements() const
     return false;
 }
 
-void Element::serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder>& element_object) const
+void Element::serialize_children_as_json(Layout::BegunRead const& read, JsonObjectSerializer<Utf16StringBuilder>& element_object) const
 {
-    bool has_pseudo_elements = this->has_synthetic_pseudo_elements();
+    bool has_pseudo_elements = this->has_synthetic_pseudo_elements(read);
     if (!is_shadow_host() && !has_child_nodes() && !has_pseudo_elements)
         return;
 
@@ -3521,7 +3606,7 @@ void Element::serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder
 
     auto serialize_pseudo_element = [&](CSS::PseudoElement pseudo_element_type, PseudoElement const& pseudo_element) {
         // FIXME: Find a way to make these still inspectable? (eg, `::before { display: none }`)
-        if (!pseudo_element.layout_node())
+        if (!pseudo_element.layout_node(read))
             return;
         auto object = MUST(children.add_object());
         auto pseudo_element_name = Utf16String::formatted("::{}", CSS::pseudo_element_name(pseudo_element_type));
@@ -3678,7 +3763,8 @@ double Element::scroll_top() const
         return 0.0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollTop);
+    Layout::ForcedReadScope read { document };
+    const_cast<Document&>(document).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementScrollTop);
 
     // 6. If the element is the root element return the value of scrollY on window.
     if (document.document_element() == this)
@@ -3691,7 +3777,7 @@ double Element::scroll_top() const
     // 8. If the element does not have any associated box, return zero and terminate these steps.
     // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
     //     stored scroll offset from when it was one for restoration when it becomes one again.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !layout_node->is_scroll_container())
         return 0.0;
 
@@ -3723,7 +3809,8 @@ double Element::scroll_left() const
         return 0.0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollLeft);
+    Layout::ForcedReadScope read { document };
+    const_cast<Document&>(document).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementScrollLeft);
 
     // 6. If the element is the root element return the value of scrollX on window.
     if (document.document_element() == this)
@@ -3736,7 +3823,7 @@ double Element::scroll_left() const
     // 8. If the element does not have any associated box, return zero and terminate these steps.
     // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
     //     stored scroll offset from when it was one for restoration when it becomes one again.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !layout_node->is_scroll_container())
         return 0.0;
 
@@ -3779,6 +3866,7 @@ void Element::set_scroll_left(double x)
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementSetScrollLeft);
 
     // 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with x as first argument and scrollY on window as second argument, and terminate these steps.
@@ -3788,7 +3876,7 @@ void Element::set_scroll_left(double x)
     }
 
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
-    auto* layout_node = this->layout_node();
+    auto* layout_node = this->layout_node(read);
     if (!layout_node)
         return;
 
@@ -3837,6 +3925,7 @@ void Element::set_scroll_top(double y)
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementSetScrollTop);
 
     // 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with scrollX as first argument and y as second argument, and terminate these steps.
@@ -3846,7 +3935,7 @@ void Element::set_scroll_top(double y)
     }
 
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
-    auto* layout_node = this->layout_node();
+    auto* layout_node = this->layout_node(read);
     if (!layout_node)
         return;
 
@@ -3873,8 +3962,9 @@ int Element::scroll_width()
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScrollWidth);
-    auto const* viewport_layout_node = document.layout_node();
+    auto const* viewport_layout_node = document.layout_node(read);
     VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
     auto viewport_scrollable_overflow_rect = Painting::scrollable_overflow_rect(*viewport_layout_node);
     VERIFY(viewport_scrollable_overflow_rect.has_value());
@@ -3895,7 +3985,7 @@ int Element::scroll_width()
         return max(viewport_scrolling_area_width, viewport_width);
 
     // 6. If the element does not have any associated box return zero and terminate these steps.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -3917,8 +4007,9 @@ int Element::scroll_height()
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScrollHeight);
-    auto const* viewport_layout_node = document.layout_node();
+    auto const* viewport_layout_node = document.layout_node(read);
     VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
     auto viewport_scrollable_overflow_rect = Painting::scrollable_overflow_rect(*viewport_layout_node);
     VERIFY(viewport_scrollable_overflow_rect.has_value());
@@ -3939,7 +4030,7 @@ int Element::scroll_height()
         return max(viewport_scrolling_area_height, viewport_height);
 
     // 6. If the element does not have any associated box return zero and terminate these steps.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -3989,18 +4080,21 @@ bool Element::is_actually_disabled() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#fragment-parsing-algorithm-steps
-WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode)
+WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode, HTML::FragmentFastPath fast_path)
 {
-    // 1. Assert: scriptingMode is either Inert or Fragment.
+    // NB: This helper implements Legacy mode with no sanitizer configuration; callers supply scriptingMode.
+    //     The HTML fragment parser requires scriptingMode to be either Inert or Fragment.
     VERIFY(scripting_mode == HTML::ParserScriptingMode::Inert || scripting_mode == HTML::ParserScriptingMode::Fragment);
 
-    // 2. If target's node document is an XML document, then return the result of invoking the XML fragment parsing
-    //    algorithm given target and markup.
+    // 1. If mode is Legacy and target's node document is an XML document, then return the result of invoking the
+    //    XML fragment parsing algorithm given target and markup.
     if (target.visit([](auto node) { return node->document().is_xml_document(); }))
         return XMLFragmentParser::parse_xml_fragment(target, markup);
 
-    // 3. If context's node document is an XML document, then set newChildren to the result of invoking the XML fragment parsing algorithm given context and markup.
-    return HTML::HTMLParser::parse_html_fragment(target, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode);
+    // 8. Return the result of the HTML fragment parsing algorithm given target, markup, allowDeclarativeShadowRoots,
+    //    scriptingMode, and sanitizerConfig.
+    // NB: Legacy mode sets allowDeclarativeShadowRoots to false and uses a null sanitizerConfig.
+    return HTML::HTMLParser::parse_html_fragment(target, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode, fast_path);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
@@ -4342,7 +4436,7 @@ WebIDL::ExceptionOr<void> Element::insert_adjacent_text(Utf16View where, Utf16Vi
 }
 
 // https://drafts.csswg.org/cssom-view-1/#determine-the-scroll-into-view-position
-static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box)
+static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead const& read, ScrollIntoViewTarget target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box)
 {
     // To determine the scroll-into-view position of a target, which is an Element, pseudo-element, or Range, with a
     // block flow direction position block, an inline base direction position inline, and a scrolling box scrolling box,
@@ -4350,6 +4444,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
 
     CSSPixelRect scrolling_box_rect;
     CSSPixelPoint current_scroll_position;
+    Layout::NodeWithStyle const* scrolling_box_layout_node = nullptr;
     if (scrolling_box.is_document()) {
         auto& document = scrolling_box.document();
         auto& visual_viewport = *document.visual_viewport();
@@ -4360,17 +4455,37 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
             CSSPixels::nearest_value_for(visual_viewport.height()),
         };
         scrolling_box_rect = { visual_viewport.offset(), visible_size };
-        if (auto* layout_node = document.layout_node())
+        if (auto* layout_node = document.layout_node(read)) {
             scrolling_box_rect = Painting::scroll_snapport_rect(*layout_node, scrolling_box_rect);
+            scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
+        }
         current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
-    } else if (auto* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+    } else if (auto* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
         current_scroll_position = Painting::scroll_offset(*layout_node);
+        scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
         scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
         return {};
     }
 
-    // FIXME: All of this needs to support different block/inline directions.
+    // NB: The block flow and inline base directions of the scrolling box decide which physical axis each runs along and
+    //     which way. The edges below are positions along those directions, which increase from their beginning edge
+    //     towards their ending edge.
+    auto writing_mode = scrolling_box_layout_node ? scrolling_box_layout_node->writing_mode() : CSS::WritingMode::HorizontalTb;
+    auto direction = scrolling_box_layout_node ? scrolling_box_layout_node->direction() : CSS::Direction::Ltr;
+    bool block_axis_is_horizontal = writing_mode != CSS::WritingMode::HorizontalTb;
+    bool block_axis_is_reversed = writing_mode == CSS::WritingMode::VerticalRl || writing_mode == CSS::WritingMode::SidewaysRl;
+    bool inline_axis_is_reversed = (direction == CSS::Direction::Rtl) != (writing_mode == CSS::WritingMode::SidewaysLr);
+    auto start_edge = [](CSSPixelRect const& rect, bool horizontal, bool reversed) {
+        if (horizontal)
+            return reversed ? -rect.right() : rect.left();
+        return reversed ? -rect.bottom() : rect.top();
+    };
+    auto end_edge = [](CSSPixelRect const& rect, bool horizontal, bool reversed) {
+        if (horizontal)
+            return reversed ? -rect.left() : rect.right();
+        return reversed ? -rect.top() : rect.bottom();
+    };
 
     // 1. Let target bounding border box be the box represented by the return value of invoking Element’s
     //    getBoundingClientRect(), if target is an Element, or Range’s getBoundingClientRect(),
@@ -4380,39 +4495,41 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
 
     // AD-HOC: The spec doesn't specify when to do this, but we need to apply scroll-margin and scroll-margin to target
     //         bounding border box (https://drafts.csswg.org/cssom-view-1/#example-51af1565).
-    auto scroll_margin = target.computed_style()->scroll_margin();
-    auto scroll_margin_top = scroll_margin.top().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_right = scroll_margin.right().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_bottom = scroll_margin.bottom().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_left = scroll_margin.left().to_px_or_zero(CSSPixels { 0 });
+    if (target.has<Element*>()) {
+        auto scroll_margin = target.get<Element*>()->computed_style()->scroll_margin();
+        auto scroll_margin_top = scroll_margin.top().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_right = scroll_margin.right().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_bottom = scroll_margin.bottom().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_left = scroll_margin.left().to_px_or_zero(CSSPixels { 0 });
 
-    target_bounding_border_box.set_top(target_bounding_border_box.top() - scroll_margin_top);
-    target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_margin_left + scroll_margin_right);
-    target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_margin_top + scroll_margin_bottom);
-    target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_margin_left);
+        target_bounding_border_box.set_top(target_bounding_border_box.top() - scroll_margin_top);
+        target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_margin_left + scroll_margin_right);
+        target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_margin_top + scroll_margin_bottom);
+        target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_margin_left);
+    }
 
     // 2. Let scrolling box edge A be the beginning edge in the block flow direction of scrolling box, and
     //    let element edge A be target bounding border box’s edge on the same physical side as that of
     //    scrolling box edge A.
-    CSSPixels element_edge_a = target_bounding_border_box.top();
-    CSSPixels scrolling_box_edge_a = scrolling_box_rect.top();
+    CSSPixels element_edge_a = start_edge(target_bounding_border_box, block_axis_is_horizontal, block_axis_is_reversed);
+    CSSPixels scrolling_box_edge_a = start_edge(scrolling_box_rect, block_axis_is_horizontal, block_axis_is_reversed);
 
     // 3. Let scrolling box edge B be the ending edge in the block flow direction of scrolling box, and let
     //    element edge B be target bounding border box’s edge on the same physical side as that of scrolling
     //    box edge B.
-    CSSPixels element_edge_b = target_bounding_border_box.bottom();
-    CSSPixels scrolling_box_edge_b = scrolling_box_rect.bottom();
+    CSSPixels element_edge_b = end_edge(target_bounding_border_box, block_axis_is_horizontal, block_axis_is_reversed);
+    CSSPixels scrolling_box_edge_b = end_edge(scrolling_box_rect, block_axis_is_horizontal, block_axis_is_reversed);
 
     // 4. Let scrolling box edge C be the beginning edge in the inline base direction of scrolling box, and
     //    let element edge C be target bounding border box’s edge on the same physical side as that of scrolling
     //    box edge C.
-    CSSPixels element_edge_c = target_bounding_border_box.left();
-    CSSPixels scrolling_box_edge_c = scrolling_box_rect.left();
+    CSSPixels element_edge_c = start_edge(target_bounding_border_box, !block_axis_is_horizontal, inline_axis_is_reversed);
+    CSSPixels scrolling_box_edge_c = start_edge(scrolling_box_rect, !block_axis_is_horizontal, inline_axis_is_reversed);
 
     // 5. Let scrolling box edge D be the ending edge in the inline base direction of scrolling box, and let element
     //    edge D be target bounding border box’s edge on the same physical side as that of scrolling box edge D.
-    CSSPixels element_edge_d = target_bounding_border_box.right();
-    CSSPixels scrolling_box_edge_d = scrolling_box_rect.right();
+    CSSPixels element_edge_d = end_edge(target_bounding_border_box, !block_axis_is_horizontal, inline_axis_is_reversed);
+    CSSPixels scrolling_box_edge_d = end_edge(scrolling_box_rect, !block_axis_is_horizontal, inline_axis_is_reversed);
 
     // 6. Let element height be the distance between element edge A and element edge B.
     CSSPixels element_height = element_edge_b - element_edge_a;
@@ -4428,21 +4545,22 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
 
     // 10. Let position be the scroll position scrolling box would have by following these steps:
     auto position = [&]() -> CSSPixelPoint {
-        auto x = current_scroll_position.x();
-        auto y = current_scroll_position.y();
+        // NB: These are distances to scroll along the block flow and inline base directions.
+        CSSPixels block_delta = 0;
+        CSSPixels inline_delta = 0;
 
         // 1. If block is "start", then align element edge A with scrolling box edge A.
         if (block == Element::ScrollLogicalPosition::Start) {
-            y += element_edge_a - scrolling_box_edge_a;
+            block_delta += element_edge_a - scrolling_box_edge_a;
         }
         // 2. Otherwise, if block is "end", then align element edge B with scrolling box edge B.
         else if (block == Element::ScrollLogicalPosition::End) {
-            y += element_edge_b - scrolling_box_edge_b;
+            block_delta += element_edge_b - scrolling_box_edge_b;
         }
         // 3. Otherwise, if block is "center", then align the center of target bounding border box with the center of
         //    scrolling box in scrolling box’s block flow direction.
         else if (block == Element::ScrollLogicalPosition::Center) {
-            y += (element_edge_a + element_height / 2) - (scrolling_box_edge_a + scrolling_box_height / 2);
+            block_delta += (element_edge_a + element_height / 2) - (scrolling_box_edge_a + scrolling_box_height / 2);
         }
         // 4. Otherwise, block is "nearest":
         else {
@@ -4454,28 +4572,28 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
             // If element edge B is outside scrolling box edge B and element height is greater than scrolling box height
             else if ((element_edge_a <= scrolling_box_edge_a && element_height < scrolling_box_height) || (element_edge_b >= scrolling_box_edge_b && element_height > scrolling_box_height)) {
                 // Align element edge A with scrolling box edge A.
-                y += element_edge_a - scrolling_box_edge_a;
+                block_delta += element_edge_a - scrolling_box_edge_a;
             }
             // If element edge A is outside scrolling box edge A and element height is greater than scrolling box height
             // If element edge B is outside scrolling box edge B and element height is less than scrolling box height
             else if ((element_edge_b >= scrolling_box_edge_b && element_height < scrolling_box_height) || (element_edge_a <= scrolling_box_edge_a && element_height > scrolling_box_height)) {
                 // Align element edge B with scrolling box edge B.
-                y += element_edge_b - scrolling_box_edge_b;
+                block_delta += element_edge_b - scrolling_box_edge_b;
             }
         }
 
         // 5. If inline is "start", then align element edge C with scrolling box edge C.
         if (inline_ == Element::ScrollLogicalPosition::Start) {
-            x += element_edge_c - scrolling_box_edge_c;
+            inline_delta += element_edge_c - scrolling_box_edge_c;
         }
         // 6. Otherwise, if inline is "end", then align element edge D with scrolling box edge D.
         else if (inline_ == Element::ScrollLogicalPosition::End) {
-            x += element_edge_d - scrolling_box_edge_d;
+            inline_delta += element_edge_d - scrolling_box_edge_d;
         }
         // 7. Otherwise, if inline is "center", then align the center of target bounding border box with the center of
         //    scrolling box in scrolling box’s inline base direction.
         else if (inline_ == Element::ScrollLogicalPosition::Center) {
-            x += (element_edge_c + element_width / 2) - (scrolling_box_edge_c + scrolling_box_width / 2);
+            inline_delta += (element_edge_c + element_width / 2) - (scrolling_box_edge_c + scrolling_box_width / 2);
         }
         // 8. Otherwise, inline is "nearest":
         else {
@@ -4487,13 +4605,13 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
             // If element edge D is outside scrolling box edge D and element width is greater than scrolling box width
             else if ((element_edge_c <= scrolling_box_edge_c && element_width < scrolling_box_width) || (element_edge_d >= scrolling_box_edge_d && element_width > scrolling_box_width)) {
                 // Align element edge C with scrolling box edge C.
-                x += element_edge_c - scrolling_box_edge_c;
+                inline_delta += element_edge_c - scrolling_box_edge_c;
             }
             // If element edge C is outside scrolling box edge C and element width is greater than scrolling box width
             // If element edge D is outside scrolling box edge D and element width is less than scrolling box width
             else if ((element_edge_d >= scrolling_box_edge_d && element_width < scrolling_box_width) || (element_edge_c <= scrolling_box_edge_c && element_width > scrolling_box_width)) {
                 // Align element edge D with scrolling box edge D.
-                x += element_edge_d - scrolling_box_edge_d;
+                inline_delta += element_edge_d - scrolling_box_edge_d;
             }
         }
 
@@ -4502,6 +4620,12 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
         //           nearest scroll container is a scroll snap container. The user agent may also do this even when the
         //           scroll container has scroll-snap-type: none.
 
+        if (block_axis_is_reversed)
+            block_delta = -block_delta;
+        if (inline_axis_is_reversed)
+            inline_delta = -inline_delta;
+        auto x = current_scroll_position.x() + (block_axis_is_horizontal ? block_delta : inline_delta);
+        auto y = current_scroll_position.y() + (block_axis_is_horizontal ? inline_delta : block_delta);
         return CSSPixelPoint { x, y };
     }();
 
@@ -4510,40 +4634,94 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
 }
 
 // https://drafts.csswg.org/cssom-view-1/#scroll-a-target-into-view
-static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise)
+void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarget target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise)
 {
+    auto target_document = [](ScrollIntoViewTarget current_target) -> Document& {
+        return current_target.visit(
+            [](Element* element) -> Document& { return element->document(); },
+            [](Range* range) -> Document& { return range->start_container()->document(); });
+    };
+
+    // AD-HOC: This algorithm is also invoked by internal navigation and parser tasks, which do
+    //         not necessarily have a JavaScript execution context. The scrolling algorithms create
+    //         promises even when their caller does not request one, so provide the target Document's
+    //         relevant settings object while those promises are created and resolved.
+    HTML::TemporaryExecutionContext temporary_execution_context { target_document(target).relevant_settings_object() };
+
     // 1. Let ancestorPromises be an empty set of Promises.
     GC::RootVector<GC::Ref<WebIDL::Promise>> ancestor_promises;
 
     // 2. For each ancestor element or viewport that establishes a scrolling box scrolling box, in order of innermost
     //    to outermost scrolling box, run these substeps:
-    auto* ancestor = target.parent();
-    Vector<Node&> scrolling_boxes;
-    while (ancestor) {
-        auto const* ancestor_layout_node = ancestor->layout_node();
-        if (ancestor_layout_node && Painting::has_committed_box(*ancestor_layout_node) && Painting::has_scrollable_overflow(*ancestor_layout_node))
-            scrolling_boxes.append(*ancestor);
-        ancestor = ancestor->parent();
-    }
+    // INTEROP: Scrolling the boxes outside a box that is fixed to the viewport cannot move it, so other engines do not
+    //          scroll them to bring the box into view. A fixed box that compensates for the scroll of its default
+    //          anchor moves with that scroll, so it is not fixed to the viewport.
+    auto is_fixed_to_the_viewport = [&](Node const& node) {
+        auto const* layout_node = as_if<Layout::NodeWithStyle>(node.layout_node(read));
+        if (!layout_node || !layout_node->is_fixed_position() || layout_node->compensates_for_default_anchor_scroll())
+            return false;
+        auto const* containing_block = layout_node->containing_block();
+        return containing_block && containing_block->is_viewport();
+    };
+    auto current_target = target;
+    bool reached_container = false;
 
-    auto target_bounding_border_box = target.get_bounding_client_rect();
+    auto target_is_fixed_to_the_viewport = [&](ScrollIntoViewTarget current_target) {
+        return current_target.visit(
+            [&](Element* element) {
+                for (Node const* node = element; node; node = node->flat_tree_parent()) {
+                    if (is_fixed_to_the_viewport(*node))
+                        return true;
+                }
+                return false;
+            },
+            [&](Range* range) {
+                for (auto* node = range->start_container().ptr(); node; node = node->flat_tree_parent()) {
+                    if (is_fixed_to_the_viewport(*node))
+                        return true;
+                }
+                return false;
+            });
+    };
 
-    for (auto& scrolling_box : scrolling_boxes) {
+    auto get_target_bounding_border_box = [](ScrollIntoViewTarget current_target) {
+        return current_target.visit(
+            [](Element* element) {
+                return element->get_bounding_client_rect();
+            },
+            [](Range* range) {
+                // AD-HOC: Text-fragment scrolling centers the beginning of a match. Using the union
+                //         of every client rect can put the beginning of a long passage outside the viewport.
+                auto rects = range->client_rects();
+                if (rects.is_empty())
+                    return CSSPixelRect {};
+                auto const& rect = rects.first();
+                return CSSPixelRect {
+                    CSSPixels::nearest_value_for(rect.x()),
+                    CSSPixels::nearest_value_for(rect.y()),
+                    CSSPixels::nearest_value_for(rect.width()),
+                    CSSPixels::nearest_value_for(rect.height()),
+                };
+            });
+    };
+    auto target_bounding_border_box = get_target_bounding_border_box(current_target);
+
+    auto scroll_scrolling_box = [&](Node& scrolling_box) {
         // 1. If the Document associated with target is not same origin with the Document associated with the element
         //    or viewport associated with scrolling box, abort any remaining iteration of this loop.
-        if (target.document().origin() != scrolling_box.document().origin())
-            break;
+        if (target_document(current_target).origin() != scrolling_box.document().origin())
+            return IterationDecision::Break;
 
         // 2. Let position be the scroll position resulting from running the steps to determine the scroll-into-view
         //    position of target with behavior as the scroll behavior, block as the block flow position, inline as the
         //    inline base direction position and scrolling box as the scrolling box.
-        auto position = determine_the_scroll_into_view_position(target, target_bounding_border_box, block, inline_, scrolling_box);
+        auto position = determine_the_scroll_into_view_position(read, current_target, target_bounding_border_box, block, inline_, scrolling_box);
 
         // AD-HOC: A smooth scroll leaves the scrolling box at its old scroll position while the outer scrolling boxes
         //         are considered, so move the target to where this scroll is going to leave it. The viewport is always
         //         the outermost scrolling box, so its own scroll cannot affect a later iteration.
         if (!scrolling_box.is_document()) {
-            if (auto const* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+            if (auto const* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
                 target_bounding_border_box.translate_by(Painting::scroll_offset(*layout_node) - Painting::clamp_scroll_offset(*layout_node, position));
                 auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
@@ -4552,10 +4730,16 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
             }
         }
 
-        // 3. If position is not the same as scrolling box’s current scroll position, or scrolling box has an ongoing
-        //    smooth scroll,
-        // FIXME: Actually check this condition.
-        if (true) {
+        // 3. If position is not the same as scrolling box's current scroll position, then:
+        auto current_scroll_position = [&] {
+            if (scrolling_box.is_document()) {
+                auto& document = static_cast<Document&>(scrolling_box);
+                return document.navigable()->viewport_scroll_offset() + document.visual_viewport()->offset();
+            }
+            auto const* layout_node = scrolling_box.layout_node(read);
+            return layout_node ? Painting::scroll_offset(*layout_node) : CSSPixelPoint {};
+        }();
+        if (position != current_scroll_position) {
             // -> If scrolling box is associated with an element
             if (auto* element = as_if<Element>(scrolling_box)) {
                 if (auto navigable = element->document().navigable())
@@ -4577,8 +4761,48 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
         //    or is a viewport whose document is a shadow-including inclusive ancestor of container, abort any
         //    remaining iteration of this loop.
         // NB: Our viewports *are* Documents in the DOM, so both checks are equivalent.
-        if (container != nullptr && scrolling_box.is_shadow_including_inclusive_ancestor_of(*container))
+        if (container != nullptr && scrolling_box.is_shadow_including_inclusive_ancestor_of(*container)) {
+            reached_container = true;
+            return IterationDecision::Break;
+        }
+
+        return IterationDecision::Continue;
+    };
+
+    for (;;) {
+        auto* ancestor = current_target.visit(
+            [](Element* element) -> Node* { return element->flat_tree_parent(); },
+            [](Range* range) -> Node* { return range->common_ancestor_container().ptr(); });
+
+        auto const target_is_fixed = target_is_fixed_to_the_viewport(current_target);
+        for (; ancestor && !ancestor->is_document(); ancestor = ancestor->flat_tree_parent()) {
+            auto const* ancestor_layout_node = ancestor->layout_node(read);
+            if (ancestor_layout_node && Painting::has_committed_box(*ancestor_layout_node) && Painting::has_scrollable_overflow(*ancestor_layout_node)) {
+                if (scroll_scrolling_box(*ancestor) == IterationDecision::Break)
+                    break;
+            }
+            if (is_fixed_to_the_viewport(*ancestor))
+                break;
+        }
+        if (reached_container)
             break;
+
+        auto& document = target_document(current_target);
+        if (!target_is_fixed && scroll_scrolling_box(document) == IterationDecision::Break)
+            break;
+
+        // Element scrolling retains CSSOM View's per-document behavior. Text-fragment ranges
+        // additionally bubble through same-origin iframe containers to bring the match into view.
+        if (current_target.has<Element*>())
+            break;
+
+        auto navigable = document.navigable();
+        auto container_element = navigable ? navigable->container() : nullptr;
+        if (!container_element || document.origin() != container_element->document().origin())
+            break;
+
+        current_target = ScrollIntoViewTarget { container_element.ptr() };
+        target_bounding_border_box = get_target_bounding_border_box(current_target);
     }
 
     // 4. Return scrollPromise, and run the remaining steps in parallel.
@@ -4616,6 +4840,7 @@ void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC
 
     // 7. If the element does not have any associated box, or is not available to user-agent features, then return a
     //    resolved Promise and abort the remaining steps.
+    Layout::ForcedReadScope read { document() };
     document().update_layout(UpdateLayoutReason::ElementScrollIntoView);
     HTML::TemporaryExecutionContext temporary_execution_context { document().relevant_settings_object() };
     if (!has_layout_box()) {
@@ -4626,7 +4851,7 @@ void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC
 
     // 8. Scroll the element into view with behavior, block, inline, and container. Let scrollPromise be the Promise
     //    returned from this step.
-    scroll_an_element_into_view(*this, behavior, block, inline_, container, promise);
+    scroll_a_target_into_view(read, ScrollIntoViewTarget { this }, behavior, block, inline_, container, promise);
 
     // FIXME: 9. Optionally perform some other action that brings the element to the user’s attention.
 }
@@ -4660,11 +4885,11 @@ void Element::scroll_into_view(Variant<bool, ScrollIntoViewOptions> const& arg, 
 ENUMERATE_ARIA_ATTRIBUTES
 #undef __ENUMERATE_ARIA_ATTRIBUTE
 
-bool Element::is_hidden() const
+bool Element::is_hidden(Layout::BegunRead const& read) const
 {
-    if (layout_node() == nullptr)
+    if (layout_node(read) == nullptr)
         return true;
-    if (layout_node()->visibility() == CSS::Visibility::Hidden || layout_node()->visibility() == CSS::Visibility::Collapse || layout_node()->content_visibility() == CSS::ContentVisibility::Hidden)
+    if (layout_node(read)->visibility() == CSS::Visibility::Hidden || layout_node(read)->visibility() == CSS::Visibility::Collapse || layout_node(read)->content_visibility() == CSS::ContentVisibility::Hidden)
         return true;
     for (ParentNode const* self_or_ancestor = this; self_or_ancestor; self_or_ancestor = self_or_ancestor->parent_or_shadow_host()) {
         if (self_or_ancestor->is_element()) {
@@ -4676,10 +4901,10 @@ bool Element::is_hidden() const
     return false;
 }
 
-bool Element::has_hidden_ancestor() const
+bool Element::has_hidden_ancestor(Layout::BegunRead const& read) const
 {
     for (ParentNode const* self_or_ancestor = this; self_or_ancestor; self_or_ancestor = self_or_ancestor->parent_or_shadow_host()) {
-        if (self_or_ancestor->is_element() && static_cast<DOM::Element const*>(self_or_ancestor)->is_hidden())
+        if (self_or_ancestor->is_element() && static_cast<DOM::Element const*>(self_or_ancestor)->is_hidden(read))
             return true;
     }
     return false;
@@ -4687,30 +4912,27 @@ bool Element::has_hidden_ancestor() const
 
 bool Element::is_referenced() const
 {
-    bool is_referenced = false;
-    if (id().has_value()) {
-        auto id_view = id()->view();
-        root().for_each_in_subtree_of_type<HTML::HTMLElement>([&](auto& element) {
-            auto aria_data = MUST(Web::ARIA::AriaData::build_data(element));
-            for (auto const& id_reference : aria_data->aria_labelled_by_or_default()) {
-                if (id_reference.utf16_view() != id_view)
-                    continue;
-
-                is_referenced = true;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-    }
-    return is_referenced;
+    return id().has_value() && document().tree_references_id_from_aria(root(), *id());
 }
 
-bool Element::has_referenced_and_hidden_ancestor() const
+bool Element::has_referenced_and_hidden_ancestor(Layout::BegunRead const& read) const
 {
     for (auto const* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
         if (ancestor->is_element())
-            if (auto const* element = static_cast<DOM::Element const*>(ancestor); element->is_referenced() && element->is_hidden())
+            if (auto const* element = static_cast<DOM::Element const*>(ancestor); element->is_referenced() && element->is_hidden(read))
                 return true;
+    }
+    return false;
+}
+
+bool Element::is_aria_hidden() const
+{
+    // aria-hidden="true" on any ancestor hides this element, and a descendant's aria-hidden="false" doesn't override
+    // it. So, keep walking up past non-"true" values — rather than stopping at the first aria-hidden attribute.
+    for (auto const* node = this; node; node = node->parent_element().ptr()) {
+        auto hidden = node->get_attribute(ARIA::AttributeNames::aria_hidden);
+        if (hidden.has_value() && hidden.value() == "true"sv)
+            return true;
     }
     return false;
 }
@@ -4721,17 +4943,33 @@ bool Element::exclude_from_accessibility_tree() const
     // The following elements are not exposed via the accessibility API and user agents MUST NOT include them in the accessibility tree:
 
     // Elements, including their descendent elements, that have host language semantics specifying that the element is not displayed, such as CSS display:none, visibility:hidden, or the HTML hidden attribute.
-    if (!has_layout_box())
+    // A display:contents element has no layout node either, but it is displayed: its children are laid out in its
+    // parent's box. So the missing layout box alone doesn't exclude it. Blink (AXObject::ShouldIgnoreForHiddenOrInert,
+    // HasDisplayContentsStyle), Gecko (nsCoreUtils::CanCreateAccessibleWithoutFrame, IsDisplayContents) and WebKit
+    // (AXObjectCache::getOrCreate, hasDisplayContents) all keep such an element.
+    if (!has_layout_box() && !has_display_contents())
+        return true;
+
+    // visibility:hidden
+    if (auto const* box_values = style_group<CSS::ComputedValues::InheritedBoxValues>();
+        box_values && static_cast<CSS::Visibility>(box_values->visibility) != CSS::Visibility::Visible)
         return true;
 
     // Elements with none or presentation as the first role in the role attribute. However, their exclusion is conditional. In addition, the element's descendants and text content are generally included. These exceptions and conditions are documented in the presentation (role) section.
-    // FIXME: Handle exceptions to excluding presentation role
+    // role_or_default() has already applied the presentational-role conflict rules — a none/presentation role
+    // attribute on an element that's focusable or carries a global ARIA attribute came back as the implicit role — so
+    // a none here is an implicit one: an img with an empty alt and no ARIA name. It stays out whatever other ARIA
+    // attributes it carries, as in WebKit (AccessibilityRenderObject::computeIsIgnored()); Blink (AXNodeObject::
+    // ShouldIncludeBasedOnSemantics()) and Gecko (nsAccessibilityService::ShouldCreateImgAccessible()) keep such an
+    // img for any ARIA attribute.
     auto role = role_or_default();
     if (role == ARIA::Role::none || role == ARIA::Role::presentation)
         return true;
 
-    // TODO: If not already excluded from the accessibility tree per the above rules, user agents SHOULD NOT include the following elements in the accessibility tree:
+    // If not already excluded from the accessibility tree per the above rules, user agents SHOULD NOT include the following elements in the accessibility tree:
     //    Elements, including their descendants, that have aria-hidden set to true. In other words, aria-hidden="true" on a parent overrides aria-hidden="false" on descendants.
+    if (is_aria_hidden())
+        return true;
     //    Any descendants of elements that have the characteristic "Children Presentational: True" unless the descendant is not allowed to be presentational because it meets one of the conditions for exception described in Presentational Roles Conflict Resolution. However, the text content of any excluded descendants is included.
     //    Elements with the following roles have the characteristic "Children Presentational: True":
     //      button
@@ -4751,6 +4989,14 @@ bool Element::exclude_from_accessibility_tree() const
     return false;
 }
 
+// Whether the computed display is contents: the element then has no layout node of its own while its children are laid
+// out as its parent's — which tells it apart from an element that isn't displayed at all.
+bool Element::has_display_contents() const
+{
+    auto const* box_values = style_group<CSS::ComputedValues::BoxValues>();
+    return box_values && CSS::display_from_ffi_display(box_values->display).is_contents();
+}
+
 // https://www.w3.org/TR/wai-aria-1.2/#tree_inclusion
 bool Element::include_in_accessibility_tree() const
 {
@@ -4768,6 +5014,23 @@ bool Element::include_in_accessibility_tree() const
     //       This issue https://github.com/w3c/aria/issues/1851 seeks clarification on this point
     auto aria_hidden = this->aria_hidden();
     if ((role_or_default().has_value() || has_global_aria_attribute()) && (!aria_hidden.has_value() || aria_hidden->utf16_view() != u"true"sv))
+        return true;
+
+    // A navigable container that holds a document (an iframe, e.g.) is a tree node in its own right, as Gecko
+    // (nsAccessibilityService::CreateAccessible makes an OuterDocAccessible of an outer-doc frame), WebKit
+    // (AccessibilityRenderObject::isWidget() for a RenderWidget) and Blink (AXNodeObject::NativeRoleIgnoringAria()
+    // gives a frame Role::kIframe) expose it: the node the child document hangs off once the tree descends into
+    // iframes — and until then, the one that carries the focus when it moves into the iframe. An object or embed
+    // element showing anything but a document stays out.
+    if (auto const* container = as_if<HTML::NavigableContainer>(*this); container && container->content_navigable())
+        return true;
+
+    // A password input has no role (HTML-AAM maps input type=password to none, so HTMLInputElement::default_role()
+    // leaves it roleless), but every engine exposes it as a text field: Gecko (HTMLTextFieldAccessible::NativeRole()
+    // gives it roles::PASSWORD_TEXT), WebKit (AccessibilityNodeObject::isSecureField() marks its text field) and Blink
+    // (AXNodeObject::NativeRoleIgnoringAria() gives an input element kTextField by default). So, include one even when
+    // nothing names it — the platform bridges map it to their password-field roles.
+    if (auto const* input = as_if<HTML::HTMLInputElement>(*this); input && input->type_state() == HTML::HTMLInputElement::TypeAttributeState::Password && (!aria_hidden.has_value() || aria_hidden->utf16_view() != u"true"sv))
         return true;
 
     // TODO: Elements that are not hidden and have an ID that is referenced by another element via a WAI-ARIA property.
@@ -5101,21 +5364,21 @@ void Element::for_each_attribute(Function<void(QualifiedName, Utf16String)> call
     }
 }
 
-Layout::NodeWithStyle* Element::layout_node()
+Layout::NodeWithStyle* Element::layout_node(Layout::BegunRead const& read)
 {
-    return static_cast<Layout::NodeWithStyle*>(Node::layout_node());
+    return static_cast<Layout::NodeWithStyle*>(Node::layout_node(read));
 }
 
-Layout::NodeWithStyle const* Element::layout_node() const
+Layout::NodeWithStyle const* Element::layout_node(Layout::BegunRead const& read) const
 {
-    return static_cast<Layout::NodeWithStyle const*>(Node::layout_node());
+    return static_cast<Layout::NodeWithStyle const*>(Node::layout_node(read));
 }
 
 // https://drafts.csswg.org/css-tables-3/#table-wrapper-box
-Layout::NodeWithStyle const* Element::principal_layout_node() const
+Layout::NodeWithStyle const* Element::principal_layout_node(Layout::BegunRead const& read) const
 {
     // The table wrapper box is the principal box of a table, and contains its caption boxes.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !layout_node->display().is_table_inside())
         return layout_node;
     if (auto const* parent = layout_node->parent(); parent && parent->is_table_wrapper())
@@ -5123,14 +5386,14 @@ Layout::NodeWithStyle const* Element::principal_layout_node() const
     return layout_node;
 }
 
-Layout::NodeWithStyle* Element::unsafe_layout_node()
+Layout::NodeWithStyle* Element::unsafe_layout_node(Layout::BegunRead const& read)
 {
-    return static_cast<Layout::NodeWithStyle*>(Node::unsafe_layout_node());
+    return static_cast<Layout::NodeWithStyle*>(Node::unsafe_layout_node(read));
 }
 
-Layout::NodeWithStyle const* Element::unsafe_layout_node() const
+Layout::NodeWithStyle const* Element::unsafe_layout_node(Layout::BegunRead const& read) const
 {
-    return static_cast<Layout::NodeWithStyle const*>(Node::unsafe_layout_node());
+    return static_cast<Layout::NodeWithStyle const*>(Node::unsafe_layout_node(read));
 }
 
 bool Element::has_attributes() const
@@ -5155,22 +5418,23 @@ ReadonlySpan<Element::Attribute> Element::attribute_list() const
 
 CSS::ComputedStyleRecordView Element::computed_style(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
-    return document().style_computer().computed_style_record_view(style_record_identity(pseudo_element_type));
+    // NB: An element that was never styled has no record to view, which keeps a document that styles nothing from
+    //     needing a style computer.
+    auto const& style = installed_style(pseudo_element_type);
+    if (!style)
+        return {};
+    return document().style_computer().computed_style_record_view(style);
 }
 
-CSS::StyleRecordID Element::style_record_identity(Optional<CSS::PseudoElement> pseudo_element_type) const
+CSS::InstalledStyle const& Element::installed_style(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
     if (pseudo_element_type.has_value()) {
+        static CSS::InstalledStyle const none;
         if (auto pseudo_element = get_pseudo_element(*pseudo_element_type); pseudo_element.has_value())
-            return pseudo_element->style_record_identity();
-        return 0;
+            return pseudo_element->installed_style();
+        return none;
     }
-    return m_style_record_identity;
-}
-
-void const* Element::style_record_payloads(Optional<CSS::PseudoElement> pseudo_element_type) const
-{
-    return document().style_computer().style_record_payloads(style_record_identity(pseudo_element_type));
+    return m_installed_style;
 }
 
 void Element::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, Optional<CSS::PseudoElement> pseudo_element_type, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
@@ -5192,33 +5456,69 @@ void Element::update_animated_properties_for_abstract_element(Badge<Web::Animati
     effect.update_computed_properties_for_style(context, abstract_element);
 }
 
+// The animation style group of an installed style, which holds the timelines it declares by name.
+static CSS::ComputedValues::AnimationValues const* installed_animation_values(CSS::InstalledStyle const& style)
+{
+    auto const* payloads = static_cast<void const* const*>(style.payloads());
+    if (!payloads)
+        return nullptr;
+    return static_cast<CSS::ComputedValues::AnimationValues const*>(payloads[CSS::ComputedValues::AnimationValues::style_group_index]);
+}
+
+// Whether two installed styles differ in the timelines they declare by name, or the timeline names they scope.
+static bool timeline_declarations_differ(CSS::InstalledStyle const& old_style, CSS::InstalledStyle const& new_style)
+{
+    auto const* old_values = installed_animation_values(old_style);
+    auto const* new_values = installed_animation_values(new_style);
+    bool const old_declares = old_values && CSS::ComputedValuesFFI::rust_animation_values_declare_timelines(old_values);
+    bool const new_declares = new_values && CSS::ComputedValuesFFI::rust_animation_values_declare_timelines(new_values);
+    if (!old_declares && !new_declares)
+        return false;
+    if (old_declares != new_declares)
+        return true;
+    return old_values != new_values && !CSS::ComputedValuesFFI::rust_animation_values_timeline_declarations_equal(old_values, new_values);
+}
+
 void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
     VERIFY(!style_record_identity || style_node_id() != 0);
-    auto old_style_record_identity = m_style_record_identity;
-    if (old_style_record_identity == style_record_identity)
+    if (m_installed_style.record() == style_record_identity)
         return;
-    m_style_record_identity = style_record_identity;
+    Layout::ForcedReadScope read { document() };
+    auto held_before = exchange(m_installed_style, document().style_computer().install_style(read, style_record_identity));
+    // The element holds the record it installed before until the engine takes the new one in, so the layout node reads
+    // what it moves from, and everything below that compares against the old record is read from it, before the
+    // element lets go of it. The engine may free the old record's payloads as soon as it is no longer held.
+    if (auto* layout_node = unsafe_layout_node(read))
+        layout_node->set_style_record_identity(m_installed_style.record());
+    bool const was_display_none = !held_before || held_before.display_is_none();
+    // https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
+    bool const timeline_declarations_changed = timeline_declarations_differ(held_before, m_installed_style);
     if (style_node_id() != 0)
-        document().style_computer().style_engine().set_held_style_record(style_node_id(), style_record_identity);
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->set_style_record_identity(style_record_identity);
+        CSS::StyleEngineFFI::style_engine_set_held_style_record(document().style_computer().style_engine().host(), style_node_id(), style_record_identity.value());
+    // Children that wait to arrive in a display:none subtree may be revealed as the subtree's root, or an element
+    // between it and them, stops being display:none.
+    if ((child_style_arrivals_wait() || descendant_style_arrival_pending()) && m_installed_style && !m_installed_style.display_is_none()
+        && was_display_none)
+        CSS::record_waiting_children_may_be_revealed(*this);
     // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
     // attributes for the layout tree build to resolve, so they follow every record the element takes.
     if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity)
         Layout::publish_svg_style_references(*this);
+    if (timeline_declarations_changed)
+        document().did_change_timeline_declarations();
 }
 
 // What C++ installs beside a pseudo-element it computes: its element's inheritable environment, or the one its own
 // custom declarations resolved to over that.
-void Element::install_engine_pseudo_element_custom_property_data(CSS::PseudoElement pseudo_element, u64 environment)
+void Element::install_engine_pseudo_element_custom_property_data(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element, u64 environment)
 {
     auto& style_computer = document().style_computer();
     auto element_data = custom_property_data({});
-    auto inherited = element_data ? element_data->inheritable(document()) : nullptr;
+    auto inherited = element_data ? element_data->inheritable(read, document()) : nullptr;
     auto data = inherited;
     if (CSS::StyleEngine::is_engine_custom_property_environment(environment) && environment != (inherited ? inherited->identity() : 0))
-        data = style_computer.engine_custom_property_environment(environment, inherited);
+        data = style_computer.engine_custom_property_environment(read, environment, inherited);
     set_custom_property_data(pseudo_element, move(data));
 }
 
@@ -5354,6 +5654,7 @@ SyntheticPseudoElement& Element::ensure_synthetic_pseudo_element(CSS::PseudoElem
 
 void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
+    Layout::ForcedReadScope read { document() };
     AbstractElement const abstract_element { *this, pseudo_element };
     if (!data || !data->is_animation_overlay_for(abstract_element)) {
         if (auto current = custom_property_data(pseudo_element); current && current->is_animation_overlay_for(abstract_element)) {
@@ -5365,17 +5666,18 @@ void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_eleme
             data = CSS::CustomPropertyData::create_animation_overlay(move(animated_values), move(data), abstract_element);
         }
     }
-    install_custom_property_data(pseudo_element, move(data));
+    install_custom_property_data(read, pseudo_element, move(data));
 }
 
 void Element::replace_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
-    install_custom_property_data(pseudo_element, move(data));
+    Layout::ForcedReadScope read { document() };
+    install_custom_property_data(read, pseudo_element, move(data));
 }
 
 // The style engine keeps the custom-property environments an element and its synthetic pseudo-elements hold; the
 // element keeps no copy of its own. This is the only place they move.
-void Element::install_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
+void Element::install_custom_property_data(Layout::BegunRead const& read, Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
     if (pseudo_element.has_value() && !CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
         return;
@@ -5387,12 +5689,12 @@ void Element::install_custom_property_data(Optional<CSS::PseudoElement> pseudo_e
             return;
         auto& style_engine = document().style_computer().style_engine();
         if (!pseudo_element.has_value()) {
-            style_engine.set_element_custom_property_data(*this, data.ptr());
+            style_engine.set_element_custom_property_data(read, *this, data.ptr());
             return;
         }
         if (data)
             (void)ensure_synthetic_pseudo_element(pseudo_element.value());
-        style_engine.set_pseudo_element_custom_property_data(style_node, pseudo_element.value(), data.ptr());
+        CSS::StyleEngineFFI::style_engine_set_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value()), data.ptr(), data ? data->identity() : 0);
         return;
     }
 
@@ -5419,8 +5721,8 @@ RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS
             return nullptr;
         auto const& style_engine = document().style_computer().style_engine();
         if (!pseudo_element.has_value())
-            return style_engine.element_custom_property_data(style_node);
-        return style_engine.pseudo_element_custom_property_data(style_node, pseudo_element.value());
+            return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_element_custom_property_data(style_engine.host(), style_node.value()));
+        return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value())));
     }
 
     if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
@@ -5429,14 +5731,14 @@ RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS
     return nullptr;
 }
 
-void Element::republish_style_record_environment()
+void Element::republish_style_record_environment(Layout::BegunRead const& read)
 {
     if (!has_style() || style_node_id() == 0)
         return;
     auto data = custom_property_data({});
     if (data && data->is_animation_overlay_for({ *this }))
         data = data->parent();
-    auto new_style_record = document().style_computer().style_engine().republish_record_environment(style_node_id(), data ? data->identity() : 0, data ? data->rust_store() : nullptr);
+    auto new_style_record = document().style_computer().style_engine().republish_record_environment(read, style_node_id(), data ? data->identity() : 0, data ? data->rust_store() : nullptr);
     if (!!new_style_record && new_style_record != style_record_identity())
         refresh_computed_style({}, new_style_record);
 }
@@ -5507,7 +5809,7 @@ void Element::scroll(Bindings::ScrollToOptions options, GC::Ptr<WebIDL::Promise>
         && this != document.document_element()) {
         document.update_style();
         auto const* misc_reset_values = style_group<CSS::ComputedValues::MiscResetValues>();
-        if (!misc_reset_values || misc_reset_values->scroll_snap_type_value().strictness == CSS::ScrollSnapStrictness::None) {
+        if (!misc_reset_values || misc_reset_values->scroll_snap_strictness_value() == CSS::ScrollSnapStrictness::None) {
             if (promise)
                 WebIDL::resolve_promise(*promise);
             return;
@@ -5515,6 +5817,7 @@ void Element::scroll(Bindings::ScrollToOptions options, GC::Ptr<WebIDL::Promise>
     }
 
     // NB: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScroll);
 
     // 8. If the element is the root element, return the Promise returned by scroll() on window after the method is
@@ -5535,7 +5838,7 @@ void Element::scroll(Bindings::ScrollToOptions options, GC::Ptr<WebIDL::Promise>
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element
     //     has no overflow, return a resolved Promise and abort the remaining steps.
     // FIXME: or the element has no overflow
-    auto* layout_node = this->layout_node();
+    auto* layout_node = this->layout_node(read);
     if (!layout_node || !layout_node->is_scroll_container()) {
         if (promise)
             WebIDL::resolve_promise(*promise);
@@ -5598,10 +5901,11 @@ void Element::scroll_by(ScrollToOptions options, GC::Ptr<WebIDL::Promise> promis
 bool Element::check_visibility(CheckVisibilityOptions const& options)
 {
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementCheckVisibility);
 
     // 1. If this does not have an associated box, return false.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return false;
 
@@ -5649,7 +5953,7 @@ ProximityToTheViewport Element::proximity_to_the_viewport() const
 }
 
 // https://drafts.csswg.org/css-contain/#proximity-to-the-viewport
-void Element::determine_proximity_to_the_viewport()
+void Element::determine_proximity_to_the_viewport(Layout::BegunRead const& read)
 {
     // An element that has content-visibility: auto is in one of three states when it comes to its proximity to the viewport:
 
@@ -5661,7 +5965,7 @@ void Element::determine_proximity_to_the_viewport()
     // viewport soon. A margin of 50% is suggested as a reasonable default.
     viewport_rect.inflate(viewport_rect.width(), viewport_rect.height());
     // FIXME: We don't have paint containment or the overflow clip edge yet, so this is just using the absolute rect for now.
-    if (Painting::absolute_rect(*unsafe_layout_node()).intersects(viewport_rect)) {
+    if (Painting::absolute_rect(*unsafe_layout_node(read)).intersects(viewport_rect)) {
         ensure_element_rare_data().proximity_to_the_viewport = ProximityToTheViewport::CloseToTheViewport;
         return;
     }
@@ -5771,16 +6075,8 @@ void Element::schedule_list_item_renumber_for_list_owner()
 bool Element::after_pseudo_element_style_depends_on_list_item_counter() const
 {
     auto style_depends_on_list_item_counter = [](CSS::ComputedValues const& style) {
-        auto definitions_contain_list_item_counter = [](auto const& definitions) {
-            return any_of(definitions, [](auto const& definition) {
-                return definition.name == CSS::list_item_counter_name();
-            });
-        };
         return style.display().is_list_item()
-            || style.content_uses_list_item_counter()
-            || definitions_contain_list_item_counter(style.counter_increment())
-            || definitions_contain_list_item_counter(style.counter_reset())
-            || definitions_contain_list_item_counter(style.counter_set());
+            || (style.generated_content_facts() & (CSS::ComputedValuesFFI::GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER | CSS::ComputedValuesFFI::GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER));
     };
 
     auto style = computed_style(CSS::PseudoElement::After);
@@ -5810,7 +6106,7 @@ static bool subtree_renders_list_item_counters(Element const& ancestor, bool ite
             && style->display().is_list_item()
             && (!marker_style || marker_style->content_is_normal())
             && !style->list_style_image()
-            && CSS::marker_text_depends_on_list_item_counter_value(style->list_style_type(element->style_scope())))
+            && element->style_scope().list_style_type_depends_on_counter_value(style->list_style_type_data()))
             return true;
         if (subtree_renders_list_item_counters(*element, items_renumber_with_walked_owner && !element->is_html_ol_ul_menu_element()))
             return true;
@@ -5879,20 +6175,14 @@ void Element::set_last_relative_scroll_direction(u8 direction)
 // That is why the unchecked layout node accessor is the right one here.
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
 {
-    // The document's scroll state mirrors these offsets, so it is invalidated here, next to the
-    // store, rather than by each caller.
     if (pseudo_element_type.has_value()) {
         auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type);
         if (!pseudo_element.has_value())
             return;
-        if (pseudo_element->scroll_offset() != offset)
-            document().invalidate_scroll_state();
         pseudo_element->set_scroll_offset(offset);
         return;
     }
 
-    if (scroll_offset({}) != offset)
-        document().invalidate_scroll_state();
     if (!offset.is_zero())
         ensure_element_rare_data().scroll_offset = offset;
     else if (auto* rare_data = element_rare_data())
@@ -6197,6 +6487,10 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         if (value == Utf16String {} && !old_value.has_value())
             return;
 
+        // AD-HOC: Assigned nodes are recomputed lazily.
+        if (auto assigned_slot = assigned_slot_internal())
+            assigned_slot->assign_slottables_if_needed();
+
         // 4. If value is null or the empty string, then set element’s name to the empty string.
         if (!value.has_value() || value->is_empty())
             set_slottable_name({});
@@ -6218,21 +6512,19 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
     if (local_name == HTML::AttributeNames::id) {
         // StyleEngine keys local features by interned atom, so capture the old side before the
         // element's own copy is replaced.
-        auto old_style_engine_id = m_id;
+        auto old_id = m_id;
 
         if (value_or_empty.is_empty())
             m_id = {};
         else
             m_id = Utf16FlyString::from_utf16(value_or_empty);
 
-        if (is_connected()) {
-            Optional<Utf16FlyString> old_id;
-            if (old_value.has_value())
-                old_id = Utf16FlyString::from_utf16(old_value->utf16_view());
-            document().element_id_changed({}, *this, old_id);
+        // Setting the id an element already has moves nothing that is keyed by it.
+        if (m_id != old_id) {
+            if (is_connected())
+                document().element_id_changed({}, *this, old_id);
+            CSS::record_element_id_changed(*this, old_id, m_id);
         }
-
-        CSS::record_element_id_changed(*this, old_style_engine_id, m_id);
     } else if (local_name == HTML::AttributeNames::name) {
         m_has_name = !value_or_empty.is_empty();
         if (m_has_name) {
@@ -6264,6 +6556,8 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
 
         if (old_style_engine_classes.has_value())
             CSS::record_element_class_list_changed(*this, *old_style_engine_classes, m_classes);
+        else if (is_connected())
+            CSS::record_waiting_element_classes_changed(*this);
     } else if (local_name == HTML::AttributeNames::style) {
         // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
         if (m_inline_style && m_inline_style->is_updating())
@@ -6273,7 +6567,25 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         document().flush_deferred_style_change_event();
         if (!m_inline_style)
             m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this });
-        m_inline_style->set_declarations_from_text(value_or_empty);
+        // https://html.spec.whatwg.org/multipage/dom.html#the-style-attribute
+        // However, if the Should element's inline behavior be blocked by Content Security Policy? algorithm returns
+        // "Blocked" when executed upon the attribute's element, "style attribute", and the attribute's value, then
+        // the style rules defined in the attribute's value must not be applied to the element.
+        // NB: The internal elements of a user agent shadow tree get their style attribute before they are inserted
+        //     into it, and are styled by the user agent rather than the document. So the check is made when an
+        //     element that is not connected becomes connected, and the resources its declarations use are fetched then.
+        if (value.has_value() && !is_connected()) {
+            ensure_element_rare_data().style_attribute_awaits_content_security_policy_check = true;
+            m_inline_style->set_declarations_from_text(*value);
+            return;
+        }
+        if (auto* rare_data = element_rare_data())
+            rare_data->style_attribute_awaits_content_security_policy_check = false;
+        if (!value.has_value()) {
+            m_inline_style->set_declarations_from_text({});
+            return;
+        }
+        m_inline_style->set_declarations_from_text(style_attribute_is_blocked_by_content_security_policy(*this, *value) ? Utf16View {} : *value);
         prefetch_inline_style_image_resources(*m_inline_style, document());
     } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
         bool const is_dir = local_name == HTML::AttributeNames::dir;
@@ -6450,6 +6762,35 @@ WebIDL::ExceptionOr<void> Element::set_html_unsafe(StringView html)
     return {};
 }
 
+// https://html.spec.whatwg.org/multipage/dom.html#advisory-information
+Utf16String Element::advisory_information() const
+{
+    // The advisory information of an element is the value that the following algorithm returns, with the algorithm
+    // being aborted once a value is returned. When the algorithm returns the empty string, then there is no advisory
+    // information.
+    // NB: The loop below takes step 2's recursion as its iteration, so a deep tree can't exhaust the stack.
+    for (auto const* element = this; element; element = element->flat_tree_parent_element()) {
+        // 1. If the element has a title attribute, then return the result of running normalize newlines on its value.
+        // NB: The title attribute is a global attribute of HTML elements, so only an HTML element has one.
+        if (auto const* html_element = as_if<HTML::HTMLElement>(*element)) {
+            if (auto title = html_element->title(); title.has_value())
+                return Infra::normalize_newlines(*title);
+        }
+
+        // 2. If the element has a parent element, then return the parent element's advisory information.
+        // AD-HOC: The spec's parent element is the element's parent in the DOM tree, so the walk ends at the root of a
+        //         shadow tree, and never reaches the slot an element is assigned to. We take the parent element in the
+        //         flat tree instead, so a shadow host's title covers its shadow tree's content, and the titles of a
+        //         slot and its ancestors cover the content assigned to that slot — as Blink, WebKit, and Gecko all do:
+        //         Blink's HitTestResult::Title() walks FlatTreeTraversal::Parent(), WebKit's HitTestResult::title()
+        //         walks parentInComposedTree(), and Gecko's TooltipTextProvider walks flattenedTreeParentNode.
+        //         https://github.com/whatwg/html/issues/13035
+    }
+
+    // 3. Return the empty string.
+    return {};
+}
+
 // https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes
 Optional<Utf16String> Element::lang() const
 {
@@ -6525,10 +6866,10 @@ void Element::invalidate_lang_value()
 }
 
 // https://drafts.csswg.org/css-images-4/#element-not-rendered
-bool Element::not_rendered() const
+bool Element::not_rendered(Layout::BegunRead const& read) const
 {
     // An element is not rendered if it does not have an associated box.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return true;
 
@@ -6578,23 +6919,74 @@ Optional<Gfx::DecodedImageFrame> Element::capture_the_image()
     return Gfx::DecodedImageFrame { *bitmap };
 }
 
-void Element::set_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#dfn-active-pointer
+// A mouse connected to the device is always active, and it is the one pointer there is.
+static bool pointer_id_names_an_active_pointer(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::setPointerCapture()");
+    return pointer_id == UIEvents::mouse_pointer_id;
 }
 
-void Element::release_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#setting-pointer-capture
+WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::releasePointerCapture()");
+    // 1. If the pointerId provided as the method's argument does not match any of the active pointers, then throw a
+    //    "NotFoundError" DOMException.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
+
+    // 2. Let the pointer be the active pointer specified by the given pointerId.
+    // 3. If the element is not connected, throw an "InvalidStateError" DOMException.
+    if (!is_connected())
+        return WebIDL::InvalidStateError::create("Cannot set pointer capture on an element that is not connected"_utf16);
+
+    // FIXME: 4. If this method is invoked while the element's node document has a locked element, throw an
+    //           "InvalidStateError" DOMException.
+
+    // 5. If the pointer is not in the active buttons state or the element's node document is not the active document
+    //    of the pointer, then terminate these steps.
+    auto navigable = document().navigable();
+    if (!navigable)
+        return {};
+    auto& event_handler = navigable->event_handler();
+    if (!event_handler.is_mouse_pointer_in_active_buttons_state())
+        return {};
+
+    // 6. For the specified pointerId, set the pending pointer capture target override to the Element on which this
+    //    method was invoked.
+    event_handler.set_pending_pointer_capture_target_override({}, *this);
+    return {};
 }
 
-bool Element::has_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#releasing-pointer-capture
+WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::hasPointerCapture()");
-    return false;
+    // 1. If the pointerId provided as the method's argument does not match any of the active pointers and these steps
+    //    are not being invoked as a result of the implicit release of pointer capture, then throw a "NotFoundError"
+    //    DOMException.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
+
+    // 2. If hasPointerCapture is false for the Element with the specified pointerId, then terminate these steps.
+    if (!has_pointer_capture(pointer_id))
+        return {};
+
+    // 3. For the specified pointerId, clear the pending pointer capture target override, if set.
+    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({});
+    return {};
+}
+
+// https://w3c.github.io/pointerevents/#dom-element-haspointercapture
+bool Element::has_pointer_capture(WebIDL::Long pointer_id) const
+{
+    // Indicates whether the element on which this method is invoked has pointer capture for the pointer identified by
+    // the argument pointerId. In particular, returns true if the pending pointer capture target override for pointerId
+    // is set to the element on which this method is invoked, and false otherwise.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return false;
+    auto navigable = document().navigable();
+    if (!navigable)
+        return false;
+    return navigable->event_handler().pending_pointer_capture_target_override().ptr() == this;
 }
 
 GC::Ptr<NamedNodeMap> Element::attributes()
@@ -6612,6 +7004,10 @@ GC::Ptr<NamedNodeMap const> Element::attributes() const
 
 Utf16FlyString const& Element::html_uppercased_qualified_name() const
 {
+    // NB: Whether the qualified name is uppercased depends on the node document, which can change when the element is
+    //     adopted. So we only use the cached uppercased name while it applies.
+    if (namespace_uri() != Namespace::HTML || document().document_type() != Document::Type::HTML)
+        return qualified_name();
     return ensure_element_rare_data().html_uppercased_qualified_name.ensure([&] { return make_html_uppercased_qualified_name(); });
 }
 
@@ -6769,6 +7165,24 @@ void Element::set_fullscreen_flag(bool is_fullscreen)
         return;
     m_fullscreen_flag = is_fullscreen;
     CSS::record_element_state_changed(*this, CSS::PseudoClass::Fullscreen, is_fullscreen);
+
+    // https://w3c.github.io/picture-in-picture/#fullscreen
+    // It is RECOMMENDED that when a Picture-in-Picture element's fullscreen flag is set, the user agent runs these
+    // steps:
+    // AD-HOC: These steps are from the overhaul proposed in https://github.com/w3c/picture-in-picture/pull/260.
+    if (is_fullscreen && is_picture_in_picture_element()) {
+        // 1. Let doc be the Picture-in-Picture element's node document.
+        auto& document = this->document();
+
+        // 2. Enqueue the following steps to doc's picture-in-picture parallel queue:
+        //    1. Run the exit Picture-in-Picture algorithm given doc and null.
+        document.page().picture_in_picture_controller().enqueue_exit(document, nullptr);
+    }
+}
+
+bool Element::is_picture_in_picture_element() const
+{
+    return document().picture_in_picture_element().ptr() == this;
 }
 
 void Element::set_fullscreen_request_type(Fullscreen::RequestType request_type)
@@ -6912,11 +7326,11 @@ GC::Ref<Geometry::DOMRect> get_bounding_client_rect(DOM::Element const& element)
 
 GC::Ref<Geometry::DOMRectList> get_client_rects(DOM::Element const& element)
 {
-    Vector<GC::Root<Geometry::DOMRect>> rects;
+    Vector<Gfx::DoubleRect> rects;
     for (auto const& rect : element.get_client_rects())
-        rects.append(create_dom_rect(rect));
+        rects.append(rect.to_type<double>());
 
-    return Geometry::DOMRectList::create(move(rects));
+    return Geometry::DOMRectList::create(rects);
 }
 
 GC::Ref<WebIDL::Promise> request_pointer_lock(DOM::Element& element, Optional<PointerLockOptions> const& options)

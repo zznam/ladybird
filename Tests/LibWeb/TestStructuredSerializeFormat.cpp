@@ -14,13 +14,10 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/Serializable.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
-#include <LibWeb/Crypto/KeyAlgorithms.h>
 #include <LibWeb/FileAPI/File.h>
 #include <LibWeb/FileAPI/FileList.h>
 #include <LibWeb/Geometry/DOMMatrix.h>
-#include <LibWeb/Geometry/DOMMatrixReadOnly.h>
 #include <LibWeb/Geometry/DOMPointReadOnly.h>
-#include <LibWeb/Geometry/DOMQuad.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectReadOnly.h>
 #include <LibWeb/HTML/ImageBitmap.h>
@@ -428,11 +425,7 @@ TEST_CASE(record_wrappers_round_trip_through_ipc)
 TEST_CASE(storage_serializable_object_is_framed_with_interface_then_version)
 {
     (void)test_realm();
-    auto point = Web::Geometry::DOMPoint::create();
-    point->set_x(1.0);
-    point->set_y(2.0);
-    point->set_z(3.0);
-    point->set_w(4.0);
+    auto point = Web::Geometry::DOMPoint::create(1.0, 2.0, 3.0, 4.0);
 
     auto record = storage_serialize(point);
 
@@ -456,11 +449,7 @@ TEST_CASE(storage_serializable_object_is_framed_with_interface_then_version)
 
 TEST_CASE(ipc_serializable_object_has_no_version_framing)
 {
-    auto point = Web::Geometry::DOMPoint::create();
-    point->set_x(1.0);
-    point->set_y(2.0);
-    point->set_z(3.0);
-    point->set_w(4.0);
+    auto point = Web::Geometry::DOMPoint::create(1.0, 2.0, 3.0, 4.0);
 
     auto record = structured_serialize(test_realm().vm(), point);
     Web::HTML::StructuredSerializeReader reader { record };
@@ -539,11 +528,7 @@ TEST_CASE(geometry_serializables_encode_to_frozen_bytes)
 {
     (void)test_realm();
     {
-        auto point = Web::Geometry::DOMPoint::create();
-        point->set_x(1.5);
-        point->set_y(-2.5);
-        point->set_z(3.5);
-        point->set_w(-4.5);
+        auto point = Web::Geometry::DOMPoint::create(1.5, -2.5, 3.5, -4.5);
         Vector<u8> body;
         for (double element : { 1.5, -2.5, 3.5, -4.5 })
             append_little_endian_double(body, element);
@@ -554,11 +539,7 @@ TEST_CASE(geometry_serializables_encode_to_frozen_bytes)
     }
 
     {
-        auto rect = Web::Geometry::DOMRect::create();
-        rect->set_x(10.0);
-        rect->set_y(20.0);
-        rect->set_width(30.0);
-        rect->set_height(40.0);
+        auto rect = Web::Geometry::DOMRect::create(10.0, 20.0, 30.0, 40.0);
         Vector<u8> body;
         for (double element : { 10.0, 20.0, 30.0, 40.0 })
             append_little_endian_double(body, element);
@@ -570,12 +551,12 @@ TEST_CASE(geometry_serializables_encode_to_frozen_bytes)
 
     {
         // Identity 2D matrices serialize six components.
-        auto matrix = Web::Geometry::DOMMatrixReadOnly::create();
         Vector<u8> body;
         body.append(1);
         for (double element : { 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 })
             append_little_endian_double(body, element);
-        expect_storage_encoding(matrix, serializable_storage_record("DOMMatrixReadOnly"sv, 1, body));
+        auto record = serializable_storage_record("DOMMatrixReadOnly"sv, 1, body);
+        expect_storage_encoding(GC::Ref { MUST(storage_deserialize(record)).as_object() }, record);
 
         auto mutable_matrix = Web::Geometry::DOMMatrix::create();
         expect_storage_encoding(mutable_matrix, serializable_storage_record("DOMMatrix"sv, 1, body));
@@ -583,17 +564,15 @@ TEST_CASE(geometry_serializables_encode_to_frozen_bytes)
 
     {
         // DOMQuad serializes its four corner points as nested DOMPoint sub-values.
-        auto quad = Web::Geometry::DOMQuad::create();
         Vector<u8> body;
-        for (auto point : Array { quad->p1(), quad->p2(), quad->p3(), quad->p4() }) {
+        for (int i = 0; i < 4; ++i) {
             Vector<u8> point_body;
-            append_little_endian_double(point_body, point->x());
-            append_little_endian_double(point_body, point->y());
-            append_little_endian_double(point_body, point->z());
-            append_little_endian_double(point_body, point->w());
+            for (double coordinate : { 1.0 + i, 2.0, 3.0, 4.0 })
+                append_little_endian_double(point_body, coordinate);
             frozen_serializable_value(body, "DOMPoint"sv, 1, point_body);
         }
-        expect_storage_encoding(quad, serializable_storage_record("DOMQuad"sv, 1, body));
+        auto record = serializable_storage_record("DOMQuad"sv, 1, body);
+        expect_storage_encoding(GC::Ref { MUST(storage_deserialize(record)).as_object() }, record);
     }
 }
 
@@ -602,8 +581,9 @@ TEST_CASE(image_serializables_encode_to_frozen_bytes)
     auto& realm = test_realm();
 
     {
-        auto pixels = MUST(JS::Uint8ClampedArray::create(realm, 4));
-        auto image = MUST(Web::HTML::ImageData::create(realm, pixels, 1));
+        auto image = MUST(Web::HTML::ImageData::create(realm, 1, 1));
+        auto image_wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, image);
+        auto pixels = GC::Ref { MUST(image_wrapper->get("data"_utf16_fly_string)).as_object() };
 
         // Build the data sub-value from the live typed array.
         auto data_body = serialized_object_body(pixels);
@@ -617,12 +597,22 @@ TEST_CASE(image_serializables_encode_to_frozen_bytes)
 
     {
         auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 2, 2 }));
-        auto image_bitmap = Web::HTML::ImageBitmap::create();
-        image_bitmap->set_bitmap(bitmap);
+        auto image_bitmap = Web::HTML::ImageBitmap::create(bitmap);
 
         // Use the bitmap's actual pitch and data size.
         ReadonlyBytes data { bitmap->scanline_u8(0), bitmap->data_size() };
         auto expected = image_bitmap_record(bitmap->width(), bitmap->height(), bitmap->pitch(), "BGRA8888"sv, "premultiplied"sv, data);
+        expect_storage_encoding(image_bitmap, expected);
+    }
+
+    {
+        auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 2, 2 }));
+        auto color_space = MUST(Gfx::ColorSpace::from_cicp({ Media::ColorPrimaries::SMPTE432, Media::TransferCharacteristics::SRGB, Media::MatrixCoefficients::Identity, Media::VideoFullRangeFlag::Full }));
+        auto image_bitmap = Web::HTML::ImageBitmap::create(Gfx::DecodedImageFrame { *bitmap, move(color_space) });
+
+        ReadonlyBytes data { bitmap->scanline_u8(0), bitmap->data_size() };
+        Array<u8, 3> display_p3 { 1, 12, 13 }; // CICP, SMPTE432 primaries, sRGB transfer characteristics
+        auto expected = image_bitmap_record(bitmap->width(), bitmap->height(), bitmap->pitch(), "BGRA8888"sv, "premultiplied"sv, data, { display_p3.data(), display_p3.size() });
         expect_storage_encoding(image_bitmap, expected);
     }
 }
@@ -634,14 +624,18 @@ static GC::Ref<JS::Object> wrap_image_bitmap(JS::Realm& realm, GC::Ref<Web::HTML
 
 static GC::Ref<Web::HTML::ImageBitmap> create_image_bitmap(NonnullRefPtr<Gfx::Bitmap> bitmap)
 {
-    auto image_bitmap = Web::HTML::ImageBitmap::create();
-    image_bitmap->set_bitmap(move(bitmap));
-    return image_bitmap;
+    return Web::HTML::ImageBitmap::create(move(bitmap));
 }
 
-static Vector<JS::Value> deserialize_transfer_data_holders(JS::Realm& realm, Web::HTML::SerializedTransferRecord& record)
+// The transfer-receiving steps of an ImageBitmap, which create the ImageBitmap.
+static Web::WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> receive_image_bitmap(JS::Realm& realm, Web::HTML::TransferDataDecoder& decoder)
 {
-    Vector<JS::Value> values;
+    return Web::Bindings::create_transferred_platform_object(Web::HTML::TransferType::ImageBitmap, realm, decoder);
+}
+
+static GC::RootVector<JS::Value> deserialize_transfer_data_holders(JS::Realm& realm, Web::HTML::SerializedTransferRecord& record)
+{
+    GC::RootVector<JS::Value> values;
     for (auto& holder : record.transfer_data_holders) {
         Web::HTML::TransferDataDecoder decoder { move(holder) };
         decoder.set_shared_buffers(record.shared_buffers);
@@ -865,11 +859,11 @@ TEST_CASE(image_bitmap_transfer_rejects_invalid_shared_pixels)
         MUST(holder.encode(1));
         MUST(holder.encode(format));
         MUST(holder.encode(Gfx::AlphaType::Premultiplied));
+        MUST(holder.encode(static_cast<u8>(0))); // sRGB
         Web::HTML::TransferDataDecoder decoder { move(holder) };
         if (buffers)
             decoder.set_shared_buffers(*buffers);
-        auto receiver = Web::HTML::ImageBitmap::create();
-        return receiver->transfer_receiving_steps(realm, decoder);
+        return receive_image_bitmap(realm, decoder);
     };
     EXPECT(!receive(&shared_buffers, 0, 0, Gfx::BitmapFormat::BGRA8888, 16).is_error());
     EXPECT(receive(nullptr, 0, 0, Gfx::BitmapFormat::BGRA8888, 16).is_error());
@@ -884,8 +878,9 @@ TEST_CASE(image_bitmap_transfer_rejects_invalid_shared_pixels)
 TEST_CASE(image_bitmap_transfer_protects_against_backing_truncation)
 {
     auto& realm = test_realm();
-    auto source = create_image_bitmap(MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 16, 1 })));
-    source->bitmap()->set_pixel(0, 0, Gfx::Color::Red);
+    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 16, 1 }));
+    bitmap->set_pixel(0, 0, Gfx::Color::Red);
+    auto source = create_image_bitmap(bitmap);
     auto wrapper = wrap_image_bitmap(realm, source);
     Array<GC::Ref<JS::Object>, 1> transfer { wrapper };
     auto record = MUST(Web::HTML::structured_serialize_with_transfer(realm, wrapper, transfer));
@@ -904,8 +899,8 @@ TEST_CASE(image_bitmap_transfer_protects_against_backing_truncation)
     Web::HTML::TransferDataDecoder decoder { move(record.transfer_data_holders[0]) };
     EXPECT_EQ(MUST(decoder.decode<Web::HTML::TransferType>()), Web::HTML::TransferType::ImageBitmap);
     decoder.set_shared_buffers(record.shared_buffers);
-    auto receiver = Web::HTML::ImageBitmap::create();
-    MUST(receiver->transfer_receiving_steps(realm, decoder));
+    auto received = MUST(receive_image_bitmap(realm, decoder));
+    auto& receiver = unwrap_wrappable<Web::HTML::ImageBitmap>(JS::Value(static_cast<JS::Object*>(received.ptr())));
 #    if defined(AK_OS_LINUX)
     auto const seals = fcntl(buffer.fd(), F_GET_SEALS);
     EXPECT(seals >= 0);
@@ -917,8 +912,8 @@ TEST_CASE(image_bitmap_transfer_protects_against_backing_truncation)
 #    else
     EXPECT_EQ(ftruncate(buffer.fd(), 0), 0);
 #    endif
-    EXPECT_EQ(receiver->bitmap()->get_pixel(0, 0), Gfx::Color::Red);
-    receiver->close();
+    EXPECT_EQ(receiver.bitmap()->get_pixel(0, 0), Gfx::Color::Red);
+    receiver.close();
 }
 #endif
 
@@ -937,11 +932,10 @@ TEST_CASE(image_bitmap_transfer_rejects_unsealed_backing)
     MUST(holder.encode(1));
     MUST(holder.encode(Gfx::BitmapFormat::BGRA8888));
     MUST(holder.encode(Gfx::AlphaType::Premultiplied));
+    MUST(holder.encode(static_cast<u8>(0))); // sRGB
     Web::HTML::TransferDataDecoder decoder { move(holder) };
     decoder.set_shared_buffers(shared_buffers);
-    auto receiver = Web::HTML::ImageBitmap::create();
-    EXPECT(receiver->transfer_receiving_steps(realm, decoder).is_error());
-    EXPECT_EQ(receiver->bitmap(), nullptr);
+    EXPECT(receive_image_bitmap(realm, decoder).is_error());
     EXPECT_EQ(ftruncate(shared_buffers[0].fd(), 0), 0);
 }
 #endif
@@ -960,8 +954,7 @@ TEST_CASE(image_bitmap_transfer_rejects_invalid_inline_pixels)
         MUST(holder.encode(Gfx::AlphaType::Premultiplied));
         MUST(holder.encode(pixels));
         Web::HTML::TransferDataDecoder decoder { move(holder) };
-        auto receiver = Web::HTML::ImageBitmap::create();
-        return receiver->transfer_receiving_steps(realm, decoder);
+        return receive_image_bitmap(realm, decoder);
     };
     Array<u8, 4> pixels {};
     EXPECT(!receive(Gfx::BitmapFormat::BGRA8888, 4, pixels).is_error());
@@ -982,7 +975,7 @@ TEST_CASE(file_api_serializables_encode_to_frozen_bytes)
         expect_storage_encoding(blob, serializable_storage_record("Blob"sv, 1, body));
     }
 
-    auto file = MUST(Web::FileAPI::File::create({ { "data"_utf16 } }, "f.txt"_utf16));
+    auto file = Web::FileAPI::File::create("data"sv.bytes(), "f.txt"_utf16, {});
     {
         Vector<u8> body;
         append_storage_string(body, ""sv); // default type

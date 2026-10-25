@@ -12,7 +12,6 @@ interface Internals {
     undefined setShowLineBoxBorders(boolean enabled);
     undefined setForceDarkThresholds(long foreground, long background);
     unsigned long long visualContextTreeNodeCount();
-    unsigned long long visualContextPendingDirtyBoxCount();
     unsigned long long accumulatedVisualContextIncrementalUpdateCount();
     unsigned long long visualContextTreeNodeCapacity();
     unsigned long long visualContextTreeDeadNodeCount();
@@ -43,6 +42,15 @@ interface Internals {
     XMLHttpRequest createXMLHttpRequestForDocument(Document document);
     [ImplementedAs=hit_test_result] object hitTest(double x, double y);
     object? takeContextMenuRequest();
+    // Enters or exits Picture-in-Picture for the media context menu's video, as the menu's item does.
+    undefined toggleMediaContextMenuPictureInPicture();
+
+    // Spellchecking
+    undefined addSpellingErrorForTesting(Node node, unsigned long start, unsigned long end);
+    DOMString spellingErrorRanges(Node node);
+    Promise<DOMString> checkSpellingForTesting(DOMString text);
+    Promise<undefined> spellCheckSettled();
+    Promise<DOMString> activateSpellingMenuItem(SpellingMenuItem item, optional unsigned long guessIndex = 0);
 
     const unsigned short MOD_NONE = 0;
     const unsigned short MOD_ALT = 1;
@@ -60,34 +68,52 @@ interface Internals {
     undefined sendText(HTMLElement target, DOMString text, optional unsigned short modifiers = 0);
     undefined sendTextThroughUIProcess(DOMString text);
     undefined grantTransientActivation();
-    undefined clickThroughUIProcess(double x, double y);
-    undefined wheelThroughUIProcess(double x, double y, double deltaX, double deltaY);
+    // These send input as the UI process would send the user's, after the compositor has every frame rendered so far,
+    // and resolve once the UI process reports that the input has been handled.
+    [CreatesPromise] Promise<undefined> clickThroughUIProcess(double x, double y);
+    [CreatesPromise] Promise<undefined> mouseEventThroughUIProcess(MouseEventThroughUIProcessType type, double x, double y, optional MouseEventThroughUIProcessOptions options = {});
+    [CreatesPromise] Promise<undefined> wheelThroughUIProcess(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none", optional WheelTicks ticks = {});
     undefined sendKey(HTMLElement target, DOMString keyName, optional unsigned short modifiers = 0, optional unsigned long repeatCount = 1);
+    undefined sendTextEditingCommand(HTMLElement target, DOMString commandName, optional boolean extendSelection = false);
     undefined paste(HTMLElement target, DOMString text);
     undefined pasteFromClipboard();
     undefined commitText();
 
     // Low-level mouse primitives
     undefined mouseDown(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
-    undefined mouseDownOnScrollbarDraggedByCompositor(double x, double y, Element scroller, boolean vertical);
     undefined mouseUp(double x, double y, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     undefined mouseMove(double x, double y, optional unsigned short modifiers = 0);
     undefined mouseLeave();
+    undefined mouseCancel();
 
     // High-level mouse conveniences
     undefined click(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     undefined clickAndHold(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
-    [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none");
+    [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none", optional WheelTicks ticks = {});
+    // The scrolling state the compositor has installed from the frames rendered so far, its wheel routing admission,
+    // and how far, in CSS pixels, it presents the scroller past the edges of its scroll range. The scroller is the
+    // viewport if none is given.
+    object compositorScrollState(optional Element? scroller = null);
     undefined pinch(double x, double y, double scaleDelta, optional unsigned short modifiers = 0);
     undefined resetZoom();
 
     DOMString currentCursor();
+    // The color of one pixel of the current image cursor's bitmap, or null when the cursor is no image.
+    DOMString? currentCursorPixel(long x, long y);
+    DOMString themeColor();
 
     // Returns the text that would be placed on the clipboard if the user copied the current selection now.
     // Excludes nodes whose used value of user-select is 'none' — mirroring what browsers actually copy.
     DOMString selectedTextForClipboard();
 
+    undefined findInPage(DOMString query, optional boolean highlightAll = false);
+    undefined findInPageNextMatch();
+    undefined findInPageEnd();
+
     undefined setClipboardFile(DOMString name, DOMString mimeType, DOMString data);
+
+    // Test-only entry point for the browser's "Copy Link to Highlight" generator.
+    DOMString? generateTextFragmentURL(Range range, USVString currentURL);
 
     // Drive marked/preedit-text composition via the same path platform input methods use. setMarkedTextFromInputMethod
     // updates the inline preedit — replacing any previous preedit. commitText finalizes the composition with the given
@@ -103,6 +129,8 @@ interface Internals {
 
     boolean dispatchUserActivatedEvent(EventTarget target, Event event);
     undefined spoofCurrentURL(USVString url);
+    // Sets the navigator compatibility mode of this process; the realms created afterwards expose what that mode has.
+    undefined setNavigatorCompatibilityMode(InternalsNavigatorCompatibilityMode mode);
 
     // Loads a URL in the top-level traversable — deferred so it starts outside the calling task and can land between
     // session-history traversal-queue steps, as can one requested by ConnectionFromClient::load_url in the UI process.
@@ -115,10 +143,13 @@ interface Internals {
     undefined simulateDrop(double x, double y);
 
     undefined expireCookiesWithTimeOffset(long long seconds);
+    // Clears this document's local ("local") or session ("session") storage the way the browser does, through its jar.
+    undefined clearStorageForTesting(DOMString type);
     Promise<undefined> deleteAllCookies();
     boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
     boolean setHttpMemoryCacheEnabled(boolean enabled);
+    boolean setDiskCacheEnabledForNavigations(boolean enabled);
     undefined simulateRequestServerConnectionLoss();
     undefined simulateWorkerRequestServerConnectionLoss();
     undefined sendBadIpcMessageForTesting(DOMString kind);
@@ -130,21 +161,30 @@ interface Internals {
     undefined beginLayoutTrace();
     undefined updateLayoutForTesting();
     DOMString takeLayoutTrace();
-    unsigned long long tableCellMeasurementCacheMissCount();
-    unsigned long long intrinsicMeasurementCount();
-    unsigned long long intrinsicInlineMeasurementCount();
     unsigned long long accumulatedVisualContextTreeBuildCount();
     undefined beginDisplayListTrace();
     DOMString takeDisplayListTrace();
-    [ImplementedAs=recorded_async_scrolling_state_object] object recordedAsyncScrollingState();
+    // Records where the compositor and this process route each input event, and why, until takeInputTrace().
+    undefined beginInputTrace();
+    object takeInputTrace();
+    // Where the first step of a wheel gesture at the position would go, and why: as the compositor routes it with the
+    // frames rendered so far, and as the display list this document last recorded routes it. Neither knows of a gesture
+    // in progress.
+    object compositorWheelTargetAt(double x, double y, double deltaX, double deltaY);
+    object recordedDisplayListWheelTargetAt(double x, double y, double deltaX, double deltaY);
+    // Whether the display list this document last recorded has blocking wheel event listeners take a wheel at the
+    // position.
     boolean recordedDisplayListBlocksWheelEventAt(double x, double y);
+    [ImplementedAs=recorded_async_scrolling_state_object] object recordedAsyncScrollingState();
     undefined recordDisplayListForTesting(optional boolean paintOverlay = false, optional boolean cold = false);
     undefined setAutoplayPolicy(DOMString policy);
 
     DOMString getComputedRole(Element element);
     DOMString getComputedLabel(Element element);
     DOMString getComputedAriaLevel(Element element);
+    undefined setAccessibilityFocusTarget(Element element);
     unsigned short getEchoServerPort();
+    unsigned short getHttpsEchoServerPort();
 
     undefined setHSTSPolicy(DOMString domain, unsigned long long maxAge, boolean includeSubDomains);
     undefined ingestHSTSHeader(USVString url, DOMString headerValue);
@@ -152,12 +192,15 @@ interface Internals {
 
     undefined setBrowserZoom(double factor);
     undefined setDevicePixelRatio(double ratio);
+    undefined resizeWindow(long width, long height);
 
     readonly attribute boolean headless;
     readonly attribute boolean screenWakeLockActive;
+    readonly attribute DOMString pictureInPictureWindowState;
 
     readonly attribute boolean needsRepaint;
     readonly attribute boolean needsDisplayListRecord;
+    readonly attribute boolean hasAnimationFrameCallbacks;
 
     DOMString dumpDisplayList();
     DOMString dumpAccessibilityTree();
@@ -175,22 +218,27 @@ interface Internals {
     DOMString dumpSiteIsolationProcessTree();
     // Reports if the browser process has created a document for the iframe that it hasn't made active yet.
     boolean hasPopulatedDocument(HTMLIFrameElement iframe);
+    // Whether the canvas drew content that it has not presented to the compositor yet.
+    boolean canvasHasUnpresentedContent(HTMLCanvasElement canvas);
     undefined crashRemoteFrameProcesses();
     // Stops loading and reloads as the browser's Stop and Reload buttons do.
     undefined stopLoadingThroughUIProcess();
     undefined reloadThroughUIProcess();
+    // Reloads bypassing the HTTP cache, as the browser's Reload Without Cache action does.
+    undefined reloadBypassingCacheThroughUIProcess();
     // Traverses the history by a delta as the browser's Back and Forward buttons do, with no source document.
     undefined traverseHistoryThroughUIProcess(long delta);
     Promise<undefined> flushSessionHistoryTraversalQueue();
 
     boolean hasHTMLParserEndState(Document document);
+    boolean htmlParserBodyIsExhausted(Document document);
 
     boolean hasShadowRoot(Element element);
 
     // Returns the shadow root of the element, if it has one, even if it's not normally accessible to JS.
     ShadowRoot? getShadowRoot(Element element);
 
-    undefined handleSDLInputEvents();
+    undefined pumpGamepadEvents();
 
     undefined setEnvironmentsTopLevelURL(USVString url);
     undefined setGeolocationEmulatedPosition(double latitude, double longitude, optional double accuracy = 100);
@@ -213,6 +261,54 @@ interface Internals {
     undefined resetRenderingSchedulerCounters();
     undefined setManualRenderingOpportunities(boolean enabled);
     undefined injectRenderingOpportunity(double frameTimeMs);
+    // Hands the clock lanes of the current document a tick at the given time, and waits until it has run.
+    // With a viewport scroll offset, the compositor had scrolled the viewport down to it at the tick.
+    undefined injectClockTick(double frameTimeMs, optional double viewportScrollY);
+    // Hands the clock lanes of the current document a pointer move to the given point in CSS pixels as the compositor
+    // would, beside the mouse event with the given input event id, if any, and waits until the tick that hovers what is
+    // under it has run, at the given frame time, or now.
+    undefined injectHoverPointer(double x, double y, optional double frameTimeMs, optional unsigned long long inputEventId);
+    // Queues a mouse move to the given point in CSS pixels, with the given mouse buttons held, as the UI process would
+    // send it, which the next rendering update handles, and answers its input event id.
+    unsigned long long queueMouseMove(double x, double y, optional unsigned long buttons = 0);
+    // Hands the clock lanes of the current document a pointer move to the given point in CSS pixels as the compositor
+    // would, beside the mouse event with the given input event id, if any, which waits for the tick a test injects to
+    // hover what is under it.
+    undefined moveHoverPointer(double x, double y, optional unsigned long long inputEventId);
+    // What the clock lane of the document's presented frame does: "none" where there is none, "ticking" while it samples
+    // animations, "parked" once a tick parked it, and "hovering" where it samples no animation and only follows the
+    // pointer.
+    DOMString clockLaneState(Document document);
+    // Whether the lane of a frame the document sampled after the one it presented last has yet to come together.
+    boolean clockLaneIsComing(Document document);
+    // The color, as a CSS color string, that the box of the element, or of its "::before", "::after" or "::marker"
+    // pseudo-element, showed in the last frame a tick of a clock lane presented where the tick restyled it, or null.
+    DOMString? presentedColor(Element element, optional DOMString pseudoElement);
+    // The border box of the element in the last frame a clock tick presented.
+    DOMRect? presentedBorderBox(Element element);
+    // How many compositor animations drove the box of the element in the last frame a clock tick presented, or null
+    // where the frame showed no border box of it.
+    unsigned long? presentedCompositorAnimationCount(Element element);
+    // The opacity the visual contexts of the box of the element gave it in the last frame a clock tick presented, or
+    // null where the frame showed no border box of it.
+    double? presentedOpacity(Element element);
+    // "laying-out" while a rendering update's layout runs beside the event loop, or has and the update has not run its
+    // steps after it yet, "in-flight" while a rendering update's frame or recording flies beside the event loop,
+    // "landed" once the event loop took the frame in and the update has not run its steps from its style and layout on
+    // yet, "idle" otherwise.
+    DOMString frameSchedulerState();
+    // Keeps the next recording that flies in flight, before it reads its frame, until releaseHeldFrame(), or until a
+    // read waits for it. With "layout", only the next rendering update's layout that flies, or recording, is held,
+    // before it reads anything.
+    undefined holdNextFrame(optional DOMString hold = "");
+    // What presented the last frame of the document's navigable: "commit" for a frame a rendering update committed,
+    // "clock" for a tick of the document's clock lane, or "none" before the first frame.
+    DOMString lastFramePresentedBy(Document document);
+    // Whether the last frame of the page handed the compositor the keyboard scroll state the page holds now.
+    boolean lastFrameKeyboardScrollStateIsCurrent();
+    undefined releaseHeldFrame();
+    // Whether the rendering update in flight holds back the tasks of the document, as it does where no test holds it.
+    boolean renderingUpdateHoldsTasksOf(Document document);
     undefined updateCompositorAnimations();
     boolean runEmptyAnimationStyleUpdateForTesting();
     undefined armCompositorAnimationTimersForTesting();
@@ -275,6 +371,8 @@ interface Internals {
     // Returns how many tasks sit in the main thread event loop's task queue, runnable or not.
     unsigned long long taskQueueLength();
     DOMString canvasColorScheme();
+    // Returns the number of shared image requests owned by the given document.
+    unsigned long long imageRequestCount(Document document);
     // Returns the selector-insight cache state for stylesheet invalidation tests.
     object imageAnimationStateForURL(USVString url);
     boolean mediaElementIsFetching(HTMLMediaElement element);
@@ -287,14 +385,25 @@ interface Internals {
     undefined disconnectMediaServer();
     undefined setPageMuted(boolean muted);
 
-    [ImplementedAs=async_scrolling_state_object] object asyncScrollingState();
-    boolean asyncScrollingStateBlocksWheelEventAt(double x, double y);
-    boolean asyncScrollingStateCanWheelScrollAt(double x, double y, double deltaX, double deltaY, optional boolean forceStaleWheelEventRegions = false);
-    DOMString asyncScrollingStateWheelRoutingAdmission();
-    DOMString asyncScrollingStateWheelScrollAdmissionAt(double x, double y, double deltaX, double deltaY, optional boolean forceStaleWheelEventRegions = false);
-    DOMString asyncScrollingStateWheelTargetAt(double x, double y, double deltaX, double deltaY);
     DOMString viewportOverflowX();
 
 };
 
+enum InternalsNavigatorCompatibilityMode { "chrome", "gecko", "webkit" };
+enum SpellingMenuItem { "none", "guess", "ignore", "learn" };
 enum ScrollGesturePhase { "none", "ongoing", "momentum", "ended" };
+enum MouseEventThroughUIProcessType { "mousedown", "mouseup", "mousemove", "mouseleave" };
+
+// How many wheel ticks a wheel step amounts to on each axis. By default, they are counted from the pixel delta.
+dictionary WheelTicks {
+    double x;
+    double y;
+};
+
+dictionary MouseEventThroughUIProcessOptions {
+    unsigned short button = 0;
+    // The buttons held once the event has happened. By default, the button a mousedown presses, and none otherwise.
+    unsigned short buttons;
+    unsigned short modifiers = 0;
+    unsigned short clickCount = 1;
+};

@@ -28,6 +28,8 @@ struct RustFfiHtmlParserAttribute;
 
 namespace Web::HTML {
 
+class IncrementalDocumentParser;
+
 class WEB_API HTMLParser final : public JS::Cell {
     GC_CELL(HTMLParser, JS::Cell);
     GC_DECLARE_ALLOCATOR(HTMLParser);
@@ -60,7 +62,16 @@ public:
     };
 
     static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View markup,
-        AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No, ParserScriptingMode = ParserScriptingMode::Inert);
+        AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No, ParserScriptingMode = ParserScriptingMode::Inert, FragmentFastPath = FragmentFastPath::Allow);
+
+    // Parses a restricted subset of in-body markup in context. On success, appends the parsed top-level nodes to
+    // top_level_nodes. Their subtrees are linked without running the insertion steps, which inserting each top-level
+    // node into a parent runs for the whole subtree.
+    static bool try_parse_html_fragment_fast_into_detached_nodes(DOM::Element& context, Utf16View, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes);
+
+    // Parses a document from markup whose content is in the same subset of in-body markup without a parser, then runs
+    // "the end". Returns false without changing anything when the markup is not in that subset.
+    static bool try_parse_document_fast(DOM::Document&, Utf16View);
 
     enum class SerializableShadowRoots {
         No,
@@ -69,6 +80,8 @@ public:
     static Utf16String serialize_html_fragment(DOM::Node const&, SerializableShadowRoots, ReadonlySpan<GC::Ref<DOM::ShadowRoot>>, DOM::FragmentSerializationMode = DOM::FragmentSerializationMode::Inner);
 
     HTMLTokenizer& tokenizer() { return m_tokenizer; }
+    bool streaming_body_is_exhausted() const { return m_streaming_body_is_exhausted; }
+    void did_exhaust_streaming_body(Badge<IncrementalDocumentParser>) { m_streaming_body_is_exhausted = true; }
 
     void set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots allow) { m_allow_declarative_shadow_roots = allow; }
 
@@ -138,6 +151,7 @@ private:
     void invoke_post_parse_action();
     static void the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>, u64 parser_generation);
 
+    bool m_streaming_body_is_exhausted { false };
     HTMLTokenizer m_tokenizer;
     RustFfiHtmlParserHandle* m_rust_parser { nullptr };
 

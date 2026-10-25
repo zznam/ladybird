@@ -235,7 +235,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     sink: &mut BoxNodeWriter<'_>,
     slot: NodeSlotId,
     inherited: DescendantVisualContexts,
-    may_be_root_element: bool,
     anchor_scroll_shift_resolver: &dyn AnchorScrollShiftResolver,
 ) -> PaintableVisualContextAssignment {
     let layout_arena = env.layout_arena;
@@ -256,8 +255,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         PaintableVisualContextRecord {
             inherited_input: inherited,
             output_for_descendants: inherited,
-            has_mask_nodes: false,
-            may_be_root_element,
             owns_geometry_dependent_nodes: false,
             subtree_may_own_geometry_dependent_nodes: false,
             stacking_context: stacking_context_facts,
@@ -354,11 +351,17 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
 
     let mut sticky_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     if creates_sticky_scroll_node {
+        // The scroll state fills in the geometry once the tree is built. The scroller is the nearest scroll node
+        // above any enclosing sticky boxes, as the scroll state resolves it.
+        let (scroller, parent_sticky) = match &sink.spatial_node_at(nearest_ancestor_scroll_node_index).data {
+            SpatialData::Sticky(parent) => (parent.scroller, Some(nearest_ancestor_scroll_node_index)),
+            _ => (nearest_ancestor_scroll_node_index, None),
+        };
         own_state = sink.append_spatial_node_under(
             own_state,
             SpatialData::Sticky(StickyData::unconstrained(
-                nearest_ancestor_scroll_node_index,
-                None,
+                scroller,
+                parent_sticky,
                 NO_SCROLL_STATE_SLOT,
                 slot,
                 nearest_ancestor_scroll_node_index,
@@ -498,18 +501,17 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Path(facts.clip_path_data().unwrap()));
     }
 
-    // A backdrop filter is limited to the box's rounded border box in the box's own space, and a clip
-    // path clips the filtered backdrop along with the content, so its layer sits under the transform
-    // and clip nodes rather than above them.
-    if effects_layer_is_inside_transform_and_clips {
-        append_shared_effect!(EffectNodeData::Effects(facts.effects_data().unwrap()));
-    }
-
-    if !facts.mask_layers.is_empty() {
-        assignment.record.has_mask_nodes = true;
-    }
     for mask_layer in &facts.mask_layers {
         append_shared_effect!(EffectNodeData::Mask(*mask_layer));
+    }
+
+    // https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation
+    // A backdrop filter is limited to the box's rounded border box in the box's own space, and a clip
+    // path clips the filtered backdrop along with the content, so its layer sits under the transform
+    // and clip nodes rather than above them. Masks apply to the filtered backdrop too, so the layer
+    // also sits under the box's masks, and replay draws the backdrop into the outermost mask's layer.
+    if effects_layer_is_inside_transform_and_clips {
+        append_shared_effect!(EffectNodeData::Effects(facts.effects_data().unwrap()));
     }
 
     if facts.needs_compositor_background_color_effect {
@@ -534,6 +536,9 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         && let Some(overflow_clip) = facts.overflow_clip
     {
         state_for_descendants = sink.append_clip_node_under(state_for_descendants, ClipNodeData::Rect(overflow_clip));
+        if let Some(contour) = facts.overflow_clip_contour {
+            state_for_descendants = sink.append_clip_node_under(state_for_descendants, ClipNodeData::Path(contour));
+        }
     }
 
     if paintable_geometry::has_scrollable_overflow(layout_arena, slot) {

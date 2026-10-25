@@ -8,14 +8,18 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/TypeCasts.h>
+#include <AK/Vector.h>
 #include <AK/kmalloc.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/Tab.h>
 
+#include <QHash>
 #include <QPointer>
 #include <QPushButton>
 #include <QStackedWidget>
+#include <QStaticText>
 #include <QTabBar>
 #include <QWidget>
 
@@ -42,6 +46,8 @@ namespace Ladybird {
 class TabPreviewPopup;
 class TabWidget;
 
+static constexpr int TAB_ICON_SIZE = 16;
+
 enum class TabLayout : u8 {
     Horizontal,
     VerticalCollapsed,
@@ -60,9 +66,20 @@ public:
 
     TabLayout tab_layout() const { return m_tab_layout; }
     void set_tab_layout(TabLayout);
+    // While collapsed vertical tabs only peek open on hover, the pinned tabs keep their rows, one tab each, rather than
+    // forming the grid, so no tab moves out from under the pointer.
+    void set_pinned_tabs_in_rows(bool);
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
     void refresh_tab_layout();
     void recreate_icons();
+    int pinned_tab_count() const;
+
+    void play_load_sheen(Tab&);
+    void update_loading_swirl_animation();
+
+    int drop_index_at(QPoint const&) const;
+    void update_drop_preview(QPoint const&);
+    void hide_drop_preview();
 
 private:
     virtual QSize sizeHint() const override;
@@ -87,8 +104,31 @@ private:
     virtual void mouseReleaseEvent(QMouseEvent*) override;
     virtual void wheelEvent(QWheelEvent*) override;
 
-    int insertion_index_at(QPoint const&) const;
-    int drop_indicator_index_for_insertion_index(int insertion_index) const;
+    // How far a tab moves, and how much it grows, while tabs make way for a dragged tab.
+    struct TabShift {
+        qreal x_offset { 0 };
+        qreal y_offset { 0 };
+        qreal width_delta { 0 };
+        qreal height_delta { 0 };
+    };
+    struct DropPreview {
+        Vector<TabShift> tab_shifts;
+        qreal strip_growth { 0 };
+        qreal pinned_region_growth { 0 };
+    };
+
+    Optional<int> dragged_tab_index() const;
+    bool dragging_pinned_tab() const;
+    QRect incoming_drop_layout_rect(int position) const;
+    int drop_slot_at(QPoint const&) const;
+    void set_drop_slot(Optional<int>);
+    void clear_drop_preview();
+    DropPreview drop_preview_for_slot(Optional<int>) const;
+    DropPreview current_drop_preview() const;
+    TabShift current_tab_shift(int index) const;
+    qreal current_strip_growth() const;
+    qreal current_pinned_region_growth() const;
+    QRect shifted_tab_rect(int index) const;
     QPixmap render_tab_drag_pixmap(int index) const;
     void toggle_window_maximized();
     bool start_window_move();
@@ -99,6 +139,25 @@ private:
     void hide_tab_preview();
     QPoint tab_preview_position_for(int index, QSize const& popup_size) const;
 
+    // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
+    // separator below. Its height is 0 when there's no pinned tab.
+    struct PinnedRegion {
+        int count { 0 };
+        int columns { 1 };
+        int tile_width { 0 };
+        int height { 0 };
+        // The pinned tabs stay in place only while they fit in half the bar's height. Past that, they scroll with the
+        // unpinned tabs, so every tab stays within reach.
+        bool scrolls { false };
+
+        int fixed_height() const { return scrolls ? 0 : height; }
+    };
+    PinnedRegion pinned_region() const;
+    PinnedRegion pinned_region_for(int pinned_count) const;
+    QRect vertical_tab_rect(int index, PinnedRegion const&) const;
+    bool pinned_tabs_are_tiles() const;
+    int vertical_bar_width() const;
+
     QRect visual_tab_rect(int index) const;
     int tab_index_at(QPoint const&) const;
     QSize vertical_size_hint(int tab_count) const;
@@ -108,21 +167,38 @@ private:
     void set_vertical_scroll_offset(int);
 
     void set_hovered_tab_index(int);
+    Optional<qreal> load_sheen_progress(int index) const;
+    bool is_tab_loading(int index) const;
     void ensure_tab_visible(int index);
     void update_tab_button_geometry();
 
     QPointer<TabWidget> m_tab_widget;
 
     TabLayout m_tab_layout { TabLayout::Horizontal };
+    bool m_pinned_tabs_in_rows { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     int m_available_width { 0 };
     int m_hovered_tab_index { -1 };
     int m_hover_animation_tab_index { -1 };
     int m_vertical_scroll_offset { 0 };
     qreal m_hover_progress { 0.0 };
-    int m_drop_indicator_index { -1 };
     QVariantAnimation* m_hover_animation { nullptr };
+
+    Optional<int> m_drop_slot;
+    DropPreview m_drop_preview_start;
+    DropPreview m_drop_preview_target;
+    qreal m_drop_preview_progress { 1.0 };
+    QVariantAnimation* m_drop_preview_animation { nullptr };
+
+    struct LoadSheen {
+        QPointer<Tab> tab;
+        QVariantAnimation* animation { nullptr };
+    };
+    Vector<LoadSheen> m_load_sheens;
+    QVariantAnimation* m_loading_swirl_animation { nullptr };
     QIcon m_fallback_tab_icon;
+    QHash<QString, QStaticText> m_tab_title_texts;
+    QFont m_tab_title_texts_font;
     QPointer<Tab> m_pressed_tab;
     QPoint m_position_in_selected_tab_while_dragging;
     QPoint m_drag_start_position;
@@ -143,7 +219,6 @@ public:
 
     TabBar* tab_bar() const { return m_tab_bar; }
     QWidget* tab_bar_row() const { return m_tab_bar_row; }
-    QRect tab_strip_global_rect() const;
 
     void add_tab(Tab* widget, QString const& label);
     void insert_tab(int index, Tab* widget, QString const& label);
@@ -172,7 +247,9 @@ public:
     void set_vertical_tabs_expanded(bool);
     void set_vertical_tabs_expand_on_hover(bool);
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
+    bool can_expand_vertical_tabs_on_hover() const;
     void update_tab_button_visibility();
+    void update_tab_layout();
 
 signals:
     void current_tab_changed(int index);
@@ -180,6 +257,7 @@ signals:
 
 protected:
     virtual void dragEnterEvent(QDragEnterEvent*) override;
+    virtual void dragLeaveEvent(QDragLeaveEvent*) override;
     virtual void dragMoveEvent(QDragMoveEvent*) override;
     virtual void dropEvent(QDropEvent*) override;
     virtual bool event(QEvent* event) override;
@@ -190,7 +268,6 @@ private:
     TabLayout current_tab_layout() const;
     QWidget* tab_drag_area_widget() const;
     bool vertical_tabs_effectively_expanded() const;
-    bool can_expand_vertical_tabs_on_hover() const;
     bool cursor_is_over_vertical_tabs() const;
     bool vertical_tabs_are_on_right() const;
     int vertical_tabs_layout_width() const;
@@ -213,8 +290,10 @@ private:
     QRect vertical_tabs_chrome_rect() const;
     int vertical_tabs_tab_width() const;
     void update_vertical_tabs_button_layout();
-    void update_tab_layout();
     void update_tab_chrome_visibility();
+#ifdef AK_OS_MACOS
+    void update_web_view_frame(Tab&);
+#endif
     void recreate_icons();
     void update_chrome_style();
     void update_vertical_tabs_overlay_geometry();
@@ -224,7 +303,7 @@ private:
     void update_vertical_tabs_hover_expanded();
     void toggle_window_maximized();
     bool start_window_move();
-    void accept_tab_drag(QDragMoveEvent*);
+    void accept_tab_drag(QDragMoveEvent*, QWidget* target);
     void accept_tab_drop(QDropEvent*, int index);
 
     TabBar* m_tab_bar { nullptr };
@@ -244,7 +323,9 @@ private:
     QWidget* m_vertical_tabs_content_separator { nullptr };
     QWidget* m_vertical_tabs_resize_handle { nullptr };
     QWidget* m_vertical_tabs_content { nullptr };
+    QTimer* m_vertical_tabs_hover_expand_timer { nullptr };
     QTimer* m_vertical_tabs_hover_collapse_timer { nullptr };
+    QVariantAnimation* m_vertical_tabs_hover_expand_animation { nullptr };
     QBoxLayout* m_main_layout { nullptr };
     QBoxLayout* m_tab_bar_row_layout { nullptr };
     QBoxLayout* m_page_column_layout { nullptr };
@@ -257,6 +338,7 @@ private:
     bool m_vertical_tabs_expand_on_hover { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     bool m_vertical_tabs_hover_expanded { false };
+    qreal m_vertical_tabs_hover_expand_progress { 0.0 };
     bool m_is_resizing_vertical_tabs { false };
     bool m_is_updating_chrome_style { false };
     int m_vertical_tabs_expanded_width { 0 };

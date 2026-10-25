@@ -48,7 +48,6 @@ namespace Web::Compositor {
 class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
-class CompositorHostBase;
 class NavigablePresenter;
 struct CompositorFrame;
 
@@ -75,7 +74,9 @@ class AnimationPlaybackEvent;
 class AnimationTimeline;
 class DocumentTimeline;
 class KeyframeEffect;
+class NamedTimelines;
 class ScrollTimeline;
+class ViewTimeline;
 
 }
 
@@ -92,8 +93,6 @@ namespace Web::Bindings {
 
 class Intrinsics;
 enum class NamedPropertyDeletionResult : u8;
-class OptionConstructor;
-class PlatformObject;
 class Wrappable;
 class WrapperWorld;
 
@@ -154,13 +153,6 @@ namespace Web::Clipboard {
 
 class Clipboard;
 class ClipboardItem;
-
-}
-
-namespace Web::Compression {
-
-class CompressionStream;
-class DecompressionStream;
 
 }
 
@@ -232,18 +224,13 @@ enum class ElementBoxKind : u8;
 
 class AbstractImageStyleValue;
 class AbstractOrHypotheticalElement;
-class AnchorStyleValue;
 class Angle;
 class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
-class BorderImageSliceStyleValue;
-class BorderRadiusRectStyleValue;
-class BorderRadiusStyleValue;
 class CalculatedStyleValue;
 class CustomPropertyData;
-class Clip;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
 class ColorSchemeStyleValue;
@@ -251,14 +238,10 @@ class ColorStyleValue;
 class ComputedStyleWorkingSet;
 class ComputedValues;
 class ComputedStyleRecordView;
-class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
-class CounterStyle;
 class CounterStyleStyleValue;
-class CounterStyleSystemStyleValue;
-class CounterStyleValue;
 class CSSAnimation;
 class CSSConditionRule;
 class CSSContainerRule;
@@ -296,6 +279,8 @@ class CSSNumericValue;
 class CSSPageRule;
 class CSSPageDescriptors;
 class CSSPerspective;
+class CSSPositionTryDescriptors;
+class CSSPositionTryRule;
 class CSSPropertyRule;
 class CSSRotate;
 class CSSRule;
@@ -324,7 +309,6 @@ class DimensionStyleValue;
 class Display;
 class DisplayStyleValue;
 class DropShadowFilterStyleValue;
-class EdgeStyleValue;
 class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
@@ -338,6 +322,8 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
+class Highlight;
+class HighlightRegistry;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
 class ImageStyleValue;
@@ -345,34 +331,22 @@ class IntegerStyleValue;
 class KeywordStyleValue;
 class Length;
 class LengthBox;
-class LengthOrAuto;
 class LengthPercentage;
 class LengthPercentageOrAuto;
 class LengthStyleValue;
-class LinearGradientStyleValue;
 class MediaList;
-class MediaQuery;
 class MediaQueryList;
 class MediaQueryListEvent;
 class Number;
 class NumberStyleValue;
 class NumericType;
 class OpacityValueStyleValue;
-class OpenTypeTaggedStyleValue;
-class OverflowClipMarginStyleValue;
-class ParsedFontFace;
 class PendingSubstitutionStyleValue;
 class Percentage;
 class PercentageStyleValue;
-class PositionStyleValue;
 class PropertyNameAndID;
-class RadialGradientStyleValue;
-class RadialSizeStyleValue;
-class RandomValueSharingStyleValue;
 class Ratio;
 class RatioStyleValue;
-class RectStyleValue;
-class RepeatStyleStyleValue;
 class Resolution;
 class ResolutionStyleValue;
 class Screen;
@@ -380,8 +354,6 @@ class ScreenOrientation;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
-class Size;
-class ScrollbarColorStyleValue;
 class StringStyleValue;
 class StyleComputer;
 class StylePropertyMap;
@@ -392,15 +364,10 @@ class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
 class StyleValueList;
-class SuperellipseStyleValue;
-class SVGPaint;
-class TextIndentStyleValue;
 class Time;
 class TimePercentage;
 class TimeStyleValue;
 class TransformationStyleValue;
-class TreeCountingFunctionStyleValue;
-class TupleStyleValue;
 class UnicodeRangeStyleValue;
 class UnresolvedStyleValue;
 class URL;
@@ -468,10 +435,9 @@ enum class TextUnderlinePositionVertical : u8;
 enum class TransitionBehavior : u8;
 enum class WritingMode : u8;
 
-struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
-struct ColorResolutionContext;
+struct ColorResolutionStyle;
 struct ComputationContext;
 struct CustomPropertyRegistration;
 struct LogicalAliasMappingContext;
@@ -482,7 +448,6 @@ struct RequiredInvalidationAfterStyleChange;
 using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
-using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
 
 }
 
@@ -530,9 +495,9 @@ class ElementByIdMap;
 class Event;
 class EventHandler;
 class EventTarget;
+class FragmentDirective;
 class HTMLCollection;
 class IDLEventListener;
-class InvalidationJournal;
 class LiveNodeList;
 class MutationObserver;
 class MutationRecord;
@@ -575,16 +540,10 @@ namespace Web::Editing {
 
 class EditCommand;
 class EditingHistory;
+class SpellCheckController;
+class SpellingMarkers;
 class UndoStep;
 enum class HistoryAction : u8;
-
-}
-
-namespace Web::Encoding {
-
-class TextDecoder;
-class TextEncoder;
-class TextEncoderStream;
 
 }
 
@@ -602,7 +561,9 @@ class FileSystemEntry;
 
 namespace Web::EventTiming {
 
+class EventCounts;
 class PerformanceEventTiming;
+struct WindowEventTimingState;
 
 }
 
@@ -672,7 +633,6 @@ class DOMMatrix;
 class DOMMatrixReadOnly;
 class DOMPoint;
 class DOMPointReadOnly;
-class DOMQuad;
 class DOMRect;
 class DOMRectList;
 class DOMRectReadOnly;
@@ -832,7 +792,6 @@ class Navigator;
 class OffscreenCanvas;
 class OffscreenCanvasRenderingContext2D;
 class PageTransitionEvent;
-class Path2D;
 class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
@@ -852,7 +811,6 @@ class Storage;
 class StructuredSerializeReader;
 class StructuredSerializeWriter;
 class SubmitEvent;
-class TextMetrics;
 class TextTrack;
 class TextTrackCue;
 class TextTrackCueList;
@@ -866,6 +824,7 @@ class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
+class VideoPlaybackQuality;
 class VideoTrack;
 class VideoTrackList;
 class Window;
@@ -956,15 +915,24 @@ class IntersectionObserverEntry;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct BegunRead;
+
+}
+
 namespace Web::Layout {
 
 class ImageProvider;
 class Box;
+class ForcedReadScope;
 class Node;
 class NodeArena;
 class NodeWithStyle;
 class TextNode;
 class Viewport;
+
+using BegunRead = RustFFI::BegunRead;
 
 }
 
@@ -1013,6 +981,18 @@ class Notification;
 
 }
 
+namespace Web::LargestContentfulPaint {
+
+class LargestContentfulPaint;
+
+}
+
+namespace Web::PaintTiming {
+
+class PerformancePaintTiming;
+
+}
+
 namespace Web::Painting {
 
 class BoxViewRepaintAccess;
@@ -1032,6 +1012,14 @@ namespace Web::PermissionsAPI {
 
 class Permissions;
 class PermissionStatus;
+
+}
+
+namespace Web::PictureInPicture {
+
+class PictureInPictureController;
+class PictureInPictureEvent;
+class PictureInPictureWindow;
 
 }
 
@@ -1099,7 +1087,6 @@ class SpeechGrammarList;
 class SpeechRecognition;
 class SpeechRecognitionAlternative;
 class SpeechRecognitionEvent;
-class SpeechRecognitionPhrase;
 class SpeechRecognitionResult;
 class SpeechRecognitionResultList;
 class SpeechSynthesis;
@@ -1110,25 +1097,11 @@ class SpeechSynthesisVoice;
 
 namespace Web::Streams {
 
-class ByteLengthQueuingStrategy;
-class CountQueuingStrategy;
-class ReadableByteStreamController;
 class ReadableStream;
-class ReadableStreamAsyncIterator;
-class ReadableStreamBYOBReader;
-class ReadableStreamBYOBRequest;
-class ReadableStreamDefaultController;
 class ReadableStreamDefaultReader;
-class ReadableStreamGenericReaderMixin;
-class ReadIntoRequest;
 class ReadRequest;
 class TransformStream;
-class TransformStreamDefaultController;
 class WritableStream;
-class WritableStreamDefaultController;
-class WritableStreamDefaultWriter;
-
-struct PullIntoDescriptor;
 
 }
 
@@ -1145,6 +1118,8 @@ class StorageShelf;
 namespace Web::SVG {
 
 class Path;
+class SMILAnimation;
+class SMILTimeContainer;
 class SVGAnimatedEnumeration;
 class SVGAnimatedInteger;
 class SVGAnimatedLength;
@@ -1152,6 +1127,7 @@ class SVGAnimatedLengthList;
 class SVGAnimatedNumber;
 class SVGAnimatedNumberList;
 class SVGAnimatedRect;
+class SVGAnimateMotionElement;
 class SVGAnimationElement;
 class SVGCircleElement;
 class SVGClipPathElement;
@@ -1187,6 +1163,7 @@ class SVGLengthList;
 class SVGLineElement;
 class SVGMaskElement;
 class SVGMetadataElement;
+class SVGMPathElement;
 class SVGNumber;
 class SVGNumberList;
 class SVGPathElement;
@@ -1195,6 +1172,7 @@ class SVGPolygonElement;
 class SVGPolylineElement;
 class SVGRectElement;
 class SVGScriptElement;
+class SVGSetElement;
 class SVGSVGElement;
 class SVGSwitchElement;
 class SVGSymbolElement;
@@ -1216,17 +1194,9 @@ class UIEvent;
 
 }
 
-namespace Web::URLPattern {
-
-class URLPattern;
-
-}
-
 namespace Web::DOMURL {
 
-class DOMURL;
 class URLSearchParams;
-class URLSearchParamsIterator;
 
 }
 
@@ -1250,7 +1220,7 @@ class Instance;
 class Memory;
 class Module;
 class Table;
-class WebAssemblyModule;
+class Tag;
 
 namespace Detail {
 
@@ -1294,39 +1264,10 @@ class PeriodicWave;
 namespace Web::WebGL {
 
 class RemoteWebGLTransport;
-class WebGLContextProxy;
 class WebGL2RenderingContext;
-class WebGLActiveInfo;
-class WebGLBuffer;
 class WebGLContextEvent;
-class WebGLFramebuffer;
-class WebGLObject;
-class WebGLProgram;
-class WebGLQuery;
-class WebGLRenderbuffer;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
-class WebGLSampler;
-class WebGLShader;
-class WebGLShaderPrecisionFormat;
-class WebGLSync;
-class WebGLTexture;
-class WebGLTransformFeedback;
-class WebGLUniformLocation;
-class WebGLVertexArrayObject;
-class ANGLEInstancedArrays;
-class EXTBlendMinMax;
-class EXTColorBufferFloat;
-class EXTRenderSnorm;
-class EXTTextureFilterAnisotropic;
-class EXTTextureNorm16;
-class OESElementIndexUint;
-class OESStandardDerivatives;
-class OESVertexArrayObject;
-class WebGLCompressedTextureS3tc;
-class WebGLCompressedTextureS3tcSrgb;
-class WebGLDrawBuffers;
-class WebGLVertexArrayObjectOES;
 
 }
 

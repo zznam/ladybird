@@ -5,9 +5,10 @@
  */
 
 #[cfg(feature = "allocator")]
-/// cbindgen:ignore
-#[path = "../../../RustAllocator.rs"]
-mod rust_allocator;
+extern crate ladybird_allocator;
+
+#[path = "../../../RustDemangle.rs"]
+mod rust_demangle;
 
 #[path = "../../../RustPanic.rs"]
 mod rust_panic;
@@ -56,7 +57,7 @@ unsafe extern "C" {
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
     assert_send_and_sync::<font::FontHandle>();
-    assert_send_and_sync::<path::OwnedPath>();
+    assert_send_and_sync::<path::Path>();
     assert_send_and_sync::<image_frame::ImageFrameHandle>();
     assert_send_and_sync::<text_layout::GlyphBuffer>();
 };

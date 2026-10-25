@@ -4,18 +4,22 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibURL/Site.h>
+#include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/RequestServerManager.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
+#include <LibWebView/WebUI.h>
 
 namespace WebView {
 
-NonnullRefPtr<CanonicalDocument> CanonicalDocument::create(URL::URL creation_url, URL::Origin origin, NonnullRefPtr<CanonicalBrowsingContext> browsing_context, NonnullRefPtr<CanonicalWindow> relevant_global_object, IsInitialAboutBlank is_initial_about_blank)
+NonnullRefPtr<CanonicalDocument> CanonicalDocument::create(Web::HTML::CrossProcessId id, URL::URL creation_url, URL::Origin origin, NonnullRefPtr<CanonicalBrowsingContext> browsing_context, NonnullRefPtr<CanonicalWindow> relevant_global_object, Web::HTML::SandboxingFlagSet active_sandboxing_flag_set, IsInitialAboutBlank is_initial_about_blank)
 {
-    auto document = adopt_ref(*new CanonicalDocument(move(creation_url), move(origin), move(browsing_context), move(relevant_global_object), is_initial_about_blank));
+    auto document = adopt_ref(*new CanonicalDocument(id, move(creation_url), move(origin), move(browsing_context), move(relevant_global_object), active_sandboxing_flag_set, is_initial_about_blank));
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
     // 10. Set window's associated Document to document.
@@ -31,22 +35,58 @@ NonnullRefPtr<CanonicalDocument> CanonicalDocument::create(URL::URL creation_url
     return document;
 }
 
-CanonicalDocument::CanonicalDocument(URL::URL creation_url, URL::Origin origin, NonnullRefPtr<CanonicalBrowsingContext> browsing_context, NonnullRefPtr<CanonicalWindow> relevant_global_object, IsInitialAboutBlank is_initial_about_blank)
-    : m_creation_url(move(creation_url))
+CanonicalDocument::CanonicalDocument(Web::HTML::CrossProcessId id, URL::URL creation_url, URL::Origin origin, NonnullRefPtr<CanonicalBrowsingContext> browsing_context, NonnullRefPtr<CanonicalWindow> relevant_global_object, Web::HTML::SandboxingFlagSet active_sandboxing_flag_set, IsInitialAboutBlank is_initial_about_blank)
+    : m_id(id)
+    , m_creation_url(move(creation_url))
     , m_origin(move(origin))
     , m_browsing_context(move(browsing_context))
     , m_relevant_global_object(move(relevant_global_object))
+    , m_active_sandboxing_flag_set(active_sandboxing_flag_set)
     , m_is_initial_about_blank(is_initial_about_blank)
 {
+    if (m_creation_url.scheme() == "about"sv && m_creation_url.path_segment_count() == 1) {
+        if (auto page = WebUI::page_for_host(m_creation_url.path_segments().first()); page.has_value() && page->type == WebUI::PageType::Dynamic)
+            m_web_ui_host = MUST(String::from_utf8(page->host));
+    }
 }
 
 CanonicalDocument::~CanonicalDocument() = default;
 
+Optional<URL::Origin> CanonicalDocument::top_level_origin() const
+{
+    auto& top_level_browsing_context = m_browsing_context->top_level_browsing_context();
+
+    // NB: A top-level document is not yet its browsing context's active document when it is placed in a process.
+    if (&top_level_browsing_context == m_browsing_context.ptr())
+        return m_origin;
+    if (top_level_browsing_context.has_been_discarded())
+        return {};
+    return top_level_browsing_context.active_document()->origin();
+}
+
 void CanonicalDocument::set_host(RefPtr<WebContentPage> host)
 {
     m_host = move(host);
-    if (m_host)
+    if (m_host) {
         m_relevant_global_object->agent().set_hosting_process_if_unset(m_host->client());
+        // The process makes the document's requests through the RequestServer of the document's top-level site.
+        if (auto top_level_origin = this->top_level_origin(); top_level_origin.has_value()) {
+            if (auto top_level_site = URL::Site::serialize_for_partitioning(*top_level_origin); top_level_site.has_value())
+                RequestServerManager::the().assign_site(m_host->client(), *top_level_site);
+        }
+        m_host->client().request_server_site_bindings().bind_sites_of(*this);
+    }
+}
+
+// NB: Only a navigation the UI process admitted to a file: URL creates a document from one. A blob: URL entry local file
+//     content added carries that content's origin, as a document created from it does. The entry can be revoked once
+//     the document exists, so this is settled when the document is populated, before a process is chosen to host it.
+void CanonicalDocument::determine_whether_it_is_local_file_content(BlobURLStore const* blob_url_store)
+{
+    m_is_local_file_content = m_creation_url.scheme() == "file"sv
+        || (m_creation_url.scheme() == "blob"sv
+            && blob_url_store
+            && blob_url_store->is_entry_of_local_file_content(Utf16String::from_utf8(m_creation_url.serialize(URL::ExcludeFragment::Yes)), m_origin));
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#make-active

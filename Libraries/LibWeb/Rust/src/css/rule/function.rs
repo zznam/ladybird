@@ -7,15 +7,20 @@
 use super::NativeRuleType;
 use super::read::{NativeRuleView, RuleRef};
 use crate::css::container_conditions::ContainerConditionsData;
-use crate::css::descriptor_block::DescriptorBlockData;
+use crate::css::custom_properties::{
+    SubstitutionFunctionDeclaration, prepare_function_declarations, prepare_function_parameter_defaults,
+};
+use crate::css::ffi_support::OwnedArc;
 use crate::css::function_signature::FunctionSignature;
 use crate::css::media_list::MediaListData;
+use crate::css::parser::component_value::ComponentValueList;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// One block of a function's declarations, with the conditions that gate it.
 pub(crate) struct FunctionDeclarationInput {
-    pub(crate) declarations: Arc<DescriptorBlockData>,
+    pub(crate) declarations: Vec<SubstitutionFunctionDeclaration>,
+    pub(crate) reads_attributes: bool,
     /// The container conditions around the block, nearest first, which hold for an element or not.
     pub(crate) containers: Vec<Arc<ContainerConditionsData>>,
     /// The `@media` lists around the block, which hold for the document or not.
@@ -27,6 +32,8 @@ pub(crate) struct FunctionDeclarationInput {
 pub struct CompiledFunction {
     pub(crate) identity: u64,
     pub(crate) signature: Arc<FunctionSignature>,
+    pub(crate) parameter_defaults: Vec<Option<ComponentValueList>>,
+    pub(crate) parameter_defaults_read_attributes: bool,
     pub(crate) inputs: Vec<FunctionDeclarationInput>,
 }
 
@@ -53,8 +60,11 @@ impl CompiledFunction {
                             .cloned()
                             .collect()
                     };
+                    let (parsed_declarations, reads_attributes) =
+                        prepare_function_declarations(&rule.descriptors().unwrap());
                     inputs.push(FunctionDeclarationInput {
-                        declarations: rule.descriptors().unwrap(),
+                        declarations: parsed_declarations,
+                        reads_attributes,
                         containers: conditions,
                         media: media.clone(),
                     });
@@ -79,9 +89,13 @@ impl CompiledFunction {
                 _ => {}
             }
         }
+        let signature = view.rule.function_signature().unwrap();
+        let (parameter_defaults, parameter_defaults_read_attributes) = prepare_function_parameter_defaults(&signature);
         let mut result = Self {
             identity: view.rule.identity(),
-            signature: view.rule.function_signature().unwrap(),
+            signature,
+            parameter_defaults,
+            parameter_defaults_read_attributes,
             inputs: Vec::new(),
         };
         let _ = view.rule.visit_children(&mut |child| {
@@ -103,33 +117,16 @@ pub extern "C" fn rust_rule_view_compile_function(view: &NativeRuleView<'_>) -> 
     Arc::into_raw(Arc::new(CompiledFunction::compile(view)))
 }
 
-/// # Safety
-/// The function must be an owned reference returned by compilation or retention.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compiled_function_release(function: *const CompiledFunction) {
-    if !function.is_null() {
-        drop(unsafe { Arc::from_raw(function) });
-    }
-}
-
-/// # Safety
-/// The function must be live and Arc-owned.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compiled_function_retain(function: *const CompiledFunction) -> *const CompiledFunction {
-    unsafe {
-        Arc::increment_strong_count(function);
-    }
-    function
+pub extern "C" fn rust_compiled_function_release(function: OwnedArc<CompiledFunction>) {
+    drop(function);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_compiled_function_identity(function: &CompiledFunction) -> u64 {
-    function.identity
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_compiled_function_signature(function: &CompiledFunction) -> *const FunctionSignature {
-    Arc::as_ptr(&function.signature)
+pub extern "C" fn rust_compiled_function_retain(
+    function: crate::css::ffi_support::ArcRef<'_, CompiledFunction>,
+) -> *const CompiledFunction {
+    Arc::into_raw(function.to_arc())
 }
 
 /// The functions a style sheet's top-level `@function` rules compile to, in order, with no rule
@@ -137,13 +134,11 @@ pub extern "C" fn rust_compiled_function_signature(function: &CompiledFunction) 
 #[cfg(test)]
 pub(crate) fn compile_functions_for_testing(source: &str) -> Vec<CompiledFunction> {
     let units: Vec<_> = source.encode_utf16().collect();
-    let context: crate::css::parser::value_parser::ParseContext = unsafe { std::mem::zeroed() };
-    let parsed = unsafe {
-        crate::css::parser::syntax_parser::parse_shared_stylesheet(
-            crate::css::css_tokenizer::TokenizerInput::Utf16(&units),
-            &raw const context,
-        )
-    };
+    let context = crate::css::parser::value_parser::ParseContext::default();
+    let parsed = crate::css::parser::syntax_parser::parse_shared_stylesheet(
+        crate::css::css_tokenizer::TokenizerInput::Utf16(&units),
+        Some(&context),
+    );
     let rules = super::NativeRuleList::from_parsed(parsed);
     let mut compiled = Vec::new();
     let _ = rules.visit_rules(&mut |rule| {

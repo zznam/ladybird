@@ -51,6 +51,9 @@ static NavigationRequestDescriptor create_navigation_request_descriptor(Fetch::I
         .referrer_policy = request.referrer_policy(),
         .policy_container = serialize_request_policy_container(request),
         .redirect_count = request.redirect_count(),
+        .text_directive_user_activation = request.text_directive_user_activation(),
+        .browsing_context_group_has_multiple_contexts = request.browsing_context_group_has_multiple_contexts(),
+        .cache_mode = request.cache_mode(),
     };
 }
 
@@ -176,6 +179,9 @@ static NavigationParamsDescriptor create_navigation_params_descriptor(Navigation
         .about_base_url = params.about_base_url,
         .user_involvement = params.user_involvement,
         .agent_cluster_id = params.agent_cluster_id,
+        .agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode,
+        .new_browsing_context_group_id = params.new_browsing_context_group_id,
+        .permissions_policy = params.permissions_policy,
     };
 }
 
@@ -236,6 +242,9 @@ static GC::Ptr<Fetch::Infrastructure::Request> create_navigation_request_from_de
     request->set_referrer_policy(descriptor->referrer_policy);
     request->set_policy_container(create_a_policy_container_from_serialized_policy_container(descriptor->policy_container));
     request->set_redirect_count(descriptor->redirect_count);
+    request->set_text_directive_user_activation(descriptor->text_directive_user_activation);
+    request->set_browsing_context_group_has_multiple_contexts(descriptor->browsing_context_group_has_multiple_contexts);
+    request->set_cache_mode(descriptor->cache_mode);
     return request;
 }
 
@@ -257,7 +266,7 @@ static GC::Ptr<Fetch::Infrastructure::Body> adopt_navigation_response_body(JS::R
     // populate_session_history_entry_document() decides whether to load it as a document or transfer it again.
     request->set_body_delivery_paused(true);
 
-    auto stream = realm.heap().allocate<Streams::ReadableStream>();
+    auto stream = Streams::ReadableStream::create(realm);
     auto pull_algorithm = GC::create_function(realm.heap(), [&realm]() {
         return WebIDL::create_resolved_promise(realm, JS::js_undefined());
     });
@@ -275,7 +284,7 @@ static GC::Ptr<Fetch::Infrastructure::Body> adopt_navigation_response_body(JS::R
     auto cross_origin_isolated_capability = Bindings::principal_host_defined_environment_settings_object(realm).cross_origin_isolated_capability();
 
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {},
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) { },
         [receiver_root, &realm](Requests::ResponseData data) {
             receiver_root->handle_network_data(realm, move(data), Fetch::Fetching::FetchedDataReceiver::NetworkState::Ongoing);
         },
@@ -388,6 +397,9 @@ ErrorOr<NavigationParamsVariant> create_navigation_params_from_descriptor(JS::Re
         params.user_involvement);
     navigation_params->fetch_timing_info = fetch_timing_info;
     navigation_params->agent_cluster_id = params.agent_cluster_id;
+    navigation_params->agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode;
+    navigation_params->new_browsing_context_group_id = params.new_browsing_context_group_id;
+    navigation_params->permissions_policy = move(params.permissions_policy);
     return navigation_params;
 }
 

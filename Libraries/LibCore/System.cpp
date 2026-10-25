@@ -273,10 +273,10 @@ ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int opti
         return Error::from_errno(saved_errno);
     }
 
-    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. On macOS, the flag is
-    //        accepted, but the fd stays resizable (ftruncate remains possible). SAB backing relies on this seal to stop
-    //        a transferred fd from being shrunk under a peer. POSIX shared memory has no equivalent seal — so a macOS
-    //        equivalent would require implementing backing of the block with a Mach memory entry instead of an shm fd.
+    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. macOS needs no seal, because it
+    //        allows only one successful ftruncate() per POSIX shared memory object. On other platforms, the flag is
+    //        accepted, but the fd stays resizable. SAB backing relies on this seal to stop a transferred fd from being
+    //        shrunk under a peer.
 #if defined(AK_OS_LINUX)
     // Seal a fixed-size shared fd against resizing: A peer process holding the transferred fd must not be able to
     // ftruncate it smaller, and SIGBUS siblings that touch the now-missing pages. Writes stay allowed on purpose (no
@@ -756,7 +756,7 @@ ErrorOr<void> socketpair(int domain, int type, int protocol, int sv[2])
     return {};
 }
 
-ErrorOr<Array<int, 2>> pipe2(int flags)
+ErrorOr<Array<int, 2>> pipe2(int flags, PipeReadEnd)
 {
     Array<int, 2> fds;
 
@@ -764,6 +764,14 @@ ErrorOr<Array<int, 2>> pipe2(int flags)
     if (::pipe2(fds.data(), flags) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 #else
+#    if defined(AK_OS_MACOS) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+    if (__builtin_available(macOS 27.0, *)) {
+        if (::pipe2(fds.data(), flags) < 0)
+            return Error::from_syscall("pipe2"sv, errno);
+        return fds;
+    }
+#    endif
+
     if (::pipe(fds.data()) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 
@@ -834,7 +842,9 @@ ErrorOr<int> poll(Span<struct pollfd> poll_fds, int timeout)
 
 unsigned hardware_concurrency()
 {
-    return sysconf(_SC_NPROCESSORS_ONLN);
+    // A count the system can't report is one processor, rather than the failure's -1 cast to a huge count.
+    auto count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count < 1 ? 1 : count;
 }
 
 u64 physical_memory_bytes()

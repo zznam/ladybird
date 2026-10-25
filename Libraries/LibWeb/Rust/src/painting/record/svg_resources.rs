@@ -19,7 +19,7 @@ use crate::painting::visual_context::build::{
 };
 use crate::painting::visual_context::node_values::{MaskLayerPresenceEntry, mask_layer_presence};
 use crate::painting::visual_context::{ClipData, EffectNodeData, EffectNodeIndex, MaskData, MaskLayerOrigin};
-use libgfx_rust::path::PathBuilder;
+use libgfx_rust::path::Path;
 use libgfx_rust::{AffineTransform, CompositingAndBlendingOperator, FloatPoint, FloatRect, MaskKind, multiply_affine};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,10 @@ pub enum MaskLayerSet {
 pub(crate) struct SvgResourceWalk {
     pub enclosing_context: ContextRef,
     pub draws_clip_path_geometry: bool,
+    // The rect of the walk's recorded space that whatever consumes the resource clips it to: the mask
+    // region or the pattern tile. Clipping the resource's groups to it bounds their ink, filters
+    // included, without changing what they draw.
+    pub consumer_clip_rect: FloatRect,
 }
 
 fn affine_of_matrix(matrix: libgfx_rust::FloatMatrix4x4) -> AffineTransform {
@@ -66,7 +70,7 @@ fn transformed_rect_clip(transform: AffineTransform, rect: FloatRect, clip: &Cli
     )
 }
 
-fn transformed_rect_path(transform: AffineTransform, rect: FloatRect) -> libgfx_rust::path::OwnedPath {
+fn transformed_rect_path(transform: AffineTransform, rect: FloatRect) -> Path {
     let corners = [
         FloatPoint { x: rect.x, y: rect.y },
         FloatPoint {
@@ -83,13 +87,13 @@ fn transformed_rect_path(transform: AffineTransform, rect: FloatRect) -> libgfx_
         },
     ]
     .map(|corner| transform.map_point(corner));
-    let mut path = PathBuilder::new();
-    path.move_to(corners[0].x, corners[0].y);
+    let mut path = Path::new();
+    path.move_to(corners[0]);
     for corner in &corners[1..] {
-        path.line_to(corner.x, corner.y);
+        path.line_to(*corner);
     }
     path.close();
-    path.build()
+    path
 }
 
 fn transformed_int_rect_clip(transform: AffineTransform, rect: libgfx_rust::IntRect) -> PendingInlineClip {
@@ -156,6 +160,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                             paintable,
                             layer.origin,
                             AffineTransform::identity(),
+                            mask.rect.to_float(),
                         );
                     }
                 }
@@ -188,6 +193,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         target: NodeSlotId,
         origin: MaskLayerOrigin,
         target_to_enclosing_space: AffineTransform,
+        consumer_clip_rect: FloatRect,
     ) {
         let (resource_kind, draws_clip_path_geometry, producer) = match origin {
             MaskLayerOrigin::SvgMask => (NodeKind::SVGMaskBox, false, "svg-mask"),
@@ -215,7 +221,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
         // so force-dark stays out of it. Patterns keep it: they render as page content.
         let suspended_force_dark = self.recorder.suspend_force_dark();
         self.trace_paint(Operation::Named(Some(target), producer), |this| {
-            this.walk_svg_resource(resource_box, root_transform, true, draws_clip_path_geometry);
+            this.walk_svg_resource(
+                resource_box,
+                root_transform,
+                true,
+                draws_clip_path_geometry,
+                consumer_clip_rect,
+            );
         });
         self.recorder.restore_force_dark(suspended_force_dark);
     }
@@ -237,6 +249,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             border_radii: crate::painting::border_radii::BorderRadii::default(),
             image_rendering: crate::css::css_enums::image_rendering::AUTO,
             is_root_element,
+            visible_device_rect: None,
         };
         crate::painting::record::paint::background::paint_resolved_background(self, paintable, &inputs);
         self.recorder.restore_force_dark(suspended_force_dark);
@@ -248,10 +261,12 @@ impl<O: Observer> PaintRecorder<'_, O> {
         root_transform: AffineTransform,
         include_root_element_transform: bool,
         draws_clip_path_geometry: bool,
+        consumer_clip_rect: FloatRect,
     ) {
         let walk = SvgResourceWalk {
             enclosing_context: self.recorder.accumulated_visual_context(),
             draws_clip_path_geometry,
+            consumer_clip_rect,
         };
         let enclosing_walk = self.svg_resource_walk.replace(walk);
         let enclosing_transform = self.recorder.set_ambient_inline_transform(Some(root_transform));
@@ -353,11 +368,16 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
         for (mut group, mask, clip_depth) in mask_groups.into_iter().rev() {
             self.recorder.begin_group_mask(&mut group);
-            self.record_referenced_svg_mask_or_clip_content(svg_box, mask.origin, to_enclosing_space);
+            self.record_referenced_svg_mask_or_clip_content(
+                svg_box,
+                mask.origin,
+                to_enclosing_space,
+                walk.consumer_clip_rect,
+            );
             self.recorder.finish_group_with_effects(
                 group,
                 IsolatedGroupEffects {
-                    clip_rect: None,
+                    clip_rect: walk.consumer_clip_rect,
                     opacity: 1.0,
                     filter: None,
                     compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
@@ -370,7 +390,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             self.recorder.finish_group_with_effects(
                 group,
                 IsolatedGroupEffects {
-                    clip_rect: None,
+                    clip_rect: walk.consumer_clip_rect,
                     opacity: effects.opacity,
                     filter: effects.filter,
                     compositing_and_blending_operator: effects.blend_mode,

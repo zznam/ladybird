@@ -20,28 +20,26 @@ use std::sync::Arc;
 use super::publication::{Drive, Unanswered};
 use super::*;
 use crate::css::cascaded_properties::{
-    CallbackFreeParseOutcome, FfiCascadeResolutionContext, FfiCustomPropertyDriveInput,
-    destroy_resolved_custom_properties, parse_substituted_source, parse_substituted_without_callbacks,
-    resolve_declared_custom_properties,
+    CascadeResolutionContext, parse_substituted_value, resolve_declared_custom_properties,
 };
 use crate::css::custom_properties::{
-    CustomPropertyFinalization, CustomPropertyStore, FfiSubstitutionFunctionDeclaration,
-    FfiSubstitutionFunctionDefinition, FfiSubstitutionFunctionVisibility, NativeVarResolution,
-    prepare_var_resolution_environment,
+    CustomFunctionRegistry, CustomFunctionVisibility, CustomPropertyFinalization, CustomPropertyStore,
+    FfiSubstitutionFunctionVisibility, NativeVarResolution, PreparedCustomFunction, SubstitutionAttribute,
+    VarResolutionInputs, prepare_var_resolution_environment,
 };
-use crate::css::ffi_support::FfiUtf16View;
 use crate::css::parser::component_value::{ComponentKind, ComponentValue};
-use crate::css::parser::value_parser::ParseOutcome;
 use crate::css::rule::CompiledFunction;
 use crate::css::style_value::{
-    RetainedStyleValueData, StyleValueData, release_style_value, utf16_equals_ascii_case_insensitive,
+    RetainedStyleValueData, StyleValueData, custom_property_references, utf16_equals_ascii_case_insensitive,
 };
 use custom_property_environments::{CascadedCustomProperty, CustomPropertyName};
+
+static EMPTY_CUSTOM_FUNCTIONS: CustomFunctionRegistry<'static> = CustomFunctionRegistry::empty();
 
 /// The document's media features as the style update a transaction belongs to saw them, which
 /// `media()` conditions in `if()` read. Copied rather than borrowed: the host's snapshot ends with
 /// the style update, and a record demanded after it still resolves against these.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct DocumentMediaSnapshot {
     values: Vec<crate::css::parser::query_parser::FfiMediaFeatureValue>,
     /// Lent no output flag: `take_in` clears the one the host's context points to.
@@ -64,7 +62,7 @@ impl DocumentMediaSnapshot {
         self.values.clear();
         if !inputs.media_feature_values.is_none() && inputs.media_feature_value_count != 0 {
             self.values.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(
+                ak::slice_from_raw_parts(
                     inputs.media_feature_values.as_pointer().cast(),
                     inputs.media_feature_value_count,
                 )
@@ -87,15 +85,8 @@ impl DocumentMediaSnapshot {
     }
 
     /// The snapshot as the resolver reads a media environment, borrowing from it.
-    fn environment(&self) -> crate::css::parser::query_parser::FfiMediaEnvironment {
-        crate::css::parser::query_parser::FfiMediaEnvironment {
-            values: self.values.as_ptr(),
-            value_count: self.values.len(),
-            length_resolution_context: self
-                .length
-                .as_ref()
-                .map_or(std::ptr::null(), |length| std::ptr::from_ref(length).cast()),
-        }
+    fn environment(&self) -> crate::css::parser::query_parser::FfiMediaEnvironment<'_> {
+        crate::css::parser::query_parser::FfiMediaEnvironment::new(&self.values, self.length.as_ref())
     }
 
     /// What lengths resolve against for a document without styled elements.
@@ -107,7 +98,7 @@ impl DocumentMediaSnapshot {
 /// The `@function` definitions each scope sees, as the host published them with a transaction's
 /// inputs: what a custom function call resolves against. A scope is a host `StyleScope`, named by
 /// its identity, as the resolver names the scope of a call and of a definition.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct DocumentFunctionSnapshot {
     /// Each definition some scope sees, by its identity, with the scope that defines it.
     definitions: HashMap<u64, (Arc<CompiledFunction>, usize)>,
@@ -122,10 +113,12 @@ pub(super) struct DocumentFunctionSnapshot {
 /// What a call from one scope reaches, as `visible_from` finds it, with the input blocks of each
 /// definition's body the document's media selects: only the container-gated blocks among those
 /// differ from one element to the next.
+#[derive(Clone)]
 pub(super) struct ScopeFunctions {
     /// Each reachable definition, with the scope that defines it and its selected blocks.
     definitions: Vec<(Arc<CompiledFunction>, usize, Box<[usize]>)>,
-    visibilities: Vec<FfiSubstitutionFunctionVisibility>,
+    /// Caller scope identities paired with indices into `definitions`.
+    visibilities: Vec<CustomFunctionVisibility>,
 }
 
 /// What a call from one tree scope may reach: the definitions its scope sees, and those the
@@ -137,16 +130,18 @@ struct VisibleFunctions<'a> {
 }
 
 impl DocumentFunctionSnapshot {
-    /// Take in what the host lent with the inputs, retaining each definition, and clear the
-    /// borrowed fields so the inputs compare by value from here on.
+    /// Take in what the host lent with the inputs, retaining each definition a scope sees, and
+    /// clear the borrowed fields so the inputs compare by value from here on. `layer_index` ranks a
+    /// cascade layer within its tree scope.
     ///
     /// # Safety
     /// The borrowed fields must name a live array of their stated length, or nothing, for this
-    /// call, and each entry a live compiled function.
+    /// call, and each entry a live compiled function or none.
     pub(super) unsafe fn take_in(
         &mut self,
         inputs: &mut bridge::FfiDocumentStyleComputationInputs,
         media: &DocumentMediaSnapshot,
+        layer_index: impl Fn(TreeScopeID, CascadeLayerID) -> u32,
     ) {
         self.definitions.clear();
         self.visibilities.clear();
@@ -156,7 +151,7 @@ impl DocumentFunctionSnapshot {
             &[]
         } else {
             unsafe {
-                std::slice::from_raw_parts(
+                ak::slice_from_raw_parts(
                     inputs
                         .custom_functions
                         .as_pointer()
@@ -165,39 +160,74 @@ impl DocumentFunctionSnapshot {
                 )
             }
         };
+        // SAFETY: The host lends a live compiled function, or none.
+        let function_of =
+            |entry: &bridge::FfiCustomFunctionEntry| unsafe { entry.function.cast::<CompiledFunction>().as_ref() };
+        // What a scope defines under a name is the rule of the most precedent origin, and within it
+        // of the last layer, a later rule winning a tie.
+        let mut parent_scopes = HashMap::default();
+        let mut winners = HashMap::default();
         for entry in entries {
-            let function = entry.function.cast::<CompiledFunction>();
-            // SAFETY: The host lends a live compiled function, which is shared by reference count.
-            let Some(identity) = (unsafe { function.as_ref() }).map(|function| function.identity) else {
-                debug_assert!(false, "a published custom function names its definition");
+            self.caller_scopes.insert(TreeScopeID(entry.tree_scope), entry.scope);
+            parent_scopes.insert(entry.scope, entry.parent_scope);
+            let Some(function) = function_of(entry) else {
                 continue;
             };
-            self.definitions.entry(identity).or_insert_with(|| {
-                // SAFETY: As above; the snapshot keeps a reference of its own.
-                let function = unsafe {
-                    Arc::increment_strong_count(function);
-                    Arc::from_raw(function)
-                };
-                (function, entry.definition_scope)
-            });
-            self.visibilities.push(FfiSubstitutionFunctionVisibility {
-                caller_scope_identity: entry.caller_scope,
-                function_identity: identity,
-            });
-            self.caller_scopes
-                .insert(TreeScopeID(entry.tree_scope), entry.caller_scope);
+            let precedence = (
+                entry.origin,
+                layer_index(TreeScopeID(entry.tree_scope), CascadeLayerID(entry.layer)),
+            );
+            let key = (entry.scope, function.signature.name.units());
+            if winners.get(&key).is_none_or(|&(winner, _)| winner <= precedence) {
+                winners.insert(key, (precedence, function));
+            }
+        }
+        let mut defined: HashMap<usize, Vec<&CompiledFunction>> = HashMap::default();
+        for entry in entries {
+            if let Some(function) = function_of(entry)
+                && std::ptr::eq(winners[&(entry.scope, function.signature.name.units())].1, function)
+            {
+                defined.entry(entry.scope).or_default().push(function);
+            }
+        }
+        // https://drafts.csswg.org/css-shadow-1/#tree-scoped-name-global
+        // A name a scope does not define is looked up in the scope of its host's tree, and so on up.
+        for &caller_scope in parent_scopes.keys() {
+            let mut names = HashSet::default();
+            let mut scope = caller_scope;
+            while scope != 0 {
+                for &function in defined.get(&scope).into_iter().flatten() {
+                    if !names.insert(function.signature.name.units()) {
+                        continue;
+                    }
+                    self.definitions.entry(function.identity).or_insert_with(|| {
+                        let function = std::ptr::from_ref(function);
+                        // SAFETY: The host lends a function shared by reference count; the snapshot keeps one.
+                        let function = unsafe {
+                            Arc::increment_strong_count(function);
+                            Arc::from_raw(function)
+                        };
+                        (function, scope)
+                    });
+                    self.visibilities.push(FfiSubstitutionFunctionVisibility {
+                        caller_scope_identity: caller_scope,
+                        function_identity: function.identity,
+                    });
+                }
+                scope = parent_scopes.get(&scope).copied().unwrap_or(0);
+            }
         }
         inputs.custom_functions = bridge::FfiHostHandle::default();
         inputs.custom_function_count = 0;
         let media_environment = media.environment();
         // SAFETY: The environment points into the media snapshot, which outlives the evaluation.
-        let media_environment = unsafe { media_environment.borrow() };
+        let media_environment = media_environment.borrow();
         for &caller_scope in self.caller_scopes.values() {
             if self.scope_functions.contains_key(&caller_scope) {
                 continue;
             }
             let visible = self.visible_from_scope(caller_scope);
-            let definitions = visible
+            let definitions: Vec<_> = visible
                 .definitions
                 .iter()
                 .map(|(function, scope)| {
@@ -218,9 +248,23 @@ impl DocumentFunctionSnapshot {
                     (function, *scope, selected)
                 })
                 .collect();
+            let visibilities = visible
+                .visibilities
+                .iter()
+                .filter_map(|visibility| {
+                    let index = definitions
+                        .iter()
+                        .position(|(function, _, _)| function.identity == visibility.function_identity);
+                    debug_assert!(index.is_some(), "a visible function is published with its definition");
+                    Some(CustomFunctionVisibility {
+                        caller_scope_identity: visibility.caller_scope_identity,
+                        definition_index: index?,
+                    })
+                })
+                .collect();
             let scope_functions = ScopeFunctions {
                 definitions,
-                visibilities: visible.visibilities,
+                visibilities,
             };
             self.scope_functions.insert(caller_scope, scope_functions);
         }
@@ -282,15 +326,11 @@ impl DocumentFunctionSnapshot {
 
 /// The custom functions a node's calls may reach, as the resolver takes them: each definition with
 /// the declarations its conditions select for the node, and which definition each scope's calls
-/// name. It points into the definitions the engine retains for the transaction, which outlive
-/// every drive in it.
-pub(super) struct PreparedCustomFunctions {
-    /// What `definitions` point into.
-    _declarations: Vec<Vec<FfiSubstitutionFunctionDeclaration>>,
-    definitions: Vec<FfiSubstitutionFunctionDefinition>,
-    visibilities: Vec<FfiSubstitutionFunctionVisibility>,
-    caller_scope: usize,
-    /// Whether a selected declaration substitutes `attr()`, which reads the node's attributes.
+/// name.
+pub(super) struct PreparedCustomFunctions<'a> {
+    registry: CustomFunctionRegistry<'a>,
+    /// Whether a parameter default or selected declaration substitutes `attr()`, which reads the
+    /// node's attributes.
     pub(super) reads_attributes: bool,
     /// What the container conditions read of the node's containers, for the host to record with
     /// its record; `None` when no condition was evaluated.
@@ -306,80 +346,38 @@ pub(super) struct RegisteredValueContext {
     pub color_scheme: u8,
 }
 
-/// Draws the random base value of a registered value's random caching key for its element from
-/// the engine's own, as the host draws one.
-///
-/// # Safety
-/// `context` must point at the element and the engine's random base values, and `name` at
-/// `length` code units.
-unsafe extern "C" fn draw_engine_random_base_value(
-    context: *mut c_void,
-    name: *const u16,
-    length: usize,
-    element_shared: bool,
-) -> f64 {
-    let (node, values) = unsafe { &mut *context.cast::<(StyleNodeID, &mut super::random_bases::RandomBaseValues)>() };
-    let name = match length {
-        0 => &[],
-        _ => unsafe { std::slice::from_raw_parts(name, length) },
-    };
-    values.ensure(Some(*node), name, element_shared)
-}
-
 /// The resolution context the engine substitutes under: the stores alone, with no callback into
 /// C++ - what the engine cannot resolve without one is left to C++ before this is built.
 #[expect(
     clippy::too_many_arguments,
     reason = "the context borrows each resolution input on its own"
 )]
-fn engine_resolution_context(
-    parse_context: &crate::css::parser::value_parser::ParseContext,
-    store: *const c_void,
-    inheritance_store: *const c_void,
-    registry: *const c_void,
-    attributes: Option<&SubstitutionAttributes<'_>>,
-    media_environment: &crate::css::parser::query_parser::FfiMediaEnvironment,
-    style_query: Option<&crate::css::cascaded_properties::FfiStyleQueryInputs>,
-    style_query_references: Option<&mut Option<Box<crate::css::custom_properties::StyleQueryDependencies>>>,
-    functions: Option<&PreparedCustomFunctions>,
-) -> FfiCascadeResolutionContext {
-    let substitution_attributes = attributes.map_or(&[][..], |attributes| attributes.attributes.as_slice());
-    FfiCascadeResolutionContext {
-        parse_context: std::ptr::from_ref(parse_context).cast(),
-        media_environment: std::ptr::from_ref(media_environment).cast(),
-        load_media_environment: None,
-        custom_property_store: store,
-        inheritance_custom_property_store: inheritance_store,
-        custom_property_registry: registry,
-        root_custom_property_name: FfiUtf16View {
-            ascii: std::ptr::null(),
-            utf16: std::ptr::null(),
-            length: 0,
+fn engine_resolution_context<'a>(
+    parse_context: &'a crate::css::parser::value_parser::ParseContext,
+    store: Option<&'a CustomPropertyStore>,
+    inheritance_store: Option<&'a CustomPropertyStore>,
+    registry: &'a crate::css::custom_properties::CustomPropertyRegistry,
+    attributes: Option<&'a SubstitutionAttributes<'a>>,
+    media_environment: &'a crate::css::parser::query_parser::FfiMediaEnvironment<'a>,
+    style_query: Option<&'a crate::css::cascaded_properties::FfiStyleQueryInputs>,
+    style_query_references: Option<&'a mut Option<Box<crate::css::custom_properties::StyleQueryDependencies>>>,
+    functions: Option<&'a PreparedCustomFunctions<'a>>,
+) -> CascadeResolutionContext<'a> {
+    CascadeResolutionContext {
+        inputs: VarResolutionInputs {
+            store,
+            inheritance_store,
+            registry: Some(registry),
+            parse_context: Some(parse_context),
+            media_environment: Some(media_environment),
+            attribute_names_are_ascii_case_insensitive: attributes
+                .is_some_and(|attributes| attributes.names_are_ascii_case_insensitive),
+            style_query_inputs: style_query,
         },
-        attributes: substitution_attributes.as_ptr(),
-        attribute_count: substitution_attributes.len(),
-        attribute_names_are_ascii_case_insensitive: attributes
-            .is_some_and(|attributes| attributes.names_are_ascii_case_insensitive),
-        custom_functions: functions.map_or(std::ptr::null(), |functions| functions.definitions.as_ptr()),
-        custom_function_count: functions.map_or(0, |functions| functions.definitions.len()),
-        custom_function_scope_identity: functions.map_or(0, |functions| functions.caller_scope),
-        custom_function_visibilities: functions.map_or(std::ptr::null(), |functions| functions.visibilities.as_ptr()),
-        custom_function_visibility_count: functions.map_or(0, |functions| functions.visibilities.len()),
-        callback_context: std::ptr::null_mut(),
-        install_custom_properties: None,
-        style_query_inputs: style_query.map_or(std::ptr::null(), std::ptr::from_ref),
-        load_style_query_inputs: None,
-        style_query_dependencies: style_query_references
-            .map_or(std::ptr::null_mut(), |references| std::ptr::from_mut(references).cast()),
-        note_substitution: None,
+        attributes: attributes.map_or(&[][..], |attributes| attributes.attributes.as_slice()),
+        custom_functions: functions.map_or(&EMPTY_CUSTOM_FUNCTIONS, |functions| &functions.registry),
+        style_query_dependencies: style_query_references,
     }
-}
-
-#[cfg(feature = "style-recording")]
-/// Whether a token stream is a substitution the engine resolves itself: one that substitutes no
-/// `attr()`.
-pub(super) fn value_is_engine_resolvable_substitution(value: &StyleValueData) -> bool {
-    matches!(value, StyleValueData::Unresolved { .. }) && !value_reads_attributes(value)
 }
 
 /// The token stream a written value substitutes: itself, or the shorthand a longhand pending its
@@ -391,6 +389,128 @@ fn substituted_tokens(value: &StyleValueData) -> &StyleValueData {
         } => substituted_tokens(original_shorthand_value.data()),
         value => value,
     }
+}
+
+/// Custom property names, sorted and without duplicates.
+pub(crate) type CustomPropertyNames = Arc<[Arc<[u16]>]>;
+
+/// What an element's custom declarations resolve over, where its match answer decides them all.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct EnvironmentByAnswerKey {
+    answer: MatchAnswerID,
+    tree_scope: TreeScopeID,
+    parent_environment: u64,
+    registration_generation: u64,
+}
+
+/// The environment such declarations resolved to, and what they read beyond it.
+#[derive(Clone)]
+pub(super) struct EnvironmentByAnswer {
+    environment: u64,
+    reads: u8,
+    custom_property_reads: Option<Option<CustomPropertyNames>>,
+}
+
+/// The custom properties cascaded custom declarations declare or read, by the declarations: the operator, written
+/// value and name of each, the last two of which an entry holds so that neither is handed out again while it does.
+#[derive(Default)]
+pub(super) struct CustomPropertyReadsByDeclarations(HashMap<u64, MemoizedCustomPropertyReads>);
+
+/// A cascaded custom declaration as the memo holds it: its operator, written value and declared name.
+type HeldCustomDeclaration = (CascadeOperator, RetainedStyleValueData, Arc<[u16]>);
+
+struct MemoizedCustomPropertyReads {
+    declarations: Box<[HeldCustomDeclaration]>,
+    reads: Option<CustomPropertyNames>,
+}
+
+// A copy of the engine state starts over, as the memo only saves work.
+impl Clone for CustomPropertyReadsByDeclarations {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl CustomPropertyReadsByDeclarations {
+    /// The most declaration lists remembered at once.
+    const LIMIT: usize = 4096;
+
+    fn get(
+        &self,
+        hash: u64,
+        declarations: &[(CascadeOperator, &RetainedStyleValueData, Arc<[u16]>)],
+    ) -> Option<Option<CustomPropertyNames>> {
+        let memoized = self.0.get(&hash)?;
+        let same = memoized.declarations.len() == declarations.len()
+            && memoized.declarations.iter().zip(declarations).all(
+                |((operator, value, name), (other_operator, other_value, other_name))| {
+                    operator == other_operator
+                        && value.pointer() == other_value.pointer()
+                        && Arc::ptr_eq(name, other_name)
+                },
+            );
+        same.then(|| memoized.reads.clone())
+    }
+
+    fn remember(
+        &mut self,
+        hash: u64,
+        declarations: &[(CascadeOperator, &RetainedStyleValueData, Arc<[u16]>)],
+        reads: Option<CustomPropertyNames>,
+    ) {
+        if self.0.len() >= Self::LIMIT {
+            self.0.clear();
+        }
+        let declarations = declarations
+            .iter()
+            .map(|(operator, value, name)| (*operator, (*value).clone(), Arc::clone(name)))
+            .collect();
+        self.0.insert(hash, MemoizedCustomPropertyReads { declarations, reads });
+    }
+}
+
+pub(super) fn append_custom_property_reads(value: &StyleValueData, names: &mut Vec<Arc<[u16]>>) -> bool {
+    let Some((references, all_references_visible)) = custom_property_references(substituted_tokens(value)) else {
+        return true;
+    };
+    names.extend(references.into_iter().map(Arc::from));
+    all_references_visible
+}
+
+pub(super) fn value_reads_any_of_custom_properties(value: &StyleValueData, names: &[Arc<[u16]>]) -> bool {
+    let Some((references, all_references_visible)) = custom_property_references(substituted_tokens(value)) else {
+        return false;
+    };
+    !all_references_visible
+        || references
+            .into_iter()
+            .any(|reference| names.binary_search_by(|name| name.as_ref().cmp(reference)).is_ok())
+}
+
+/// The custom properties a written value reads by name, or `None` when it may read others: an
+/// `if()` condition, a custom function or an attribute's value can read any.
+fn named_custom_property_reads(value: &StyleValueData) -> Option<Vec<&[u16]>> {
+    let value = substituted_tokens(value);
+    if let StyleValueData::Unresolved {
+        presence_attr,
+        presence_dashed_function,
+        presence_if,
+        ..
+    } = value
+        && (*presence_attr || *presence_dashed_function || *presence_if)
+    {
+        return None;
+    }
+    let Some((references, all_references_visible)) = custom_property_references(value) else {
+        return Some(Vec::new());
+    };
+    all_references_visible.then_some(references)
+}
+
+pub(super) fn sorted_custom_property_names(mut names: Vec<Arc<[u16]>>) -> CustomPropertyNames {
+    names.sort_unstable();
+    names.dedup();
+    names.into()
 }
 
 /// Whether a written value substitutes `attr()`, which reads the element's attributes.
@@ -416,12 +536,17 @@ pub(super) fn value_reads_inherited_values(value: &StyleValueData) -> bool {
     )
 }
 
-/// Whether a written value substitutes `if()`, whose conditions read the document's media
-/// features and the element's lengths beside its custom-property environment.
+/// Whether a written value may substitute `if()`, directly or through an attribute's value.
+/// Its conditions read the document's media features and the element's lengths beside its
+/// custom-property environment.
 pub(super) fn value_reads_conditions(value: &StyleValueData) -> bool {
     matches!(
         substituted_tokens(value),
         StyleValueData::Unresolved { presence_if: true, .. }
+            | StyleValueData::Unresolved {
+                presence_attr: true,
+                ..
+            }
     )
 }
 
@@ -517,36 +642,25 @@ pub(super) struct SubstitutionInputs<'a> {
     /// Where the custom properties a `style()` query reads are noted.
     pub style_query_references:
         Option<&'a std::cell::RefCell<Option<Box<crate::css::custom_properties::StyleQueryDependencies>>>>,
-    pub functions: Option<&'a PreparedCustomFunctions>,
+    pub functions: Option<&'a PreparedCustomFunctions<'a>>,
 }
 
 /// What an `attr()` reads of an element, as the resolution takes it: each of the element's
 /// attributes in no namespace, by local name, with its value's text, and whether names match ASCII
 /// case-insensitively, as an HTML element's do. It points into the facts it borrows.
 pub(super) struct SubstitutionAttributes<'a> {
-    attributes: Vec<crate::css::custom_properties::FfiSubstitutionAttribute>,
+    attributes: Vec<SubstitutionAttribute<'a>>,
     names_are_ascii_case_insensitive: bool,
-    facts: std::marker::PhantomData<&'a index::ElementFactStore>,
 }
 
 impl<'a> SubstitutionAttributes<'a> {
     pub(super) fn of(facts: &'a index::ElementFactStore, node: StyleNodeID, html_namespace: StyleAtomID) -> Self {
-        use crate::css::custom_properties::FfiSubstitutionAttribute;
-        let view = |text: &[u16]| FfiUtf16View {
-            ascii: std::ptr::null(),
-            utf16: text.as_ptr(),
-            length: text.len(),
-        };
         Self {
             attributes: facts
                 .substitution_attributes(node)
-                .map(|(name, value)| FfiSubstitutionAttribute {
-                    name: view(name),
-                    value: view(value),
-                })
+                .map(|(name, value)| SubstitutionAttribute { name, value })
                 .collect(),
             names_are_ascii_case_insensitive: !html_namespace.is_none() && facts.namespace_of(node) == html_namespace,
-            facts: std::marker::PhantomData,
         }
     }
 }
@@ -723,16 +837,20 @@ impl RetainedState {
         if !self.facts.element_custom_declarations(node).is_empty() {
             return true;
         }
-        matches!(
-            self.try_for_each_element_match(node, |rule, _, _, _| {
-                if self.program.custom_declarations_of(rule).is_empty() {
-                    ControlFlow::Continue(())
-                } else {
-                    ControlFlow::Break(())
-                }
-            }),
-            Some(ControlFlow::Break(()))
-        )
+        let declares = |rule: RuleID, _: TreeScopeID, _: Specificity, _: u32| {
+            if self.program.custom_declarations_of(rule).is_empty() {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        };
+        // An element standing for its shadow host's pseudo-element, such as the slot `::details-content` is, cascades
+        // the host's rules for that pseudo-element, and its environment resolves their custom declarations.
+        let result = match self.backed_host_pseudo_element(node) {
+            Some((kind, host)) => self.try_for_each_match(host, Some(kind), declares),
+            None => self.try_for_each_element_match(node, declares),
+        };
+        matches!(result, Some(ControlFlow::Break(())))
     }
 
     /// Whether a reaction on the node may move its custom-property environment, which its
@@ -770,6 +888,34 @@ impl RetainedState {
             return true;
         };
         self.state_has_substitutions(node, state)
+    }
+
+    pub(super) fn node_style_reads_any_of_custom_properties(&self, node: StyleNodeID, names: &[Arc<[u16]>]) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        let reads_any = |reads: &[Arc<[u16]>]| reads.iter().any(|read| names.binary_search(read).is_ok());
+        let groups = self.current_winner_groups();
+        let Lookup::Known((_, state)) = groups.token_for(WinnerGroupKey::current(node, self.program.version())) else {
+            return true;
+        };
+        let states_read_any = std::iter::once(state)
+            .chain(groups.pseudo_states(node).map(|(_, _, state, _)| state))
+            .any(|state| {
+                self.state_custom_property_reads(node, state)
+                    .is_none_or(|reads| reads_any(&reads))
+            });
+        if states_read_any {
+            return true;
+        }
+        let declarations_read_any = match self.custom_declaration_custom_property_reads.get(&node) {
+            Some(reads) => reads.as_ref().is_none_or(|reads| reads_any(reads)),
+            None => self.node_declares_custom_properties(node),
+        };
+        declarations_read_any
+            || self
+                .animation_effect_descriptions
+                .keyframes_read_any_of_custom_properties(node, names)
     }
 
     /// Whether the node's winner inventory is complete once custom properties are set aside: the
@@ -1072,6 +1218,9 @@ impl RetainedState {
         target: computed::ComputedStyleTarget,
     ) -> Option<crate::css::cascaded_properties::FfiStyleQueryInputs> {
         let node = target.node();
+        let tree_counting = self
+            .element_sibling_position(node)
+            .map(|(count, index)| (u64::from(count), u64::from(index)));
         let parent_record = || {
             if target.pseudo_kind() == u8::MAX {
                 self.computed_group_sets
@@ -1093,12 +1242,14 @@ impl RetainedState {
             );
             return Some(crate::css::cascaded_properties::FfiStyleQueryInputs {
                 length,
+                tree_counting,
                 color_scheme: values.inherited_ui().color_scheme,
                 current_color: values.inherited_text().color,
             });
         }
         Some(crate::css::cascaded_properties::FfiStyleQueryInputs {
             length: *self.document_media.length()?,
+            tree_counting,
             color_scheme: self.document_style_computation_inputs.preferred_color_scheme,
             // Opaque black, the initial color.
             current_color: 0xff00_0000,
@@ -1133,6 +1284,23 @@ impl RetainedState {
             })
     }
 
+    pub(super) fn declares_custom_property_registered_with_syntax(
+        &self,
+        node: StyleNodeID,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> bool {
+        let registry = inputs.custom_property_registry();
+        registry.has_registrations()
+            && self
+                .cascaded_custom_declarations_of(node, None)
+                .is_some_and(|cascaded| {
+                    cascaded.iter().any(|(declared, _)| {
+                        self.declared_custom_property_name(declared.name)
+                            .is_some_and(|name| registry.name_has_syntax(&name.text))
+                    })
+                })
+    }
+
     /// What a registered custom property computes against in a record's element: the record's
     /// lengths, and the color scheme its table settled. `None` for a record without a font.
     pub(super) fn record_registered_value_context(
@@ -1141,7 +1309,7 @@ impl RetainedState {
     ) -> Option<RegisteredValueContext> {
         let view = self.computed_group_sets.style_record_view(record.raw())?;
         let length = self.record_length_resolution_context(&view)?;
-        let table = unsafe { view.longhand_table.as_ref() }?;
+        let table = view.longhand_table?;
         Some(RegisteredValueContext {
             length,
             color_scheme: u8::try_from(table.effective_color_scheme())
@@ -1205,23 +1373,19 @@ impl RetainedState {
     /// resolve against: the functions its tree scope's calls reach, each with the blocks of
     /// declarations whose `@media` conditions hold for the transaction and whose container
     /// conditions hold for the node. `None` when the engine cannot decide a container condition.
-    pub(super) fn prepare_custom_functions(
+    pub(super) fn prepare_custom_functions<'a>(
         &self,
+        snapshot: &'a DocumentFunctionSnapshot,
         node: StyleNodeID,
         pseudo: Option<u8>,
-    ) -> Option<PreparedCustomFunctions> {
-        let (caller_scope, visible) = self.document_functions.scope_functions(self.tree.tree_scope(node));
+    ) -> Option<PreparedCustomFunctions<'a>> {
+        let (caller_scope, visible) = snapshot.scope_functions(self.tree.tree_scope(node));
         let visible_definitions = visible.map_or(&[][..], |visible| visible.definitions.as_slice());
         let mut container_effects: Option<super::container_queries::ContainerVerdict> = None;
         let mut reads_attributes = false;
-        let mut declarations = Vec::with_capacity(visible_definitions.len());
-        for (function, _, selected_inputs) in visible_definitions {
-            reads_attributes |= function
-                .signature
-                .parameters
-                .iter()
-                .filter_map(|parameter| parameter.default_value.as_deref())
-                .any(value_reads_attributes);
+        let mut definitions = Vec::with_capacity(visible_definitions.len());
+        for (function, scope, selected_inputs) in visible_definitions {
+            reads_attributes |= function.parameter_defaults_read_attributes;
             let mut selected = Vec::new();
             for input in selected_inputs.iter().map(|&index| &function.inputs[index]) {
                 if !input.containers.is_empty() {
@@ -1232,58 +1396,70 @@ impl RetainedState {
                         continue;
                     }
                 }
-                for descriptor in &input.declarations.descriptors {
-                    reads_attributes |= value_reads_attributes(&descriptor.value);
-                    let name = descriptor.name.units();
-                    selected.push(FfiSubstitutionFunctionDeclaration {
-                        name: FfiUtf16View {
-                            ascii: std::ptr::null(),
-                            utf16: name.as_ptr(),
-                            length: name.len(),
-                        },
-                        data: Arc::as_ptr(&descriptor.value).cast(),
-                    });
-                }
+                reads_attributes |= input.reads_attributes;
+                selected.extend(&input.declarations);
             }
-            declarations.push(selected);
+            definitions.push(PreparedCustomFunction {
+                identity: function.identity,
+                scope_identity: *scope,
+                signature: &function.signature,
+                parameter_defaults: &function.parameter_defaults,
+                declarations: selected,
+            });
         }
-        let definitions = visible_definitions
-            .iter()
-            .zip(&declarations)
-            .map(
-                |((function, scope, _), declarations)| FfiSubstitutionFunctionDefinition {
-                    identity: function.identity,
-                    scope_identity: *scope,
-                    signature: Arc::as_ptr(&function.signature).cast(),
-                    declarations: declarations.as_ptr(),
-                    declaration_count: declarations.len(),
-                },
-            )
-            .collect();
         Some(PreparedCustomFunctions {
-            _declarations: declarations,
-            definitions,
-            visibilities: visible.map_or_else(Vec::new, |visible| visible.visibilities.clone()),
-            caller_scope,
+            registry: CustomFunctionRegistry {
+                definitions,
+                visible: visible.map_or(&[][..], |visible| visible.visibilities.as_slice()),
+                caller_scope_identity: caller_scope,
+            },
             reads_attributes,
             container_effects,
         })
     }
 
-    /// Take in the custom functions the host lent with a transaction's inputs, and what a call
-    /// from each scope reaches under the document's media, which the inputs moved first.
-    ///
-    /// # Safety
-    /// As for `DocumentFunctionSnapshot::take_in`.
-    pub(super) unsafe fn take_in_document_functions(&mut self, inputs: &mut bridge::FfiDocumentStyleComputationInputs) {
-        unsafe { self.document_functions.take_in(inputs, &self.document_media) };
+    fn cascaded_custom_property_reads(
+        &mut self,
+        cascaded: &[(CustomDeclaration, RetainedStyleValueData)],
+    ) -> Option<CustomPropertyNames> {
+        let mut declarations = Vec::with_capacity(cascaded.len());
+        for (declared, value) in cascaded {
+            if !matches!(declared.operator, CascadeOperator::Declared | CascadeOperator::Initial) {
+                return None;
+            }
+            let name = Arc::clone(&self.declared_custom_property_name(declared.name)?.text);
+            declarations.push((declared.operator, value, name));
+        }
+        // OPTIMIZATION: Elements alike in their rules cascade the same declarations, which read the same names.
+        let hash = intern_table::content_hash(
+            declarations
+                .iter()
+                .map(|(operator, value, name)| (*operator, value.pointer(), Arc::as_ptr(name).cast::<u16>()))
+                .collect::<SmallVec<[_; 16]>>(),
+        );
+        if let Some(memoized) = self.custom_property_reads_by_declarations.get(hash, &declarations) {
+            return memoized;
+        }
+        let mut names = Vec::new();
+        let mut reads_are_listed = true;
+        for (_, value, name) in &declarations {
+            if !append_custom_property_reads(value.data(), &mut names) {
+                reads_are_listed = false;
+                break;
+            }
+            // A declared name counts as a read. An environment leaves out a declared value equal to the
+            // one it inherits.
+            names.push(Arc::clone(name));
+        }
+        let reads = reads_are_listed.then(|| sorted_custom_property_names(names));
+        self.custom_property_reads_by_declarations
+            .remember(hash, &declarations, reads.clone());
+        reads
     }
 
     /// The name a cascaded custom declaration names, as its store entry keys it. A block's
     /// publication notes every custom property name it declares before the block is set, so a
-    /// live declaration's name is always known. A replay notes names without their fly strings,
-    /// and a name without one keys no store entry: `None` there, and the declaration declares
-    /// nothing.
+    /// live declaration's name is always known.
     fn declared_custom_property_name(&self, name: StyleAtomID) -> Option<&CustomPropertyName> {
         let noted = self.custom_property_environments.name(name);
         debug_assert!(
@@ -1297,13 +1473,13 @@ impl RetainedState {
     /// names an environment keeps its store alive, and C++ makes a store for every environment,
     /// so a parent's is always held. `None` if it is not anyway: an environment built over no
     /// store would drop every custom property the node inherits.
-    fn inherited_environment_store(&self, environment: u64) -> Option<*const c_void> {
+    fn inherited_environment_store(&self, environment: u64) -> Option<Option<Arc<CustomPropertyStore>>> {
         if environment == 0 {
-            return Some(std::ptr::null());
+            return Some(None);
         }
         let store = self.custom_property_environments.store(environment);
         debug_assert!(store.is_some(), "an inherited environment keeps its store");
-        store
+        store.cloned().map(Some)
     }
 
     /// The environment of a node the engine computes a record for: the one it inherits of its
@@ -1318,9 +1494,94 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
-        self.engine_custom_property_environment_of(node, None, parent_environment, inputs, registered, counters)
+        self.engine_custom_property_environment_of(node, None, parent_environment, inputs, registered)
+    }
+
+    /// `engine_custom_property_environment` for an element whose cascade declares no registered custom property: the
+    /// environment an element alike in its match answer, its tree and the environment it inherits resolved to.
+    pub(super) fn engine_custom_property_environment_by_answer(
+        &mut self,
+        node: StyleNodeID,
+        parent_environment: u64,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> Drive<u64> {
+        let key = self.environment_by_answer_key(node, parent_environment, inputs);
+        if let Some(key) = key
+            && let Some(memoized) = self.custom_property_environments_by_answer.get(&key).cloned()
+        {
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentAnswerHits);
+            match memoized.reads {
+                0 => self.custom_declaration_reads.remove(&node),
+                reads => self.custom_declaration_reads.insert(node, reads),
+            };
+            match memoized.custom_property_reads {
+                None => self.custom_declaration_custom_property_reads.remove(&node),
+                Some(reads) => self.custom_declaration_custom_property_reads.insert(node, reads),
+            };
+            return Ok(memoized.environment);
+        }
+        self.last_custom_property_environment_memoizable = false;
+        let environment = self.engine_custom_property_environment(node, parent_environment, inputs, None)?;
+        if let Some(key) = key
+            && self.last_custom_property_environment_memoizable
+        {
+            let memoized = EnvironmentByAnswer {
+                environment,
+                reads: self.custom_declaration_reads.get(&node).copied().unwrap_or(0),
+                custom_property_reads: self.custom_declaration_custom_property_reads.get(&node).cloned(),
+            };
+            self.custom_property_environments_by_answer.insert(key, memoized);
+        }
+        Ok(environment)
+    }
+
+    /// What decides an element's custom declarations, where its published match answer does: no batch of matches
+    /// stands in for the answer, the element's inline style declares no custom property, and no container condition
+    /// gates a rule of the answer declaring one.
+    fn environment_by_answer_key(
+        &self,
+        node: StyleNodeID,
+        parent_environment: u64,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> Option<EnvironmentByAnswerKey> {
+        if self.facts.element_custom_declarations_written(node).is_some() {
+            return None;
+        }
+        let gated = |rule: RuleID| {
+            self.program.rule_is_gated_by_container_query(rule) && !self.program.custom_declarations_of(rule).is_empty()
+        };
+        let answer_id = if let Some(matches) = self.batch_custom_property_matches.get(&node) {
+            if matches.iter().any(|entry| entry.pseudo.is_none() && gated(entry.rule)) {
+                return None;
+            }
+            *self.batch_custom_property_answers.get(&node)?
+        } else {
+            let (published, answer) = Self::published_answer_lookup(
+                &self.published_match_answers,
+                self.batch_matching_traversal.as_deref(),
+                node,
+            )?;
+            let matches = published.matches_for(answer)?;
+            if matches
+                .iter()
+                .any(|entry| entry.pseudo_element.is_none() && gated(entry.rule))
+            {
+                return None;
+            }
+            answer.cascade_input?
+        };
+        Some(EnvironmentByAnswerKey {
+            answer: answer_id,
+            tree_scope: self.tree.tree_scope(node),
+            parent_environment,
+            registration_generation: inputs.custom_property_registration_generation,
+        })
+    }
+
+    /// Forget the environments taken by match answer, whose identities may be handed out again.
+    pub(super) fn forget_custom_property_environments_by_answer(&mut self) {
+        self.custom_property_environments_by_answer.clear();
     }
 
     /// What `engine_custom_property_environment` says of the element, for one of its
@@ -1332,12 +1593,13 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
         if !self.any_custom_property_is_declared() {
             if pseudo.is_none() {
                 self.custom_declaration_reads.remove(&node);
+                self.custom_declaration_custom_property_reads.remove(&node);
             }
+            self.last_custom_property_environment_memoizable = true;
             return Ok(self.custom_property_environments.inheritable(parent_environment));
         }
         // A node the engine drives has the match answer its winners came from, and a published
@@ -1346,19 +1608,11 @@ impl RetainedState {
         let cascaded = self.cascaded_custom_declarations_of(node, pseudo);
         debug_assert!(cascaded.is_some(), "a driven node's custom declarations cascade");
         let Some(cascaded) = cascaded else {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return Err(Unanswered::Refused);
         };
         self.note_custom_declaration_reads(node, pseudo, &cascaded);
-        self.engine_custom_property_environment_over(
-            node,
-            pseudo,
-            cascaded,
-            parent_environment,
-            inputs,
-            registered,
-            counters,
-        )
+        self.engine_custom_property_environment_over(node, pseudo, cascaded, parent_environment, inputs, registered)
     }
 
     /// Note what the custom declarations cascaded for an element or one of its pseudo-elements
@@ -1371,6 +1625,26 @@ impl RetainedState {
         pseudo: Option<u8>,
         cascaded: &[(CustomDeclaration, RetainedStyleValueData)],
     ) {
+        let custom_property_reads = (!cascaded.is_empty()).then(|| self.cascaded_custom_property_reads(cascaded));
+        match (custom_property_reads, pseudo) {
+            (None, None) => {
+                self.custom_declaration_custom_property_reads.remove(&node);
+            }
+            (None, Some(_)) => {}
+            (Some(reads), None) => {
+                self.custom_declaration_custom_property_reads.insert(node, reads);
+            }
+            (Some(reads), Some(_)) => {
+                let merged = match (self.custom_declaration_custom_property_reads.remove(&node), reads) {
+                    (None, reads) => reads,
+                    (Some(Some(existing)), Some(reads)) => Some(sorted_custom_property_names(
+                        existing.iter().chain(reads.iter()).cloned().collect(),
+                    )),
+                    (Some(_), _) => None,
+                };
+                self.custom_declaration_custom_property_reads.insert(node, merged);
+            }
+        }
         let reads = cascaded
             .iter()
             .fold(0, |reads, (_, value)| reads | substitution_reads(value.data()));
@@ -1389,10 +1663,6 @@ impl RetainedState {
     /// What `engine_custom_property_environment_of` says of custom declarations the caller
     /// cascaded for the node or one of its pseudo-elements; `attr()` among them reads the node's
     /// attributes.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the declarations resolve over independent inputs"
-    )]
     pub(super) fn engine_custom_property_environment_over(
         &mut self,
         node: StyleNodeID,
@@ -1401,10 +1671,10 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
         let inherited_environment = self.custom_property_environments.inheritable(parent_environment);
         if cascaded.is_empty() {
+            self.last_custom_property_environment_memoizable = true;
             return Ok(inherited_environment);
         }
         let registry_ref = inputs.custom_property_registry();
@@ -1427,8 +1697,8 @@ impl RetainedState {
         {
             // A container condition the engine cannot decide asks about an ancestor the host styles
             // in this update: the row waits for it.
-            let Some(mut functions) = self.prepare_custom_functions(node, pseudo) else {
-                counters.bump(Counter::EngineComputedRecordBailRecordParent);
+            let Some(mut functions) = self.prepare_custom_functions(&self.document_functions, node, pseudo) else {
+                self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                 return Err(Unanswered::AwaitsParent);
             };
             container_effects = functions.container_effects.take();
@@ -1446,6 +1716,7 @@ impl RetainedState {
         let reads_conditions =
             functions.is_some() || cascaded.iter().any(|(_, value)| value_reads_conditions(value.data()));
         let memoizes = !reads_attributes && !reads_conditions && registered.is_none();
+        self.last_custom_property_environment_memoizable = memoizes;
         let key = Self::environment_inputs(
             parent_environment,
             inputs.custom_property_registration_generation,
@@ -1461,17 +1732,17 @@ impl RetainedState {
                 && identity & custom_property_environments::ENGINE_ENVIRONMENT_IDENTITY_BIT == 0
         });
         if memoizes && let Some(identity) = memoized.filter(|_| !keeps_cpp_environment) {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentMemoHits);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentMemoHits);
             return Ok(identity);
         }
         let (Some(parent_store), Some(inheritance_store)) = (
             self.inherited_environment_store(inherited_environment),
             self.inherited_environment_store(parent_environment),
         ) else {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return Err(Unanswered::Refused);
         };
-        let parent = unsafe { parent_store.cast::<CustomPropertyStore>().as_ref() };
+        let parent = parent_store.as_deref();
         let mut values = Vec::with_capacity(cascaded.len());
         for (declared, value) in &cascaded {
             let Some(name) = self.declared_custom_property_name(declared.name) else {
@@ -1502,11 +1773,10 @@ impl RetainedState {
         // The attributes an `attr()` among the declarations reads.
         let attributes =
             reads_attributes.then(|| SubstitutionAttributes::of(&self.facts, node, self.html_element_namespace));
-        // SAFETY: The parent store is live for as long as a record names its environment, and the
-        // values are the program's interned values, live for the call.
-        let cascaded_store = unsafe { CustomPropertyStore::cascaded_child(parent_store, values) };
-        let mut random_function_index = 0_usize;
-        let mut parse_context = registry_ref.parse_context(&mut random_function_index);
+        // SAFETY: The values are the program's interned values, live for the call.
+        let cascaded_store = unsafe { CustomPropertyStore::cascaded_child(parent_store.clone(), values) };
+        let random_function_index = crate::css::parser::value_parser::RandomFunctionIndex::default();
+        let mut parse_context = registry_ref.parse_context(&random_function_index);
         parse_context.in_quirks_mode = inputs.in_quirks_mode;
         let media_environment = self.document_media.environment();
         let style_query = reads_conditions
@@ -1515,11 +1785,11 @@ impl RetainedState {
         // The custom properties a `style()` query reads are the element's style query references,
         // which the host records with its record.
         let mut style_query_references = None;
-        let resolution_context = engine_resolution_context(
+        let mut resolution_context = engine_resolution_context(
             &parse_context,
-            cascaded_store,
-            inheritance_store,
-            std::ptr::from_ref(registry_ref).cast(),
+            Some(&cascaded_store),
+            inheritance_store.as_deref(),
+            registry_ref,
             attributes.as_ref(),
             &media_environment,
             style_query.as_ref(),
@@ -1539,44 +1809,33 @@ impl RetainedState {
             .then(|| self.sibling_position(node))
             .flatten()
             .map(|position| (u64::from(position.count), u64::from(position.index)));
-        let mut random_base_values = (node, &mut self.random_base_values);
+        let random_base_values = std::cell::RefCell::new(&mut self.random_base_values);
+        let draw_random_base_value = |name: &[u16], element_shared: bool| {
+            random_base_values.borrow_mut().ensure(Some(node), name, element_shared)
+        };
         let finalization = CustomPropertyFinalization {
             length: length.as_ref(),
             tree_counting,
             random_base_values: &[],
             color_scheme: registered.as_ref().map_or(0, |registered| registered.color_scheme),
-            draw_random_base_value: Some((
-                draw_engine_random_base_value,
-                std::ptr::from_mut(&mut random_base_values).cast(),
-            )),
+            draw_random_base_value: Some(&draw_random_base_value),
         };
-        let drive = FfiCustomPropertyDriveInput {
-            store: cascaded_store,
-            resolved_parent_store: parent_store,
-            reuse_resolved_parent_if_empty: !parent_store.is_null(),
-            resolution_context: &raw const resolution_context,
-            finalization_length_resolution_context: std::ptr::null(),
-            finalization_environment: std::ptr::null(),
-            finalization_color_scheme: 0,
-            draw_random_base_value: None,
-            random_base_context: std::ptr::null_mut(),
-        };
-        // SAFETY: Every pointer the drive reads is live for the call.
-        let (resolved, reads) = unsafe { resolve_declared_custom_properties(&drive, finalization) };
-        // The resolved values live in the store; the listing transfers references of its own.
-        let properties = match resolved.count {
-            0 => &[],
-            count => unsafe { std::slice::from_raw_parts(resolved.properties, count) },
-        };
-        for property in properties {
-            unsafe { release_style_value(property.data.cast()) };
-        }
-        unsafe { destroy_resolved_custom_properties(resolved.storage, resolved.count) };
-        unsafe { Arc::decrement_strong_count(cascaded_store.cast::<CustomPropertyStore>()) };
-        counters.bump(Counter::EngineCustomPropertyEnvironmentsResolved);
-        // What the registered values read beyond the element's fonts reaches the element's
-        // records as what they read themselves does: a sibling change, a container's size.
-        if reads.sibling_position {
+        let (rust_store, reads) = resolve_declared_custom_properties(
+            &cascaded_store,
+            parent_store.as_ref(),
+            parent_store.is_some(),
+            &mut resolution_context,
+            finalization,
+        );
+        drop(cascaded_store);
+        self.counters.bump(Counter::EngineCustomPropertyEnvironmentsResolved);
+        // What the registered values and style queries read beyond the element's fonts reaches
+        // the element's records as what they read themselves does: a sibling change, a container's size.
+        if reads.sibling_position
+            || style_query_references
+                .as_ref()
+                .is_some_and(|dependencies| dependencies.sibling_position)
+        {
             *self.custom_declaration_reads.entry(node).or_default() |=
                 bridge::FfiNodeRecordReads::SiblingPosition as u8;
         }
@@ -1601,16 +1860,21 @@ impl RetainedState {
                 },
             );
         }
-        let identity = if resolved.rust_store.is_null() {
-            inherited_environment
-        } else {
-            unsafe {
-                self.custom_property_environments.adopt_engine_environment(
-                    resolved.rust_store,
-                    inherited_environment,
-                    parent_store,
-                    registry_ref,
-                )
+        let identity = match rust_store {
+            None => inherited_environment,
+            Some(rust_store) => {
+                if let Some(previous) =
+                    self.environment_resolving_to_the_same_values(node, pseudo, &rust_store, registry_ref)
+                {
+                    previous
+                } else {
+                    self.custom_property_environments.adopt_engine_environment(
+                        rust_store,
+                        inherited_environment,
+                        parent_store.as_deref(),
+                        registry_ref,
+                    )
+                }
             }
         };
         // A viewport change reaches the records under the environment. One the element shares with
@@ -1624,6 +1888,32 @@ impl RetainedState {
                 .remember(key, identity, written_values);
         }
         Ok(identity)
+    }
+
+    /// The environment the element's declarations resolved to last, beneath any animation overlay, where they resolve to
+    /// its values again in `resolved`: an environment resolved anew, as one holding a registered value is, would move
+    /// what the element's descendants inherit without moving any value they see. What an environment hands down was
+    /// decided under the registrations it was resolved under, so only one handing down every value, then and now, is
+    /// kept.
+    fn environment_resolving_to_the_same_values(
+        &self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        resolved: &CustomPropertyStore,
+        registry: &crate::css::custom_properties::CustomPropertyRegistry,
+    ) -> Option<u64> {
+        if pseudo.is_some() {
+            return None;
+        }
+        let held = self.element_custom_property_data.get(&node)?;
+        let previous = held.sampled_over.unwrap_or(held.identity);
+        if previous & custom_property_environments::ENGINE_ENVIRONMENT_IDENTITY_BIT == 0
+            || self.custom_property_environments.inheritable(previous) != previous
+        {
+            return None;
+        }
+        let previous_store = self.custom_property_environments.store(previous)?;
+        (resolved.hands_down_every_value(registry) && resolved.holds_same_values_as(previous_store)).then_some(previous)
     }
 
     /// What a node's records read beyond their cascade, as `FfiNodeRecordReads` bits, for the row
@@ -1663,6 +1953,172 @@ impl RetainedState {
         reads
     }
 
+    /// What the custom properties an element declares resolve to once its animations sampled
+    /// `animated` into its custom properties. An animated value wins the cascade over a declared
+    /// one, so a declaration reading an animated name, or reading a declaration that does, resolves
+    /// against the animated values. Answers each such declaration whose value moved from the one
+    /// it holds in `base`, the element's environment beneath its animations. `inheritance` is the
+    /// environment the element inherits, and `finalization` computes registered values against the
+    /// element's lengths.
+    pub(crate) fn resolve_custom_properties_reading_animated_values(
+        &mut self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        base: *const c_void,
+        inheritance: *const c_void,
+        animated: &[(
+            crate::css::retained_fly_string::RetainedUtf16FlyString,
+            RetainedStyleValueData,
+        )],
+        finalization: CustomPropertyFinalization<'_>,
+    ) -> Vec<(
+        crate::css::retained_fly_string::RetainedUtf16FlyString,
+        RetainedStyleValueData,
+    )> {
+        if animated.is_empty() || !self.any_custom_property_is_declared() {
+            return Vec::new();
+        }
+        let Some(cascaded) = self.cascaded_custom_declarations_of(node, pseudo) else {
+            return Vec::new();
+        };
+        let mut moved: HashSet<Arc<[u16]>> = animated
+            .iter()
+            .map(|(name, _)| Arc::from(name.to_utf16().as_ref()))
+            .collect();
+        let mut candidates: Vec<_> = cascaded
+            .iter()
+            .filter(|(declared, _)| declared.operator == CascadeOperator::Declared)
+            .filter_map(|(declared, value)| {
+                let name = self.declared_custom_property_name(declared.name)?;
+                Some((name, declared, value, named_custom_property_reads(value.data())))
+            })
+            .filter(|(name, _, _, _)| !moved.contains(&name.text))
+            .collect();
+        // What a declaration reads moves where any name it reads moved, and a read the scan
+        // cannot name may read any.
+        let mut readers = Vec::new();
+        loop {
+            let reads_moved = |reads: &Option<Vec<&[u16]>>| {
+                reads
+                    .as_ref()
+                    .is_none_or(|reads| reads.iter().any(|read| moved.contains(*read)))
+            };
+            let Some(index) = candidates.iter().position(|(_, _, _, reads)| reads_moved(reads)) else {
+                break;
+            };
+            let (name, declared, value, _) = candidates.swap_remove(index);
+            moved.insert(name.text.clone());
+            readers.push((name.clone(), declared, value));
+        }
+        if readers.is_empty() {
+            return Vec::new();
+        }
+
+        let functions = if readers
+            .iter()
+            .any(|(_, _, value)| value_calls_custom_functions(value.data()))
+        {
+            // A container condition the engine cannot decide leaves the declarations as they resolved.
+            let Some(functions) = self.prepare_custom_functions(&self.document_functions, node, pseudo) else {
+                return Vec::new();
+            };
+            Some(functions)
+        } else {
+            None
+        };
+        let reads_attributes = functions.as_ref().is_some_and(|functions| functions.reads_attributes)
+            || readers.iter().any(|(_, _, value)| value_reads_attributes(value.data()));
+        let attribute_element = self.substitution_attribute_element(node, pseudo);
+        let attributes = reads_attributes
+            .then(|| SubstitutionAttributes::of(&self.facts, attribute_element, self.html_element_namespace));
+        let reads_conditions =
+            functions.is_some() || readers.iter().any(|(_, _, value)| value_reads_conditions(value.data()));
+        let style_query = reads_conditions
+            .then(|| self.style_query_inputs(computed::ComputedStyleTarget::new(node, pseudo.unwrap_or(u8::MAX))))
+            .flatten();
+
+        // The readers resolve as declared, over the element's environment, beside the animated values.
+        let values = readers
+            .iter()
+            .map(|(name, declared, value)| {
+                (
+                    name.raw.raw(),
+                    name.text.clone(),
+                    declared.important,
+                    value.pointer().cast(),
+                )
+            })
+            .chain(animated.iter().map(|(name, value)| {
+                (
+                    name.raw(),
+                    Arc::from(name.to_utf16().as_ref()),
+                    false,
+                    value.pointer().cast(),
+                )
+            }))
+            .collect();
+        // SAFETY: The base store is live for the sample, and the values are live for the call.
+        let base = unsafe { super::environment_move::retained_store(base) };
+        // SAFETY: The values are live for the call.
+        let cascaded_store = unsafe { CustomPropertyStore::cascaded_child(base.clone(), values) };
+        let registry = self.document_style_computation_inputs.custom_property_registry();
+        let random_function_index = crate::css::parser::value_parser::RandomFunctionIndex::default();
+        let mut parse_context = registry.parse_context(&random_function_index);
+        parse_context.in_quirks_mode = self.document_style_computation_inputs.in_quirks_mode;
+        let media_environment = self.document_media.environment();
+        // The `style()` queries the declarations read were noted as they resolved beneath the animations.
+        let mut style_query_references = None;
+        // SAFETY: The store the element inherits from is live for the sample.
+        let inheritance_store = unsafe { inheritance.cast::<CustomPropertyStore>().as_ref() };
+        let mut resolution_context = engine_resolution_context(
+            &parse_context,
+            Some(&cascaded_store),
+            inheritance_store,
+            registry,
+            attributes.as_ref(),
+            &media_environment,
+            style_query.as_ref(),
+            Some(&mut style_query_references),
+            functions.as_ref(),
+        );
+        // A registered reader's random() takes the base value drawn for the element as its
+        // declarations resolved, not one the keyframes share.
+        let random_base_values = std::cell::RefCell::new(&mut self.random_base_values);
+        let draw_random_base_value = |name: &[u16], element_shared: bool| {
+            random_base_values.borrow_mut().ensure(Some(node), name, element_shared)
+        };
+        let finalization = CustomPropertyFinalization {
+            random_base_values: &[],
+            draw_random_base_value: Some(&draw_random_base_value),
+            ..finalization
+        };
+        let (resolved, _) = resolve_declared_custom_properties(
+            &cascaded_store,
+            base.as_ref(),
+            true,
+            &mut resolution_context,
+            finalization,
+        );
+        let Some(resolved) = resolved else {
+            return Vec::new();
+        };
+        readers
+            .iter()
+            .filter_map(|(name, _, _)| {
+                let name_raw = name.raw.raw();
+                if !resolved.declared_names.contains(&name_raw) {
+                    return None;
+                }
+                let value = resolved.own_values.get(&name_raw)?.value.clone();
+                // SAFETY: The name is live while the engine notes it.
+                Some((
+                    unsafe { crate::css::retained_fly_string::RetainedUtf16FlyString::from_borrowed_raw(name_raw) },
+                    value,
+                ))
+            })
+            .collect()
+    }
+
     /// What a keyframe's written value substitutes to on the element being sampled, against the
     /// custom-property store the element holds and the one it inherits from, which the host hands
     /// over: what the host's `resolve_unresolved_style_value` makes of it.
@@ -1685,7 +2141,7 @@ impl RetainedState {
     ) -> RetainedStyleValueData {
         let calls_functions = value_calls_custom_functions(written.data());
         let functions = calls_functions
-            .then(|| self.prepare_custom_functions(node, pseudo_kind))
+            .then(|| self.prepare_custom_functions(&self.document_functions, node, pseudo_kind))
             .flatten();
         let reads_attributes = value_reads_attributes(written.data())
             || functions.as_ref().is_some_and(|functions| functions.reads_attributes);
@@ -1707,6 +2163,13 @@ impl RetainedState {
             style_query: style_query.as_ref(),
             style_query_references: Some(style_query_references),
             functions: functions.as_ref(),
+        };
+        // SAFETY: The stores are null or live for the sample.
+        let (store, inheritance_store) = unsafe {
+            (
+                store.cast::<CustomPropertyStore>().as_ref(),
+                inheritance_store.cast::<CustomPropertyStore>().as_ref(),
+            )
         };
         substitute_against_stores(
             store,
@@ -1733,7 +2196,7 @@ impl RetainedState {
         inputs: &SubstitutionInputs<'_>,
         property: u16,
         written: RetainedStyleValueData,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Drive<RetainedStyleValueData> {
         let calls_functions = value_calls_custom_functions(written.data());
         let functions = inputs.functions.filter(|_| calls_functions);
@@ -1754,8 +2217,8 @@ impl RetainedState {
             return Ok(value);
         }
         let store_of = |identity| match identity {
-            0 => Some(std::ptr::null()),
-            identity => environments.store(identity),
+            0 => Some(None),
+            identity => environments.store(identity).map(|store| Some(&**store)),
         };
         let Some(store) = store_of(environment.own) else {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
@@ -1768,7 +2231,7 @@ impl RetainedState {
             };
             store
         } else {
-            std::ptr::null()
+            None
         };
         // The resolution reads the attributes and the custom functions only where the value does.
         let inputs = SubstitutionInputs {
@@ -1792,8 +2255,8 @@ impl RetainedState {
 /// source no grammar accepts, is the guaranteed-invalid value: the declaration is invalid at
 /// computed-value time.
 fn substitute_against_stores(
-    store: *const c_void,
-    inheritance_store: *const c_void,
+    store: Option<&CustomPropertyStore>,
+    inheritance_store: Option<&CustomPropertyStore>,
     inputs: &SubstitutionInputs<'_>,
     property: u16,
     root_custom_property_name: &[u16],
@@ -1802,76 +2265,39 @@ fn substitute_against_stores(
     let attributes = inputs.attributes;
     let functions = inputs.functions;
     let registry_ref = inputs.document.custom_property_registry();
-    let mut random_function_index = 0_usize;
-    let mut parse_context = registry_ref.parse_context(&mut random_function_index);
+    let random_function_index = crate::css::parser::value_parser::RandomFunctionIndex::default();
+    let mut parse_context = registry_ref.parse_context(&random_function_index);
     parse_context.in_quirks_mode = inputs.document.in_quirks_mode;
     let media_environment = inputs.media.environment();
-    let substitution_attributes = attributes.map_or(&[][..], |attributes| attributes.attributes.as_slice());
-    let resolution_environment = unsafe {
-        prepare_var_resolution_environment(
-            substitution_attributes.as_ptr(),
-            substitution_attributes.len(),
-            functions.map_or(std::ptr::null(), |functions| functions.definitions.as_ptr()),
-            functions.map_or(0, |functions| functions.definitions.len()),
-            functions.map_or(0, |functions| functions.caller_scope),
-            functions.map_or(std::ptr::null(), |functions| functions.visibilities.as_ptr()),
-            functions.map_or(0, |functions| functions.visibilities.len()),
-        )
-    };
+    let mut resolution_environment = prepare_var_resolution_environment(
+        attributes.map_or(&[][..], |attributes| attributes.attributes.as_slice()),
+        functions.map_or(&EMPTY_CUSTOM_FUNCTIONS, |functions| &functions.registry),
+    );
     let mut style_query_references = inputs.style_query_references.map(std::cell::RefCell::borrow_mut);
-    // A function definition whose declarations do not tokenize resolves nothing.
-    let resolution = match resolution_environment {
-        // SAFETY: The store is live while a record names its environment, and the written
-        // value is retained by the declaration that carries it.
-        Some(mut resolution_environment) => unsafe {
-            crate::css::custom_properties::resolve_vars(
-                store,
-                inheritance_store,
-                std::ptr::from_ref(registry_ref).cast(),
-                Some(&parse_context),
-                Some(&media_environment),
-                None,
-                property,
-                FfiUtf16View {
-                    ascii: std::ptr::null(),
-                    utf16: root_custom_property_name.as_ptr(),
-                    length: root_custom_property_name.len(),
-                },
-                written.pointer().cast(),
-                &mut resolution_environment,
-                attributes.is_some_and(|attributes| attributes.names_are_ascii_case_insensitive),
-                std::ptr::null_mut(),
-                inputs.style_query,
-                None,
-                style_query_references.as_deref_mut(),
-                None,
-            )
-        },
-        None => NativeVarResolution::NotHandled,
+    let resolution_inputs = VarResolutionInputs {
+        store,
+        inheritance_store,
+        registry: Some(registry_ref),
+        parse_context: Some(&parse_context),
+        media_environment: Some(&media_environment),
+        attribute_names_are_ascii_case_insensitive: attributes
+            .is_some_and(|attributes| attributes.names_are_ascii_case_insensitive),
+        style_query_inputs: inputs.style_query,
     };
-    // The substituted source parses as the C++ cascade parses it: without callbacks first,
-    // then with the parse context's.
+    let resolution = crate::css::custom_properties::resolve_vars(
+        &resolution_inputs,
+        property,
+        root_custom_property_name,
+        written.data(),
+        &mut resolution_environment,
+        style_query_references.as_deref_mut(),
+    );
     let invalid = || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid);
     match resolution {
         NativeVarResolution::Resolved {
             source,
             contains_attr_tainted_values,
-        } => {
-            let CallbackFreeParseOutcome { outcome, source } =
-                parse_substituted_without_callbacks(&parse_context, property, source, contains_attr_tainted_values);
-            let outcome = match outcome {
-                ParseOutcome::NotHandled => {
-                    parse_substituted_source(&parse_context, property, &source, contains_attr_tainted_values)
-                }
-                outcome => outcome,
-            };
-            match outcome {
-                ParseOutcome::Parsed(value) => unsafe {
-                    RetainedStyleValueData::from_retained_pointer(std::sync::Arc::into_raw(value))
-                },
-                ParseOutcome::Invalid | ParseOutcome::NotHandled => invalid(),
-            }
-        }
+        } => parse_substituted_value(&parse_context, property, &source, contains_attr_tainted_values),
         NativeVarResolution::Invalid | NativeVarResolution::NotHandled => invalid(),
     }
 }
@@ -1885,27 +2311,40 @@ mod tests {
         let functions: Vec<_> = crate::css::rule::compile_functions_for_testing(
             "@function --outer() { result: --inner(); }
             @function --inner() { result: 2px; }
-            @function --local() { result: 1px; }",
+            @function --local() { result: 1px; }
+            @function --local() { result: 3px; }
+            @function --inner() { result: 4px; }",
         )
         .into_iter()
         .map(Arc::new)
         .collect();
-        let [outer, inner, local] = [&functions[0], &functions[1], &functions[2]];
-        // The document's scope (1) sees --local and --outer, which a shadow tree's scope (2)
-        // defines; the shadow tree's sees --outer and --inner.
-        let entry = |function: &Arc<CompiledFunction>, caller_scope, definition_scope, tree_scope| {
+        let [outer, inner, user_agent_local, local, shadow_inner] = [
+            &functions[0],
+            &functions[1],
+            &functions[2],
+            &functions[3],
+            &functions[4],
+        ];
+        // The document's scope (1) defines --outer, --inner and --local, whose author rule wins
+        // over the user agent's in a later layer. A shadow tree's scope (2) defines another --inner,
+        // and a scope below it (3) defines nothing.
+        let entry = |function: Option<&Arc<CompiledFunction>>, scope, parent_scope, tree_scope, layer, origin| {
             bridge::FfiCustomFunctionEntry {
-                function: Arc::as_ptr(function).cast(),
-                caller_scope,
-                definition_scope,
+                function: function.map_or(std::ptr::null(), |function| Arc::as_ptr(function).cast()),
+                scope,
+                parent_scope,
                 tree_scope,
+                layer,
+                origin,
             }
         };
         let entries = [
-            entry(outer, 1, 2, 0),
-            entry(local, 1, 1, 0),
-            entry(outer, 2, 2, 5),
-            entry(inner, 2, 2, 5),
+            entry(Some(outer), 1, 0, 0, 0, 2),
+            entry(Some(inner), 1, 0, 0, 0, 2),
+            entry(Some(local), 1, 0, 0, 0, 2),
+            entry(Some(user_agent_local), 1, 0, 0, 7, 0),
+            entry(Some(shadow_inner), 2, 1, 5, 0, 2),
+            entry(None, 3, 2, 9, 0, 0),
         ];
         let mut inputs = bridge::FfiDocumentStyleComputationInputs {
             custom_functions: bridge::FfiHostHandle::from_pointer(entries.as_ptr().cast()),
@@ -1913,39 +2352,38 @@ mod tests {
             ..Default::default()
         };
         let mut snapshot = DocumentFunctionSnapshot::default();
-        unsafe { snapshot.take_in(&mut inputs, &DocumentMediaSnapshot::default()) };
+        unsafe { snapshot.take_in(&mut inputs, &DocumentMediaSnapshot::default(), |_, layer| layer.0) };
         assert_eq!(inputs, bridge::FfiDocumentStyleComputationInputs::default());
-        let reached = |visible: &VisibleFunctions<'_>| {
-            visible
+        let reached = |tree_scope| {
+            snapshot
+                .visible_from(TreeScopeID(tree_scope))
                 .definitions
                 .iter()
                 .map(|(function, scope)| (function.identity, *scope))
                 .collect::<Vec<_>>()
         };
 
-        // A call in the document reaches --inner through the body of --outer.
-        let document = snapshot.visible_from(TreeScopeID(0));
         assert_eq!(snapshot.scope_functions(TreeScopeID(0)).0, 1);
         assert_eq!(
-            reached(&document),
-            [(outer.identity, 2), (local.identity, 1), (inner.identity, 2)]
+            reached(0),
+            [(outer.identity, 1), (inner.identity, 1), (local.identity, 1)]
         );
-        assert_eq!(document.visibilities.len(), entries.len());
 
-        // A call in the shadow tree never reaches what only the document sees.
-        let shadow = snapshot.visible_from(TreeScopeID(5));
+        // A call in the shadow tree reaches its own --inner, and the document's through the body
+        // of --outer, as does one in the scope below it.
+        let below_shadow = [
+            (shadow_inner.identity, 2),
+            (outer.identity, 1),
+            (local.identity, 1),
+            (inner.identity, 1),
+        ];
         assert_eq!(snapshot.scope_functions(TreeScopeID(5)).0, 2);
-        assert_eq!(reached(&shadow), [(outer.identity, 2), (inner.identity, 2)]);
-        assert!(
-            shadow
-                .visibilities
-                .iter()
-                .all(|visibility| visibility.caller_scope_identity == 2)
-        );
+        assert_eq!(reached(5), below_shadow);
+        assert_eq!(snapshot.scope_functions(TreeScopeID(9)).0, 3);
+        assert_eq!(reached(9), below_shadow);
 
-        // A tree scope whose scope sees no definition reaches none.
-        let elsewhere = snapshot.visible_from(TreeScopeID(9));
-        assert_eq!(snapshot.scope_functions(TreeScopeID(9)).0, 0);
-        assert!(elsewhere.definitions.is_empty() && elsewhere.visibilities.is_empty());
+        // A tree scope with no scope reaches none.
+        assert_eq!(snapshot.scope_functions(TreeScopeID(11)).0, 0);
+        assert!(reached(11).is_empty());
     }
 }

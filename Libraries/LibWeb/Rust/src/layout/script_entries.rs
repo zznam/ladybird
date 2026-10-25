@@ -15,13 +15,12 @@ use super::used_values::FfiCssPixelSize;
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style::tree::StyleNodeID;
-use crate::layout::rendered_text::FfiRenderedTextView;
 use crate::layout::text_queries::FfiDomTextRange;
 use crate::painting::ffi::{
     FfiBoxModelMetrics, FfiCaretRectResult, FfiEmptyLineCaretRect, FfiOptionalCssPixelRect, FfiRectToViewportTransform,
 };
 use crate::painting::paint_read::{GeometryRead, PaintRead, PaintSource};
-use crate::render_state::{Answer, ArenaAnswer, ArenaQuery, DocumentHost, LentSlice, Query, ScriptForcedRead, ask};
+use crate::render_state::{DocumentHost, ScriptForcedRead};
 use std::ffi::c_void;
 
 /// Mints the forced read of a script call that reaches the host through one of this module's entries.
@@ -33,27 +32,23 @@ const SCRIPT_ENTRY: ScriptEntry = ScriptEntry { _private: () };
 
 /// Answers `read` from the rows of `host`'s document as of every write the host made, spending the script call's
 /// forced read. Every entry here is called with a live document host, on its document's thread.
-fn read_rows<R>(host: *mut DocumentHost, read: impl FnOnce(&PaintSource<'_>) -> R) -> R {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: The host is live.
-    unsafe { &*host }.read_rows(ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY), false, read)
+fn read_rows<R>(host: &DocumentHost, read: impl FnOnce(&PaintSource<'_>) -> R) -> R {
+    host.read_rows(ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY), false, read)
 }
 
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and
-/// `rect_to_viewport_transform` must satisfy `rect_to_viewport_transform_from_ffi`.
+/// The callback must be sound to call with `context`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_client_rects(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     layout_node: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
     context: *mut c_void,
     push_rect: unsafe extern "C" fn(*mut c_void, FfiCssPixelRect),
 ) {
     read_rows(host, |arena| {
-        let rect_to_viewport_transform =
-            unsafe { crate::painting::ffi::rect_to_viewport_transform_from_ffi(&rect_to_viewport_transform) };
+        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
         crate::painting::client_rects::for_each_client_rect(
             arena,
             layout_node,
@@ -66,38 +61,29 @@ pub unsafe extern "C" fn layout_script_client_rects(
     });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and
-/// `rect_to_viewport_transform` must satisfy `rect_to_viewport_transform_from_ffi`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_bounding_client_rect(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_bounding_client_rect(
+    host: &DocumentHost,
     layout_node: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform,
-) -> FfiCssPixelRect {
-    read_rows(host, |arena| {
-        let rect_to_viewport_transform =
-            unsafe { crate::painting::ffi::rect_to_viewport_transform_from_ffi(&rect_to_viewport_transform) };
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
+        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
         crate::painting::client_rects::bounding_client_rect(arena, layout_node, rect_to_viewport_transform.as_ref())
             .into()
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and
-/// `rect_to_viewport_transform` must satisfy `rect_to_viewport_transform_from_ffi`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_transform_subtree_is_clipped_outside(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_transform_subtree_is_clipped_outside(
+    host: &DocumentHost,
     target: NodeSlotId,
     root_bounds: FfiCssPixelRect,
-    rect_to_viewport_transform: FfiRectToViewportTransform,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
 ) -> bool {
     read_rows(host, |arena| {
-        let rect_to_viewport_transform =
-            unsafe { crate::painting::ffi::rect_to_viewport_transform_from_ffi(&rect_to_viewport_transform) };
+        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
         crate::painting::intersection_observer::transform_subtree_is_clipped_outside(
             arena,
             target,
@@ -109,25 +95,24 @@ pub unsafe extern "C" fn layout_script_transform_subtree_is_clipped_outside(
 
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and
-/// `rect_to_viewport_transform` must satisfy `rect_to_viewport_transform_from_ffi`.
+/// The callback must be sound to call with `context`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_intersection_observer_intersection_rect(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     target: NodeSlotId,
     target_rect: FfiCssPixelRect,
     intersection_root: NodeSlotId,
     root_bounds: FfiCssPixelRect,
-    rect_to_viewport_transform: FfiRectToViewportTransform,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
     context: *mut c_void,
     inflate_scroll_container_clip_rect_by_scroll_margin: unsafe extern "C" fn(
         *mut c_void,
         FfiCssPixelRect,
     ) -> FfiCssPixelRect,
-) -> FfiCssPixelRect {
-    read_rows(host, |arena| {
-        let rect_to_viewport_transform =
-            unsafe { crate::painting::ffi::rect_to_viewport_transform_from_ffi(&rect_to_viewport_transform) };
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
+        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
         crate::painting::intersection_observer::intersection_rect(
             arena,
             target,
@@ -141,15 +126,12 @@ pub unsafe extern "C" fn layout_script_intersection_observer_intersection_rect(
             },
         )
         .into()
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_can_compute_client_rects_without_visual_context_update(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_can_compute_client_rects_without_visual_context_update(
+    host: &DocumentHost,
     layout_node: NodeSlotId,
     viewport_scroll_offset_is_zero: bool,
 ) -> bool {
@@ -164,26 +146,23 @@ pub unsafe extern "C" fn layout_script_can_compute_client_rects_without_visual_c
 
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, used on the document
-/// thread, and
-/// `rect_to_viewport_transform` must satisfy `rect_to_viewport_transform_from_ffi`.
+/// The callback must be sound to call with `context`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_text_range_rects(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     primary: NodeSlotId,
     selection_state: u8,
     range_start_offset: usize,
     range_end_offset: usize,
     filter_dom_start: usize,
     filter_dom_end: usize,
-    rect_to_viewport_transform: FfiRectToViewportTransform,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
     context: *mut c_void,
     push_rect: unsafe extern "C" fn(*mut c_void, FfiCssPixelRect),
 ) {
     read_rows(host, |arena| {
         let paintable_rows = arena;
-        let rect_to_viewport_transform =
-            unsafe { crate::painting::ffi::rect_to_viewport_transform_from_ffi(&rect_to_viewport_transform) };
+        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
 
         let fragments = arena.text_fragments(primary);
         let node_slots = fragments.as_slice();
@@ -220,17 +199,14 @@ pub unsafe extern "C" fn layout_script_text_range_rects(
     });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, used on the document
-/// thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_text_caret_rect_in_dom_range(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_text_caret_rect_in_dom_range(
+    host: &DocumentHost,
     primary: NodeSlotId,
     offset: usize,
-) -> FfiOptionalCssPixelRect {
-    read_rows(host, |arena| {
+    out: &mut FfiOptionalCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         let fragments = arena.text_fragments(primary);
         let node_slots = fragments.as_slice();
@@ -244,20 +220,17 @@ pub unsafe extern "C" fn layout_script_text_caret_rect_in_dom_range(
                 rect: FfiCssPixelRect::default(),
             },
         }
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, used on the document
-/// thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_text_caret_rect_for_position(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_text_caret_rect_for_position(
+    host: &DocumentHost,
     primary: NodeSlotId,
     offset: usize,
     affinity_is_downstream: bool,
-) -> FfiCaretRectResult {
+    out: &mut FfiCaretRectResult,
+) {
     let mut result = FfiCaretRectResult {
         found: false,
         rect: FfiCssPixelRect::default(),
@@ -265,7 +238,7 @@ pub unsafe extern "C" fn layout_script_text_caret_rect_for_position(
         owner_paintable: NodeSlotId::INVALID,
         nearest_self_painting_inline: NodeSlotId::INVALID,
     };
-    read_rows(host, |arena| {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         let fragments = arena.text_fragments(primary);
         let node_slots = fragments.as_slice();
@@ -282,19 +255,16 @@ pub unsafe extern "C" fn layout_script_text_caret_rect_for_position(
             crate::painting::fragment_ownership::nearest_self_painting_inline_box(paintable_rows, answer.node)
                 .unwrap_or(NodeSlotId::INVALID);
         result
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, used on the document
-/// thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_atomic_inline_caret_rect_for_position(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_atomic_inline_caret_rect_for_position(
+    host: &DocumentHost,
     primary: NodeSlotId,
     after: bool,
-) -> FfiCaretRectResult {
+    out: &mut FfiCaretRectResult,
+) {
     let mut result = FfiCaretRectResult {
         found: false,
         rect: FfiCssPixelRect::default(),
@@ -302,7 +272,7 @@ pub unsafe extern "C" fn layout_script_atomic_inline_caret_rect_for_position(
         owner_paintable: NodeSlotId::INVALID,
         nearest_self_painting_inline: NodeSlotId::INVALID,
     };
-    read_rows(host, |arena| {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         let Some(answer) = crate::painting::caret::caret_rect_for_atomic_inline(paintable_rows, primary, after) else {
             return result;
@@ -315,162 +285,204 @@ pub unsafe extern "C" fn layout_script_atomic_inline_caret_rect_for_position(
             crate::painting::fragment_ownership::nearest_self_painting_inline_box(paintable_rows, answer.node)
                 .unwrap_or(NodeSlotId::INVALID);
         result
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, used on the document
-/// thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_empty_line_caret_rect(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_empty_line_caret_rect(
+    host: &DocumentHost,
     block: NodeSlotId,
     primary: NodeSlotId,
     offset: usize,
-) -> FfiEmptyLineCaretRect {
+    out: &mut FfiEmptyLineCaretRect,
+) {
     let mut result = FfiEmptyLineCaretRect {
         has_value: false,
         rect: FfiCssPixelRect::default(),
         style_source: NodeSlotId::INVALID,
     };
-    read_rows(host, |arena| {
-        let paintable_rows = arena;
-        if !paintable_rows.paintable_row_is_populated(block) {
-            return result;
-        }
+    *out = read_rows(host, |arena| {
         let fragments = arena.text_fragments(primary);
-        let node_slots = fragments.as_slice();
-        let side = arena.committed_side_data(block);
-        let Some(first_fragment) = side.fragments().first() else {
-            return result;
-        };
-        if !node_slots.contains(&first_fragment.layout_node) {
-            return result;
-        }
-        for target in crate::painting::visual_lines::empty_line_caret_targets(paintable_rows, block) {
-            if target.offset == offset {
-                result.has_value = true;
-                result.rect = target.rect.into();
-                result.style_source = crate::painting::text_fragment::style_source(paintable_rows, first_fragment);
-                break;
-            }
+        if let Some(caret) =
+            crate::painting::caret::caret_rect_on_empty_line(arena, block, fragments.as_slice(), offset)
+        {
+            result.has_value = true;
+            result.rect = caret.rect.into();
+            result.style_source = caret.style_source;
         }
         result
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_absolute_rect(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_absolute_rect(
+    host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelRect {
-    read_rows(host, |arena| {
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
         crate::painting::paintable_geometry::absolute_rect_or_default(arena, slot).into()
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_absolute_padding_box_rect(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_absolute_padding_box_rect(
+    host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelRect {
-    read_rows(host, |arena| {
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_padding_box_rect(paintable_rows, slot).into()
-    })
+        crate::painting::paintable_geometry::first_fragment_padding_box_rect(paintable_rows, slot).into()
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_absolute_border_box_rect(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_absolute_border_box_rect(
+    host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelRect {
-    read_rows(host, |arena| {
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_border_box_rect(paintable_rows, slot).into()
+        crate::painting::paintable_geometry::first_fragment_border_box_rect(paintable_rows, slot).into()
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_border_box_rect_of_fragments(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return FfiCssPixelRect::default();
+        }
+        crate::painting::paintable_geometry::absolute_border_box_rect(arena, slot).into()
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_box_fragment_count(host: &DocumentHost, slot: NodeSlotId) -> usize {
+    read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return 0;
+        }
+        crate::painting::paintable_geometry::fragment_count(arena, slot)
     })
 }
 
-/// # Safety
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_box_model(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_unbroken_border_box_size(
+    host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiBoxModelMetrics {
-    read_rows(host, |arena| {
+    out: &mut FfiCssPixelSize,
+) {
+    *out = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return FfiCssPixelSize::default();
+        }
+        crate::painting::paintable_geometry::unbroken_border_box_size(arena, slot)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_empty_line_ended_by_forced_break_position(
+    host: &DocumentHost,
+    block: NodeSlotId,
+    forced_break: NodeSlotId,
+    out: &mut super::used_values::FfiCssPixelPoint,
+) -> bool {
+    let position = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(block) {
+            return None;
+        }
+        let side = arena.committed_side_data(block);
+        let line = side
+            .lines()
+            .iter()
+            .find(|line| line.forced_break_node == forced_break && line.fragment_count == 0)?;
+        let root_position =
+            crate::painting::paintable_geometry::LineRootPositions::new(arena, block).of_fragment(line.box_fragment);
+        Some(CssPixelRect::from(line.rect).translated_by(root_position).location())
+    });
+    let Some(position) = position else {
+        return false;
+    };
+    *out = position.into();
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_box_model(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    out: &mut FfiBoxModelMetrics,
+) {
+    *out = read_rows(host, |arena| {
         if !arena.paintable_row_is_populated(slot) {
             return FfiBoxModelMetrics::default();
         }
+        let (margin, padding, border) = crate::painting::paintable_geometry::unbroken_box_model(arena, slot);
         FfiBoxModelMetrics {
-            margin: crate::painting::paintable_geometry::committed_margin(arena, slot),
-            padding: crate::painting::paintable_geometry::committed_padding(arena, slot),
-            border: crate::painting::paintable_geometry::committed_border(arena, slot),
+            margin,
+            padding,
+            border,
             inset: crate::painting::paintable_geometry::committed_inset(arena, slot),
         }
-    })
+    });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_paintable_content_size(
-    host: *mut DocumentHost,
+pub extern "C" fn layout_script_paintable_content_size(
+    host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelSize {
-    read_rows(host, |arena| {
+    out: &mut FfiCssPixelSize,
+) {
+    *out = read_rows(host, |arena| {
         let paintable_rows = arena;
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelSize::default();
         }
-        crate::painting::paintable_geometry::committed_content_size(paintable_rows, slot)
+        crate::painting::paintable_geometry::unbroken_content_size(paintable_rows, slot)
+    });
+}
+
+/// Answers `read` of the layout arena of `host`'s document, spending the script call's forced read.
+fn read_arena<R>(host: &DocumentHost, read: impl FnOnce(&mut crate::layout::LayoutNodeArena) -> R) -> R {
+    host.ask(ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY), |state| {
+        read(state.arena_mut())
     })
 }
 
-/// Asks the render state of `host`'s document the arena question `query`, spending the script call's forced read.
-fn ask_arena(host: *mut DocumentHost, query: ArenaQuery) -> ArenaAnswer {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Every entry here is called with a live document host, on its document's thread.
-    let host = unsafe { &*host };
-    let Answer::Arena(answer) = ask(
-        ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY),
-        host,
-        Query::Arena(query),
-    ) else {
-        unreachable!("an arena question is answered from the arena");
-    };
-    answer
+#[repr(C)]
+pub struct FfiRenderedTextView {
+    pub text: *const u16,
+    pub length_in_code_units: usize,
 }
 
-fn text_of(answer: ArenaAnswer) -> Vec<u16> {
-    let ArenaAnswer::Text(text) = answer else {
-        unreachable!("a text question is answered with text");
-    };
-    text
+#[repr(C)]
+pub struct FfiRenderedTextOffset {
+    pub dom_start_offset: usize,
+    pub dom_end_offset: usize,
 }
 
-/// The text the rows of the text node whose primary row is `primary` render, with whitespace collapsed where their
-/// style collapses it if `collapse_whitespace`, handed to `append`.
+#[repr(C)]
+pub struct FfiRenderedTextWithOffsetsView {
+    pub text: *const u16,
+    pub length_in_code_units: usize,
+    pub offset_mapping: *const FfiRenderedTextOffset,
+    pub offset_mapping_length: usize,
+}
+
+/// The text the rows of the text node whose primary row is `primary` render, handed to `append`.
 ///
 /// # Safety
 ///
@@ -478,19 +490,21 @@ fn text_of(answer: ArenaAnswer) -> Vec<u16> {
 /// styled parents, and `append` must copy the view synchronously.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_rendered_text(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     primary: NodeSlotId,
-    collapse_whitespace: bool,
     context: *mut c_void,
     append: unsafe extern "C" fn(*mut c_void, FfiRenderedTextView),
 ) {
-    let text = text_of(ask_arena(
-        host,
-        ArenaQuery::RenderedText {
-            primary,
-            collapse_whitespace,
-        },
-    ));
+    // The rows carry the text each text row renders, unless the row waits for its text to be rendered again, which only
+    // the render state does.
+    let from_rows = host.read_rows_with_rendered_text(
+        ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY),
+        |rows, awaiting_render| crate::layout::text_queries::rendered_text_of_rows(rows, awaiting_render, primary),
+    );
+    let text = match from_rows {
+        Some(text) => text,
+        None => read_arena(host, |arena| crate::layout::text_queries::rendered_text(arena, primary)),
+    };
     let view = FfiRenderedTextView {
         text: text.as_ptr(),
         length_in_code_units: text.len(),
@@ -499,26 +513,52 @@ pub unsafe extern "C" fn layout_script_rendered_text(
     unsafe { append(context, view) };
 }
 
-/// The text the pseudo-element of kind `generated_for` on the element `style_node` resolved its generated content to
-/// when its box was built, as a raw `AK::Utf16String` representation for which the caller takes one reference.
+/// The rendered text and its rendered-to-DOM UTF-16 offset mapping for a text row.
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread.
+/// `host` must be a live document host on its document's thread, `primary` must be a live text row, and `append` must
+/// copy both views synchronously.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_script_generated_content_accessible_text(
-    host: *mut DocumentHost,
+pub unsafe extern "C" fn layout_script_rendered_text_with_dom_offsets(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    context: *mut c_void,
+    append: unsafe extern "C" fn(*mut c_void, FfiRenderedTextWithOffsetsView),
+) {
+    let (text, offsets) = read_arena(host, |arena| {
+        crate::layout::text_queries::rendered_text_with_dom_offsets(arena, primary)
+    });
+    let offset_mapping: Vec<_> = offsets
+        .into_iter()
+        .map(|(dom_start_offset, dom_end_offset)| FfiRenderedTextOffset {
+            dom_start_offset,
+            dom_end_offset,
+        })
+        .collect();
+    let view = FfiRenderedTextWithOffsetsView {
+        text: text.as_ptr(),
+        length_in_code_units: text.len(),
+        offset_mapping: offset_mapping.as_ptr(),
+        offset_mapping_length: offset_mapping.len(),
+    };
+    // SAFETY: Both vectors outlive the call, which copies the views.
+    unsafe { append(context, view) };
+}
+
+/// The text the pseudo-element of kind `generated_for` on the element `style_node` resolved its generated content to
+/// when its box was built, as a raw `AK::Utf16String` representation for which the caller takes one reference.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_generated_content_accessible_text(
+    host: &DocumentHost,
     style_node: u32,
     generated_for: u8,
 ) -> usize {
     let text = match StyleNodeID::from_raw(style_node) {
-        Some(element) => text_of(ask_arena(
-            host,
-            ArenaQuery::GeneratedContentAccessibleText(crate::layout::counters::CounterOwner {
-                element,
-                generated_for,
-            }),
-        )),
+        Some(element) => read_arena(host, |arena| {
+            let owner = crate::layout::counters::CounterOwner { element, generated_for };
+            arena.generated_content().borrow().accessible_text(owner).to_vec()
+        }),
         None => Vec::new(),
     };
     ak::Utf16String::from_utf16(&text).into_raw()
@@ -533,7 +573,7 @@ pub unsafe extern "C" fn layout_script_generated_content_accessible_text(
 /// the callbacks may read the DOM but must not change it or the layout tree.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_find_matching_text(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     viewport: NodeSlotId,
     query: FfiUtf16View,
     case_sensitive: bool,
@@ -542,32 +582,75 @@ pub unsafe extern "C" fn layout_script_find_matching_text(
     append: unsafe extern "C" fn(*mut c_void, FfiDomTextRange),
 ) {
     // SAFETY: The host lends the query for this synchronous call.
-    let query = unsafe { query.to_utf16() }.expect("query carries no storage");
+    let query = query.to_utf16().expect("query carries no storage");
     if query.is_empty() {
         return;
     }
-    let ArenaAnswer::TextNodes(candidates) = ask_arena(host, ArenaQuery::SearchCandidates { viewport }) else {
-        unreachable!("search candidates are answered with text nodes");
-    };
+    let candidates = read_arena(host, |arena| {
+        crate::layout::text_queries::search_candidates(arena, viewport)
+    });
     let mut excluded: Vec<StyleNodeID> = candidates
         .into_iter()
         // SAFETY: The callback only reads whether the DOM text node is searchable.
         .filter(|text| !unsafe { is_searchable(context, text.raw()) })
         .collect();
     excluded.sort_unstable();
-    let ArenaAnswer::TextRanges(matches) = ask_arena(
-        host,
-        ArenaQuery::FindText {
-            viewport,
-            query: LentSlice::new(&query),
-            case_sensitive,
-            excluded: LentSlice::new(&excluded),
-        },
-    ) else {
-        unreachable!("a search is answered with text ranges");
-    };
+    let matches = read_arena(host, |arena| {
+        crate::layout::text_queries::find_matching_text(arena, viewport, &query, case_sensitive, &excluded)
+    });
     for range in matches {
         // SAFETY: The host resolves each identity's DOM node itself, synchronously.
         unsafe { append(context, range) };
     }
+}
+
+/// A min or max sizing property, whose anchor-size() functions the abspos engine resolves.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
+pub enum FfiAnchorSizedProperty {
+    MinWidth,
+    MinHeight,
+    MaxWidth,
+    MaxHeight,
+}
+
+/// Writes the size `property` of the absolutely positioned box `slot` resolved to in the committed layout to `out`,
+/// when its anchor-size() functions resolved against an anchor box.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_anchor_resolved_size(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    property: FfiAnchorSizedProperty,
+    out: &mut crate::css::css_pixels::CssPixels,
+) -> bool {
+    use super::style_values::ResolvedSizeOverride;
+    let resolved = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return None;
+        }
+        arena.with_committed_fragment_link(slot, |link| {
+            let link = link?;
+            let sizes = link.abspos_layout_inputs.as_ref()?.resolved_anchor_sizes;
+            // NB: The sizes lie in the frame the box was laid out in, whose axes a vertical writing mode transposes.
+            let (physical_width, physical_height) = if link.frame.is_transposed() {
+                ((sizes.min_height, sizes.max_height), (sizes.min_width, sizes.max_width))
+            } else {
+                ((sizes.min_width, sizes.max_width), (sizes.min_height, sizes.max_height))
+            };
+            match property {
+                FfiAnchorSizedProperty::MinWidth => physical_width.0,
+                FfiAnchorSizedProperty::MaxWidth => physical_width.1,
+                FfiAnchorSizedProperty::MinHeight => physical_height.0,
+                FfiAnchorSizedProperty::MaxHeight => physical_height.1,
+            }
+        })
+    });
+    // NB: A size resolved to a keyword holds an anchor function with neither an anchor box nor a fallback value, which
+    //     makes the declaration invalid at computed-value time however its other functions resolve.
+    let Some(ResolvedSizeOverride::Length(px)) = resolved else {
+        return false;
+    };
+    *out = px;
+    true
 }

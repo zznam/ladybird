@@ -8,10 +8,7 @@ use super::box_build::{
     AnchorScrollShiftResolver, BoxBuildEnvironment, PaintableVisualContextAssignment, build_box_visual_context_nodes,
 };
 use super::delta::VisualContextTreeDelta;
-use super::dirty::{
-    BoxDirtyBits, VisualContextBoxDirtyKind, VisualContextDirtySet, VisualContextGlobalRebuildReason,
-    VisualContextUpdateScope,
-};
+use super::dirty::{BoxDirtyBits, VisualContextBoxDirtyKind, VisualContextDirtySet, VisualContextUpdateScope};
 use super::reconcile::BoxNodeWriter;
 use super::refresh::compute_sticky_data;
 use super::scroll_state::ScrollState;
@@ -37,12 +34,11 @@ impl ChildCascade {
 pub(crate) struct IncrementalUpdateOutcome {
     pub delta: VisualContextTreeDelta,
     pub assignments: Vec<PaintableVisualContextAssignment>,
-    pub mask_node_owners_changed: bool,
 }
 
 pub(crate) enum IncrementalUpdateResult {
     Applied(Box<IncrementalUpdateOutcome>),
-    NeedsFullBuild(VisualContextGlobalRebuildReason),
+    NeedsFullBuild(VisualContextUpdateScope),
 }
 
 fn incremental_tree_requires_fresh_build(tree: &VisualContextTree, delta: &VisualContextTreeDelta) -> bool {
@@ -73,14 +69,15 @@ struct WorkPlan {
 fn expand_dirty_entries(
     layout_arena: &impl PaintableRowsRead,
     dirty: &VisualContextDirtySet,
-) -> Result<WorkPlan, VisualContextGlobalRebuildReason> {
+    offset_path_boxes: &HashSet<NodeSlotId>,
+) -> Result<WorkPlan, VisualContextUpdateScope> {
     let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::default();
     for (slot, bits) in &dirty.boxes {
         if !layout_arena.paintable_row_is_populated(*slot) {
             continue;
         }
         if box_is_inside_svg_resource_subtree(layout_arena, *slot) {
-            return Err(VisualContextGlobalRebuildReason::SvgResourceSubtreeChanged);
+            return Err(VisualContextUpdateScope::EveryBox);
         }
         let mut bits = *bits;
         if layout_arena.node_kind_if_live(*slot) == Some(NodeKind::SVGSVGBox) && !bits.is_value_only() {
@@ -93,6 +90,56 @@ fn expand_dirty_entries(
         if layout_arena.paintable_row_is_populated(removed.former_paint_parent) {
             revalidate_children_of.insert(removed.former_paint_parent);
         }
+    }
+    // Only style and tree changes can change a stacking context's blending descendants.
+    // A dirty box is already rebuilt. Start at its parent since the box's own blend, or a change in whether it
+    // establishes a stacking context, can change its enclosing group's isolation too.
+    let changed: Vec<_> = work
+        .iter()
+        .filter_map(|(slot, bits)| {
+            (bits.contains(VisualContextBoxDirtyKind::NewRow)
+                || bits.contains(VisualContextBoxDirtyKind::RecommittedInPlace)
+                || bits.contains(VisualContextBoxDirtyKind::ReattachedInLayoutTree)
+                || bits.contains(VisualContextBoxDirtyKind::StyleValueChange)
+                || bits.contains(VisualContextBoxDirtyKind::StyleStructuralChange))
+            .then(|| layout_arena.node_parent_if_live(*slot))
+            .flatten()
+        })
+        .chain(revalidate_children_of.iter().copied())
+        .collect();
+    let mut visited = HashSet::default();
+    for slot in changed {
+        let mut ancestor = Some(slot);
+        while let Some(parent) = ancestor {
+            if !visited.insert(parent) {
+                break;
+            }
+            if crate::painting::style_queries::establishes_stacking_context(layout_arena, parent) {
+                work.entry(parent)
+                    .or_default()
+                    .insert(VisualContextBoxDirtyKind::StyleValueChange);
+                break;
+            }
+            ancestor = layout_arena.node_parent_if_live(parent);
+        }
+    }
+    // The offset transform of a box with an offset path depends on the geometry and style of its containing block,
+    // so the box is rebuilt whenever its containing block is.
+    let offset_path_boxes_to_rebuild: Vec<_> = offset_path_boxes
+        .iter()
+        .copied()
+        .filter(|slot| {
+            !work.contains_key(slot)
+                && layout_arena.paintable_row_is_populated(*slot)
+                && layout_arena
+                    .node_containing_block_if_live(*slot)
+                    .is_some_and(|containing_block| work.contains_key(&containing_block))
+        })
+        .collect();
+    for slot in offset_path_boxes_to_rebuild {
+        work.entry(slot)
+            .or_default()
+            .insert(VisualContextBoxDirtyKind::OffsetPathContainingBlockChanged);
     }
     let mut plan = WorkPlan {
         work,
@@ -304,7 +351,6 @@ pub(crate) fn box_owns_geometry_dependent_nodes(
 
 struct PendingBox {
     slot: NodeSlotId,
-    parent: Option<NodeSlotId>,
     input: DescendantVisualContexts,
     cascade: ChildCascade,
 }
@@ -386,13 +432,13 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     let plan = if scope.rebuilds_every_box() {
         WorkPlan::default()
     } else {
-        match expand_dirty_entries(layout_arena, &state.dirty_boxes) {
+        match expand_dirty_entries(layout_arena, &state.dirty_boxes, &state.offset_path_boxes) {
             Ok(plan) => plan,
             Err(reason) => return IncrementalUpdateResult::NeedsFullBuild(reason),
         }
     };
     let Some(tree) = state.tree.as_mut() else {
-        return IncrementalUpdateResult::NeedsFullBuild(VisualContextGlobalRebuildReason::FirstBuild);
+        return IncrementalUpdateResult::NeedsFullBuild(VisualContextUpdateScope::FreshTree);
     };
     let mut delta = VisualContextTreeDelta::default();
     debug_assert!(
@@ -400,6 +446,9 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
         "removed handles name nodes of the discarded tree"
     );
     tombstone_removed_blocks(std::sync::Arc::make_mut(tree), &state.dirty_boxes, &mut delta);
+    if scope.rebuilds_every_box() {
+        state.offset_path_boxes.clear();
+    }
 
     let environment = BoxBuildEnvironment {
         layout_arena,
@@ -409,7 +458,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
         .paintable_visual_context_record(viewport)
         .map(|record| record.output_for_descendants);
     let Some(viewport_output) = viewport_output else {
-        return IncrementalUpdateResult::NeedsFullBuild(VisualContextGlobalRebuildReason::FirstBuild);
+        return IncrementalUpdateResult::NeedsFullBuild(VisualContextUpdateScope::FreshTree);
     };
     if scope.rebuilds_every_box() {
         std::sync::Arc::make_mut(tree)
@@ -423,11 +472,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     let mut assignments: Vec<PaintableVisualContextAssignment> = Vec::with_capacity(every_box_capacity);
     let mut assignment_index_by_slot: HashMap<NodeSlotId, usize> =
         HashMap::with_capacity_and_hasher(every_box_capacity, Default::default());
-    let mut mask_node_owners_changed = state
-        .dirty_boxes
-        .removed
-        .iter()
-        .any(|removed| state.paintables_with_mask_nodes.contains(&removed.slot));
     let mut stack: Vec<PendingBox> = Vec::new();
     let push_children = |stack: &mut Vec<PendingBox>,
                          parent: NodeSlotId,
@@ -439,7 +483,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
             if visit_every_child || plan.work.contains_key(&child) || plan.ancestors_of_work.contains(&child) {
                 stack.push(PendingBox {
                     slot: child,
-                    parent: Some(parent),
                     input: input_for_children,
                     cascade,
                 });
@@ -473,9 +516,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
             },
         };
         let slot = pending.slot;
-        let parent = pending
-            .parent
-            .expect("every pending box below the viewport has a paint parent");
         let input = pending.input;
         let work_bits = plan.work.get(&slot).copied();
         // A box that only moved changes no more than the boxes a moved ancestor carries along: only the nodes that
@@ -507,8 +547,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
             let record_existed = existing_record.is_some();
             let previous_output = existing_record.as_ref().map(|record| record.output_for_descendants);
             let previous_stacking_context_facts = existing_record.as_ref().map(|record| record.stacking_context);
-            let previous_has_mask_nodes = existing_record.as_ref().is_some_and(|record| record.has_mask_nodes);
-            let may_be_root_element = parent == viewport;
             let tree = std::sync::Arc::make_mut(state.tree.as_mut().expect("the tree exists throughout the pass"));
             let existing_handles = layout_arena.paintable_visual_context_node_handles(slot);
             let mut writer = BoxNodeWriter::new(tree, existing_handles.as_deref(), &mut delta);
@@ -517,7 +555,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
                 &mut writer,
                 slot,
                 input,
-                may_be_root_element,
                 &WalkAnchorScrollShiftResolver {
                     layout_arena,
                     assignments: &assignments,
@@ -525,6 +562,14 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
                 },
             );
             let (handles, reconcile) = writer.finish();
+            if layout_arena
+                .node_style_if_live(slot)
+                .is_some_and(|style| style.transform().has_offset_path)
+            {
+                state.offset_path_boxes.insert(slot);
+            } else {
+                state.offset_path_boxes.remove(&slot);
+            }
             let new_output = assignment.record.output_for_descendants;
             assignment.node_handles = handles;
             assignment.record.owns_geometry_dependent_nodes =
@@ -559,9 +604,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
             delta.requires_display_list_recording |= contexts_changed;
             if reconcile.shape_changed || !record_existed || contexts_changed {
                 layout_arena.push_paint_damage(slot, crate::painting::record::damage::PaintDamage::ALL_PRODUCERS);
-            }
-            if previous_has_mask_nodes != assignment.record.has_mask_nodes {
-                mask_node_owners_changed = true;
             }
             drop(existing_record);
             if assignment.record.owns_geometry_dependent_nodes && !subtree_may_own_geometry_dependent_nodes {
@@ -611,7 +653,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
 
     let tree = std::sync::Arc::make_mut(state.tree.as_mut().expect("the tree exists throughout the pass"));
     if incremental_tree_requires_fresh_build(tree, &delta) {
-        return IncrementalUpdateResult::NeedsFullBuild(VisualContextGlobalRebuildReason::InvalidIncrementalReferences);
+        return IncrementalUpdateResult::NeedsFullBuild(VisualContextUpdateScope::FreshTree);
     }
     debug_assert!(tree.node_references_are_consistent());
     let scroll_state = rebuild_scroll_state_from_tree(layout_arena, tree, &tree_inputs);
@@ -631,11 +673,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     }
     state.scroll_state = scroll_state;
     state.needs_to_refresh_scroll_state = true;
-    IncrementalUpdateResult::Applied(Box::new(IncrementalUpdateOutcome {
-        delta,
-        assignments,
-        mask_node_owners_changed,
-    }))
+    IncrementalUpdateResult::Applied(Box::new(IncrementalUpdateOutcome { delta, assignments }))
 }
 
 #[cfg(debug_assertions)]
@@ -709,6 +747,7 @@ mod tests {
 
     fn effects() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 0.5,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,

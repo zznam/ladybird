@@ -15,13 +15,12 @@
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaTime.h>
 #include <LibMedia/Sinks/VideoSink.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoFramePool.h>
+#include <LibMediaCodecs/VideoFrameHandle.h>
+#include <LibMediaCodecs/VideoFramePool.h>
 #include <LibThreading/Forward.h>
 
 namespace Media {
 
-class PresentedFramePage;
 class VideoEdgeQueue;
 
 // The pump end of a cross-process video edge. Video frames are converted to handles and sent over a shared-memory
@@ -30,11 +29,12 @@ class VideoEdgeQueue;
 class MEDIA_API RemoteVideoSink final : public VideoSink {
 public:
     struct Delegates {
-        // Rung from the pump thread when newly enqueued data or a status change may need the consumer woken.
+        // Rung when newly enqueued data, a status change or a resumed clock may need the consumer woken.
         Function<void()> ring_data_available;
-        // A seek reaches the far-end consumer first so its cached frames are consulted before anything moves upstream.
-        // The consumer will then seek upstream, which passes through the RemoteVideoProducer and across the edge.
-        Function<void()> transmit_seek;
+        // A seek reaches the far-end consumer so that its cached frames are consulted. Unless the frames lent to it
+        // could satisfy the seek, the input is seeked before the seek is transmitted, and the consumer's request for
+        // the same seek, which passes through the RemoteVideoProducer and across the edge, is then already answered.
+        Function<void(InvalidateHeldData)> transmit_seek;
         // Relays a replacement time reader (e.g. after audio is disabled) to the consumer; the initial one rides video_edge_ready.
         Function<void(MediaTimeReader const&)> transmit_time_reader;
         // Called to lend each new buffer backing a slot to the other side, before the first handle that refers to it.
@@ -47,17 +47,16 @@ public:
     virtual ~RemoteVideoSink() override;
 
     VideoEdgeQueue const& edge() const;
-    PresentedFramePage const& presented_frame_page() const;
 
     virtual ErrorOr<void> connect_input(NonnullRefPtr<VideoProducer> const&) override;
     virtual void disconnect_input(NonnullRefPtr<VideoProducer> const&) override;
 
-    virtual void seek(AK::Duration timestamp) override;
-    void seek_upstream(AK::Duration timestamp);
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
+    virtual void notify_clock_resumed() override;
+    void seek_upstream(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No);
     virtual void set_time_reader(MediaTimeReader) override;
     virtual void set_state_change_handler(PipelineStateChangeHandler) override;
     virtual void set_resize_handler(PipelineResizeHandler) override;
-    virtual RefPtr<VideoFrame> current_frame() const override;
     void start_input();
 
     void report_remote_status(PipelineStatus);
@@ -67,16 +66,8 @@ public:
     void notify_space_available();
     void release_slot(VideoFramePoolID, u32 slot_index);
 
-    // The storage of a slot that is lent to the far-end consumer, for a reader in another process to map. The reader
-    // takes no hold: it validates the slot's acquisition ID around its reads instead, so a recycled slot fails its read.
-    struct SlotStorage {
-        Core::AnonymousBuffer buffer;
-        RefPtr<VideoSurface> surface;
-    };
-    Optional<SlotStorage> lent_slot_storage(VideoFramePoolID, u32 slot_index);
-
-    // Observes the retire_pool delegate, for a host that maps slots for readers beyond the far-end consumer.
-    void set_pool_retired_observer(Function<void(VideoFramePoolID)>);
+    void stop_and_reclaim_unconsumed_frames();
+    bool has_lent_slots() const;
 
 private:
     class ThreadData;

@@ -10,6 +10,7 @@
 
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -22,6 +23,7 @@
 #include <LibWeb/ServiceWorker/Registration.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
+#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h>
 
 namespace Web::HTML {
 
@@ -55,7 +57,7 @@ public:
     Optional<URL::Origin> top_level_origin;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-target-browsing-context
-    GC::Ptr<BrowsingContext> target_browsing_context;
+    GC::Weak<BrowsingContext> target_browsing_context;
 
     // FIXME: An active service worker https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-active-service-worker
 
@@ -67,15 +69,7 @@ public:
 
 protected:
     Environment() = default;
-    Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
-        : id(move(id))
-        , creation_url(move(creation_url))
-        , top_level_creation_url(move(top_level_creation_url))
-        , top_level_origin(move(top_level_origin))
-        , target_browsing_context(move(target_browsing_context))
-    {
-    }
-    virtual void visit_edges(Cell::Visitor&) override;
+    Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context);
 };
 
 enum class RunScriptDecision {
@@ -122,6 +116,10 @@ public:
     //         of its own. An empty value names no cluster at all, and so matches none.
     virtual Optional<u64> agent_cluster_id() const = 0;
 
+    // https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster-cross-origin-isolation
+    // Of the agent cluster agent_cluster_id names.
+    virtual CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode() const = 0;
+
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
     virtual double time_origin() const = 0;
 
@@ -130,12 +128,21 @@ public:
     Optional<Utf16String> encoding_parse_and_serialize_url(Utf16View);
 
     JS::Realm& realm();
+    JS::Realm const& realm() const;
     JS::Object& global_object();
     JS::Object const& global_object() const { return const_cast<EnvironmentSettingsObject*>(this)->global_object(); }
     EventLoop& responsible_event_loop();
 
     // https://fetch.spec.whatwg.org/#concept-fetch-group
     auto& fetch_group() { return m_fetch_group; }
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy
+    UpgradeInsecureRequests::InsecureRequestsPolicy insecure_requests_policy() const;
+    void set_insecure_requests_policy(UpgradeInsecureRequests::InsecureRequestsPolicy policy) { m_insecure_requests_policy = policy; }
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
+    UpgradeInsecureRequests::UpgradeInsecureNavigationsSet upgrade_insecure_navigations_set() const;
+    void add_to_upgrade_insecure_navigations_set(UpgradeInsecureRequests::HostAndPort tuple) { m_upgrade_insecure_navigations_set.insert(move(tuple)); }
 
     SerializedEnvironmentSettingsObject serialize();
 
@@ -213,6 +220,15 @@ private:
     bool m_discarded { false };
 
     Vector<GC::Ref<WorkerAgentParent>> m_owned_worker_agents;
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy
+    // It is set to Do Not Upgrade unless otherwise specified.
+    // NB: These hold what the settings object inherited. See insecure_requests_policy() for its own policies.
+    UpgradeInsecureRequests::InsecureRequestsPolicy m_insecure_requests_policy { UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade };
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
+    // Its value is the empty set unless otherwise specified.
+    UpgradeInsecureRequests::UpgradeInsecureNavigationsSet m_upgrade_insecure_navigations_set;
 };
 
 RunScriptDecision can_run_script(EnvironmentSettingsObject const&);

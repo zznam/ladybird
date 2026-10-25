@@ -56,6 +56,8 @@ struct SessionHistoryDocumentStateDescriptor {
     Optional<URL::URL> about_base_url;
     DocumentResource resource;
     bool reload_pending { false };
+    // AD-HOC: Whether the pending reload bypasses the HTTP cache.
+    bool reload_bypasses_cache { false };
     bool ever_populated { false };
     UserAgentInitiated user_agent_initiated { UserAgentInitiated::No };
     Utf16String navigable_target_name;
@@ -87,6 +89,8 @@ struct SessionHistoryEntryDescriptor {
     Utf16String navigation_api_id;
     ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
     SessionHistoryEntryScrollPositionData scroll_position_data;
+    CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 };
 
 struct PendingSessionHistoryEntryDescriptor {
@@ -98,6 +102,8 @@ struct PendingSessionHistoryEntryDescriptor {
     Utf16String navigation_api_id;
     ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
     SessionHistoryEntryScrollPositionData scroll_position_data;
+    CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#nested-history

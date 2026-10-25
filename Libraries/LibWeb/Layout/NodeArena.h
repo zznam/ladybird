@@ -24,8 +24,8 @@ namespace Web::Layout {
 class Node;
 class TextNode;
 
-// A document's layout node arena, in the render state the document's style engine created, kept alive by the layout
-// shells and paint objects that reach the arena.
+// A document's layout node arena, in the render state the document's style engine created, which the host reaches
+// only through the document's host. It is kept alive by the layout shells and paint objects that reach the arena.
 class WEB_API NodeArena : public RefCounted<NodeArena> {
     AK_MAKE_NONCOPYABLE(NodeArena);
     AK_MAKE_NONMOVABLE(NodeArena);
@@ -34,15 +34,10 @@ public:
     explicit NodeArena(RenderDocument&);
     ~NodeArena();
 
-    void free_subtree(Compositing::RustFFI::NodeSlotId);
-    Node* node_if_live(Compositing::RustFFI::NodeSlotId) const;
-    void* handle() const { return m_handle; }
+    void free_subtree(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId);
+    Node* node_if_live(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId) const;
     RustFFI::DocumentHost* host() const { return m_render_document->host(); }
-    u64 table_cell_measurement_cache_miss_count() const;
-    u64 intrinsic_measurement_count() const;
-    u64 intrinsic_inline_measurement_count() const;
-
-    void sync_enrolled_content_for_layout();
+    RenderDocument const& render_document() const { return *m_render_document; }
 
     DOM::Document* document() const { return m_document.ptr(); }
     void set_document(Badge<DOM::Document>, DOM::Document* document) { m_document = document; }
@@ -55,12 +50,7 @@ public:
 
 private:
     NonnullRefPtr<RenderDocument> m_render_document;
-    // The arena of the document's render state, which the entries that have not been converted to render messages
-    // still take.
-    void* m_handle { nullptr };
     GC::RawPtr<DOM::Document> m_document;
 };
-
-WEB_API bool destroy_layout_subtree(Node&);
 
 }
