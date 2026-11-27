@@ -6,34 +6,11 @@
 
 use crate::css::css_enums::writing_mode;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
-use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
+use crate::layout::query::inline_cursor::{CaretPosition, InlineCursor};
 use crate::painting::paintable_geometry::{absolute_padding_box_rect, has_scrollable_overflow};
 use crate::painting::paintable_rows::PaintableRowsRead;
-use crate::painting::{caret, chrome_geometry, scroll_snap};
-
-fn accepted_wheel_delta(arena: &impl PaintableRowsRead, node: NodeSlotId, delta: CssPixelPoint) -> CssPixelPoint {
-    let axes = chrome_geometry::wheel_scrollable_axes(arena, node);
-    let zero = CssPixels::from_raw(0);
-    CssPixelPoint::new(
-        if axes.horizontal { delta.x } else { zero },
-        if axes.vertical { delta.y } else { zero },
-    )
-}
-
-fn clamp_scroll_offset(arena: &impl PaintableRowsRead, node: NodeSlotId, offset: CssPixelPoint) -> CssPixelPoint {
-    let Some((minimum_offset, maximum_offset)) = chrome_geometry::scroll_offset_bounds(arena, node) else {
-        return offset;
-    };
-    CssPixelPoint::new(
-        offset.x.clamp(minimum_offset.x, maximum_offset.x),
-        offset.y.clamp(minimum_offset.y, maximum_offset.y),
-    )
-}
-
-fn scrolling_box_moved_by(arena: &impl PaintableRowsRead, node: NodeSlotId, delta: CssPixelPoint) -> bool {
-    let current_offset = arena.row_scroll_offset(node);
-    clamp_scroll_offset(arena, node, current_offset.translated(delta.x, delta.y)) != current_offset
-}
+use crate::painting::{chrome_geometry, scroll_snap, style_queries};
 
 /// The nearest box, `start` included, that keeps a scroll step by the delta to itself: neither it nor a box inside it
 /// passes the step on to a scroller around it. A step belongs to one scroller, and a touchpad rarely moves along one
@@ -59,70 +36,6 @@ pub(crate) fn box_ending_scroll_chain(
         node = arena.containing_block_by_walking_ancestors(node);
     }
     NodeSlotId::INVALID
-}
-
-pub(crate) fn scrolling_box_for_scroll_step(
-    arena: &impl PaintableRowsRead,
-    target: NodeSlotId,
-    viewport: NodeSlotId,
-    delta: CssPixelPoint,
-) -> NodeSlotId {
-    let scroll_step_moves = |node: NodeSlotId| {
-        let accepted_delta = accepted_wheel_delta(arena, node, delta);
-        accepted_delta != CssPixelPoint::default() && scrolling_box_moved_by(arena, node, accepted_delta)
-    };
-    let box_ending_scroll_chain = box_ending_scroll_chain(arena, target, delta.x.to_double(), delta.y.to_double());
-
-    let mut node = target;
-    while let Some(data) = arena.node_data_if_live(node) {
-        if data.kind.get() == NodeKind::Viewport {
-            break;
-        }
-        if scroll_step_moves(node) {
-            return node;
-        }
-        if node == box_ending_scroll_chain {
-            return NodeSlotId::INVALID;
-        }
-        node = arena.containing_block_by_walking_ancestors(node);
-    }
-
-    if arena.slot_is_live(viewport) && scroll_step_moves(viewport) {
-        return viewport;
-    }
-    NodeSlotId::INVALID
-}
-
-pub(crate) fn for_each_wheel_scrollable_box_in_containing_block_chain(
-    arena: &impl PaintableRowsRead,
-    start: NodeSlotId,
-    wheel_delta_x: f64,
-    wheel_delta_y: f64,
-    mut push_scrollable_box: impl FnMut(NodeSlotId, f64, f64),
-) {
-    let box_ending_scroll_chain = box_ending_scroll_chain(arena, start, wheel_delta_x, wheel_delta_y);
-    let mut node = start;
-    while let Some(data) = arena.node_data_if_live(node) {
-        if data.kind.get() != NodeKind::Viewport {
-            let axes = chrome_geometry::wheel_scrollable_axes(arena, node);
-            let accepted_delta_x = if axes.horizontal { wheel_delta_x } else { 0.0 };
-            let accepted_delta_y = if axes.vertical { wheel_delta_y } else { 0.0 };
-            if accepted_delta_x != 0.0 || accepted_delta_y != 0.0 {
-                push_scrollable_box(node, accepted_delta_x, accepted_delta_y);
-                let accepted_delta = CssPixelPoint::new(
-                    CssPixels::nearest_value_for(accepted_delta_x),
-                    CssPixels::nearest_value_for(accepted_delta_y),
-                );
-                if scrolling_box_moved_by(arena, node, accepted_delta) {
-                    return;
-                }
-            }
-        }
-        if node == box_ending_scroll_chain {
-            return;
-        }
-        node = arena.containing_block_by_walking_ancestors(node);
-    }
 }
 
 pub(crate) fn first_wheel_scrollable_box_in_containing_block_chain(
@@ -153,14 +66,11 @@ pub(crate) fn scroll_target_for_text_position(
     affinity_is_downstream: bool,
     scroll_block_axis: bool,
 ) -> Option<(NodeSlotId, CssPixelPoint)> {
-    let fragments = arena.text_fragments(text);
-    let node_slots = fragments.as_slice();
-    let caret = match caret::caret_rect_for_position(arena, node_slots, offset, affinity_is_downstream) {
-        Some(caret) => caret,
-        // No fragment holds the position: the caret sits on an empty line of the block that lays the text out.
-        None => std::iter::successors(arena.node_parent_if_live(text), |&node| arena.node_parent_if_live(node))
-            .find_map(|block| caret::caret_rect_on_empty_line(arena, block, node_slots, offset))?,
-    };
+    let caret = InlineCursor::new(arena).caret_rect(CaretPosition::Text {
+        text,
+        offset,
+        downstream: affinity_is_downstream,
+    })?;
     let style = arena.node_style_if_live(caret.style_source)?;
     let horizontal = style.writing_mode() == writing_mode::HORIZONTAL_TB;
     let one = CssPixels::from_integer(1);
@@ -179,10 +89,21 @@ pub(crate) fn scroll_target_for_text_position(
     }
 
     let mut container = caret.owner;
+    let mut axes_fixed_to_the_viewport = (false, false);
     while !has_scrollable_overflow(arena, container) {
-        container = arena
+        let containing_block = arena
             .node_containing_block_if_live(container)
             .filter(|&containing_block| arena.paintable_row_is_populated(containing_block))?;
+        // INTEROP: Scrolling the viewport cannot move a box that is fixed to it, so other engines do not scroll it to
+        //          bring a caret in such a box into view. A fixed box that compensates for the scroll of its default
+        //          anchor in an axis moves with that scroll, so it is not fixed to the viewport in that axis.
+        if let Some(axes) = axes_fixed_to_the_viewport_of(arena, container, containing_block) {
+            if axes == (true, true) {
+                return None;
+            }
+            axes_fixed_to_the_viewport = axes;
+        }
+        container = containing_block;
     }
     let snapport = scroll_snap::scroll_snapport_rect(arena, container, absolute_padding_box_rect(arena, container));
     let current_offset = arena.row_scroll_offset(container);
@@ -195,7 +116,34 @@ pub(crate) fn scroll_target_for_text_position(
             rect.width = snapport.width;
         }
     }
-    Some((container, offset_showing_rect(rect, snapport, current_offset)))
+    let mut new_offset = offset_showing_rect(rect, snapport, current_offset);
+    if axes_fixed_to_the_viewport.0 {
+        new_offset.x = current_offset.x;
+    }
+    if axes_fixed_to_the_viewport.1 {
+        new_offset.y = current_offset.y;
+    }
+    Some((container, new_offset))
+}
+
+// The horizontal and vertical axes in which `node` is fixed to the viewport, if `node` is a fixed box whose containing
+// block is the viewport.
+fn axes_fixed_to_the_viewport_of(
+    arena: &impl PaintableRowsRead,
+    node: NodeSlotId,
+    containing_block: NodeSlotId,
+) -> Option<(bool, bool)> {
+    let containing_block_is_viewport = arena
+        .node_data_if_live(containing_block)
+        .is_some_and(|data| data.kind.get() == NodeKind::Viewport);
+    if !style_queries::is_fixed_position(arena, node) || !containing_block_is_viewport {
+        return None;
+    }
+    let flags = arena.node_flags_if_live(node);
+    Some((
+        flags & NodeFlag::CompensatesForHorizontalScroll as u32 == 0,
+        flags & NodeFlag::CompensatesForVerticalScroll as u32 == 0,
+    ))
 }
 
 // The nearest offset to `current_offset` at which `rect`, in the same space as `snapport`, lies inside the snapport.

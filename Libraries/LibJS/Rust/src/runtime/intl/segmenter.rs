@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Finalize, GcCell, define_cell};
-use crate::gc::gc_ref_cell::GcRefCell;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
@@ -20,6 +19,7 @@ use crate::runtime::completion::{Must, ThrowCompletionOr};
 use crate::runtime::intl::intl_object::{IntlObject, ResolutionOptionDescriptor};
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::primitive_string::PrimitiveString;
+use crate::runtime::realm::Realm;
 use crate::unicode::intl::{self as unicode, Inclusive, SegmenterGranularity};
 use crate::utf16::Utf16View;
 
@@ -29,13 +29,13 @@ use crate::utf16::Utf16View;
 pub struct Segmenter {
     base: Object,
     #[gc(untraced)]
-    locale: GcRefCell<Utf16String>, // [[Locale]]
+    locale: RefCell<Utf16String>, // [[Locale]]
     #[gc(untraced)]
     segmenter_granularity: Cell<SegmenterGranularity>, // [[SegmenterGranularity]]
 
     // Non-standard. Stores the ICU segmenter for the Intl object's segmentation options.
     #[gc(untraced)]
-    segmenter: GcRefCell<Option<unicode::Segmenter>>,
+    segmenter: RefCell<Option<unicode::Segmenter>>,
 }
 
 define_cell!(Segmenter, Object, extends: [Object], finalize: finalize);
@@ -55,12 +55,18 @@ impl Finalize for Segmenter {
 }
 
 impl Segmenter {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> Segmenter {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> Segmenter {
         Segmenter {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-            locale: GcRefCell::default(),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            locale: RefCell::default(),
             segmenter_granularity: Cell::new(SegmenterGranularity::Grapheme),
-            segmenter: GcRefCell::new(None),
+            segmenter: RefCell::new(None),
         }
     }
 
@@ -118,7 +124,7 @@ impl IntlObject for Segmenter {
 /// allocations this makes.
 pub fn create_segment_data_object(
     vm: &Vm,
-    segmenter: &GcRefCell<Option<unicode::Segmenter>>,
+    segmenter: &RefCell<Option<unicode::Segmenter>>,
     string_value: Gc<PrimitiveString>,
     string: Utf16View<'_>,
     start_index: usize,

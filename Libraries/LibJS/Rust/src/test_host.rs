@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 
-pub fn validate_regex(_pattern: &[u16], _flags: &[u16]) -> Result<(), String> {
+use num_bigint::BigInt;
+
+pub fn validate_regex(_pattern: &[u16], _flags: &[u16]) -> Result<(), crate::host::RegexError> {
     Ok(())
 }
 
@@ -23,6 +25,30 @@ pub fn number_to_utf16(value: f64) -> Vec<u16> {
         value.to_string()
     };
     text.encode_utf16().collect()
+}
+
+pub fn string_to_number(_string: &[u16]) -> f64 {
+    unimplemented!("no cargo test folds constants")
+}
+
+pub fn string_to_bigint(_string: &[u16]) -> Option<BigInt> {
+    unimplemented!("no cargo test folds constants")
+}
+
+pub fn exponentiate(_base: f64, _exponent: f64) -> f64 {
+    unimplemented!("no cargo test folds constants")
+}
+
+pub fn bigint_exponentiate(_base: &BigInt, _exponent: &BigInt) -> Option<BigInt> {
+    unimplemented!("no cargo test folds constants")
+}
+
+pub fn bigint_left_shift(_x: &BigInt, _y: &BigInt) -> Option<BigInt> {
+    unimplemented!("no cargo test folds constants")
+}
+
+pub fn bigint_signed_right_shift(_x: &BigInt, _y: &BigInt) -> Option<BigInt> {
+    unimplemented!("no cargo test folds constants")
 }
 
 #[unsafe(no_mangle)]
@@ -45,9 +71,9 @@ extern "C" fn unicode_code_point_has_identifier_continue_property(code_point: u3
 static FLY_STRINGS: Mutex<Option<HashMap<Vec<u16>, usize>>> = Mutex::new(None);
 
 /// Allocates a string with one reference and uninitialized storage, laid out the way AK lays it out.
-fn allocate_uninitialized_string(length: usize, has_ascii_storage: bool) -> usize {
+fn allocate_uninitialized_string(length: usize, has_latin1_storage: bool) -> usize {
     let header_size = size_of::<ak::Utf16StringDataHeader>();
-    let unit_size = if has_ascii_storage { 1 } else { size_of::<u16>() };
+    let unit_size = if has_latin1_storage { 1 } else { size_of::<u16>() };
     let layout = Layout::from_size_align(
         header_size + length * unit_size,
         align_of::<ak::Utf16StringDataHeader>(),
@@ -64,7 +90,7 @@ fn allocate_uninitialized_string(length: usize, has_ascii_storage: bool) -> usiz
                 length_in_code_units: u32::try_from(length).expect("test strings fit in u32"),
                 length_in_code_points: AtomicU32::new(u32::MAX),
                 hash: AtomicU32::new(0),
-                flags: AtomicU32::new(if has_ascii_storage { 0 } else { ak::HAS_UTF16_STORAGE }),
+                flags: AtomicU32::new(if has_latin1_storage { 0 } else { ak::HAS_UTF16_STORAGE }),
             });
         storage as usize
     }
@@ -108,9 +134,22 @@ extern "C" fn ladybird_utf16_fly_string_from_utf8(data: *const u8, length: usize
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ladybird_utf16_string_create_uninitialized(length: usize, has_ascii_storage: bool) -> usize {
-    allocate_uninitialized_string(length, has_ascii_storage)
+extern "C" fn ladybird_utf16_string_from_utf8(data: *const u8, length: usize) -> usize {
+    // SAFETY: The frontend passes `length` readable bytes of UTF-8.
+    let string = std::str::from_utf8(unsafe { ak::slice_from_raw_parts(data, length) }).expect("valid UTF-8");
+    allocate_utf16_string(&string.encode_utf16().collect::<Vec<_>>())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_utf16_string_create_uninitialized(length: usize, has_latin1_storage: bool) -> usize {
+    allocate_uninitialized_string(length, has_latin1_storage)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_utf16_string_unref(_raw: usize) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_add_idle_thread_memory_release(_release: extern "C" fn()) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_release_idle_thread_memory() {}

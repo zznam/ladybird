@@ -12,6 +12,7 @@ use libjs_runtime_macros::Trace;
 use crate::gc::class::{GcCell, cast_ref, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
+use crate::layout::member::{Member, NullableMember};
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::completion::ThrowCompletionOr;
@@ -33,15 +34,20 @@ pub enum PromiseResolvingFunctionKind {
 #[derive(Trace)]
 pub struct PromiseResolvingFunction {
     base: NativeFunction,
-    promise: Cell<Gc<Promise>>,
-    resolve_function: Cell<Option<Gc<PromiseResolvingFunction>>>,
+    promise: Member<Promise>,
+    resolve_function: NullableMember<PromiseResolvingFunction>,
     already_resolved: Cell<bool>,
     #[gc(untraced)]
     kind: PromiseResolvingFunctionKind,
 }
 
+const _: () = assert!(size_of::<PromiseResolvingFunction>() == 88);
+
 static PROMISE_RESOLVING_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
     call: PromiseResolvingFunction::call,
+    // NB: An embedder resolves a promise as a step that cannot throw, and it can do so at any stack depth. What these
+    //     steps run of script, a "then" getter, is a checked call of its own, and its error rejects the promise.
+    ignores_stack_space_limit: true,
     ..NATIVE_FUNCTION_VIRTUAL_METHODS
 };
 
@@ -68,16 +74,16 @@ impl Deref for PromiseResolvingFunction {
 
 impl PromiseResolvingFunction {
     pub fn create_resolve(vm: &Vm, realm: Gc<Realm>, promise: Gc<Promise>) -> Gc<PromiseResolvingFunction> {
-        realm.create_object(
-            vm,
+        realm.create_object(vm, |_| {
             Self::new(
                 vm,
+                realm,
                 promise,
                 PromiseResolvingFunctionKind::Resolve,
                 None,
                 realm.function_prototype(),
-            ),
-        )
+            )
+        })
     }
 
     pub fn create_reject(
@@ -86,29 +92,30 @@ impl PromiseResolvingFunction {
         promise: Gc<Promise>,
         resolve_function: Gc<PromiseResolvingFunction>,
     ) -> Gc<PromiseResolvingFunction> {
-        realm.create_object(
-            vm,
+        realm.create_object(vm, |_| {
             Self::new(
                 vm,
+                realm,
                 promise,
                 PromiseResolvingFunctionKind::Reject,
                 Some(resolve_function),
                 realm.function_prototype(),
-            ),
-        )
+            )
+        })
     }
 
     fn new(
         vm: &Vm,
+        realm: Gc<Realm>,
         promise: Gc<Promise>,
         kind: PromiseResolvingFunctionKind,
         resolve_function: Option<Gc<PromiseResolvingFunction>>,
         prototype: Gc<Object>,
     ) -> PromiseResolvingFunction {
         PromiseResolvingFunction {
-            base: NativeFunction::new_with_prototype(vm, Self::CLASS, prototype),
-            promise: Cell::new(promise),
-            resolve_function: Cell::new(resolve_function),
+            base: NativeFunction::new_with_prototype(vm, Self::CLASS, realm, prototype, None),
+            promise: Member::new(promise),
+            resolve_function: NullableMember::new(resolve_function),
             already_resolved: Cell::new(false),
             kind,
         }
@@ -138,6 +145,11 @@ impl PromiseResolvingFunction {
             PromiseResolvingFunctionKind::Resolve => Promise::resolve_function_steps(vm, promise, already_resolved),
             PromiseResolvingFunctionKind::Reject => Promise::reject_function_steps(vm, promise, already_resolved),
         })
+    }
+
+    /// Sets [[AlreadyResolved]] to true, and returns whether it was false.
+    pub fn mark_already_resolved(&self) -> bool {
+        !self.already_resolved_owner().already_resolved.replace(true)
     }
 
     /// The function whose [[AlreadyResolved]] this one uses: the resolve function keeps the bit both share.

@@ -15,6 +15,7 @@
 #include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibWebView/Application.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/ProcessManager.h>
 
@@ -22,7 +23,6 @@
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/TransportBootstrapMach.h>
-#    include <LibWebView/Application.h>
 #    include <LibWebView/ProcessReaper.h>
 #    include <LibWebView/Utilities.h>
 #endif
@@ -30,7 +30,6 @@
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
 #    include <LibIPC/HandleBrokerServer.h>
-#    include <LibWebView/Application.h>
 #endif
 
 namespace WebView {
@@ -61,7 +60,8 @@ void Process::did_register(Badge<ProcessManager>, u64 child_id)
 
 void Process::save_crash_report(Optional<int> exit_status)
 {
-    if (m_crash_report && exit_status.has_value()) {
+    auto keeps_reports = Application::settings().crash_report_sending() != CrashReportSending::NeverSend;
+    if (m_crash_report && exit_status.has_value() && keeps_reports) {
         if (auto result = m_crash_report->save(*exit_status); result.is_error())
             warnln("Could not save {} crash report: {}", process_name_from_type(m_type), result.error());
         else
@@ -132,13 +132,24 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         "PULSE_RUNTIME_PATH"sv,
         "PULSE_SERVER"sv,
     };
-    // Mesa and the Vulkan loader read these to select and configure the GPU driver.
+    // Mesa, its drivers, libva, NVIDIA's driver and the Vulkan loader read these to select and configure the GPU driver.
     static constexpr Array gpu_prefixes {
+        "ACO_"sv,
+        "AMD_"sv,
+        "ANV_"sv,
         "DRI_PRIME"sv,
+        "INTEL_"sv,
+        "LIBVA_"sv,
         "MESA_"sv,
+        "NAK_"sv,
+        "NVK_"sv,
+        "RADV_"sv,
         "VK_"sv,
         "__EGL_"sv,
         "__GLX_"sv,
+        "__GL_"sv,
+        "__NV_"sv,
+        "__VK_"sv,
     };
 
     Vector<ByteString> environment;
@@ -199,7 +210,35 @@ ErrorOr<Process::ProcessAndTransport> Process::spawn_with_transport(ProcessType 
     return ProcessAndTransport { move(process), move(transport) };
 }
 
-ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([[maybe_unused]] ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output)
+// The lifetime, environment and input that every helper is spawned with, whether or not it is connected to over IPC.
+static void apply_helper_spawn_options([[maybe_unused]] ProcessType type, Core::ProcessSpawnOptions& spawn_options)
+{
+    spawn_options.die_with_parent = true;
+    // Ctrl+C in the terminal that the Browser was started from must reach only the Browser, which ends its helpers once
+    // it has quit. A helper that died of it first would look like a crash to a Browser that is still running.
+    spawn_options.new_process_group = true;
+#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
+    spawn_options.environment = Process::helper_process_environment(type);
+#endif
+
+#if !defined(AK_OS_WINDOWS)
+    // Helpers must not read the terminal or pipe that the Browser was started from.
+    spawn_options.file_actions.append(Core::FileAction::OpenFile { .path = "/dev/null", .mode = Core::File::OpenMode::Read, .fd = STDIN_FILENO });
+#endif
+}
+
+ErrorOr<Core::Process> Process::spawn_without_transport(ProcessType type, Core::ProcessSpawnOptions const& options)
+{
+    auto spawn_options = options;
+    apply_helper_spawn_options(type, spawn_options);
+    auto process = TRY(Core::Process::spawn(spawn_options));
+#if defined(AK_OS_MACOS)
+    watch_with_process_reaper(process.pid());
+#endif
+    return process;
+}
+
+ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output)
 {
     // Set up pipes for stdout/stderr capture if requested
     ProcessOutputCapture output_capture;
@@ -207,21 +246,13 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     Array<int, 2> stderr_pipe {};
 
     auto spawn_options = options;
-    spawn_options.die_with_parent = true;
+    apply_helper_spawn_options(type, spawn_options);
     Vector<ByteString> arguments_with_stats;
     if (auto* stats_log = Core::StatsLog::the()) {
         arguments_with_stats = Vector<ByteString> { options.arguments };
         arguments_with_stats.append(ByteString::formatted("--stats-log-dir={}", stats_log->directory()));
         spawn_options.arguments = arguments_with_stats;
     }
-#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
-    spawn_options.environment = helper_process_environment(type);
-#endif
-
-#if !defined(AK_OS_WINDOWS)
-    // Helpers must not read the terminal or pipe that the Browser was started from.
-    spawn_options.file_actions.append(Core::FileAction::OpenFile { .path = "/dev/null", .mode = Core::File::OpenMode::Read, .fd = STDIN_FILENO });
-#endif
 
     if (capture_output) {
         stdout_pipe = TRY(Core::System::pipe2(O_CLOEXEC));
@@ -251,7 +282,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
     // The child may receive startup messages before it has constructed its transport.
-    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+    IPC::Transport::raise_receive_queue_limit(port_b_recv);
 
     MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
     process = TRY(Core::Process::spawn(spawn_options));
@@ -259,7 +290,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
 
     Application::transport_bootstrap_server().register_child_transport(process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
 
-    auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
+    auto transport = TRY(IPC::Transport::create(move(port_a_recv), move(port_b_send)));
 #elif defined(AK_OS_WINDOWS)
     // A Windows pipe cannot carry a handle, so the helper also gets a line to the Browser's handle broker.
     auto channel = TRY(Core::System::duplex_pipe());
@@ -300,11 +331,8 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
 
     process = TRY(Core::Process::spawn(spawn_options));
 
-    auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
     guard_fd_0.disarm();
-    TRY(ipc_socket->set_blocking(true));
-
-    auto transport = make<IPC::Transport>(move(ipc_socket));
+    auto transport = TRY(IPC::Transport::adopt_fd(socket_fds[0]));
 #endif
 
     if (capture_output) {

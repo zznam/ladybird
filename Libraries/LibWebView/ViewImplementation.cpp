@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <AK/Error.h>
@@ -13,6 +14,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <LibCompositing/FrameFitting.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/StandardPaths.h>
@@ -20,27 +22,31 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SharedImageBuffer.h>
-#include <LibURL/Parser.h>
 #include <LibWebCommon/CSS/SystemColor.h>
 #include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/Loader/ContentBlocking.h>
 #include <LibWebCommon/WebDriver/Error.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
+#include <LibWebCommon/WebDriver/Input.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/BookmarkStore.h>
+#include <LibWebView/CanonicalSessionHistoryEntry.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportReview.h>
-#include <LibWebView/ErrorHTML.h>
-#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryDebug.h>
-#include <LibWebView/HistoryStore.h>
-#include <LibWebView/Menu.h>
+#include <LibWebView/PageTranslation.h>
+#include <LibWebView/PermissionManager.h>
+#include <LibWebView/RequestServerManager.h>
+#include <LibWebView/RequestServerSiteBindings.h>
+#include <LibWebView/SessionHistory.h>
+#include <LibWebView/TabDiscarder.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebDriverBiDi.h>
 #include <math.h>
 
 namespace WebView {
@@ -51,10 +57,16 @@ static HashMap<u64, ViewImplementation*>& all_views()
     return *views;
 }
 
+// NB: WebDriver BiDi names the navigable that is gone a browsing context, whose error code is no such frame.
+static Web::WebDriver::ErrorCode error_code_for_a_navigable_that_is_gone(auto protocol)
+{
+    return protocol == decltype(protocol)::BiDi ? Web::WebDriver::ErrorCode::NoSuchFrame : Web::WebDriver::ErrorCode::NoSuchWindow;
+}
+
 static void fail_webdriver_content_commands_after_window_close(auto const& commands)
 {
     for (auto const& command : commands)
-        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window closed while executing the command"sv));
+        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(error_code_for_a_navigable_that_is_gone(command.value.protocol), "Window closed while executing the command"sv));
 }
 
 static u64 s_view_count = 1; // This has to start at 1 for Firefox DevTools.
@@ -74,6 +86,43 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_id(u64 id)
     return {};
 }
 
+Optional<ViewImplementation&> ViewImplementation::tab_view()
+{
+    if (!m_owner_view_id.has_value())
+        return *this;
+    if (!m_owner_document)
+        return {};
+    return find_view_by_id(*m_owner_view_id);
+}
+
+void ViewImplementation::set_owner_view(ViewImplementation& owner_view)
+{
+    VERIFY(!m_owner_view_id.has_value());
+    m_owner_view_id = owner_view.view_id();
+    ++owner_view.m_owned_view_count;
+    m_counts_as_owned_view = true;
+}
+
+void ViewImplementation::stop_counting_as_owned_view()
+{
+    if (!exchange(m_counts_as_owned_view, false))
+        return;
+    if (auto owner = find_view_by_id(*m_owner_view_id); owner.has_value())
+        --owner->m_owned_view_count;
+}
+
+void ViewImplementation::did_leave_owners_tab(Badge<PictureInPictureWindow>)
+{
+    m_owner_document = nullptr;
+    // NB: A window that left its owner's tab is hidden until its page closes, so the user doesn't see it anymore.
+    stop_counting_as_owned_view();
+
+    // Whether a process may capture audio depends on the tabs its pages are part of.
+    traversable().for_each_hosting_page([](WebContentPage& page) {
+        page.client().update_audio_capture_permission();
+    });
+}
+
 ViewImplementation::ViewImplementation(IsPrivate is_private)
     : m_is_private(is_private)
     , m_session(Application::session_for_new_view(is_private))
@@ -81,40 +130,72 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
     , m_view_id(s_view_count++)
 {
     all_views().set(m_view_id, this);
+    // NB: A view starts out hidden.
+    TabDiscarder::did_hide_a_tab();
 
-    initialize_context_menus();
+    m_page_translation = make<PageTranslation>(*this);
 
     m_repeated_crash_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1000), [this] {
         // Reset the "crashing a lot" counter after 1 second in case we just
         // happen to be visiting crashy websites a lot.
         this->m_crash_count = 0;
     });
+
+    m_tab_indicators.on_visibility_change = [this](TabIndicator indicator, bool visible) {
+        if (indicator == TabIndicator::PlayingAudio)
+            m_playing_audio_indicator_transitions.append(visible);
+        if (on_tab_indicator_change)
+            on_tab_indicator_change(indicator, visible);
+    };
 }
 
 ViewImplementation::~ViewImplementation()
 {
-    // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change to it.
+    stop_counting_as_owned_view();
+    Application::the().media_session_coordinator().remove_view(view_id());
+    // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change to it, nor
+    // cancelling the view's location requests or closing the view's page (which revokes its audio playback and capture)
+    // a change in what the tab shows.
     on_url_change = nullptr;
+    on_tab_indicator_change = nullptr;
+    answer_pending_console_input_completions();
     TabPerformanceMonitor::forget_view(view_id());
-    if (m_top_level_traversable)
+    // Leave the views before the permission manager hears: a one-time grant that ends with this view has it revoke
+    // location in every view that shows the site, and this one is on its way out.
+    all_views().remove(m_view_id);
+    session().permission_manager->remove_view(view_id());
+    if (m_top_level_traversable) {
         m_top_level_traversable->clear_ongoing_navigation();
+        update_state_of_discarded_tab();
+    }
     cancel_all_native_geolocation_requests();
 
     if (!m_window_handle.is_empty() && !m_owner_view_id.has_value())
         Application::the().notify_webdriver_window_closed(m_window_handle);
 
     reset_spell_checking();
-    all_views().remove(m_view_id);
+
+    if (m_remote_layer_id.has_value())
+        Application::the().destroy_remote_layer(*m_remote_layer_id);
+
+    // NB: WebDriver BiDi may activate another top-level traversable, which must not be this one that is going away.
+    if (!m_window_handle.is_empty() && !m_owner_view_id.has_value()) {
+        if (auto* webdriver_bidi = WebDriverBiDi::the())
+            webdriver_bidi->top_level_traversable_did_close(m_window_handle);
+    }
 
     if (m_top_level_traversable) {
         m_top_level_traversable->discard_pending_host();
-        m_top_level_traversable->discard_representing_pages();
         if (page().is_open())
             page().client().close_page_of_closed_tab(page().id());
+        // NB: After closing the page, which can leave a page of another process hosting an iframe of the tab to represent
+        //     the tab to a popup of the tab in that process.
+        m_top_level_traversable->discard_representing_pages();
     }
 
     // A headless parent can own and destroy its child view without the child receiving a browsing-context-close
     // notification. Do not strand a WebDriver command which raced with that teardown.
+    discard_webdriver_input_commands();
     fail_webdriver_content_commands_after_window_close(m_pending_webdriver_commands);
     fail_webdriver_content_commands_after_window_close(m_pending_webdriver_crash_commands);
     fail_webdriver_content_commands_after_window_close(m_webdriver_commands_waiting_for_a_document);
@@ -126,11 +207,6 @@ ViewImplementation::~ViewImplementation()
 pid_t ViewImplementation::web_content_pid() const
 {
     return page().client().pid();
-}
-
-Vector<HistoryEntry> ViewImplementation::recent_history_entries(size_t limit) const
-{
-    return m_session->history_store->list_entries({}, 0, limit);
 }
 
 CanonicalTraversable& ViewImplementation::traversable() const
@@ -168,11 +244,131 @@ URL::URL ViewImplementation::url() const
 
 void ViewImplementation::did_update_url()
 {
-    update_bookmark_action();
-    update_report_website_issue_action();
+    // The source arrives as an about:srcdoc document, after the about:blank of a new tab; any other URL means the view
+    // moved on before the source arrived.
+    if (m_page_source_pending) {
+        auto url = this->url();
+        if (url.equals(URL::about_srcdoc(), URL::ExcludeFragment::Yes)) {
+            m_page_source_document_state = traversable().session_history().current_entry().document_state->id;
+            m_page_source_pending = false;
+        } else if (url != URL::about_blank()) {
+            m_page_source_pending = false;
+        }
+    }
+
+    did_change_state();
     if (auto page = traversable().display_page(); page && page->routed_connection())
         page->routed_connection()->update_audio_capture_permission();
     update_displayed_url();
+}
+
+void ViewImplementation::request_permission_prompt(PermissionPromptRequest request, PermissionPromptCallback on_outcome)
+{
+    for (auto& pending : m_pending_permission_prompts) {
+        if (pending.request.is_same_request_as(request)) {
+            pending.waiters.append(move(on_outcome));
+            release_held_permission_prompt_if_ready_for_testing();
+            return;
+        }
+    }
+
+    Vector<PermissionPromptCallback> waiters;
+    waiters.append(move(on_outcome));
+    m_pending_permission_prompts.append({ request, move(waiters) });
+
+    // Tests have no user to ask: They get the answer a test set up, and "Allow while visiting the site" otherwise.
+    if (Application::web_content_options().is_test_mode == IsTestMode::Yes) {
+        auto outcome = Web::Permissions::PromptOutcome::AllowAlways;
+        if (auto next = m_next_permission_prompt_outcomes_for_testing.take(request.name); next.has_value()) {
+            if (next->held) {
+                m_held_permission_prompt_for_testing = request;
+                m_held_permission_prompt_outcome_for_testing = next->outcome;
+                release_held_permission_prompt_if_ready_for_testing();
+                return;
+            }
+            outcome = next->outcome;
+        }
+        // A prompt a test answers counts as having come up on screen.
+        did_show_permission_prompt(request);
+        settle_permission_prompt(request, outcome);
+        return;
+    }
+
+    if (!on_request_permission) {
+        settle_permission_prompt(request, Web::Permissions::PromptOutcome::Cancelled);
+        return;
+    }
+
+    on_request_permission(request, [weak_this = make_weak_ptr(), request](Web::Permissions::PromptOutcome outcome) {
+        if (auto* view = weak_this.ptr())
+            view->settle_permission_prompt(request, outcome);
+    });
+}
+
+void ViewImplementation::settle_permission_prompt(PermissionPromptRequest const& request, Web::Permissions::PromptOutcome outcome)
+{
+    auto index = m_pending_permission_prompts.find_first_index_if([&](auto const& pending) { return pending.request.is_same_request_as(request); });
+    if (!index.has_value())
+        return;
+
+    auto pending = m_pending_permission_prompts.take(*index);
+    for (auto& waiter : pending.waiters)
+        waiter(outcome);
+}
+
+void ViewImplementation::ignore_pending_permission_prompts()
+{
+    auto pending_prompts = move(m_pending_permission_prompts);
+    m_held_permission_prompt_for_testing.clear();
+    m_held_permission_prompt_release_waiters_for_testing.clear();
+    for (auto& pending : pending_prompts) {
+        if (on_cancel_permission_prompt)
+            on_cancel_permission_prompt(pending.request);
+        for (auto& waiter : pending.waiters)
+            waiter(Web::Permissions::PromptOutcome::Ignored);
+    }
+}
+
+void ViewImplementation::set_next_permission_prompt_outcome_for_testing(Web::Permissions::PermissionName name, Web::Permissions::PromptOutcome outcome, bool held)
+{
+    m_next_permission_prompt_outcomes_for_testing.set(name, { outcome, held });
+}
+
+void ViewImplementation::reset_permission_prompts_for_testing()
+{
+    m_next_permission_prompt_outcomes_for_testing.clear();
+    m_held_permission_prompt_for_testing.clear();
+    m_held_permission_prompt_release_waiters_for_testing.clear();
+    m_microphone_authorizer_for_testing.clear();
+    m_sites_shown_microphone_denied_notice.clear();
+    m_microphone_denied_notices_shown = 0;
+    auto pending_prompts = move(m_pending_permission_prompts);
+    for (auto& pending : pending_prompts) {
+        for (auto& waiter : pending.waiters)
+            waiter(Web::Permissions::PromptOutcome::Cancelled);
+    }
+}
+
+void ViewImplementation::release_held_permission_prompt_for_testing(u32 waiters)
+{
+    m_held_permission_prompt_release_waiters_for_testing = waiters;
+    release_held_permission_prompt_if_ready_for_testing();
+}
+
+void ViewImplementation::release_held_permission_prompt_if_ready_for_testing()
+{
+    if (!m_held_permission_prompt_for_testing.has_value() || !m_held_permission_prompt_release_waiters_for_testing.has_value())
+        return;
+
+    auto const& request = *m_held_permission_prompt_for_testing;
+    auto pending = m_pending_permission_prompts.find_if([&](auto const& candidate) { return candidate.request.is_same_request_as(request); });
+    if (pending == m_pending_permission_prompts.end() || pending->waiters.size() < *m_held_permission_prompt_release_waiters_for_testing)
+        return;
+
+    m_held_permission_prompt_release_waiters_for_testing.clear();
+    auto held_request = m_held_permission_prompt_for_testing.release_value();
+    did_show_permission_prompt(held_request);
+    settle_permission_prompt(held_request, m_held_permission_prompt_outcome_for_testing);
 }
 
 Optional<URL::URL const&> ViewImplementation::browser_ui_load_url() const
@@ -192,6 +388,11 @@ void ViewImplementation::did_change_ongoing_navigation(Badge<CanonicalNavigable>
 
 void ViewImplementation::did_change_active_document(Badge<CanonicalTraversable>)
 {
+    m_page_translation->did_change_active_document();
+    // A prompt the document that asked has left behind goes unanswered: the user ignored it.
+    ignore_pending_permission_prompts();
+    report_permission_presence();
+    m_permissions_requested_by_page.clear();
     set_title(Utf16String::from_utf8(url().serialize()));
     set_favicon({});
     did_update_url();
@@ -237,26 +438,42 @@ void ViewImplementation::set_title(Utf16String title)
         return;
 
     m_title = move(title);
+    Application::the().media_session_coordinator().set_fallback_title(view_id(), m_title.to_utf8());
+    if (shows_background_activity())
+        m_changed_title_while_hidden = true;
 
     if (on_title_change)
         on_title_change(m_title);
 }
 
+// A page sets its title and favicon as it starts up, often from script after it loaded, or once its favicon arrived.
+// That is no work it does for the user in the background, so only what it changes after that counts.
+static constexpr auto time_to_settle_after_loading = AK::Duration::from_seconds(60);
+
+// Whether a change to the title or favicon shows the user what the page does while they don't look at it.
+bool ViewImplementation::shows_background_activity() const
+{
+    if (!m_top_level_traversable || traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+        return false;
+    return m_finished_loading_time.has_value() && MonotonicTime::now() - *m_finished_loading_time >= time_to_settle_after_loading;
+}
+
+static bool have_same_pixels(Gfx::Bitmap const* a, Gfx::Bitmap const* b)
+{
+    if (!a || !b)
+        return a == b;
+    if (a->size() != b->size() || a->format() != b->format() || a->pitch() != b->pitch())
+        return false;
+    return __builtin_memcmp(a->scanline_u8(0), b->scanline_u8(0), a->data_size()) == 0;
+}
+
 void ViewImplementation::set_favicon(Optional<Gfx::Bitmap const&> favicon)
 {
-    m_favicon_hash.clear();
-
-    if (favicon.has_value()) {
-        if (auto favicon_png = Gfx::PNGWriter::encode(*favicon); !favicon_png.is_error())
-            m_favicon_hash = m_session->favicon_store->add_favicon(favicon_png.release_value());
-
-        if (m_favicon_hash.has_value()) {
-            if (m_is_private == IsPrivate::No)
-                Application::bookmark_store().update_favicon(url(), *m_favicon_hash);
-            m_session->history_store->update_favicon(url(), *m_favicon_hash);
-        }
-    }
-
+    // NB: A page may set the favicon it already has again, which changes nothing the user sees.
+    auto const* new_favicon = favicon.has_value() ? &favicon.value() : nullptr;
+    if (shows_background_activity() && !have_same_pixels(m_favicon.ptr(), new_favicon))
+        m_changed_favicon_while_hidden = true;
+    m_favicon = new_favicon;
     if (on_favicon_change)
         on_favicon_change(favicon);
 }
@@ -266,22 +483,12 @@ void ViewImplementation::set_favicon(Optional<Gfx::Bitmap const&> favicon)
 // it there, before a document activates in the new page.
 void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio)
 {
-    bool did_swap_bitmap = false;
-    auto previous_front_bitmap_id = m_front_bitmap.id;
-    auto bitmap_index = m_other_bitmaps.find_first_index_if([bitmap_id](auto const& bitmap) { return bitmap_id == bitmap.id; });
-    if (bitmap_index.has_value()) {
-        m_has_usable_bitmap = true;
-        m_other_bitmaps[*bitmap_index].last_painted_size = size.to_type<Web::DevicePixels>();
-        m_other_bitmaps[*bitmap_index].last_painted_device_pixel_ratio = device_pixel_ratio;
-        swap(m_other_bitmaps[*bitmap_index], m_front_bitmap);
-        m_backup_shared_image_buffer = nullptr;
-        did_swap_bitmap = true;
-    }
+    auto [did_swap_bitmap, bitmap_id_to_release] = m_backing_stores->present(bitmap_id, size, device_pixel_ratio);
 
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received presented bitmap {} for page {} size={}x{} did_swap={} front={}",
-        bitmap_id, page().id(), size.width(), size.height(), did_swap_bitmap, m_front_bitmap.id);
+        bitmap_id, page().id(), size.width(), size.height(), did_swap_bitmap, m_backing_stores->front_bitmap_id());
 
-    release_backing_store(did_swap_bitmap ? previous_front_bitmap_id : bitmap_id);
+    release_backing_store(bitmap_id_to_release);
 
     if (did_swap_bitmap)
         did_accept_presented_backing_store(bitmap_id, damage_rect);
@@ -292,6 +499,109 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void ViewImplementation::server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect, double device_pixel_ratio)
+{
+    m_backing_stores->present_frame_shown_in_remote_layer(size, device_pixel_ratio);
+    if (m_crash_state.has_value() && m_crash_state->recovery_started)
+        set_crash_state({});
+    TabPerformanceMonitor::did_present(view_id());
+    did_present_frame_in_remote_layer(size, device_pixel_ratio);
+}
+
+void ViewImplementation::set_hosts_remote_layer(bool hosts_remote_layer)
+{
+    if (m_hosts_remote_layer == hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = hosts_remote_layer;
+
+    if (!hosts_remote_layer) {
+        if (auto remote_layer_id = exchange(m_remote_layer_id, {}); remote_layer_id.has_value()) {
+            Application::the().destroy_remote_layer(*remote_layer_id);
+            did_create_remote_layer({});
+        }
+        return;
+    }
+
+    auto remote_layer = Application::the().create_remote_layer();
+    if (!remote_layer.has_value()) {
+        did_create_remote_layer({});
+        return;
+    }
+    m_remote_layer_id = remote_layer->id;
+    update_remote_layer_fit();
+    Application::the().show_context_in_remote_layer(remote_layer->id, page().compositor_context_id());
+    did_create_remote_layer(remote_layer->host_handle);
+}
+
+void ViewImplementation::take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    Application::the().take_frame_snapshot(page().compositor_context_id(), move(callback));
+}
+
+ViewImplementation* ViewImplementation::find_view_showing_remote_layer(u64 remote_layer_id)
+{
+    for (auto& [_, view] : all_views()) {
+        if (view->m_remote_layer_id == remote_layer_id)
+            return view;
+    }
+    return nullptr;
+}
+
+void ViewImplementation::begin_synchronized_resize(u64 token)
+{
+    if (m_remote_layer_id.has_value())
+        Application::the().begin_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::await_synchronized_resize_frame(u64 token, Gfx::IntSize size)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_hold_synchronized_resize_frame(token);
+        return;
+    }
+    Application::the().await_synchronized_resize_frame(*m_remote_layer_id, token, size);
+}
+
+void ViewImplementation::commit_synchronized_resize(u64 token)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_commit_synchronized_resize(token);
+        return;
+    }
+    Application::the().commit_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::set_scales_frames_to_fit(bool scales_frames_to_fit)
+{
+    if (m_scales_frames_to_fit == scales_frames_to_fit)
+        return;
+
+    m_scales_frames_to_fit = scales_frames_to_fit;
+    if (has_traversable())
+        Application::the().update_compositor_context_scales_frames_to_fit(page().compositor_context_id(), scales_frames_to_fit);
+    update_remote_layer_fit();
+}
+
+// The Compositor fits the frames into the view itself, for a view that scales them to fit.
+void ViewImplementation::update_remote_layer_fit()
+{
+    if (!m_remote_layer_id.has_value())
+        return;
+    Optional<Gfx::IntSize> fit_within;
+    if (m_scales_frames_to_fit && !viewport_size().is_empty())
+        fit_within = viewport_size().to_type<int>();
+    Application::the().set_remote_layer_fit(*m_remote_layer_id, fit_within);
+}
+
+void ViewImplementation::recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>)
+{
+    if (!m_hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = false;
+    m_remote_layer_id = {};
+    set_hosts_remote_layer(true);
 }
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)
@@ -322,6 +632,253 @@ void ViewImplementation::set_system_visibility_state(Web::HTML::VisibilityState 
 
     traversable().set_system_visibility_state(visibility_state);
     Application::the().update_compositor_context_visibility(page().compositor_context_id(), visibility_state);
+    report_permission_presence();
+
+    if (visibility_state == Web::HTML::VisibilityState::Visible) {
+        m_hidden_since.clear();
+        m_discard_requested = false;
+    } else {
+        start_being_hidden();
+    }
+}
+
+void ViewImplementation::start_being_hidden()
+{
+    m_hidden_since = MonotonicTime::now();
+    TabDiscarder::did_hide_a_tab();
+    m_changed_title_while_hidden = false;
+    m_changed_favicon_while_hidden = false;
+}
+
+void ViewImplementation::set_current_tab_of_window(bool current_tab_of_window)
+{
+    m_current_tab_of_window = current_tab_of_window;
+    if (current_tab_of_window) {
+        m_hidden_since.clear();
+        m_discard_requested = false;
+    } else if (m_top_level_traversable && traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden && !m_hidden_since.has_value()) {
+        start_being_hidden();
+    }
+}
+
+// The user would notice that a tab stopped playing sound, so a tab that just did is likely to play more.
+static constexpr auto time_silent_before_discarding = AK::Duration::from_seconds(60);
+
+bool ViewImplementation::may_be_discarded(DiscardReason reason, AK::Duration minimum_time_hidden, MonotonicTime now) const
+{
+    if (m_discard_requested || !m_hidden_since.has_value() || now - *m_hidden_since < minimum_time_hidden)
+        return false;
+    return discard_blockers(reason, now) == DiscardBlockers::None;
+}
+
+DiscardBlockers ViewImplementation::discard_blockers(DiscardReason reason, MonotonicTime now) const
+{
+    if (!supports_discarding() || !m_top_level_traversable)
+        return DiscardBlockers::NotATab;
+
+    auto blockers = DiscardBlockers::None;
+    // NB: The UI brings a discarded tab back from the session history it keeps for the tab, which it only keeps for the
+    //     tabs that report it.
+    if (!m_reports_session_history)
+        blockers |= DiscardBlockers::NotRestorable;
+    if (traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+        blockers |= DiscardBlockers::Visible;
+
+    // The user keeps a pinned tab at hand, and sees a window's current tab whenever they look at the window.
+    if (m_pinned)
+        blockers |= DiscardBlockers::Pinned;
+    if (m_current_tab_of_window)
+        blockers |= DiscardBlockers::CurrentTabOfWindow;
+
+    // NB: A tab that hasn't loaded yet has nothing to restore, and a crashed tab shows the user what happened to it.
+    if (is_loading())
+        blockers |= DiscardBlockers::Loading;
+    if (m_crash_state.has_value())
+        blockers |= DiscardBlockers::Crashed;
+
+    // A tab that the user hears, or that listens or follows them, would stop doing it.
+    if (is_playing_audio())
+        blockers |= DiscardBlockers::PlayingAudio;
+    else if (m_stopped_playing_audio_time.has_value() && now - *m_stopped_playing_audio_time < time_silent_before_discarding)
+        blockers |= DiscardBlockers::RecentlyPlayedAudio;
+    if (is_capturing_audio())
+        blockers |= DiscardBlockers::CapturingAudio;
+    if (m_tab_indicators.is_active(TabIndicator::UsingLocation))
+        blockers |= DiscardBlockers::UsingLocation;
+
+    // A view that this one owns, such as a Picture-in-Picture window, shows the user what the tab does.
+    if (m_owned_view_count > 0)
+        blockers |= DiscardBlockers::OwnsAView;
+    if (m_devtools_connected)
+        blockers |= DiscardBlockers::DevToolsConnected;
+
+    // The user would lose what they typed, as nothing brings it back when the tab is loaded again.
+    // NB: Many pages listen for beforeunload whether or not they hold anything the user would lose, so that says
+    //     little about whether the tab can be unloaded.
+    if (had_user_edits())
+        blockers |= DiscardBlockers::UserEdits;
+
+    // A download that a page of the tab makes itself, such as one of a blob, fails when the page's process exits. And
+    // a permission prompt would go away unanswered.
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (page.has_renderer_owned_downloads())
+            blockers |= DiscardBlockers::Downloading;
+    });
+    if (!m_pending_permission_prompts.is_empty())
+        blockers |= DiscardBlockers::AwaitingPermissionPrompt;
+
+    if (reason == DiscardReason::Inactivity) {
+        // A tab that changes what it shows in the tab strip, such as the count of unread messages in its title, does
+        // work for the user in the background. So does one that may show them notifications.
+        if (m_changed_title_while_hidden)
+            blockers |= DiscardBlockers::ChangedTitleWhileHidden;
+        if (m_changed_favicon_while_hidden)
+            blockers |= DiscardBlockers::ChangedFaviconWhileHidden;
+        if (auto origin = permission_origin(); !origin.is_opaque()) {
+            if (session().permission_manager->effective_state(Web::Permissions::PermissionName::Notifications, origin) == Web::Permissions::EffectiveState::Granted)
+                blockers |= DiscardBlockers::MayShowNotifications;
+        } else {
+            // NB: A file: page's grant goes away with the page, so it would not even come back with the tab.
+            traversable().for_each_hosting_page([&](WebContentPage& page) {
+                if (page.hosts_a_local_file_document_that_may_use(Web::Permissions::PermissionName::Notifications))
+                    blockers |= DiscardBlockers::MayShowNotifications;
+            });
+        }
+    }
+    return blockers;
+}
+
+// The user should find the tab as they left it, so the processes hosting it first save where the user was in each of
+// its documents to its session history. A process that doesn't answer in time leaves its documents as they were saved.
+static constexpr auto time_to_save_session_history_entry_states = AK::Duration::from_seconds(1);
+
+// NB: A process may host pages of several tabs, such as tabs of one origin, or the cross-site frames of one site in
+//     several tabs. A page of another tab, even one only representing a frame, keeps the process alive.
+void ViewImplementation::for_each_process_that_discarding_ends(Function<void(WebContentClient&)> const& callback) const
+{
+    if (!m_top_level_traversable)
+        return;
+
+    HashTable<WebContentClient*> clients;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        clients.set(&page.client());
+    });
+    for (auto* client : clients) {
+        auto hosts_only_this_view = true;
+        client->for_each_page([&](WebContentPage& other_page) {
+            if (other_page.has_traversable() && &other_page.traversable() == &traversable())
+                return IterationDecision::Continue;
+            hosts_only_this_view = false;
+            return IterationDecision::Break;
+        });
+        if (hosts_only_this_view)
+            callback(*client);
+    }
+}
+
+bool ViewImplementation::discarding_ends_a_process() const
+{
+    auto ends_a_process = false;
+    for_each_process_that_discarding_ends([&](WebContentClient&) {
+        ends_a_process = true;
+    });
+    return ends_a_process;
+}
+
+void ViewImplementation::request_discard(DiscardReason reason)
+{
+    m_discard_requested = true;
+    m_discard_reason = reason;
+
+    m_pages_saving_session_history_entry_states.clear();
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        auto is_saving = any_of(m_pages_saving_session_history_entry_states, [&](auto const& saving_page) { return saving_page.ptr() == &page; });
+        if (!page.is_open() || is_saving)
+            return;
+        m_pages_saving_session_history_entry_states.append(page);
+        page.async_save_session_history_entry_states();
+    });
+    if (m_pages_saving_session_history_entry_states.is_empty()) {
+        finish_discard_request();
+        return;
+    }
+
+    if (!m_save_session_history_entry_states_timer) {
+        m_save_session_history_entry_states_timer = Core::Timer::create_single_shot(time_to_save_session_history_entry_states, [this] {
+            finish_discard_request();
+        });
+    }
+    m_save_session_history_entry_states_timer->restart();
+}
+
+void ViewImplementation::did_save_session_history_entry_states(Badge<WebContentPage>, WebContentPage& page)
+{
+    if (!m_pages_saving_session_history_entry_states.remove_first_matching([&](auto const& saving_page) { return saving_page.ptr() == &page; }))
+        return;
+    if (m_pages_saving_session_history_entry_states.is_empty())
+        finish_discard_request();
+}
+
+// NB: The UI keeps the tab for something that only it knows of, which may take a while to end. The tab is asked about
+//     again once it was hidden as long again, so that the UI isn't asked about it at each check meanwhile.
+void ViewImplementation::did_decline_discard()
+{
+    if (!m_discard_requested)
+        return;
+    m_discard_requested = false;
+    if (m_hidden_since.has_value()) {
+        m_hidden_since = MonotonicTime::now();
+        TabDiscarder::did_hide_a_tab();
+    }
+}
+
+void ViewImplementation::finish_discard_request()
+{
+    if (m_save_session_history_entry_states_timer)
+        m_save_session_history_entry_states_timer->stop();
+    m_pages_saving_session_history_entry_states.clear();
+
+    // NB: The user may have come back to the tab in the meantime.
+    if (m_discard_requested && traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden)
+        did_request_discard();
+}
+
+// One-time grants last only while some view shows their site, so each view tells the permission manager what it shows.
+void ViewImplementation::report_permission_presence()
+{
+    if (!m_top_level_traversable)
+        return;
+    auto visible = traversable().system_visibility_state() == Web::HTML::VisibilityState::Visible;
+    session().permission_manager->set_view_presence(view_id(), permission_origin(), visible);
+}
+
+// NB: The Hub may have asked the UI to discard the tab before the UI learned of the pin, which the UI then declined. The
+//     tab is asked about again once it is unpinned.
+void ViewImplementation::set_pinned(bool pinned)
+{
+    m_pinned = pinned;
+    if (pinned && m_discard_requested) {
+        m_discard_requested = false;
+        TabDiscarder::did_hide_a_tab();
+    }
+}
+
+URL::Origin ViewImplementation::permission_origin() const
+{
+    if (m_top_level_traversable) {
+        if (auto origin = traversable().active_document().top_level_origin(); origin.has_value())
+            return origin.release_value();
+    }
+    return url().origin();
+}
+
+void ViewImplementation::set_presents_from_cpu_memory(bool presents_from_cpu_memory)
+{
+    if (m_presents_from_cpu_memory == presents_from_cpu_memory)
+        return;
+
+    m_presents_from_cpu_memory = presents_from_cpu_memory;
+    Application::the().update_compositor_context_presents_from_cpu_memory(page().compositor_context_id(), presents_from_cpu_memory);
 }
 
 void ViewImplementation::set_has_system_focus(bool has_system_focus)
@@ -329,15 +886,33 @@ void ViewImplementation::set_has_system_focus(bool has_system_focus)
     traversable().set_has_system_focus(has_system_focus, {});
 }
 
-void ViewImplementation::load(URL::URL const& url, Web::Bindings::NavigationHistoryBehavior history_handling)
+void ViewImplementation::load_from_browser_ui(URL::URL const& url, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     load(traversable().prepare_navigation(url, {}, history_handling));
+}
+
+static bool process_hosting_may_read_local_files(Web::HTML::EnvironmentId const& environment_id)
+{
+    bool may_read_local_files = false;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (!client.hosted_environment(environment_id).has_value())
+            return IterationDecision::Continue;
+        may_read_local_files = client.may_read_local_files();
+        return IterationDecision::Break;
+    });
+    return may_read_local_files;
 }
 
 // A navigation a page asked the browser's UI to start for it — a link opened with a middle-click, e.g. — whose
 // source is still that page.
 void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation)
 {
+    // NB: A page can't have the browser's UI load a file: URL that its own navigation couldn't.
+    if (auto const& fetch_client = navigation.source_snapshot_params.fetch_client; navigation.url.scheme() == "file"sv && fetch_client.has_value()) {
+        if (!process_hosting_may_read_local_files(fetch_client->id))
+            return;
+    }
+
     if (on_before_browser_initiated_navigation)
         on_before_browser_initiated_navigation();
 
@@ -354,68 +929,14 @@ void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation
     dump_session_history("load"sv);
 }
 
-void ViewImplementation::load_from_user_input(URL::URL const& url)
-{
-    if (!is_url_handled_internally(url)) {
-        handle_external_url_from_user_input(url);
-        return;
-    }
-
-    load(url);
-}
-
-void ViewImplementation::load_from_user_input(StringView input)
-{
-    load_from_user_input(input, sanitize_url(input, Application::settings().search_engine_settings().engine));
-}
-
-void ViewImplementation::load_from_user_input(StringView input, Optional<URL::URL> fallback_url)
-{
-    auto classified_input = classify_user_input(input);
-
-    if (classified_input.classification != UserInputClassification::ExternalURL) {
-        if (fallback_url.has_value())
-            load(*fallback_url);
-        else
-            load_navigation_error_page(input);
-        return;
-    }
-
-    VERIFY(classified_input.url.has_value());
-    auto external_url = classified_input.url.release_value();
-
-    if (fallback_url.has_value() && *fallback_url == external_url) {
-        handle_external_url_from_user_input(external_url);
-        return;
-    }
-
-    auto input_string = MUST(String::from_utf8(input));
-    auto view_id = m_view_id;
-    handle_external_url_from_user_input(external_url, [view_id, input = move(input_string), fallback_url = move(fallback_url)] {
-        auto view = ViewImplementation::find_view_by_id(view_id);
-        if (!view.has_value())
-            return;
-
-        if (fallback_url.has_value())
-            view->load(*fallback_url);
-        else
-            view->load_navigation_error_page(input);
-    });
-}
-
 void ViewImplementation::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab)
 {
-    if (!is_url_handled_internally(url)) {
-        handle_external_url_from_user_input(url);
-        return;
-    }
-
     if (auto* view = create_view_for_new_tab_or_window(is_private())) {
-        view->load(url);
+        view->load_from_browser_ui(url);
         return;
     }
 
-    Application::the().open_url_in_new_tab(url, activate_tab);
+    Application::the().open_url_in_new_tab(url, activate_tab, this);
 }
 
 void ViewImplementation::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab)
@@ -430,7 +951,7 @@ void ViewImplementation::open_navigation_in_new_tab(Web::HTML::PreparedNavigatio
         return;
     }
 
-    Application::the().open_navigation_in_new_tab(move(navigation), activate_tab);
+    Application::the().open_navigation_in_new_tab(move(navigation), activate_tab, this);
 }
 
 void ViewImplementation::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, IsPrivate is_private)
@@ -450,13 +971,8 @@ void ViewImplementation::open_navigation_in_new_window(Web::HTML::PreparedNaviga
 
 void ViewImplementation::open_url_in_new_window(URL::URL const& url, IsPrivate is_private)
 {
-    if (!is_url_handled_internally(url)) {
-        handle_external_url_from_user_input(url);
-        return;
-    }
-
     if (auto* view = create_view_for_new_tab_or_window(is_private)) {
-        view->load(url);
+        view->load_from_browser_ui(url);
         return;
     }
 
@@ -475,15 +991,71 @@ void ViewImplementation::load_html(StringView html)
         set_loading_state(true);
 }
 
-void ViewImplementation::load_navigation_error_page(StringView text)
+void ViewImplementation::did_request_certificate_warning(Badge<WebContentPage>, URL::URL const& url, Web::HTML::CrossProcessId document_state_id)
 {
-    auto message = MUST(String::formatted("Failed to load \"{}\"", text));
+    if (!Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates))
+        return;
 
-    StringBuilder builder;
-    builder.appendff(ERROR_HTML_HEADER, ""sv, ERROR_SVG, message);
-    builder.append("<p>If you were trying to enter a search query, please enable search in <a href=\"about:settings#search\">settings</a>.</p>"sv);
-    builder.append(ERROR_HTML_FOOTER);
-    load_html(builder.string_view());
+    // Only the error page the view still displays may ask, and not once another navigation has started.
+    if (traversable().has_uncommitted_navigation() || traversable().session_history().current_entry().document_state->id != document_state_id)
+        return;
+
+    // Snapshot the rejected certificate so trusting it cannot trust a later rejection for the same host.
+    auto rejection = RequestServerManager::the().rejected_certificate(session(), url);
+    if (!rejection.has_value())
+        return;
+
+    // Use RequestServer's errors so a page cannot bypass the certificate trust settings.
+    if (!Requests::is_only_self_signed(rejection->certificate.errors) && !Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustInvalidCertificates))
+        return;
+
+    // Declining reloads the error page; suppress its repeated warning request.
+    if (auto declined = exchange(m_declined_certificate, {}); declined == rejection->certificate)
+        return;
+
+    CertificateWarning warning { .url = url, .certificate = move(rejection->certificate), .form_submission = {}, .form_initiator_origin = URL::Origin::create_opaque(), .form_is_not_resent = false };
+
+    // Preserve the form for resubmission before replacing the error page's history entry.
+    auto const& document_state = *traversable().session_history().current_entry().document_state;
+    if (auto const* form_submission = document_state.resource.get_pointer<Web::HTML::POSTResource>()) {
+        auto const& initiator_origin = document_state.initiator_origin;
+        if (initiator_origin.has_value() && !initiator_origin->is_opaque() && initiator_origin->is_same_site(url.origin())) {
+            warning.form_submission = *form_submission;
+            warning.form_initiator_origin = *initiator_origin;
+        } else {
+            warning.form_is_not_resent = true;
+        }
+    }
+
+    m_certificate_warning = move(warning);
+    load(traversable().prepare_navigation(URL::URL::about("certificate"sv), {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+}
+
+void ViewImplementation::answer_certificate_warning(Badge<CertificateUI>, URL::URL const& url, StringView fingerprint, bool trust)
+{
+    // Apply the answer only to the warning the user reviewed.
+    if (!m_certificate_warning.has_value() || m_certificate_warning->url != url || m_certificate_warning->certificate.fingerprint != fingerprint)
+        return;
+    auto warning = exchange(m_certificate_warning, {});
+
+    if (!trust) {
+        // NB: Never send the form to a server whose certificate the user declined.
+        m_declined_certificate = warning->certificate;
+        load(traversable().prepare_navigation(warning->url, {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+        return;
+    }
+
+    RequestServerManager::the().trust_certificate(session(), warning->certificate);
+
+    if (!warning->form_submission.has_value()) {
+        load(traversable().prepare_navigation(warning->url, {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+        return;
+    }
+
+    auto navigation = traversable().prepare_navigation(warning->url, warning->form_submission.release_value(), Web::Bindings::NavigationHistoryBehavior::Replace);
+    navigation.csp_navigation_type = Web::ContentSecurityPolicy::Directives::NavigationType::FormSubmission;
+    navigation.initiator_origin_snapshot = move(warning->form_initiator_origin);
+    load(move(navigation));
 }
 
 void ViewImplementation::reload(BypassCache bypass_cache)
@@ -512,6 +1084,21 @@ void ViewImplementation::reload(BypassCache bypass_cache)
     }
 
     traversable().reload(bypass_cache);
+    update_navigation_action_state();
+    dump_session_history("reload-mark-current-entry-reload-pending"sv);
+}
+
+void ViewImplementation::reload_for_webdriver_bidi(BypassCache bypass_cache, Utf16String navigation_id)
+{
+    m_history_visit_transition_for_next_load = HistoryVisitTransition::Reload;
+    if (on_before_browser_initiated_navigation)
+        on_before_browser_initiated_navigation();
+
+    // NB: BiDi reloads the active document, rather than retrying a stopped or failed navigation.
+    m_last_stopped_navigation.clear();
+    prepare_for_navigation_after_crash();
+    set_loading_state(true);
+    traversable().reload(bypass_cache, move(navigation_id));
     update_navigation_action_state();
     dump_session_history("reload-mark-current-entry-reload-pending"sv);
 }
@@ -572,7 +1159,6 @@ void ViewImplementation::traverse_the_history_to_step(
 
 void ViewImplementation::will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id)
 {
-    m_history_visit_transition_for_next_load = HistoryVisitTransition::Restore;
     if (m_webdriver_navigation_observation.has_value()
         && m_webdriver_navigation_observation->completion_source == WebDriverNavigationCompletionSource::CrashRecovery) {
         m_webdriver_navigation_observation->history_operation_id = operation_id;
@@ -588,6 +1174,15 @@ void ViewImplementation::did_apply_top_level_history_traversal_step(Web::HTML::C
     complete_webdriver_history_traversal(operation_id);
 }
 
+// A traversal's load that activated no document leaves the tab loading only if something else is.
+void ViewImplementation::did_not_activate_history_traversal_load()
+{
+    if (traversable().tracked_load_navigation_id().has_value())
+        return;
+    set_loading_state(false);
+    notify_load_finish();
+}
+
 // A reload of the tab's document that did not apply leaves the tab loading only if something else is.
 void ViewImplementation::did_not_apply_reload()
 {
@@ -600,6 +1195,10 @@ void ViewImplementation::did_not_apply_reload()
 
 void ViewImplementation::did_commit_history_step()
 {
+    // A pending certificate warning belongs to the about:certificate page that shows it.
+    if (m_certificate_warning.has_value() && !url().equals(URL::URL::about("certificate"sv), URL::ExcludeFragment::Yes))
+        m_certificate_warning.clear();
+
     did_update_url();
     update_navigation_action_state();
 }
@@ -613,7 +1212,7 @@ void ViewImplementation::did_finish_history_traversal(Web::HTML::CrossProcessId 
     dump_session_history("webcontent-history-traversal-complete"sv);
 }
 
-Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::session_history_traversal_menu_items(int direction) const
+Vector<ViewImplementation::SessionHistoryTraversalItem> ViewImplementation::session_history_traversal_items(int direction) const
 {
     VERIFY(direction == -1 || direction == 1);
 
@@ -621,21 +1220,10 @@ Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::
     auto used_steps = session_history.used_steps();
     auto current_used_step_index = session_history.current_used_step_index();
 
-    Vector<SessionHistoryTraversalMenuItem> items;
+    Vector<SessionHistoryTraversalItem> items;
     auto append_item = [&](size_t target_step_index) {
         auto target_step = used_steps[target_step_index];
-        auto const& target_entry = *session_history.top_level_entry_for_step(target_step);
-        auto history_entry = m_session->history_store->entry_for_url(target_entry.url);
-        auto url = target_entry.url.serialize();
-        auto title = history_entry.has_value() && history_entry->title.has_value() && !history_entry->title->is_empty()
-            ? move(*history_entry->title)
-            : url;
-        items.append({
-            target_step,
-            move(title),
-            move(url),
-            history_entry.has_value() ? move(history_entry->favicon_png) : OptionalNone {},
-        });
+        items.append({ target_step, session_history.top_level_entry_for_step(target_step)->url });
     };
 
     if (direction < 0) {
@@ -677,23 +1265,34 @@ void ViewImplementation::set_zoom(double zoom_level)
     update_zoom();
 }
 
-void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
+void ViewImplementation::reset_zoom()
+{
+    set_zoom(1.0);
+    page().async_reset_zoom();
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
+}
+
+void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range)
 {
     m_display_id = display_id;
     m_maximum_frames_per_second = maximum_frames_per_second;
+    m_screen_shows_high_dynamic_range = screen_shows_high_dynamic_range;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+        page.async_set_screen_shows_high_dynamic_range(m_screen_shows_high_dynamic_range);
         update_compositor_display_metadata(page);
     });
 }
 
-void ViewImplementation::set_viewport_corner_radius(double radius)
+void ViewImplementation::set_frame_rate_capped(bool capped)
 {
-    if (m_viewport_corner_radius == radius)
+    if (m_frame_rate_capped == capped)
         return;
-    m_viewport_corner_radius = radius;
+    m_frame_rate_capped = capped;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
-        page.async_set_viewport_corner_radius(m_viewport_corner_radius);
+        page.async_set_frame_rate_capped(m_frame_rate_capped);
     });
 }
 
@@ -730,16 +1329,6 @@ void ViewImplementation::send_system_theme_to_page(WebContentPage& page)
         page.async_update_system_theme(theme);
 }
 
-void ViewImplementation::reset_zoom()
-{
-    m_zoom_level = 1.0;
-    update_zoom();
-    page().async_reset_zoom();
-
-    if (m_is_private == IsPrivate::No)
-        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
-}
-
 // NB: The event is handled once it leaves the queue of pending input events, or when it never enters it.
 struct WebDriverInputData final : public Web::BrowserInputData {
     explicit WebDriverInputData(Function<void()> on_handled)
@@ -758,6 +1347,11 @@ void ViewImplementation::enqueue_webdriver_mouse_event(Badge<WebContentPage>, We
     enqueue_input_event(move(event));
 }
 
+void ViewImplementation::enqueue_pinch_event_for_testing(Badge<WebContentPage>, Web::PinchEvent event)
+{
+    enqueue_input_event(event);
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#activation-triggering-input-event
 static bool is_activation_triggering_input_event(Web::InputEvent const& event)
 {
@@ -770,6 +1364,21 @@ static bool is_activation_triggering_input_event(Web::InputEvent const& event)
     if (auto const* mouse_event = event.get_pointer<Web::MouseEvent>())
         return mouse_event->type == Web::MouseEvent::Type::MouseDown;
     return false;
+}
+
+// NB: The shortcut matches the one EventHandler pastes on.
+static bool is_paste_shortcut(Web::InputEvent const& event)
+{
+    auto const* key_event = event.get_pointer<Web::KeyEvent>();
+    if (!key_event || key_event->type != Web::KeyEvent::Type::KeyDown || key_event->key != Web::UIEvents::KeyCode::Key_V
+        || (key_event->modifiers & Web::UIEvents::Mod_PlatformCtrl) == 0)
+        return false;
+
+#if defined(AK_OS_MACOS)
+    return (key_event->modifiers & Web::UIEvents::Mod_Alt) == 0 || (key_event->modifiers & Web::UIEvents::Mod_Shift) != 0;
+#else
+    return (key_event->modifiers & Web::UIEvents::Mod_Alt) == 0;
+#endif
 }
 
 // A page busy for a while handles input late, and its activation counts from then. A page that never finishes handling
@@ -799,7 +1408,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         return;
     }
 
-    if (m_has_picture_in_picture_controls && mouse_event && handle_picture_in_picture_controls_mouse_event(*mouse_event))
+    if (m_has_picture_in_picture_controls && mouse_event && !mouse_event->pointer_data.ptr() && handle_picture_in_picture_controls_mouse_event(*mouse_event))
         return;
 
     // User input enables a single request for an external URL.
@@ -838,6 +1447,8 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         });
         m_inputs_to_open_links_in_new_tabs.append({ Web::input_event_id(pending.event), now });
     }
+    if (is_paste_shortcut(pending.event))
+        pending.paste_shortcut_time = MonotonicTime::now();
     // A focused navigable another page hosts takes key events directly.
     if (pending.event.has<Web::KeyEvent>())
         pending.endpoint = focused_navigable_host();
@@ -847,17 +1458,27 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 // Input waits while the compositor decides whether it forwards a key event, so a key it hands back is not overtaken.
 void ViewImplementation::send_queued_input_events()
 {
+    bool has_earlier_pinch_yet_to_zoom = false;
     for (size_t index = 0; index < m_pending_input_events.size(); ++index) {
+        // Pinches in different processes share the tab's visual viewport. A later pinch must not zoom it before an
+        // earlier frame has dispatched its wheel event and, if uncanceled, returned for the zoom. A pinch the
+        // compositor zoomed for holds back nothing, so a busy page does not hold back the zoom.
+        if (m_pending_input_events[index].event.has<Web::PinchEvent>() && has_earlier_pinch_yet_to_zoom)
+            continue;
         if (!m_pending_input_events[index].sent)
             send_input_event(index);
+        if (auto const* pinch_event = m_pending_input_events[index].event.get_pointer<Web::PinchEvent>())
+            has_earlier_pinch_yet_to_zoom = !pinch_event->async_zoom_performed_default_action;
         if (m_pending_input_events[index].awaits_compositor_dispatch())
             return;
     }
 }
 
-// A key press may scroll in the compositor only while no earlier input the pages have yet to handle can change its
-// target. Key release always reaches the compositor's keyboard scrolling, even if it could no longer accept a new
-// scroll.
+// A key press may scroll in the compositor unless earlier input the pages have yet to handle is likely to change its
+// target: a key press the compositor left to the page or a mouse event other than a move. Key release always reaches
+// the compositor's keyboard scrolling, even if it could no longer accept a new scroll.
+// NB: A handler of a key release or a pointer move may change the target too. We accept that, as waiting for those
+//     would stall scrolling beside a busy page for every move of the pointer.
 bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) const
 {
     auto const& key_event = m_pending_input_events[index].event.get<Web::KeyEvent>();
@@ -865,12 +1486,17 @@ bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) co
         return false;
     if (key_event.type == Web::KeyEvent::Type::KeyUp)
         return true;
-    if (!m_has_usable_bitmap)
-        return false;
     for (size_t preceding = 0; preceding < index; ++preceding) {
-        auto const* key = m_pending_input_events[preceding].event.get_pointer<Web::KeyEvent>();
-        if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
+        auto const& event = m_pending_input_events[preceding].event;
+        if (auto const* key = event.get_pointer<Web::KeyEvent>()) {
+            if (key->type == Web::KeyEvent::Type::KeyDown && !key->async_scroll_performed_default_action)
+                return false;
+        } else if (auto const* mouse = event.get_pointer<Web::MouseEvent>()) {
+            if (mouse->buttons != 0 || !first_is_one_of(mouse->type, Web::MouseEvent::Type::MouseMove, Web::MouseEvent::Type::MouseLeave))
+                return false;
+        } else {
             return false;
+        }
     }
     return true;
 }
@@ -891,7 +1517,7 @@ void ViewImplementation::send_input_event(size_t index)
         [&](Web::MouseEvent const& event) {
             // The compositor scrolls or drags a scrollbar for the event when it can, then forwards the event to
             // WebContent behind the scroll updates that produced, consumes it, or hands it back for direct dispatch.
-            if (pending.endpoint->handle_and_dispatch_mouse_event_in_compositor(event))
+            if (!event.pointer_data.ptr() && pending.endpoint->handle_and_dispatch_mouse_event_in_compositor(event))
                 pending.routed_through_compositor = true;
             else
                 pending.endpoint->async_mouse_event(event.clone_without_browser_data());
@@ -903,8 +1529,12 @@ void ViewImplementation::send_input_event(size_t index)
             pending.endpoint->async_drag_event(cloned_event);
         },
         [&](Web::PinchEvent const& event) {
-            pending.endpoint->handle_pinch_event_in_compositor(event);
-            pending.endpoint->async_pinch_event(event);
+            // The compositor zooms for the event when it can, then forwards the event to WebContent behind the scroll
+            // updates that produced, or hands it back for direct dispatch.
+            if (pending.endpoint->handle_and_dispatch_pinch_event_in_compositor(event))
+                pending.routed_through_compositor = true;
+            else
+                pending.endpoint->async_pinch_event(event);
         });
 }
 
@@ -913,11 +1543,11 @@ void ViewImplementation::handle_external_url(Badge<WebContentPage>, URL::URL url
     handle_external_url(move(url), move(initiator_origin), has_transient_activation);
 }
 
-void ViewImplementation::handle_external_url_from_user_input(URL::URL const& url, Function<void()> on_handler_unavailable)
+void ViewImplementation::handle_external_url_from_user_input(URL::URL const& url)
 {
     // Browser UI actions can submit several URLs at once, for example when opening a bookmark folder. Keep those
     // requests ordered while a handler lookup or confirmation is in progress.
-    m_pending_external_url_requests.enqueue({ url, this->url().origin(), move(on_handler_unavailable) });
+    m_pending_external_url_requests.enqueue({ url, this->url().origin() });
     process_next_external_url_request();
 }
 
@@ -926,7 +1556,7 @@ void ViewImplementation::process_next_external_url_request()
     while (!m_external_url_confirmation_pending && !m_pending_external_url_requests.is_empty()) {
         auto request = m_pending_external_url_requests.dequeue();
         m_external_url_request_policy.allow_request_from_browser_ui(request.url);
-        handle_external_url(move(request.url), move(request.initiator_origin), false, move(request.on_handler_unavailable));
+        handle_external_url(move(request.url), move(request.initiator_origin), false);
     }
 }
 
@@ -945,7 +1575,7 @@ void ViewImplementation::complete_external_url_request()
     });
 }
 
-void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation, Function<void()> on_handler_unavailable)
+void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation)
 {
     if (m_external_url_confirmation_pending)
         return;
@@ -965,11 +1595,6 @@ void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator
         return;
 
     if (headless_mode) {
-        if (on_handler_unavailable) {
-            on_handler_unavailable();
-            return;
-        }
-
         Application::the().display_error_dialog(MUST(String::formatted("External URL handling is unavailable in headless mode: {}", url)));
         return;
     }
@@ -977,7 +1602,7 @@ void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator
     m_external_url_confirmation_pending = true;
     auto view_id = m_view_id;
     auto url_for_callback = url;
-    Application::the().resolve_external_url_handler(url, [view_id, url = move(url_for_callback), initiator_origin = move(initiator_origin), action, request_source = *request_source, on_handler_unavailable = move(on_handler_unavailable)](RefPtr<ExternalURLHandler> handler) mutable {
+    Application::the().resolve_external_url_handler(url, [view_id, url = move(url_for_callback), initiator_origin = move(initiator_origin), action, request_source = *request_source](RefPtr<ExternalURLHandler> handler) mutable {
         auto view = ViewImplementation::find_view_by_id(view_id);
         if (!view.has_value())
             return;
@@ -994,12 +1619,6 @@ void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator
             //    navigable, navigationParams's id, navigationParams's navigation timing type, and navigationParams's
             //    user involvement.
             // AD-HOC: We can't implement this directly, so show a warning dialog instead.
-            if (on_handler_unavailable) {
-                view->complete_external_url_request();
-                on_handler_unavailable();
-                return;
-            }
-
             auto error_message = MUST(String::formatted("No application is registered to open {}", url));
             Application::the().display_error_dialog(error_message);
             if (auto current_view = ViewImplementation::find_view_by_id(view_id); current_view.has_value())
@@ -1009,11 +1628,6 @@ void ViewImplementation::handle_external_url(URL::URL url, URL::Origin initiator
 
         if (handler->is_ladybird()) {
             view->complete_external_url_request();
-            if (on_handler_unavailable) {
-                on_handler_unavailable();
-                return;
-            }
-
             if (request_source == ExternalURLRequestSource::Page)
                 view->m_external_url_request_policy.allow_next_request();
             return;
@@ -1079,6 +1693,31 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     if (!index.has_value() || m_pending_input_events[*index].endpoint.ptr() != &reporting_page)
         return;
+    // Keep the returned default action in its original position. Removing it and scheduling the queue first would
+    // let a later pinch overtake it, which changes the zoom when focal points differ or a scale limit is reached.
+    auto& pending_input = m_pending_input_events[*index];
+    auto pinch_default_action_returned = event_result == Web::EventResult::Accepted
+        || (pending_input.forwarded_to_child_frame && event_result != Web::EventResult::Handled && event_result != Web::EventResult::Cancelled);
+    // A gesture the page canceled stays canceled, even once the pinch moves to where nothing cancels it.
+    if (auto const* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>()) {
+        if (!pinch_event->continues_gesture)
+            m_pinch_gesture_was_canceled = false;
+        if (event_result == Web::EventResult::Cancelled)
+            m_pinch_gesture_was_canceled = true;
+    }
+    if (auto* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>();
+        pinch_event && pinch_default_action_returned && !m_pinch_gesture_was_canceled && !pinch_event->wheel_event_was_dispatched && !pinch_event->async_zoom_performed_default_action) {
+        pinch_event->wheel_event_was_dispatched = true;
+        pending_input.endpoint = page();
+        pending_input.sent = false;
+        // NB: WebContent's answer travels on another connection than the compositor's and may overtake it. What the
+        //     compositor still answers for this trip must not be taken for an answer to the next one.
+        pending_input.expects_stale_compositor_answer = pending_input.routed_through_compositor;
+        pending_input.routed_through_compositor = false;
+        send_queued_input_events();
+        return;
+    }
+
     auto pending = m_pending_input_events.take(*index);
     auto event = move(pending.event);
     send_queued_input_events();
@@ -1095,6 +1734,8 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     // A view can decide what a mouse event goes on to do by whether the page handled it, such as whether the page
     // claimed the press that starts a drag.
     if (auto const* mouse_event = event.get_pointer<Web::MouseEvent>()) {
+        if (mouse_event->pointer_data.ptr())
+            return;
         if (on_finish_handling_mouse_event)
             on_finish_handling_mouse_event(*mouse_event, event_result);
 
@@ -1137,6 +1778,23 @@ void ViewImplementation::did_forward_input_event(Badge<WebContentPage>, WebConte
     if (!index.has_value() || m_pending_input_events[*index].endpoint.ptr() != &reporting_page)
         return;
     m_pending_input_events[*index].endpoint = endpoint;
+    m_pending_input_events[*index].forwarded_to_child_frame = true;
+}
+
+void ViewImplementation::did_forward_pinch_event(Badge<WebContentPage>, WebContentPage const& reporting_page, Web::PinchEvent const& event, WebContentPage& endpoint)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event.id; });
+    if (!index.has_value() || m_pending_input_events[*index].endpoint.ptr() != &reporting_page)
+        return;
+    auto& pending = m_pending_input_events[*index];
+    auto* pinch_event = pending.event.get_pointer<Web::PinchEvent>();
+    if (!pinch_event)
+        return;
+    pending.endpoint = endpoint;
+    pending.forwarded_to_child_frame = true;
+    // The page may have coalesced earlier steps of the pinch into the event, which the zoom asked for later includes.
+    pinch_event->scale_delta = event.scale_delta;
+    pinch_event->async_zoom_performed_default_action = event.async_zoom_performed_default_action;
 }
 
 // The earliest input the page has yet to finish handling that gives it user activation: input the page handles, or
@@ -1156,6 +1814,17 @@ bool ViewImplementation::is_delivering_user_activation_to(WebContentPage const& 
     return index_of_input_in_flight_giving_user_activation_to(page).has_value();
 }
 
+// NB: A page handles its input in the order the view delivered it, so the earliest input to the page that the page has
+//     yet to finish is the input it is handling, if any. Each paste shortcut lets the page read the clipboard once.
+bool ViewImplementation::take_paste_shortcut_handled_by(Badge<WebContentPage>, WebContentPage const& page)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return pending.endpoint.ptr() == &page; });
+    if (!index.has_value())
+        return false;
+    auto paste_shortcut_time = exchange(m_pending_input_events[*index].paste_shortcut_time, {});
+    return paste_shortcut_time.has_value() && MonotonicTime::now() - *paste_shortcut_time < longest_user_activation_delivery;
+}
+
 void ViewImplementation::consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const& page)
 {
     if (auto index = index_of_input_in_flight_giving_user_activation_to(page); index.has_value())
@@ -1171,10 +1840,10 @@ void ViewImplementation::consume_user_activation_of_input_handled_by(Badge<WebCo
         m_pending_input_events[*index].user_activation_time.clear();
 }
 
-bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage>)
+bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage>, WebContentPage const& page)
 {
     // NB: Automation lets a renderer synthesize the input that opens a link.
-    if (WebContentClient::renderers_may_synthesize_input())
+    if (WebContentClient::renderers_may_synthesize_input_for_testing() || is_running_webdriver_input_command_in(page))
         return true;
     // NB: Each press opens at most one link, the earliest press first, and only while a page could still be handling it.
     auto now = MonotonicTime::now();
@@ -1220,24 +1889,34 @@ void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<W
         [&](Web::MouseEvent const& event) {
             pending.endpoint->async_mouse_event(event.clone_without_browser_data());
         },
+        [&](Web::PinchEvent const& event) {
+            pending.endpoint->async_pinch_event(event);
+        },
         [](auto const&) {
             VERIFY_NOT_REACHED();
         });
     send_queued_input_events();
 }
 
-void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action)
+void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     if (!index.has_value())
         return;
 
     auto& pending = m_pending_input_events[*index];
-    if (!pending.awaits_compositor_dispatch())
+    if (exchange(pending.expects_stale_compositor_answer, false))
+        return;
+    if (!pending.routed_through_compositor)
+        return;
+    if (auto* key_event = pending.event.get_pointer<Web::KeyEvent>())
+        key_event->async_scroll_performed_default_action = performed_default_action;
+    else if (auto* pinch_event = pending.event.get_pointer<Web::PinchEvent>())
+        pinch_event->async_zoom_performed_default_action = performed_default_action;
+    else
         return;
     // WebContent finishes the event from here on, as it does an event the view sends it directly.
     pending.routed_through_compositor = false;
-    pending.event.get<Web::KeyEvent>().async_scroll_performed_default_action = async_scroll_performed_default_action;
     send_queued_input_events();
 }
 
@@ -1249,29 +1928,61 @@ void ViewImplementation::discard_input_events_routed_through_lost_compositor(Bad
     send_queued_input_events();
 }
 
+// A process that hosts a WebUI hosts only the browser's own pages, which follow the interface theme.
+Web::CSS::PreferredColorScheme ViewImplementation::preferred_color_scheme_for_page(WebContentPage const& page) const
+{
+    if (page.client().hosted_web_ui().has_value())
+        return Application::the().interface_color_scheme();
+    return m_preferred_color_scheme;
+}
+
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
 {
     m_preferred_color_scheme = color_scheme;
     set_page_background_color(preferred_canvas_background_color());
 
     traversable().for_each_hosting_page([&](WebContentPage& page) {
-        page.async_set_preferred_color_scheme(color_scheme);
+        page.async_set_preferred_color_scheme(preferred_color_scheme_for_page(page));
     });
+}
+
+void ViewImplementation::update_interface_color_scheme()
+{
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (page.client().hosted_web_ui().has_value())
+            page.async_set_preferred_color_scheme(preferred_color_scheme_for_page(page));
+    });
+}
+
+// Pages can't read the platform's settings, so Auto reaches them as what the platform asks for.
+static Web::CSS::PreferredContrast contrast_for_pages(Web::CSS::PreferredContrast contrast)
+{
+    if (contrast != Web::CSS::PreferredContrast::Auto)
+        return contrast;
+    return Application::the().platform_prefers_more_contrast() ? Web::CSS::PreferredContrast::More : Web::CSS::PreferredContrast::NoPreference;
 }
 
 void ViewImplementation::set_preferred_contrast(Web::CSS::PreferredContrast contrast)
 {
     m_preferred_contrast = contrast;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
-        page.async_set_preferred_contrast(contrast);
+        page.async_set_preferred_contrast(contrast_for_pages(contrast));
     });
+}
+
+// Pages can't read the platform's settings, so Auto reaches them as what the platform asks for.
+static Web::CSS::PreferredMotion motion_for_pages(Web::CSS::PreferredMotion motion)
+{
+    if (motion != Web::CSS::PreferredMotion::Auto)
+        return motion;
+    return Application::the().platform_prefers_reduced_motion() ? Web::CSS::PreferredMotion::Reduce : Web::CSS::PreferredMotion::NoPreference;
 }
 
 void ViewImplementation::set_preferred_motion(Web::CSS::PreferredMotion motion)
 {
     m_preferred_motion = motion;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
-        page.async_set_preferred_motion(motion);
+        page.async_set_preferred_motion(motion_for_pages(motion));
     });
 }
 
@@ -1282,19 +1993,14 @@ static void send_browsing_behavior(WebContentPage const& page)
 
 static void send_autoplay_settings(WebContentPage const& page)
 {
-    auto const& autoplay_settings = Application::settings().autoplay_settings();
     auto const& web_content_options = Application::web_content_options();
 
-    auto policy = autoplay_settings.policy;
-    if (web_content_options.enable_autoplay == EnableAutoplay::Yes)
-        policy = Web::HTML::AutoplayPolicy::AllowAudioAndVideo;
-
-    Vector<Utf16String> allowlist;
-    allowlist.ensure_capacity(autoplay_settings.site_filters.size());
-    for (auto const& site_filter : autoplay_settings.site_filters)
-        allowlist.unchecked_append(Utf16String::from_utf8(site_filter));
-
-    page.async_set_autoplay_settings(policy, move(allowlist));
+    if (web_content_options.enable_autoplay == EnableAutoplay::Yes) {
+        page.async_set_autoplay_settings(Web::HTML::AutoplayPolicy::AllowAudioAndVideo, {});
+    } else {
+        auto const& autoplay_settings = Application::settings().autoplay_settings();
+        page.async_set_autoplay_settings(autoplay_settings.policy, autoplay_settings.site_filters);
+    }
 }
 
 static void send_global_privacy_control(WebContentPage const& page)
@@ -1302,26 +2008,38 @@ static void send_global_privacy_control(WebContentPage const& page)
     page.async_set_enable_global_privacy_control(Application::settings().global_privacy_control() == GlobalPrivacyControl::Yes);
 }
 
+static void send_offers_to_trust_certificates(WebContentPage const& page)
+{
+    auto const& settings = Application::settings();
+    auto self_signed = settings.config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates);
+    auto invalid = self_signed && settings.config_variable_as_bool(ConfigVariableID::OfferToTrustInvalidCertificates);
+    page.async_set_offers_to_trust_certificates(self_signed, invalid);
+}
+
 // Only a page hosting the tab's traversable takes this request: It applies to the page's local traversable, which a page
 // embedding an out-of-process iframe doesn't have.
 static void send_force_dark(WebContentPage const& page)
 {
-    // FIXME: This is not a "debug request". Add a proper endpoint for this toggle.
-    page.async_debug_request("set-force-dark"sv, Application::settings().content_settings().enable_force_dark ? "on"sv : "off"sv);
+    auto const& settings = Application::settings().content_settings();
+    page.async_set_force_dark_settings(settings.enable_force_dark, settings.force_dark_per_host);
 }
 
 void ViewImplementation::send_preferences_to_page(WebContentPage& page)
 {
     send_system_theme_to_page(page);
-    page.async_set_preferred_color_scheme(m_preferred_color_scheme);
-    page.async_set_preferred_contrast(m_preferred_contrast);
-    page.async_set_preferred_motion(m_preferred_motion);
+    page.async_set_preferred_color_scheme(preferred_color_scheme_for_page(page));
+    page.async_set_preferred_contrast(contrast_for_pages(m_preferred_contrast));
+    page.async_set_preferred_motion(motion_for_pages(m_preferred_motion));
     page.async_set_preferred_languages(Application::settings().languages());
     page.async_set_zoom_level(m_zoom_level);
     send_browsing_behavior(page);
     send_autoplay_settings(page);
     send_global_privacy_control(page);
-    page.async_set_spell_checking_available(Application::the().spell_checker() != nullptr);
+    send_offers_to_trust_certificates(page);
+    auto* spell_checker = Application::the().spell_checker();
+    page.async_set_spell_checking_available(spell_checker != nullptr);
+    page.async_set_writing_suggestions_available(spell_checker && spell_checker->can_suggest());
+    m_page_translation->did_create_page(page);
     send_geolocation_emulated_position(page);
     page.async_set_has_picture_in_picture_support(Application::the().supports_picture_in_picture());
 }
@@ -1557,7 +2275,7 @@ void ViewImplementation::set_editing_history_state(bool can_undo, bool can_redo)
 {
     m_can_undo = can_undo;
     m_can_redo = can_redo;
-    Application::the().update_editing_history_actions();
+    did_change_state();
 }
 
 void ViewImplementation::redo()
@@ -1588,7 +2306,25 @@ void ViewImplementation::find_in_page_end()
 
 void ViewImplementation::get_source()
 {
+    if (!can_view_source())
+        return;
     page().async_get_source();
+}
+
+bool ViewImplementation::can_view_source() const
+{
+    if (m_page_source_pending)
+        return false;
+    if (!m_page_source_document_state.has_value())
+        return true;
+    return traversable().session_history().current_entry().document_state->id != *m_page_source_document_state;
+}
+
+void ViewImplementation::did_start_showing_page_source()
+{
+    m_page_source_pending = true;
+    m_page_source_document_state.clear();
+    did_change_state();
 }
 
 // Only a website the page is showing can be reported, so not a browser page or a page that crashed.
@@ -1602,12 +2338,6 @@ void ViewImplementation::report_website_issue()
 {
     if (can_report_website_issue() && on_request_website_issue_report)
         on_request_website_issue_report();
-}
-
-void ViewImplementation::update_report_website_issue_action()
-{
-    m_report_website_issue_action->set_enabled(can_report_website_issue());
-    Application::the().update_report_website_issue_action();
 }
 
 void ViewImplementation::inspect_dom_tree()
@@ -1705,9 +2435,25 @@ void ViewImplementation::request_node_picker_hit_test(NodePickerRequestType type
     if (!m_node_picker_active)
         return;
 
-    auto request_id = m_next_node_picker_request_id++;
+    auto request_id = m_next_node_hit_test_request_id++;
     m_pending_node_picker_requests.set(request_id, type);
     page().async_get_node_id_at_position(request_id, position);
+}
+
+void ViewImplementation::did_receive_node_hit_test(u64 request_id, Web::UniqueNodeID node_id)
+{
+    if (request_id == m_inspect_element_hit_test_request_id) {
+        m_inspect_element_hit_test_request_id.clear();
+        if (node_id != 0)
+            m_inspect_element_node_id = node_id;
+
+        // The user chose Inspect Element before the hit test came back.
+        if (exchange(m_inspect_element_activated_before_hit_test, false) && m_inspect_element_node_id.has_value() && on_inspect_element_request)
+            on_inspect_element_request(*m_inspect_element_node_id);
+        return;
+    }
+
+    did_receive_node_picker_hit_test(request_id, node_id);
 }
 
 void ViewImplementation::did_receive_node_picker_hit_test(u64 request_id, Web::UniqueNodeID node_id)
@@ -2072,22 +2818,13 @@ void ViewImplementation::did_change_picture_in_picture_player_controls_visibilit
         update_ui_overlays();
 }
 
-Optional<ViewImplementation::DisplayedFrame> ViewImplementation::displayed_frame() const
-{
-    if (m_has_usable_bitmap)
-        return DisplayedFrame { m_front_bitmap.last_painted_size.to_type<int>(), m_front_bitmap.last_painted_device_pixel_ratio };
-    if (m_backup_shared_image_buffer)
-        return DisplayedFrame { m_backup_bitmap_size.to_type<int>(), m_backup_bitmap_device_pixel_ratio };
-    return {};
-}
-
 // The compositor draws the browser's overlays over the frame it presents, at the pixel ratio it painted the frame at,
 // and the frame may be scaled to fit the view.
 ViewImplementation::UIOverlayPosition ViewImplementation::ui_overlay_position(Web::DevicePixelPoint position) const
 {
     auto view_size = viewport_size().to_type<int>();
     auto view_position = position.to_type<int>();
-    auto frame = displayed_frame();
+    auto frame = m_backing_stores->displayed_frame();
     if (!frame.has_value() || frame->size.is_empty())
         return { view_position, view_size, m_device_pixel_ratio };
     if (!m_scales_frames_to_fit || frame->size == view_size)
@@ -2122,7 +2859,160 @@ void ViewImplementation::update_ui_overlays()
             .hovered_control = m_picture_in_picture_controls_pointer_state.hovered_action(),
         };
     }
+    if (Application::the().shows_compositor_layers()) {
+        overlays.compositor_layers = Compositing::CompositorLayersOverlayState {
+            .font_family = Application::the().ui_font_family(),
+            .hidden_layer_ids = m_ids_of_hidden_compositor_layers,
+            .selected_layer_ids = m_ids_of_selected_compositor_layers,
+            .hovered_layer_id = m_id_of_hovered_compositor_layer,
+            .raster_count_reset_generation = m_compositor_layer_raster_count_reset_generation,
+        };
+    } else {
+        m_ids_of_hidden_compositor_layers.clear();
+        m_ids_of_selected_compositor_layers.clear();
+        m_id_of_hovered_compositor_layer.clear();
+        m_latest_compositor_layers.clear();
+        m_owners_of_visual_context_nodes = {};
+    }
     Application::the().update_compositor_ui_overlays(page().compositor_context_id(), overlays);
+}
+
+static u64 key_of_visual_context_node(Compositing::VisualContextNodeKind kind, u32 index)
+{
+    return (static_cast<u64>(kind) << 32) | index;
+}
+
+void ViewImplementation::set_compositor_layer_hidden(u64 layer_id, bool hidden)
+{
+    if (hidden == m_ids_of_hidden_compositor_layers.contains_slow(layer_id))
+        return;
+    if (hidden)
+        m_ids_of_hidden_compositor_layers.append(layer_id);
+    else
+        m_ids_of_hidden_compositor_layers.remove_first_matching([&](auto id) { return id == layer_id; });
+    update_ui_overlays();
+}
+
+void ViewImplementation::set_selected_compositor_layers(Vector<u64> layer_ids)
+{
+    if (m_ids_of_selected_compositor_layers == layer_ids)
+        return;
+    m_ids_of_selected_compositor_layers = move(layer_ids);
+    update_ui_overlays();
+}
+
+void ViewImplementation::set_hovered_compositor_layer(Optional<u64> layer_id)
+{
+    if (m_id_of_hovered_compositor_layer == layer_id)
+        return;
+    m_id_of_hovered_compositor_layer = layer_id;
+    update_ui_overlays();
+}
+
+void ViewImplementation::show_only_compositor_layers(Vector<u64> const& layer_ids)
+{
+    if (!m_latest_compositor_layers.has_value())
+        return;
+    m_ids_of_hidden_compositor_layers.clear();
+    for (auto const& layer : m_latest_compositor_layers->layers) {
+        if (!layer_ids.contains_slow(layer.id))
+            m_ids_of_hidden_compositor_layers.append(layer.id);
+    }
+    update_ui_overlays();
+}
+
+void ViewImplementation::show_all_compositor_layers()
+{
+    if (m_ids_of_hidden_compositor_layers.is_empty())
+        return;
+    m_ids_of_hidden_compositor_layers.clear();
+    update_ui_overlays();
+}
+
+void ViewImplementation::reset_compositor_layer_raster_counts()
+{
+    ++m_compositor_layer_raster_count_reset_generation;
+    update_ui_overlays();
+}
+
+void ViewImplementation::did_update_compositor_layers(Badge<WebContentPage>, Compositing::CompositorLayersDescription const& layers)
+{
+    auto describes_layer = [&](u64 id) {
+        return layers.layers.contains([&](auto const& layer) { return layer.id == id; });
+    };
+    // A layer the compositor no longer keeps would stay hidden or selected unseen if it ever came back under the same id,
+    // so the compositor forgets it too.
+    auto forgets_layers = m_ids_of_hidden_compositor_layers.remove_all_matching([&](auto id) { return !describes_layer(id); });
+    forgets_layers |= m_ids_of_selected_compositor_layers.remove_all_matching([&](auto id) { return !describes_layer(id); });
+    if (m_id_of_hovered_compositor_layer.has_value() && !describes_layer(*m_id_of_hovered_compositor_layer)) {
+        m_id_of_hovered_compositor_layer.clear();
+        forgets_layers = true;
+    }
+    if (forgets_layers)
+        update_ui_overlays();
+
+    m_latest_compositor_layers = layers;
+
+    // The page names the elements of the nodes of its tree only while it holds the tree the compositor composites.
+    auto& owners = m_owners_of_visual_context_nodes;
+    if (owners.structural_epoch != layers.visual_context_tree_structural_epoch) {
+        owners = {};
+        owners.structural_epoch = layers.visual_context_tree_structural_epoch;
+    }
+    Vector<u32> spatial_node_indices;
+    Vector<u32> effect_node_indices;
+    for (auto const& layer : layers.layers) {
+        for (auto const& node : layer.nodes) {
+            auto key = key_of_visual_context_node(node.kind, node.index);
+            if (owners.owner_by_node.contains(key) || owners.nodes_asked.contains(key))
+                continue;
+            owners.nodes_asked.set(key);
+            (node.kind == Compositing::VisualContextNodeKind::Spatial ? spatial_node_indices : effect_node_indices).append(node.index);
+        }
+    }
+    if (!spatial_node_indices.is_empty() || !effect_node_indices.is_empty())
+        page().async_describe_owners_of_visual_context_nodes(move(spatial_node_indices), move(effect_node_indices));
+
+    tell_of_compositor_layers_with_owners_of_nodes();
+}
+
+void ViewImplementation::did_describe_owners_of_visual_context_nodes(Badge<WebContentPage>, u64 structural_epoch, Vector<u32> const& spatial_node_indices, Vector<u32> const& effect_node_indices, Vector<String> const& owners_of_nodes)
+{
+    if (owners_of_nodes.size() != spatial_node_indices.size() + effect_node_indices.size()) {
+        page().client().did_misbehave("did_describe_owners_of_visual_context_nodes"sv, "an owner for each node asked of"sv);
+        return;
+    }
+    auto& owners = m_owners_of_visual_context_nodes;
+    // Nodes the page described for another tree are asked of it again with the next layers the compositor tells of.
+    auto describes_tree_of_layers = structural_epoch == owners.structural_epoch;
+    size_t owner_index = 0;
+    auto take_owners_of = [&](Compositing::VisualContextNodeKind kind, Vector<u32> const& indices) {
+        for (auto index : indices) {
+            auto key = key_of_visual_context_node(kind, index);
+            owners.nodes_asked.remove(key);
+            if (describes_tree_of_layers)
+                owners.owner_by_node.set(key, owners_of_nodes[owner_index]);
+            ++owner_index;
+        }
+    };
+    take_owners_of(Compositing::VisualContextNodeKind::Spatial, spatial_node_indices);
+    take_owners_of(Compositing::VisualContextNodeKind::Effect, effect_node_indices);
+    if (describes_tree_of_layers)
+        tell_of_compositor_layers_with_owners_of_nodes();
+}
+
+void ViewImplementation::tell_of_compositor_layers_with_owners_of_nodes()
+{
+    if (!on_compositor_layers_change || !m_latest_compositor_layers.has_value())
+        return;
+    auto layers = *m_latest_compositor_layers;
+    for (auto& layer : layers.layers) {
+        for (auto& node : layer.nodes) {
+            if (auto owner = m_owners_of_visual_context_nodes.owner_by_node.get(key_of_visual_context_node(node.kind, node.index)); owner.has_value())
+                node.element = *owner;
+        }
+    }
+    on_compositor_layers_change(layers);
 }
 
 void ViewImplementation::update_debugger_blackboxing(Utf16String url, Vector<DebuggerBlackboxRange> ranges, DebuggerBlackboxingOperation operation)
@@ -2172,11 +3062,11 @@ void ViewImplementation::evaluate_javascript_in_debugger_frame(u64 frame_id, Str
     page().async_evaluate_javascript_in_debugger_frame(request_id, frame_id, Utf16String::from_utf8(source_text));
 }
 
-void ViewImplementation::retrieve_debugger_object_properties(u64 object_id, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived on_complete)
+void ViewImplementation::retrieve_debugger_object_properties(u64 object_id, DebuggerObjectScope scope, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived on_complete)
 {
     auto request_id = m_next_debugger_object_properties_request_id++;
     m_pending_debugger_object_properties_requests.set(request_id, move(on_complete));
-    page().async_get_debugger_object_properties(request_id, object_id);
+    page().async_get_debugger_object_properties(request_id, object_id, scope);
 }
 
 void ViewImplementation::retrieve_debugger_source_positions(Web::HTML::ScriptRegistryIdentifier source_id, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived on_complete)
@@ -2184,6 +3074,22 @@ void ViewImplementation::retrieve_debugger_source_positions(Web::HTML::ScriptReg
     auto request_id = m_next_debugger_source_positions_request_id++;
     m_pending_debugger_source_positions_requests.set(request_id, move(on_complete));
     page().async_get_debugger_source_positions(request_id, source_id);
+}
+
+// A DevTools client waits for the answer to each console input completion request before the next, so a request that
+// its page can no longer answer gets no completions instead.
+void ViewImplementation::answer_pending_console_input_completions()
+{
+    auto pending_console_input_completions = move(on_completed_js_console_input);
+    for (auto& pending : pending_console_input_completions)
+        pending.value(DevTools::DevToolsDelegate::ConsoleInputCompletion {});
+}
+
+void ViewImplementation::complete_js_console_input(String const& input, DevTools::DevToolsDelegate::OnConsoleInputCompleted on_complete)
+{
+    auto request_id = m_next_js_console_completion_request_id++;
+    on_completed_js_console_input.set(request_id, move(on_complete));
+    page().async_complete_js_console_input(request_id, input);
 }
 
 void ViewImplementation::resolve_dom_node_url(Optional<Web::UniqueNodeID> node_id, String const& url, DevTools::DevToolsDelegate::OnResolvedURLReceived on_complete)
@@ -2239,9 +3145,18 @@ void ViewImplementation::did_connect_devtools_client()
     page().async_set_has_devtools_client(true);
 }
 
+void ViewImplementation::start_sending_console_output(bool messages, bool errors)
+{
+    m_devtools_takes_console_messages |= messages;
+    m_devtools_takes_console_errors |= errors;
+    page().async_start_sending_console_output(messages, errors);
+}
+
 void ViewImplementation::did_disconnect_devtools_client()
 {
     m_devtools_connected = false;
+    m_devtools_takes_console_messages = false;
+    m_devtools_takes_console_errors = false;
     page().async_set_has_devtools_client(false);
 }
 
@@ -2315,16 +3230,38 @@ void ViewImplementation::request_style_sheet_source(Web::CSS::StyleSheetIdentifi
     page().async_request_style_sheet_source(identifier);
 }
 
-void ViewImplementation::did_block_resource(Badge<WebContentPage>)
+// The page names what it blocked, so its kind is taken only from those the content blocker names, and the list of what
+// was blocked is kept short, each host and kind listed once.
+static constexpr size_t MAX_BLOCKED_RESOURCES = 100;
+
+static StringView known_blocked_resource_kind(StringView kind)
 {
-    if (m_blocked_request_count != NumericLimits<u64>::max())
-        ++m_blocked_request_count;
+    static constexpr Array kinds { "Script"sv, "Image"sv, "Stylesheet"sv, "Font"sv, "Media"sv, "Frame"sv, "Request"sv };
+    for (auto known_kind : kinds) {
+        if (kind == known_kind)
+            return known_kind;
+    }
+    return "Request"sv;
+}
+
+void ViewImplementation::did_block_resource(Badge<WebContentPage>, URL::URL const& url, StringView kind)
+{
+    if (m_blocked_resources.size() >= MAX_BLOCKED_RESOURCES)
+        return;
+
+    auto host = MUST(String::from_utf8(url.serialized_host()));
+    auto resource_kind = known_blocked_resource_kind(kind);
+    auto is_listed = any_of(m_blocked_resources, [&](auto const& resource) { return resource.host == host && resource.kind == resource_kind; });
+    if (host.is_empty() || is_listed)
+        return;
+
+    m_blocked_resources.append({ move(host), MUST(String::from_utf8(resource_kind)) });
     notify_content_blocking_changed();
 }
 
-void ViewImplementation::reset_blocked_request_count()
+void ViewImplementation::reset_blocked_resources()
 {
-    m_blocked_request_count = 0;
+    m_blocked_resources.clear();
     notify_content_blocking_changed();
 }
 
@@ -2337,7 +3274,7 @@ void ViewImplementation::notify_content_blocking_changed()
 ContentBlockingSnapshot ViewImplementation::content_blocking_snapshot() const
 {
     ContentBlockingSnapshot snapshot;
-    snapshot.blocked_request_count = m_blocked_request_count;
+    snapshot.blocked_resources = m_blocked_resources;
 
     if (m_crash_state.has_value() || !traversable().active_document().host())
         return snapshot;
@@ -2385,6 +3322,14 @@ void ViewImplementation::js_console_input(String const& js_source)
 void ViewImplementation::exit_fullscreen()
 {
     page().async_exit_fullscreen();
+}
+
+// NB: Only the page whose fullscreen request is waiting acts on the refusal. The tab's other pages ignore it.
+void ViewImplementation::deny_fullscreen_window()
+{
+    traversable().for_each_hosting_page([](WebContentPage& page) {
+        page.async_deny_fullscreen_window();
+    });
 }
 
 void ViewImplementation::set_is_fullscreen(Web::ViewportIsFullscreen is_fullscreen)
@@ -2455,6 +3400,23 @@ void ViewImplementation::color_picker_update(Optional<Color> picked_color, Web::
     target->async_color_picker_update(picked_color, state);
 }
 
+void ViewImplementation::did_request_date_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
+{
+    if (another_page_awaits(m_date_picker_page, requesting_page) || !on_request_date_picker) {
+        requesting_page.async_date_picker_closed({});
+        return;
+    }
+    m_date_picker_page = requesting_page;
+    on_request_date_picker(input_type, value, minimum, maximum);
+}
+
+void ViewImplementation::date_picker_closed(Optional<Utf16String> picked_value)
+{
+    NonnullRefPtr<WebContentPage> target = m_date_picker_page ? *m_date_picker_page : page();
+    m_date_picker_page.clear();
+    target->async_date_picker_closed(move(picked_value));
+}
+
 void ViewImplementation::did_request_file_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files)
 {
     if (another_page_awaits(m_file_picker_page, requesting_page)) {
@@ -2498,12 +3460,20 @@ WebContentPage& ViewImplementation::focused_navigable_host() const
     return host ? *host : page();
 }
 
-void ViewImplementation::paste_from_clipboard()
+void ViewImplementation::paste_from_clipboard(Web::Clipboard::PasteMode paste_mode)
 {
-    // The user asked the browser to paste, which lets the page read the clipboard.
-    auto& host = focused_navigable_host();
-    host.give_user_activation();
-    host.async_paste_from_clipboard();
+    // The user asked the browser to paste, which hands the page the system clipboard data.
+    read_clipboard_item([host = NonnullRefPtr { focused_navigable_host() }, paste_mode](Web::Clipboard::SystemClipboardItem item) {
+        if (!host->is_open())
+            return;
+        Web::Clipboard::apply_paste_mode(item, paste_mode);
+        Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data;
+        if (!item.system_clipboard_representations.is_empty())
+            system_clipboard_data.append(move(item));
+
+        host->give_user_activation();
+        host->async_paste_from_clipboard(move(system_clipboard_data));
+    });
 }
 
 void ViewImplementation::set_marked_text_from_input_method(Utf16String const& text)
@@ -2532,6 +3502,37 @@ void ViewImplementation::set_input_method_state(Badge<WebContentPage>, InputMeth
         on_input_method_state_change();
 }
 
+void ViewImplementation::read_clipboard_item(Function<void(Web::Clipboard::SystemClipboardItem)> on_read) const
+{
+    on_read(clipboard_item());
+}
+
+// NB: The tab remembers the last clipboard write by one of its pages, so a page reads back only what its origin wrote in
+//     the same tab.
+void ViewImplementation::did_insert_clipboard_item_written_by(URL::Origin writer, Web::Clipboard::SystemClipboardItem item)
+{
+    m_last_clipboard_write_by_a_page = ClipboardWrite { move(writer), move(item) };
+}
+
+// Whatever wrote to the clipboard since, a page learns nothing new from data that its origin wrote itself. So compare
+// the clipboard's data with that origin's write, rather than tracking every change to the clipboard.
+bool ViewImplementation::is_clipboard_data_written_by(Web::Clipboard::SystemClipboardItem const& item, URL::Origin const& origin) const
+{
+    if (!m_last_clipboard_write_by_a_page.has_value() || !m_last_clipboard_write_by_a_page->writer.is_same_origin(origin))
+        return false;
+
+    auto const& written_representations = m_last_clipboard_write_by_a_page->item.system_clipboard_representations;
+    auto was_written = [&](Web::Clipboard::SystemClipboardRepresentation const& representation) {
+        auto const* data = representation.data.get_pointer<ByteString>();
+        return data && any_of(written_representations, [&](Web::Clipboard::SystemClipboardRepresentation const& written) {
+            auto const* written_data = written.data.get_pointer<ByteString>();
+            return written.name == representation.name && written_data && *written_data == *data;
+        });
+    };
+
+    return !item.system_clipboard_representations.is_empty() && all_of(item.system_clipboard_representations, was_written);
+}
+
 Web::Clipboard::SystemClipboardItem ViewImplementation::clipboard_item() const
 {
     return Application::the().clipboard_item();
@@ -2544,44 +3545,66 @@ void ViewImplementation::insert_clipboard_item(Web::Clipboard::SystemClipboardIt
 
 void ViewImplementation::toggle_page_mute_state()
 {
-    m_mute_state = Web::HTML::invert_mute_state(m_mute_state);
-    page().async_set_page_mute_state(m_mute_state);
+    set_page_mute_state(Web::HTML::invert_mute_state(m_mute_state));
 }
 
-void ViewImplementation::did_change_audio_play_state(Badge<WebContentPage>, Web::HTML::AudioPlayState play_state)
+void ViewImplementation::set_page_mute_state(Web::HTML::MuteState mute_state)
 {
-    bool state_changed = false;
+    m_mute_state = mute_state;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        page.client().set_audio_playback_mute_state(page.id(), m_mute_state);
+    });
+}
 
-    switch (play_state) {
-    case Web::HTML::AudioPlayState::Paused:
-        if (--m_number_of_elements_playing_audio == 0) {
-            m_audio_play_state = play_state;
-            state_changed = true;
-        }
-        break;
+void ViewImplementation::update_audibility()
+{
+    auto audible = false;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (page.audibility() == Audio::Audibility::Audible)
+            audible = true;
+    });
+    auto now = MonotonicTime::now();
+    if (!audible && is_playing_audio())
+        m_stopped_playing_audio_time = now;
+    m_tab_indicators.set_active(TabIndicator::PlayingAudio, audible, now);
+}
 
-    case Web::HTML::AudioPlayState::Playing:
-        if (m_number_of_elements_playing_audio++ == 0) {
-            m_audio_play_state = play_state;
-            state_changed = true;
-        }
-        break;
+void ViewImplementation::update_microphone_capture()
+{
+    // An owned view has no tab of its own, so its capture shows on its owner's, with one linger for them all.
+    if (m_owner_view_id.has_value()) {
+        if (auto owner = find_view_by_id(*m_owner_view_id); owner.has_value())
+            owner->update_microphone_capture();
+        return;
     }
 
-    if (state_changed && on_audio_play_state_changed)
-        on_audio_play_state_changed(m_audio_play_state);
+    auto capturing = false;
+    auto check_pages_of = [&](ViewImplementation const& view) {
+        view.traversable().for_each_hosting_page([&](WebContentPage& page) {
+            if (page.is_capturing_audio())
+                capturing = true;
+        });
+    };
+
+    check_pages_of(*this);
+    for_each_view([&](ViewImplementation& view) {
+        if (view.m_owner_view_id == m_view_id && view.has_traversable())
+            check_pages_of(view);
+        return IterationDecision::Continue;
+    });
+    m_tab_indicators.set_active(TabIndicator::UsingMicrophone, capturing, MonotonicTime::now());
+}
+
+void ViewImplementation::did_release_page(Badge<CanonicalTraversable>)
+{
+    update_audibility();
+    update_microphone_capture();
 }
 
 void ViewImplementation::reset_page_media_state()
 {
-    auto const should_notify_audio_play_state_changed = m_audio_play_state != Web::HTML::AudioPlayState::Paused
-        || m_number_of_elements_playing_audio != 0;
-
-    m_audio_play_state = Web::HTML::AudioPlayState::Paused;
-    m_number_of_elements_playing_audio = 0;
-
-    if (should_notify_audio_play_state_changed && on_audio_play_state_changed)
-        on_audio_play_state_changed(m_audio_play_state);
+    update_audibility();
+    update_microphone_capture();
 
     if (m_screen_wake_lock_state != Web::ScreenWakeLockState::Released) {
         m_screen_wake_lock_state = Web::ScreenWakeLockState::Released;
@@ -2598,6 +3621,17 @@ void ViewImplementation::did_change_screen_wake_lock_state(Badge<WebContentPage>
     m_screen_wake_lock_state = wake_lock_state;
     if (on_screen_wake_lock_state_changed)
         on_screen_wake_lock_state_changed(m_screen_wake_lock_state);
+}
+
+bool ViewImplementation::had_user_edits() const
+{
+    // Each page of the tab reports for the documents it hosts.
+    bool had_user_edits = false;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (page.had_user_edits())
+            had_user_edits = true;
+    });
+    return had_user_edits;
 }
 
 bool ViewImplementation::needs_beforeunload_check() const
@@ -2646,58 +3680,31 @@ void ViewImplementation::did_allocate_backing_stores(Badge<WebContentPage>, Vect
 
 void ViewImplementation::did_add_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
-    VERIFY(bitmap_ids.size() == backing_stores.size());
-    for (size_t i = 0; i < backing_stores.size(); ++i) {
-        m_other_bitmaps.append({
-            .id = bitmap_ids[i],
-            .last_painted_size = {},
-            .shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::import_from_shared_image(move(backing_stores[i]))),
-        });
-    }
+    // The compositor's presentations from backing stores that were refused are handed straight back.
+    if (auto result = m_backing_stores->add(move(bitmap_ids), move(backing_stores)); result.is_error())
+        warnln("Could not add backing stores for page {}: {}", page().id(), result.error());
 }
 
 void ViewImplementation::did_retire_backing_stores(Badge<WebContentPage>, ReadonlySpan<i32> bitmap_ids)
 {
-    m_other_bitmaps.remove_all_matching([&](auto const& bitmap) {
-        return bitmap_ids.contains_slow(bitmap.id);
-    });
+    m_backing_stores->retire(bitmap_ids);
 }
 
 void ViewImplementation::install_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
-    VERIFY(bitmap_ids.size() == backing_stores.size());
-    VERIFY(!bitmap_ids.is_empty());
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI installing {} backing stores for page {} had_usable_bitmap={}",
-        backing_stores.size(), page().id(), m_has_usable_bitmap);
-    if (m_has_usable_bitmap) {
-        // NOTE: We keep the outgoing front bitmap as a backup so we have something to paint until we get a new one.
-        m_backup_shared_image_buffer = move(m_front_bitmap.shared_image_buffer);
-        m_backup_bitmap_size = m_front_bitmap.last_painted_size;
-        m_backup_bitmap_device_pixel_ratio = m_front_bitmap.last_painted_device_pixel_ratio;
-    }
-    m_has_usable_bitmap = false;
-    m_front_bitmap.id = bitmap_ids[0];
-    m_front_bitmap.shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::import_from_shared_image(move(backing_stores[0])));
-    m_other_bitmaps.clear();
-    m_other_bitmaps.ensure_capacity(backing_stores.size() - 1);
-    for (size_t i = 1; i < backing_stores.size(); ++i) {
-        m_other_bitmaps.append({
-            .id = bitmap_ids[i],
-            .last_painted_size = {},
-            .shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::import_from_shared_image(move(backing_stores[i]))),
-        });
+        backing_stores.size(), page().id(), m_backing_stores->has_usable_front_bitmap());
+    // A publication that can't be imported is refused, and its front backing store goes straight back, since nothing
+    // here will ever present from it.
+    auto front_bitmap_id = bitmap_ids.first();
+    if (auto result = m_backing_stores->install(move(bitmap_ids), move(backing_stores)); result.is_error()) {
+        warnln("Could not install backing stores for page {}: {}", page().id(), result.error());
+        page().release_presented_bitmap(front_bitmap_id);
     }
 }
 
 void ViewImplementation::update_zoom()
 {
-    if (m_zoom_level != 1.0) {
-        m_reset_zoom_action->set_text(MUST(String::formatted("{}%", round_to<int>(m_zoom_level * 100))));
-        m_reset_zoom_action->set_visible(true);
-    } else {
-        m_reset_zoom_action->set_visible(false);
-    }
-
     // Every process showing part of the tab lays out and converts input at the tab's zoom level.
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         page.async_set_zoom_level(m_zoom_level);
@@ -2724,14 +3731,13 @@ void ViewImplementation::set_device_pixel_ratio_for_testing(WebContentPage& page
 
 Gfx::IntRect ViewImplementation::rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size)
 {
-    auto scale = min(static_cast<float>(target_size.width()) / frame_size.width(), static_cast<float>(target_size.height()) / frame_size.height());
-    auto fitted_size = frame_size.to_type<float>().scaled(scale).to_rounded<int>();
-    return Gfx::IntRect { {}, fitted_size }.centered_within({ {}, target_size });
+    return Compositing::rect_fitting_frame(frame_size, target_size);
 }
 
 void ViewImplementation::handle_resize()
 {
     page().async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
+    update_remote_layer_fit();
 
     // The page forwards its new size to the compositor once it has laid it out. Until then, scaling frames to fit needs
     // the compositor to keep presenting them whole at the size they were laid out for.
@@ -2760,8 +3766,14 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
 
     if (m_window_handle.is_empty()) {
         m_window_handle = generate_random_uuid();
-        if (!m_owner_view_id.has_value())
+        if (!m_owner_view_id.has_value()) {
             Application::the().notify_webdriver_window_created(m_window_handle);
+
+            // NB: WebDriver BiDi names a top-level traversable by its window handle, so the traversable is reported as
+            //     created once it has one.
+            if (auto* webdriver_bidi = WebDriverBiDi::the())
+                webdriver_bidi->top_level_traversable_did_get_window_handle(*traversable);
+        }
     }
     prepare_page_for_tab(page());
     display_page_changed({});
@@ -2784,25 +3796,30 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
         VERIFY_NOT_REACHED();
     };
 
-    auto make_geolocation_success_handler = [this](WebContentPage& request_page, u64 request_id, bool is_watch) {
+    auto make_geolocation_success_handler = [this](WebContentPage& request_page, u64 request_id, Web::HTML::CrossProcessId document_id, bool is_watch) {
         auto weak_this = make_weak_ptr();
         auto key = GeolocationRequestKey { request_page, request_id };
 
-        return [weak_this, request_page = NonnullRefPtr<WebContentPage>(request_page), request_id, key, is_watch](Core::GeolocationCoordinates coords) {
+        return [weak_this, request_page = NonnullRefPtr<WebContentPage>(request_page), request_id, document_id, key, is_watch](Core::GeolocationCoordinates coords) {
             auto* view = weak_this.ptr();
             if (!view || !request_page->is_open())
                 return;
+            ScopeGuard update_location_in_use = [view] { view->update_location_in_use(); };
 
             if (is_watch) {
                 if (!view->m_geolocation_watch_ids.contains(key))
                     return;
             } else if (!view->m_geolocation_position_request_ids.remove(key)) {
                 return;
+            } else {
+                view->m_geolocation_request_documents.remove(key);
             }
 
-            if (!Application::settings().geolocation_enabled()) {
+            // The permission is checked again for every position, since the user may have taken it away meanwhile.
+            if (!Application::the().sites_can_ask_for_location() || !request_page->document_may_use(document_id, Web::Permissions::PermissionName::Geolocation)) {
                 if (auto provider_watch_id = view->m_geolocation_watch_ids.take(key); provider_watch_id.has_value())
                     Application::the().stop_watching_geolocation_position(*provider_watch_id);
+                view->m_geolocation_request_documents.remove(key);
                 request_page->async_geolocation_position_response(request_id, {}, to_underlying(GeolocationErrorCode::PermissionDenied));
                 return;
             }
@@ -2820,12 +3837,15 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
             auto* view = weak_this.ptr();
             if (!view || !request_page->is_open())
                 return;
+            ScopeGuard update_location_in_use = [view] { view->update_location_in_use(); };
 
             if (is_watch) {
                 if (!view->m_geolocation_watch_ids.contains(key))
                     return;
             } else if (!view->m_geolocation_position_request_ids.remove(key)) {
                 return;
+            } else {
+                view->m_geolocation_request_documents.remove(key);
             }
 
             auto code = geolocation_error_code(error);
@@ -2833,14 +3853,16 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
                 auto provider_watch_id = view->m_geolocation_watch_ids.take(key);
                 if (provider_watch_id.has_value())
                     Application::the().stop_watching_geolocation_position(*provider_watch_id);
+                view->m_geolocation_request_documents.remove(key);
             }
 
             request_page->async_geolocation_position_response(request_id, {}, to_underlying(code));
         };
     };
 
-    on_request_geolocation_position = [this, geolocation_error_code, make_geolocation_success_handler, make_geolocation_error_handler](WebContentPage& requesting_page, u64 request_id) {
-        if (!Application::settings().geolocation_enabled()) {
+    on_request_geolocation_position = [this, geolocation_error_code, make_geolocation_success_handler, make_geolocation_error_handler](WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id) {
+        ScopeGuard update_location_in_use = [this] { this->update_location_in_use(); };
+        if (!Application::the().sites_can_ask_for_location()) {
             requesting_page.async_geolocation_position_response(request_id, {}, to_underlying(GeolocationErrorCode::PermissionDenied));
             return;
         }
@@ -2849,7 +3871,7 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
             Application::the().cancel_geolocation_position_request(*previous_provider_request_id);
 
         auto provider_request_id = Application::the().request_geolocation_position(
-            make_geolocation_success_handler(requesting_page, request_id, false),
+            make_geolocation_success_handler(requesting_page, request_id, document_id, false),
             make_geolocation_error_handler(requesting_page, request_id, false));
         if (provider_request_id.is_error()) {
             requesting_page.async_geolocation_position_response(request_id, {}, to_underlying(geolocation_error_code(provider_request_id.error())));
@@ -2857,16 +3879,21 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
         }
 
         m_geolocation_position_request_ids.set({ requesting_page, request_id }, provider_request_id.release_value());
+        m_geolocation_request_documents.set({ requesting_page, request_id }, document_id);
     };
 
     on_cancel_geolocation_position_request = [this](WebContentPage& requesting_page, u64 request_id) {
+        ScopeGuard update_location_in_use = [this] { this->update_location_in_use(); };
         auto provider_request_id = m_geolocation_position_request_ids.take({ requesting_page, request_id });
-        if (provider_request_id.has_value())
-            Application::the().cancel_geolocation_position_request(*provider_request_id);
+        if (!provider_request_id.has_value())
+            return;
+        Application::the().cancel_geolocation_position_request(*provider_request_id);
+        m_geolocation_request_documents.remove({ requesting_page, request_id });
     };
 
-    on_start_geolocation_position_watch = [this, geolocation_error_code, make_geolocation_success_handler, make_geolocation_error_handler](WebContentPage& requesting_page, u64 request_id) {
-        if (!Application::settings().geolocation_enabled()) {
+    on_start_geolocation_position_watch = [this, geolocation_error_code, make_geolocation_success_handler, make_geolocation_error_handler](WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id) {
+        ScopeGuard update_location_in_use = [this] { this->update_location_in_use(); };
+        if (!Application::the().sites_can_ask_for_location()) {
             requesting_page.async_geolocation_position_response(request_id, {}, to_underlying(GeolocationErrorCode::PermissionDenied));
             return;
         }
@@ -2875,7 +3902,7 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
             Application::the().stop_watching_geolocation_position(*previous_provider_watch_id);
 
         auto provider_watch_id = Application::the().start_watching_geolocation_position(
-            make_geolocation_success_handler(requesting_page, request_id, true),
+            make_geolocation_success_handler(requesting_page, request_id, document_id, true),
             make_geolocation_error_handler(requesting_page, request_id, true));
 
         if (provider_watch_id.is_error()) {
@@ -2884,14 +3911,17 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
         }
 
         m_geolocation_watch_ids.set({ requesting_page, request_id }, provider_watch_id.release_value());
+        m_geolocation_request_documents.set({ requesting_page, request_id }, document_id);
     };
 
     on_stop_geolocation_position_watch = [this](WebContentPage& requesting_page, u64 request_id) {
+        ScopeGuard update_location_in_use = [this] { this->update_location_in_use(); };
         auto provider_watch_id = m_geolocation_watch_ids.take({ requesting_page, request_id });
         if (!provider_watch_id.has_value())
             return;
 
         Application::the().stop_watching_geolocation_position(*provider_watch_id);
+        m_geolocation_request_documents.remove({ requesting_page, request_id });
     };
 }
 
@@ -2904,11 +3934,13 @@ void ViewImplementation::cancel_all_native_geolocation_requests()
     auto geolocation_watch_ids = move(m_geolocation_watch_ids);
     for (auto const& watch : geolocation_watch_ids)
         Application::the().stop_watching_geolocation_position(watch.value);
+    m_geolocation_request_documents.clear();
+    update_location_in_use();
 }
 
 void ViewImplementation::did_start_navigation()
 {
-    reset_blocked_request_count();
+    reset_blocked_resources();
     set_loading_state(true);
     dump_session_history("did-start-navigation"sv);
 }
@@ -2921,6 +3953,11 @@ void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canc
     else if (m_webdriver_navigation_observation.has_value())
         complete_webdriver_navigation();
 
+    notify_load_finish();
+}
+
+void ViewImplementation::notify_load_finish()
+{
     auto const& client_url = url();
     if (on_load_finish)
         on_load_finish(client_url);
@@ -2933,8 +3970,8 @@ void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canc
 
 void ViewImplementation::did_finish_navigation()
 {
-    m_last_load_finished = true;
     set_loading_state(false);
+    m_page_translation->did_finish_loading();
 
     if (!m_webdriver_navigation_observation.has_value())
         return;
@@ -2955,11 +3992,13 @@ void ViewImplementation::did_finish_navigation()
 
 void ViewImplementation::set_loading_state(bool is_loading)
 {
-    if (is_loading)
-        m_last_load_finished = false;
     if (m_is_loading == is_loading)
         return;
     m_is_loading = is_loading;
+    if (is_loading)
+        m_finished_loading_time.clear();
+    else
+        m_finished_loading_time = MonotonicTime::now();
     if (on_loading_state_change)
         on_loading_state_change(is_loading);
 }
@@ -2973,10 +4012,113 @@ void ViewImplementation::run_webdriver_content_command(u64 command_id, Web::WebD
     run_webdriver_content_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
-void ViewImplementation::run_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments)
+void ViewImplementation::run_webdriver_bidi_content_command(u64 command_id, Web::HTML::CrossProcessId navigable_id, String const& method, JsonValue params)
+{
+    run_webdriver_content_command(command_id, navigable_id, method, move(params), {}, WebDriverProtocol::BiDi);
+}
+
+// NB: An intercepted request resumes in the page that paused it, even during a document handoff.
+void ViewImplementation::run_webdriver_bidi_content_command(WebContentPage& target, u64 command_id, Web::HTML::CrossProcessId navigable_id, String const& method, JsonValue params)
+{
+    if (!target.is_open()) {
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchRequest, "Blocked request's page is closed"sv));
+        return;
+    }
+    m_pending_webdriver_commands.set(command_id, { target, method, navigable_id, WebDriverProtocol::BiDi, true });
+    target.async_run_webdriver_bidi_command(command_id, navigable_id, method, move(params));
+}
+
+void ViewImplementation::run_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments, WebDriverProtocol protocol)
+{
+    if (Web::WebDriver::is_input_state_command(name)) {
+        m_webdriver_input_commands.append({ command_id, { navigable_id, name, move(payload), move(arguments), protocol } });
+        if (m_webdriver_input_commands.size() == 1)
+            dispatch_next_webdriver_input_command();
+        return;
+    }
+    dispatch_webdriver_content_command(command_id, navigable_id, name, move(payload), move(arguments), protocol);
+}
+
+void ViewImplementation::discard_webdriver_input_commands(bool process_crashed)
+{
+    auto queued = move(m_webdriver_input_commands);
+    m_webdriver_input_command_running = false;
+    m_webdriver_input_state = JsonValue {};
+    for (auto const& command : queued) {
+        m_pending_webdriver_commands.remove(command.command_id);
+        m_webdriver_commands_waiting_for_a_document.remove(command.command_id);
+        Application::the().complete_webdriver_content_command(command.command_id, Web::WebDriver::Error::from_code(process_crashed ? Web::WebDriver::ErrorCode::UnknownError : error_code_for_a_navigable_that_is_gone(command.command.protocol), process_crashed ? "WebContent crashed while waiting for input"sv : "Browsing context was discarded while waiting for input"sv));
+    }
+}
+
+void ViewImplementation::dispatch_next_webdriver_input_command()
+{
+    if (m_webdriver_input_commands.is_empty() || m_webdriver_input_command_running)
+        return;
+    m_webdriver_input_command_running = true;
+    m_webdriver_input_state_was_lost = false;
+    auto const& queued = m_webdriver_input_commands.first();
+    auto const& command = queued.command;
+    JsonObject envelope;
+    envelope.set("__webdriver_input_state"sv, m_webdriver_input_state);
+    envelope.set("__webdriver_input_payload"sv, command.payload);
+    dispatch_webdriver_content_command(queued.command_id, command.navigable_id, command.name, move(envelope), command.arguments, command.protocol);
+}
+
+void ViewImplementation::complete_webdriver_input_command(u64 command_id, Web::WebDriver::Response response)
+{
+    if (!m_webdriver_input_commands.is_empty() && m_webdriver_input_commands.first().command_id == command_id) {
+        if (!response.is_error()) {
+            // NB: A click's navigation wait can finish in the browser or a replacement page without an envelope.
+            bool is_navigation_completion = m_webdriver_input_commands.first().command.name == "element_click"sv && response.value().is_null();
+            if (!is_navigation_completion) {
+                JsonValue discarded_state;
+                auto& input_state = m_webdriver_input_state_was_lost ? discarded_state : m_webdriver_input_state;
+                response = Web::WebDriver::unwrap_input_command_response(response.value(), input_state);
+            }
+        }
+        if (m_webdriver_input_state_was_lost)
+            response = Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "Input state was lost while executing the command"sv);
+        m_webdriver_input_commands.take_first();
+        m_webdriver_input_command_running = false;
+        // The content executor may complete before removing its local action-queue token.
+        Core::deferred_invoke([weak_this = make_weak_ptr()] {
+            if (weak_this)
+                weak_this->dispatch_next_webdriver_input_command();
+        });
+    }
+    Application::the().complete_webdriver_content_command(command_id, move(response));
+}
+
+static bool is_webdriver_cookie_command(StringView name)
+{
+    return name.is_one_of("get_all_cookies"sv, "get_named_cookie"sv, "add_cookie"sv, "delete_cookie"sv, "delete_all_cookies"sv);
+}
+
+// https://w3c.github.io/webdriver/#dfn-element-send-keys
+// NB: The renderer splits the text on newlines into the paths of the files to select, if the element is a file input.
+static Vector<ByteString> files_named_by_element_send_keys(StringView name, JsonValue const& envelope)
+{
+    if (name != "element_send_keys"sv || !envelope.is_object())
+        return {};
+    auto payload = envelope.as_object().get_object("__webdriver_input_payload"sv);
+    if (!payload.has_value())
+        return {};
+    auto text = payload->get_string("text"sv);
+    if (!text.has_value())
+        return {};
+
+    Vector<ByteString> files;
+    text->bytes_as_string_view().for_each_split_view('\n', SplitBehavior::KeepEmpty, [&](StringView path) {
+        files.append(path);
+    });
+    return files;
+}
+
+void ViewImplementation::dispatch_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments, WebDriverProtocol protocol)
 {
     if (m_crash_state.has_value() && !m_crash_state->recovery_started) {
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent has crashed"sv));
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent has crashed"sv));
         return;
     }
 
@@ -2988,7 +4130,7 @@ void ViewImplementation::run_webdriver_content_command(u64 command_id, Optional<
         // A browsing context is said to be no longer open if its navigable has been destroyed.
         navigable = traversable().find(*navigable_id);
         if (!navigable.has_value()) {
-            Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+            complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(error_code_for_a_navigable_that_is_gone(protocol), "Window not found"sv));
             return;
         }
         target = traversable().page_hosting(*navigable);
@@ -2997,19 +4139,30 @@ void ViewImplementation::run_webdriver_content_command(u64 command_id, Optional<
     // No page holds the navigable's document between the displayed document's unload and the activation of the
     // document another page populated to replace it, so the command waits for that document.
     if (traversable().is_handing_navigable_to_another_page(*navigable)) {
-        m_webdriver_commands_waiting_for_a_document.set(command_id, { navigable_id, name, move(payload), move(arguments) });
+        m_webdriver_commands_waiting_for_a_document.set(command_id, { navigable_id, name, move(payload), move(arguments), protocol });
         return;
     }
 
     if (!target || !target->is_open()) {
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(error_code_for_a_navigable_that_is_gone(protocol), "Window not found"sv));
+        return;
+    }
+
+    if (protocol == WebDriverProtocol::BiDi) {
+        m_pending_webdriver_commands.set(command_id, { *target, name, navigable_id, protocol });
+        target->async_run_webdriver_bidi_command(command_id, *navigable_id, name, move(payload));
         return;
     }
 
     if (name == "crash_current_page"sv)
         m_pending_webdriver_crash_commands.set(command_id, { *target, name, navigable_id });
-    else
-        m_pending_webdriver_commands.set(command_id, { *target, name, navigable_id });
+    else {
+        // NB: A cookie command is for the cookies of the active document of its browsing context when it starts.
+        Optional<URL::URL> cookie_document_url;
+        if (is_webdriver_cookie_command(name))
+            cookie_document_url = navigable->active_document_url();
+        m_pending_webdriver_commands.set(command_id, { *target, name, navigable_id, protocol, false, files_named_by_element_send_keys(name, payload), false, move(cookie_document_url) });
+    }
     target->async_run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
@@ -3017,7 +4170,42 @@ void ViewImplementation::run_webdriver_commands_waiting_for_a_document(Badge<Can
 {
     auto commands = move(m_webdriver_commands_waiting_for_a_document);
     for (auto& [command_id, command] : commands)
-        run_webdriver_content_command(command_id, command.navigable_id, command.name, move(command.payload), move(command.arguments));
+        dispatch_webdriver_content_command(command_id, command.navigable_id, command.name, move(command.payload), move(command.arguments), command.protocol);
+}
+
+bool ViewImplementation::is_running_webdriver_command_to_select_file(WebContentPage const& page, u64 command_id, StringView path) const
+{
+    auto command = m_pending_webdriver_commands.get(command_id);
+    return command.has_value() && command->page.ptr() == &page && command->files_to_select.contains_slow(path);
+}
+
+// NB: An input command dispatches its input in the page it runs in, until any navigation it started takes that page
+//     away.
+bool ViewImplementation::is_running_webdriver_input_command_in(WebContentPage const& page) const
+{
+    if (!m_webdriver_input_command_running || m_webdriver_input_commands.is_empty())
+        return false;
+    auto command = m_pending_webdriver_commands.get(m_webdriver_input_commands.first().command_id);
+    return command.has_value() && command->page.ptr() == &page && !command->only_waits_for_navigation;
+}
+
+Optional<URL::URL> ViewImplementation::url_of_webdriver_cookie_command_running_in(WebContentClient const& client) const
+{
+    for (auto const& [command_id, command] : m_pending_webdriver_commands) {
+        if (&command.page->client() == &client && command.cookie_document_url.has_value())
+            return command.cookie_document_url;
+    }
+    return {};
+}
+
+bool ViewImplementation::is_running_webdriver_window_command_in(WebContentPage const& page) const
+{
+    for (auto const& [command_id, command] : m_pending_webdriver_commands) {
+        if (command.page.ptr() == &page && command.protocol == WebDriverProtocol::Classic
+            && command.name.is_one_of("set_window_rect"sv, "maximize_window"sv, "minimize_window"sv, "fullscreen_window"sv))
+            return true;
+    }
+    return false;
 }
 
 void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
@@ -3028,14 +4216,19 @@ void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
     if (m_window_size.has_value())
         page.async_set_window_size(m_window_size->to_type<Web::DevicePixels>());
     page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
-    page.async_set_viewport_corner_radius(m_viewport_corner_radius);
+    if (m_screen_shows_high_dynamic_range)
+        page.async_set_screen_shows_high_dynamic_range(true);
+    if (m_frame_rate_capped)
+        page.async_set_frame_rate_capped(true);
     page.async_set_has_focus(traversable().has_system_focus());
     if (auto focused_navigable_id = traversable().focused_navigable_id(); focused_navigable_id.has_value())
         page.async_set_focused_navigable(*focused_navigable_id);
     page.async_set_document_cookie_version_buffer(m_document_cookie_version_buffer);
     if (m_debugger_is_attached)
         page.async_attach_debugger();
-    page.async_set_page_mute_state(m_mute_state);
+    // The page's sound plays while it hosts the tab's documents, unless the tab is muted.
+    page.client().set_audio_playback_mute_state(page.id(), m_mute_state);
+    page.client().authorize_audio_playback(page.id());
     if (Application::browser_options().webdriver_browser_endpoint.has_value())
         Application::the().push_webdriver_session_config(page);
     Application::the().apply_view_options({}, *this, page);
@@ -3051,6 +4244,7 @@ void ViewImplementation::prepare_page_for_tab(WebContentPage& page)
     // The window handle names the tab to WebDriver, and the viewport is the tab's: both belong to the page displaying
     // it, whose traversable is local.
     page.async_set_window_handle(m_window_handle);
+    Application::the().update_compositor_context_scales_frames_to_fit(page.compositor_context_id(), m_scales_frames_to_fit);
     page.async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
     Application::the().update_compositor_viewport(page.compositor_context_id(), viewport_size().to_type<int>(), m_device_pixel_ratio);
 }
@@ -3080,6 +4274,9 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
     if (auto pending_info_request = move(m_pending_info_request))
         pending_info_request->reject(Error::from_string_literal("The displayed page changed before sending its info"));
 
+    // So did console input completion requests.
+    answer_pending_console_input_completions();
+
     auto& page = this->page();
     if (previous_page) {
         // NB: The page has no hovered link and cannot clear the outgoing page's status label.
@@ -3096,11 +4293,7 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
         reset_page_media_state();
 
         // Keep showing the outgoing page until the page paints its first frame.
-        if (m_has_usable_bitmap) {
-            m_backup_shared_image_buffer = move(m_front_bitmap.shared_image_buffer);
-            m_backup_bitmap_size = m_front_bitmap.last_painted_size;
-            m_backup_bitmap_device_pixel_ratio = m_front_bitmap.last_painted_device_pixel_ratio;
-        }
+        m_backing_stores->keep_front_as_backup();
         if (previous_page->is_open()) {
             Application::the().update_compositor_context_visibility(previous_page->compositor_context_id(), Web::HTML::VisibilityState::Hidden);
             previous_page->async_set_has_devtools_client(false);
@@ -3108,18 +4301,33 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
 
         auto pending_webdriver_commands = move(m_pending_webdriver_commands);
         auto pending_webdriver_crash_commands = move(m_pending_webdriver_crash_commands);
+        // NB: Restore commands that resume intercepted requests before any completion callback can reenter.
+        //     Their original page can still answer while a navigation replaces the displayed page.
+        auto retain_commands_on_open_pages = [&](auto& commands) {
+            commands.remove_all_matching([&](u64 command_id, PendingWebDriverCommand const& command) {
+                if (!command.stays_on_page || !command.page->is_open())
+                    return false;
+                m_pending_webdriver_commands.set(command_id, command);
+                return true;
+            });
+        };
+        retain_commands_on_open_pages(pending_webdriver_commands);
+        retain_commands_on_open_pages(pending_webdriver_crash_commands);
         complete_webdriver_content_commands_after_process_replacement(pending_webdriver_commands);
         complete_webdriver_content_commands_after_process_replacement(pending_webdriver_crash_commands);
     }
-    m_front_bitmap = {};
-    m_other_bitmaps.clear();
-    m_has_usable_bitmap = false;
+    m_backing_stores->clear();
     if (auto backing_stores = page.take_presented_backing_stores(); backing_stores.has_value())
         install_backing_stores(move(backing_stores->bitmap_ids), move(backing_stores->backing_stores));
 
     auto compositor_context_id = page.compositor_context_id();
+    Application::the().update_compositor_context_scales_frames_to_fit(compositor_context_id, m_scales_frames_to_fit);
+    // The remote layer goes on showing the outgoing page's last frame until the page presents its first one.
+    if (m_remote_layer_id.has_value())
+        Application::the().show_context_in_remote_layer(*m_remote_layer_id, compositor_context_id);
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>(), m_device_pixel_ratio);
     Application::the().update_compositor_context_visibility(compositor_context_id, traversable().system_visibility_state());
+    Application::the().update_compositor_context_presents_from_cpu_memory(compositor_context_id, m_presents_from_cpu_memory);
     page.async_update_visibility_state(traversable().id(), traversable().system_visibility_state());
 
     // An assistive technology's interest is per-page state in WebContent, and a cross-site navigation moves the display
@@ -3131,8 +4339,11 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
     if (m_accessibility_tree_requested)
         page.async_request_accessibility_tree();
 
-    // DevTools inspects the page that displays the tab, and no other.
+    // DevTools inspects the page that displays the tab, and no other. A client that took the console's messages or
+    // errors takes those of this page too.
     page.async_set_has_devtools_client(m_devtools_connected);
+    if (m_devtools_takes_console_messages || m_devtools_takes_console_errors)
+        page.async_start_sending_console_output(m_devtools_takes_console_messages, m_devtools_takes_console_errors);
     handle_resize();
     update_ui_overlays();
 
@@ -3143,6 +4354,24 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
 
 void ViewImplementation::did_lose_page(Badge<CanonicalTraversable>, WebContentPage& page, WebContentProcessLost process_lost)
 {
+    bool lost_active_input_host = process_lost == WebContentProcessLost::Yes && !m_webdriver_input_commands.is_empty()
+        && m_webdriver_input_commands.first().command.name != "element_click"sv
+        && m_pending_webdriver_commands.contains(m_webdriver_input_commands.first().command_id)
+        && m_pending_webdriver_commands.get(m_webdriver_input_commands.first().command_id)->page.ptr() == &page;
+    if (lost_active_input_host) {
+        m_webdriver_input_state = JsonValue {};
+        m_webdriver_input_state_was_lost = true;
+        auto queued = move(m_webdriver_input_commands);
+        // Keep an executing command serialized until its host completes or is discarded.
+        if (m_webdriver_input_command_running)
+            m_webdriver_input_commands.append(queued.take_first());
+        for (auto const& command : queued)
+            Application::the().complete_webdriver_content_command(command.command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "Input state was lost while waiting for input"sv));
+        auto command_id = m_webdriver_input_commands.first().command_id;
+        m_pending_webdriver_commands.remove(command_id);
+        m_webdriver_commands_waiting_for_a_document.remove(command_id);
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "Input host was lost while executing the command"sv));
+    }
     Vector<u64> lost_close_preflight_requests;
     for (auto const& [request_id, request] : m_pending_close_preflight_requests) {
         if (request.page_id == page.id())
@@ -3162,7 +4391,7 @@ void ViewImplementation::did_lose_page(Badge<CanonicalTraversable>, WebContentPa
             return false;
         if (process_lost == WebContentProcessLost::No && complete_webdriver_content_command_after_navigation(command_id, command))
             return true;
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Browsing context was discarded while executing the command"sv));
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(error_code_for_a_navigable_that_is_gone(command.protocol), "Browsing context was discarded while executing the command"sv));
         return true;
     });
 }
@@ -3179,6 +4408,7 @@ void ViewImplementation::move_pending_webdriver_commands_to_new_host(Badge<Canon
             continue;
 
         command.page = new_host;
+        command.only_waits_for_navigation = true;
         new_host.async_run_webdriver_command(command_id, navigable_id, "wait_for_navigation"_string, JsonValue {}, {});
     }
 }
@@ -3188,6 +4418,8 @@ void ViewImplementation::move_pending_webdriver_commands_to_new_host(Badge<Canon
 // for that navigation to complete, remains.
 bool ViewImplementation::webdriver_content_command_outlives_its_page(StringView name)
 {
+    // NB: Element Click only mutates a fresh temporary pointer source and removes that source and its cancel
+    //     records before waiting for navigation. The canonical input state remains unchanged across this handoff.
     return name == "element_click"sv;
 }
 
@@ -3196,8 +4428,10 @@ bool ViewImplementation::complete_webdriver_content_command_after_navigation(u64
     if (!webdriver_content_command_outlives_its_page(command.name))
         return false;
 
-    wait_for_webdriver_navigation_completion(Application::the().webdriver_page_load_timeout(), [command_id](Web::WebDriver::Response response) {
-        Application::the().complete_webdriver_content_command(command_id, move(response));
+    wait_for_webdriver_navigation_completion(Application::the().webdriver_page_load_timeout(), [weak_this = make_weak_ptr(), command_id](Web::WebDriver::Response response) {
+        if (!weak_this || weak_this->m_webdriver_input_commands.is_empty() || weak_this->m_webdriver_input_commands.first().command_id != command_id)
+            return;
+        weak_this->complete_webdriver_input_command(command_id, move(response));
     });
     return true;
 }
@@ -3208,7 +4442,7 @@ void ViewImplementation::complete_webdriver_content_commands_after_process_repla
         if (complete_webdriver_content_command_after_navigation(command_id, command))
             continue;
 
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent was replaced while executing the command"sv));
+        complete_webdriver_input_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent was replaced while executing the command"sv));
     }
 }
 
@@ -3281,25 +4515,41 @@ void ViewImplementation::switch_webdriver_to_parent_frame(Function<void(Web::Web
     });
 }
 
-void ViewImplementation::did_complete_webdriver_content_command(Badge<WebContentPage>, u64 command_id, Web::WebDriver::Response response)
+void ViewImplementation::did_complete_webdriver_content_command(WebContentPage& page, u64 command_id, Web::WebDriver::Response response)
 {
-    if (m_pending_webdriver_crash_commands.contains(command_id)) {
+    // NB: Only the page that runs a command completes it. Another page of this view, such as one hosting a cross-site
+    //     frame, cannot.
+    auto is_running_command = [&](auto const& commands) {
+        auto command = commands.find(command_id);
+        return command != commands.end() && command->value.page.ptr() == &page;
+    };
+
+    if (is_running_command(m_pending_webdriver_crash_commands)) {
         // WebContent acknowledges the command before its deferred process exit. Keep the command pending until the
         // crash handler has obtained the page standing in for the crashed document and started session-history recovery.
         if (response.is_error()) {
             m_pending_webdriver_crash_commands.remove(command_id);
-            Application::the().complete_webdriver_content_command(command_id, move(response));
+            complete_webdriver_input_command(command_id, move(response));
         }
         return;
     }
 
-    if (m_pending_webdriver_commands.remove(command_id))
-        Application::the().complete_webdriver_content_command(command_id, move(response));
+    if (is_running_command(m_pending_webdriver_commands)) {
+        m_pending_webdriver_commands.remove(command_id);
+        complete_webdriver_input_command(command_id, move(response));
+    }
 }
 
 void ViewImplementation::did_close_browsing_context(Badge<WebContentPage>)
 {
+    discard_webdriver_input_commands();
     reject_pending_selection_requests();
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#destroy-a-top-level-traversable
+    // 6. Invoke WebDriver BiDi navigable destroyed with traversable.
+    auto* webdriver_bidi = WebDriverBiDi::the();
+    if (webdriver_bidi && !m_window_handle.is_empty() && !m_owner_view_id.has_value())
+        webdriver_bidi->navigable_destroyed(traversable());
 
     auto window_handle = move(m_window_handle);
 
@@ -3309,8 +4559,11 @@ void ViewImplementation::did_close_browsing_context(Badge<WebContentPage>)
     traversable().discard_pending_host();
     traversable().discard_representing_pages();
 
-    if (!window_handle.is_empty() && !m_owner_view_id.has_value())
+    if (!window_handle.is_empty() && !m_owner_view_id.has_value()) {
         Application::the().notify_webdriver_window_closed(window_handle);
+        if (webdriver_bidi)
+            webdriver_bidi->top_level_traversable_did_close(window_handle);
+    }
 
     auto pending_user_prompt_requests = move(m_pending_webdriver_user_prompt_requests);
     for (auto& request : pending_user_prompt_requests)
@@ -3470,8 +4723,8 @@ JsonValue ViewImplementation::webdriver_session_history() const
     serialized.set("displayedURL"sv, m_displayed_url.serialize());
     serialized.set("title"sv, m_title.to_utf8());
     serialized.set("webContentProcessID"sv, page().client().pid());
-    serialized.set("backButtonEnabled"sv, m_navigate_back_action->enabled());
-    serialized.set("forwardButtonEnabled"sv, m_navigate_forward_action->enabled());
+    serialized.set("backButtonEnabled"sv, m_can_navigate_back);
+    serialized.set("forwardButtonEnabled"sv, m_can_navigate_forward);
     serialized.set("crashOverlayActive"sv, crash_overlay_active());
     serialized.set("hasOnlyTopLevelUsedSteps"sv, traversable().session_history().has_only_top_level_used_steps());
 
@@ -3501,8 +4754,13 @@ String ViewImplementation::ui_process_session_history_for_testing(Badge<WebConte
 void ViewImplementation::update_navigation_action_state()
 {
     auto effective_current_index = traversable().effective_current_session_history_step_index();
-    m_navigate_back_action->set_enabled(effective_current_index > 0);
-    m_navigate_forward_action->set_enabled(effective_current_index + 1 < traversable().session_history().used_step_count());
+    auto can_navigate_back = effective_current_index > 0;
+    auto can_navigate_forward = effective_current_index + 1 < traversable().session_history().used_step_count();
+    if (can_navigate_back == m_can_navigate_back && can_navigate_forward == m_can_navigate_forward)
+        return;
+    m_can_navigate_back = can_navigate_back;
+    m_can_navigate_forward = can_navigate_forward;
+    did_change_state();
 }
 
 void ViewImplementation::recover_current_session_history_entry_with_history_operation()
@@ -3527,6 +4785,7 @@ SessionHistorySnapshot ViewImplementation::session_history_snapshot() const
         .entries = session_history.entries(),
         .used_steps = session_history.used_steps(),
         .current_used_step_index = session_history.current_used_step_index(),
+        .document_states_holding_local_file_content = session_history.document_states_holding_local_file_content(),
     };
 }
 
@@ -3537,6 +4796,79 @@ ErrorOr<void> ViewImplementation::restore_session_history_from_snapshot(SessionH
     reconstruct_current_session_history_entry_with_history_operation("restored-session-history-from-ui-snapshot"sv);
     update_navigation_action_state();
     return {};
+}
+
+namespace {
+
+struct DiscardedTabState {
+    // NB: sessionStorage lasts as long as the tab, so a page must find it again when the tab is loaded again.
+    NonnullOwnPtr<StorageJar> session_storage;
+    Web::HTML::MuteState mute_state { Web::HTML::MuteState::Unmuted };
+};
+
+}
+
+static HashMap<u64, DiscardedTabState>& discarded_tab_states()
+{
+    static NeverDestroyed<HashMap<u64, DiscardedTabState>> states;
+    return *states;
+}
+
+// NB: The UI asks for this once it discards the tab, right before it closes the view.
+Optional<u64> ViewImplementation::keep_state_for_discarding()
+{
+    // NB: The tab may have started to do something the user would miss, such as playing audio, while its pages saved
+    //     its history. It then stays loaded, and may be discarded later.
+    if (!m_discard_requested)
+        return {};
+    if (traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden || discard_blockers(m_discard_reason, MonotonicTime::now()) != DiscardBlockers::None) {
+        m_discard_requested = false;
+        TabDiscarder::did_hide_a_tab();
+        return {};
+    }
+
+    // A RequestServer that served only this tab keeps the connections and cache entries a page of the tab would use
+    // again soon. The tab doesn't load its pages again until the user comes back to it, so the server can go with the
+    // processes of the tab.
+    for_each_process_that_discarding_ends([](WebContentClient& client) {
+        auto const& bindings = client.request_server_site_bindings();
+        for (auto const& top_level_site : bindings.top_level_sites()) {
+            if (auto client_id = bindings.client_id_for(top_level_site); client_id.has_value())
+                RequestServerManager::the().retire_without_delay_once_disconnected(*client_id);
+        }
+    });
+
+    static u64 s_next_discarded_tab_state_id = 1;
+    auto discarded_tab_state_id = s_next_discarded_tab_state_id++;
+
+    auto session_storage = StorageJar::create();
+    session_storage->clone_from(traversable().session_storage());
+    discarded_tab_states().set(discarded_tab_state_id, { .session_storage = move(session_storage), .mute_state = m_mute_state });
+    m_discarded_tab_state_id = discarded_tab_state_id;
+    return discarded_tab_state_id;
+}
+
+// NB: The pages of the tab may still write to its sessionStorage until the view closes, which the state must keep too.
+void ViewImplementation::update_state_of_discarded_tab()
+{
+    if (!m_discarded_tab_state_id.has_value())
+        return;
+    if (auto state = discarded_tab_states().get(*m_discarded_tab_state_id); state.has_value())
+        state.value().session_storage->clone_from(traversable().session_storage());
+}
+
+void ViewImplementation::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    auto state = discarded_tab_states().take(discarded_tab_state_id);
+    if (!state.has_value())
+        return;
+    traversable().session_storage().clone_from(*state->session_storage);
+    set_page_mute_state(state->mute_state);
+}
+
+void ViewImplementation::forget_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    discarded_tab_states().remove(discarded_tab_state_id);
 }
 
 bool ViewImplementation::capture_session_history_snapshot_for_testing(Badge<WebContentPage>)
@@ -3554,17 +4886,11 @@ bool ViewImplementation::restore_captured_session_history_snapshot_for_testing(B
     return !result.is_error();
 }
 
-bool ViewImplementation::register_session_store_tab_for_testing(Badge<WebContentPage>)
+void ViewImplementation::record_reported_session_history_for_testing(Badge<WebContentPage>)
 {
-    if (m_session_tab_id.has_value())
-        return true;
-
-    auto tab_id = m_session->session_store->tab_opened({ .window_id = {}, .initial_url = url(), .insertion_index = {}, .is_active = SessionStore::IsActive::No });
-    if (tab_id.is_error())
-        return false;
-    set_session_tab_id(tab_id.value());
+    m_records_reported_session_history_for_testing = true;
+    set_reports_session_history(true);
     notify_session_history_changed();
-    return true;
 }
 
 static Optional<size_t> current_top_level_history_entry_index_for_step(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Optional<i32> current_step)
@@ -3581,65 +4907,72 @@ static Optional<size_t> current_top_level_history_entry_index_for_step(Vector<We
     return current_entry_index;
 }
 
-String ViewImplementation::session_store_tab_state_for_testing(Badge<WebContentPage>) const
+String ViewImplementation::reported_session_history_for_testing(Badge<WebContentPage>) const
 {
     JsonObject serialized;
-    if (!m_session_tab_id.has_value())
+    if (!m_reported_session_history_for_testing.has_value())
         return serialized.serialized();
 
-    auto cached_state = m_session->session_store->cached_tab_state_for_testing(*m_session_tab_id);
-    if (!cached_state.has_value())
-        return serialized.serialized();
-
-    serialized.set("url"sv, cached_state->url.serialize());
-    if (cached_state->history.has_value()) {
-        auto const& history = *cached_state->history;
-        Optional<i32> current_step;
-        if (history.current_used_step_index < history.used_steps.size())
-            current_step = history.used_steps[history.current_used_step_index];
-        serialized.set("entries"sv, history_json_entries(history.entries, current_top_level_history_entry_index_for_step(history.entries, current_step)));
-        serialized.set("usedSteps"sv, history_json_steps(history.used_steps, history.current_used_step_index));
-    }
+    auto const& reported = *m_reported_session_history_for_testing;
+    auto const& history = reported.history;
+    serialized.set("url"sv, reported.url.serialize());
+    Optional<i32> current_step;
+    if (history.current_used_step_index < history.used_steps.size())
+        current_step = history.used_steps[history.current_used_step_index];
+    serialized.set("entries"sv, history_json_entries(history.entries, current_top_level_history_entry_index_for_step(history.entries, current_step)));
+    serialized.set("usedSteps"sv, history_json_steps(history.used_steps, history.current_used_step_index));
     return serialized.serialized();
+}
+
+void ViewImplementation::set_reports_session_history(bool reports_session_history)
+{
+    auto was_reporting = exchange(m_reports_session_history, reports_session_history);
+    if (!reports_session_history || was_reporting || !has_traversable())
+        return;
+
+    // NB: A view that navigated before reporting began has nothing else coming to tell of that. One still on its first
+    //     blank page has nothing to tell, and must not overwrite the history a restored tab is about to get.
+    auto const& session_history = traversable().session_history();
+    if (session_history.used_step_count() > 1 || !session_history.current_entry().url.equals(URL::about_blank()))
+        notify_session_history_changed();
 }
 
 void ViewImplementation::notify_session_history_changed()
 {
-    if (!m_session_tab_id.has_value())
+    if (!m_reports_session_history)
         return;
+    auto history = session_history_snapshot();
     auto url = traversable().session_history().current_entry().url;
-    SessionStore::TabStateUpdate update {
-        .tab_id = *m_session_tab_id,
-        .history = session_history_snapshot(),
-        .url = move(url),
-    };
-    m_session->session_store->update_tab_state(move(update));
+    if (m_records_reported_session_history_for_testing)
+        m_reported_session_history_for_testing = ReportedSessionHistory { history, url };
+    did_change_session_history(history, url);
 }
 
-NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_session_history_for_testing()
+NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_state_for_testing()
 {
-    m_pending_session_history_reset_for_testing = Core::Promise<Empty>::construct();
+    m_pending_test_state_reset = Core::Promise<Empty>::construct();
     // The algorithms this test control replaces run on the session history traversal queue. Keep that ordering by
     // sending the reset at its queue position, and hold the queue until WebContent returns the retained active
-    // entry so canonical history is reset before anything queued behind the reset runs.
+    // entry so canonical history is reset before anything queued behind the reset runs. WebContent also restores
+    // automatic rendering before acknowledging the reset.
     traversable().append_history_queue_steps([this](NonnullRefPtr<Core::Promise<Empty>> promise) {
-        m_pending_session_history_reset_queue_promise = move(promise);
-        page().reset_session_history_for_testing();
+        m_pending_test_state_reset_queue_promise = move(promise);
+        page().reset_state_for_testing();
     });
-    return *m_pending_session_history_reset_for_testing;
+    return *m_pending_test_state_reset;
 }
 
-void ViewImplementation::did_reset_session_history_for_testing(
+void ViewImplementation::did_reset_state_for_testing(
     Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor active_entry)
 {
-    auto promise = move(m_pending_session_history_reset_for_testing);
+    auto promise = move(m_pending_test_state_reset);
     traversable().reset_session_history_for_testing(move(active_entry));
     m_webdriver_navigation_observation.clear();
     // The reset installed the process's own active entry as the canonical current entry.
     traversable().active_document().set_host(page());
     update_navigation_action_state();
 
-    if (auto queue_promise = move(m_pending_session_history_reset_queue_promise))
+    if (auto queue_promise = move(m_pending_test_state_reset_queue_promise))
         queue_promise->resolve({});
     if (promise)
         promise->resolve({});
@@ -3668,12 +5001,12 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
         traversal.has_value() ? Optional<i32> { traversal->target_step } : Optional<i32> {},
         traversal.has_value() ? CanonicalTraversable::browser_history_traversal_stage_to_string(traversal->stage) : "none"sv,
         traversable().queued_same_document_session_history_entries_for_debug(),
-        m_navigate_back_action->enabled(),
-        m_navigate_forward_action->enabled(),
+        m_can_navigate_back,
+        m_can_navigate_forward,
         history_log_entries(traversable().session_history()));
 }
 
-void ViewImplementation::handle_web_content_process_crash()
+void ViewImplementation::handle_web_content_process_crash(WebContentCrashReason crash_reason)
 {
     auto failed_url = url();
     if (auto browser_ui_load_url = this->browser_ui_load_url(); browser_ui_load_url.has_value())
@@ -3698,10 +5031,13 @@ void ViewImplementation::handle_web_content_process_crash()
     for (auto& request : pending_user_prompt_requests)
         request.value(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while handling user prompts"sv));
 
+    discard_webdriver_input_commands(true);
     auto pending_commands = move(m_pending_webdriver_commands);
     auto pending_crash_commands = move(m_pending_webdriver_crash_commands);
     for (auto const& command : pending_commands)
-        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while executing the command"sv));
+        complete_webdriver_input_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while executing the command"sv));
+    if (auto* webdriver_bidi = WebDriverBiDi::the())
+        webdriver_bidi->top_level_traversable_did_crash(traversable());
 
     auto crashed_during_recovery = m_webdriver_navigation_observation.has_value()
         && m_webdriver_navigation_observation->completion_source == WebDriverNavigationCompletionSource::CrashRecovery;
@@ -3723,8 +5059,12 @@ void ViewImplementation::handle_web_content_process_crash()
     if (auto const& headless_mode = Application::browser_options().headless_mode; headless_mode.has_value())
         recovery_mode = *headless_mode == HeadlessMode::Test ? RecoveryMode::PrepareForNextNavigation : RecoveryMode::Restore;
 
-    if (recovery_mode == RecoveryMode::ShowOverlay)
-        dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    if (recovery_mode == RecoveryMode::ShowOverlay) {
+        if (crash_reason == WebContentCrashReason::ExceededMemoryLimit)
+            dbgln("\033[31;1mWebContent process was ended for its memory use!\033[0m Last page loaded: {}", failed_url);
+        else
+            dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    }
 
     reset_page_media_state();
 
@@ -3742,21 +5082,24 @@ void ViewImplementation::handle_web_content_process_crash()
     respawn_web_content_process_after_crash();
 
     // A repeatedly crashing headless page is left dormant so the next WebDriver test or explicit navigation can
-    // proceed without feeding an automatic restore loop.
-    if (recovery_mode == RecoveryMode::Restore && !crashed_repeatedly) {
+    // proceed without feeding an automatic restore loop. So is a page that was ended for its memory use, because
+    // the restored page would grow to the limit again.
+    auto restores_page = !crashed_repeatedly && crash_reason != WebContentCrashReason::ExceededMemoryLimit;
+    if (recovery_mode == RecoveryMode::Restore && restores_page) {
         recover_current_session_history_entry_with_history_operation();
     } else if (recovery_mode == RecoveryMode::ShowOverlay) {
         traversable().abandon_history_operations();
         set_crash_state(CrashState {
             .failed_url = move(failed_url),
             .navigation_to_retry = move(navigation_to_retry),
+            .exceeded_memory_limit = crash_reason == WebContentCrashReason::ExceededMemoryLimit,
         });
     } else {
         traversable().abandon_history_operations();
     }
 
     for (auto const& command : pending_crash_commands)
-        Application::the().complete_webdriver_content_command(command.key, JsonValue {});
+        complete_webdriver_input_command(command.key, JsonValue {});
 }
 
 void ViewImplementation::respawn_web_content_process_after_crash()
@@ -3764,12 +5107,12 @@ void ViewImplementation::respawn_web_content_process_after_crash()
     // Nothing answers the crashed page's requests.
     fail_pending_debugger_requests();
     reject_pending_selection_requests();
-    // A queued session-history reset awaiting the crashed process's reply can never complete.
-    if (auto queue_promise = move(m_pending_session_history_reset_queue_promise))
+    // A queued test-state reset awaiting the crashed process's reply can never complete.
+    if (auto queue_promise = move(m_pending_test_state_reset_queue_promise))
         queue_promise->resolve({});
     cancel_all_native_geolocation_requests();
     // Don't keep a stale backup bitmap around.
-    m_backup_shared_image_buffer = nullptr;
+    m_backing_stores->clear_backup();
 
     // The tab is displayed by a page of a new process, standing in for the document the crashed process destroyed
     // until a document activates in the tab: the traversal recovering the tab populates one in that page.
@@ -3792,7 +5135,7 @@ Optional<ViewImplementation::NavigationToRetry> ViewImplementation::navigation_t
 void ViewImplementation::retry_navigation(NavigationToRetry retry, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     if (!retry.navigation.has_value()) {
-        load(retry.url, history_handling);
+        load_from_browser_ui(retry.url, history_handling);
         return;
     }
     auto navigation = retry.navigation.release_value();
@@ -3814,7 +5157,7 @@ void ViewImplementation::set_crash_state(Optional<CrashState> state)
     auto active = state.has_value();
     m_crash_state = move(state);
     notify_content_blocking_changed();
-    update_report_website_issue_action();
+    did_change_state();
     if (on_crash_overlay_state_change)
         on_crash_overlay_state_change(active);
 }
@@ -3825,6 +5168,14 @@ void ViewImplementation::did_save_crash_report(ByteString report_name)
     if (!m_crash_state.has_value())
         return;
     m_crash_state->report_name = move(report_name);
+
+    // It stays on this computer unless the user chooses to include it, and a private window leaves no trace of it.
+    if (auto website = crash_report_website(); website.has_value() && is_private() == IsPrivate::No) {
+        if (auto result = CrashReportStore::the().save_website(m_crash_state->report_name, *website); result.is_error())
+            warnln("Could not save the website of a crash report: {}", result.error());
+        CrashReportOutbox::the().reports_changed();
+    }
+
     if (on_crash_report_saved)
         on_crash_report_saved();
 }
@@ -3846,23 +5197,28 @@ Optional<String> ViewImplementation::crash_report_website() const
 {
     if (!m_crash_state.has_value())
         return {};
-    auto const& failed_url = m_crash_state->failed_url;
-    if (failed_url.scheme() != "http"sv && failed_url.scheme() != "https"sv)
-        return {};
-    auto serialized_url = failed_url.serialize();
-    if (serialized_url.bytes().size() > CrashReportReview::maximum_url_bytes)
-        return {};
-    return serialized_url;
+    return CrashReportReview::website_from_url(m_crash_state->failed_url);
+}
+
+bool ViewImplementation::force_dark_enabled() const
+{
+    return Application::settings().force_dark_for_host(current_host_for_settings());
+}
+
+bool ViewImplementation::can_set_force_dark() const
+{
+    return m_is_private == IsPrivate::No && !current_host_for_settings().is_empty();
+}
+
+void ViewImplementation::set_force_dark_enabled(bool enabled)
+{
+    if (can_set_force_dark())
+        Application::settings().set_force_dark_for_host(current_host_for_settings(), enabled);
 }
 
 String ViewImplementation::current_host_for_settings() const
 {
-    auto url = this->url();
-    if (url.host().has_value())
-        return MUST(String::from_utf8(url.serialized_host()));
-    if (url.scheme() == "about"sv)
-        return MUST(String::from_utf8(url.serialize_path()));
-    return {};
+    return host_for_settings(url());
 }
 
 void ViewImplementation::languages_changed()
@@ -3876,10 +5232,27 @@ void ViewImplementation::languages_changed()
 void ViewImplementation::content_settings_changed()
 {
     apply_zoom_for_current_host();
+    did_change_state();
 
     // The page displaying the tab, and any page chosen to host its next document, host the tab's traversable.
     send_force_dark(page());
     traversable().for_each_pending_host(send_force_dark);
+    send_force_dark_to_embedded_pages();
+}
+
+// A page embedding out-of-process iframes of the tab has no local traversable to resolve force-dark for, so it takes the
+// tab's own: what applies to the host of the tab's top-level document.
+void ViewImplementation::send_force_dark_to_embedded_page(WebContentPage& page) const
+{
+    page.async_set_force_dark_for_local_roots(Application::settings().force_dark_for_host(current_host_for_settings()));
+}
+
+void ViewImplementation::send_force_dark_to_embedded_pages() const
+{
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (&page != &this->page())
+            send_force_dark_to_embedded_page(page);
+    });
 }
 
 void ViewImplementation::browsing_behavior_changed()
@@ -3892,16 +5265,217 @@ void ViewImplementation::autoplay_settings_changed()
     traversable().for_each_hosting_page(send_autoplay_settings);
 }
 
+void ViewImplementation::permission_settings_changed(Web::Permissions::PermissionName name)
+{
+    if (name == Web::Permissions::PermissionName::Geolocation)
+        geolocation_settings_changed();
+}
+
 void ViewImplementation::global_privacy_control_changed()
 {
     traversable().for_each_hosting_page(send_global_privacy_control);
+}
+
+void ViewImplementation::config_variable_changed(ConfigVariableID id)
+{
+    if (id == ConfigVariableID::OfferToTrustSelfSignedCertificates || id == ConfigVariableID::OfferToTrustInvalidCertificates)
+        traversable().for_each_hosting_page(send_offers_to_trust_certificates);
+}
+
+Vector<SitePermissionRow> ViewImplementation::site_permission_rows() const
+{
+    auto origin = permission_origin();
+    auto const& manager = *session().permission_manager;
+
+    Vector<SitePermissionRow> rows;
+    for (auto name : { Web::Permissions::PermissionName::Geolocation, Web::Permissions::PermissionName::Microphone, Web::Permissions::PermissionName::Notifications }) {
+        auto decision = manager.decision(name, origin);
+        rows.append({
+            .name = name,
+            .decision = decision,
+            .one_time_grant_is_live = decision == PermissionDecision::AllowOnce,
+            .requested_by_page = m_permissions_requested_by_page.contains_slow(name),
+        });
+    }
+    return rows;
+}
+
+void ViewImplementation::set_site_permission(URL::Origin const& origin, Web::Permissions::PermissionName name, Optional<PermissionDecision> decision)
+{
+    session().permission_manager->set_decision(name, origin, decision);
+}
+
+void ViewImplementation::reset_site_permissions(URL::Origin const& origin)
+{
+    session().permission_manager->reset_origin(origin);
+}
+
+void ViewImplementation::did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName name)
+{
+    if (!m_permissions_requested_by_page.contains_slow(name))
+        m_permissions_requested_by_page.append(name);
+}
+
+class MicrophoneAuthorizerForTesting final : public MicrophoneAuthorizer {
+public:
+    MicrophoneAuthorizerForTesting(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held)
+        : m_authorization(authorization)
+        , m_answer(answer)
+        , m_held(held)
+    {
+    }
+
+    u64 requests() const { return m_requests; }
+
+    void release()
+    {
+        m_held = false;
+        for (auto& on_complete : exchange(m_waiting, {}))
+            answer(move(on_complete));
+    }
+
+    virtual MicrophoneAuthorization authorization() const override { return m_authorization; }
+
+    virtual void request_authorization(Function<void(MicrophoneAuthorization)> on_complete) override
+    {
+        ++m_requests;
+        if (m_held) {
+            m_waiting.append(move(on_complete));
+            return;
+        }
+        answer(move(on_complete));
+    }
+
+    virtual void open_system_settings() override { }
+
+private:
+    void answer(Function<void(MicrophoneAuthorization)> on_complete)
+    {
+        m_authorization = m_answer;
+        on_complete(m_authorization);
+    }
+
+    MicrophoneAuthorization m_authorization;
+    MicrophoneAuthorization m_answer;
+    bool m_held { false };
+    u64 m_requests { 0 };
+    Vector<Function<void(MicrophoneAuthorization)>> m_waiting;
+};
+
+MicrophoneAuthorizer& ViewImplementation::microphone_authorizer() const
+{
+    if (m_microphone_authorizer_for_testing)
+        return *m_microphone_authorizer_for_testing;
+    return Application::the().microphone_authorizer();
+}
+
+MicrophoneAuthorization ViewImplementation::microphone_authorization() const
+{
+    return microphone_authorizer().authorization();
+}
+
+void ViewImplementation::ensure_microphone_authorization(Function<void(bool authorized)> on_complete)
+{
+    // The notice is about the site that asked, which the tab may have left by the time the system answers.
+    auto settle = [weak_this = make_weak_ptr(), requesting_origin = permission_origin(), on_complete = move(on_complete)](MicrophoneAuthorization authorization) {
+        auto authorized = authorization == MicrophoneAuthorization::Authorized;
+        if (auto* view = weak_this.ptr(); view && !authorized && view->permission_origin().is_same_origin(requesting_origin))
+            view->show_microphone_denied_notice();
+        on_complete(authorized);
+    };
+
+    auto authorization = microphone_authorization();
+    if (authorization != MicrophoneAuthorization::NotDetermined) {
+        settle(authorization);
+        return;
+    }
+    microphone_authorizer().request_authorization(move(settle));
+}
+
+bool ViewImplementation::has_shown_microphone_denied_notice(URL::Origin const& top_level_origin) const
+{
+    return m_sites_shown_microphone_denied_notice.find_first_index_if([&](auto const& site) { return site.is_same_origin(top_level_origin); }).has_value();
+}
+
+void ViewImplementation::show_microphone_denied_notice()
+{
+    // Once the user has seen the notice, the site can't bring it back in this tab, however often it asks. The notice
+    // goes through the prompts, so requests made while it waits to come up share it.
+    auto top_level_origin = permission_origin();
+    if (has_shown_microphone_denied_notice(top_level_origin))
+        return;
+
+    auto is_file = top_level_origin.is_opaque() && url().scheme() == "file"sv;
+    PermissionPromptRequest request { Web::Permissions::PermissionName::Microphone, move(top_level_origin), is_file, false, PermissionPromptKind::SystemDeniedNotice };
+    request_permission_prompt(move(request), [](Web::Permissions::PromptOutcome) { });
+}
+
+void ViewImplementation::did_show_permission_prompt(PermissionPromptRequest const& request)
+{
+    // A prompt that comes up again, once its hidden tab is shown, is still the one prompt.
+    auto pending = m_pending_permission_prompts.find_if([&](auto const& candidate) { return candidate.request.is_same_request_as(request); });
+    if (pending == m_pending_permission_prompts.end() || exchange(pending->shown, true))
+        return;
+    if (request.kind != PermissionPromptKind::SystemDeniedNotice)
+        return;
+
+    ++m_microphone_denied_notices_shown;
+    if (!has_shown_microphone_denied_notice(request.top_level_origin))
+        m_sites_shown_microphone_denied_notice.append(request.top_level_origin);
+}
+
+void ViewImplementation::set_microphone_authorization_for_testing(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held)
+{
+    m_microphone_authorizer_for_testing = make<MicrophoneAuthorizerForTesting>(authorization, answer, held);
+}
+
+void ViewImplementation::release_system_microphone_answer_for_testing()
+{
+    if (m_microphone_authorizer_for_testing)
+        m_microphone_authorizer_for_testing->release();
+}
+
+u64 ViewImplementation::system_microphone_requests_for_testing() const
+{
+    return m_microphone_authorizer_for_testing ? m_microphone_authorizer_for_testing->requests() : 0;
+}
+
+void ViewImplementation::update_location_in_use()
+{
+    auto in_use = !m_geolocation_position_request_ids.is_empty() || !m_geolocation_watch_ids.is_empty();
+    m_tab_indicators.set_active(TabIndicator::UsingLocation, in_use, MonotonicTime::now());
+}
+
+void ViewImplementation::revoke_geolocation_without_permission()
+{
+    using ErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
+
+    m_geolocation_request_documents.remove_all_matching([&](auto const& key, auto const&) {
+        return !m_geolocation_position_request_ids.contains(key) && !m_geolocation_watch_ids.contains(key);
+    });
+
+    Vector<GeolocationRequestKey> revoked;
+    for (auto const& it : m_geolocation_request_documents) {
+        if (!it.key.page->document_may_use(it.value, Web::Permissions::PermissionName::Geolocation))
+            revoked.append(it.key);
+    }
+
+    for (auto const& key : revoked) {
+        m_geolocation_request_documents.remove(key);
+        if (auto provider_request_id = m_geolocation_position_request_ids.take(key); provider_request_id.has_value())
+            Application::the().cancel_geolocation_position_request(*provider_request_id);
+        if (auto provider_watch_id = m_geolocation_watch_ids.take(key); provider_watch_id.has_value())
+            Application::the().stop_watching_geolocation_position(*provider_watch_id);
+        key.page->async_geolocation_position_response(key.request_id, {}, to_underlying(ErrorCode::PermissionDenied));
+    }
+    update_location_in_use();
 }
 
 void ViewImplementation::geolocation_settings_changed()
 {
     using ErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
 
-    if (Application::web_content_options().is_test_mode != IsTestMode::Yes && !Application::settings().geolocation_enabled()) {
+    if (Application::web_content_options().is_test_mode != IsTestMode::Yes && !Application::the().sites_can_ask_for_location()) {
         auto geolocation_position_request_ids = move(m_geolocation_position_request_ids);
         for (auto const& request : geolocation_position_request_ids) {
             Application::the().cancel_geolocation_position_request(request.value);
@@ -3913,6 +5487,7 @@ void ViewImplementation::geolocation_settings_changed()
             Application::the().stop_watching_geolocation_position(watch.value);
             watch.key.page->async_geolocation_position_response(watch.key.request_id, {}, to_underlying(ErrorCode::PermissionDenied));
         }
+        m_geolocation_request_documents.clear();
     }
 
     send_geolocation_emulated_position(page());
@@ -3920,6 +5495,7 @@ void ViewImplementation::geolocation_settings_changed()
         if (&page != &this->page())
             send_geolocation_emulated_position(page);
     });
+    update_location_in_use();
 }
 
 void ViewImplementation::send_geolocation_emulated_position(WebContentPage& page)
@@ -3928,88 +5504,106 @@ void ViewImplementation::send_geolocation_emulated_position(WebContentPage& page
 
     if (Application::web_content_options().is_test_mode == IsTestMode::Yes)
         page.async_set_geolocation_emulated_position({ 37.7647658, -122.4345892, 100.0, 0.0, 0.0, 0.0, 0.0 }, {});
-    else if (Application::settings().geolocation_enabled())
+    else if (Application::the().sites_can_ask_for_location())
         page.async_set_geolocation_emulated_position({}, {});
     else
         page.async_set_geolocation_emulated_position({}, to_underlying(ErrorCode::PermissionDenied));
 }
 
-void ViewImplementation::bookmarks_changed()
+static ErrorOr<void> write_screenshot_to_path(ReadonlyBytes encoded, LexicalPath const& path)
 {
-    update_bookmark_action();
-}
-
-void ViewImplementation::update_bookmark_action()
-{
-    Application::the().update_bookmark_action_for_current_web_view();
-
-    auto is_bookmarked = Application::bookmark_store().is_bookmarked(url());
-
-    m_toggle_bookmark_action->set_tooltip(is_bookmarked ? "Remove bookmark"sv : "Bookmark this page"sv);
-    m_toggle_bookmark_action->set_engaged(is_bookmarked);
-}
-
-static ErrorOr<LexicalPath> save_screenshot(Gfx::Bitmap const* bitmap)
-{
-    if (!bitmap)
-        return Error::from_string_literal("Failed to take a screenshot");
-
-    auto path = TRY([] -> ErrorOr<LexicalPath> {
-        if (auto const& screenshot_path = Application::browser_options().screenshot_path; screenshot_path.has_value())
-            return LexicalPath { *screenshot_path };
-
-        auto file = AK::UnixDateTime::now().to_byte_string("screenshot-%Y-%m-%d-%H-%M-%S.png"sv);
-        return Application::the().path_for_downloaded_file(file);
-    }());
-
-    auto encoded = TRY(Gfx::PNGWriter::encode(*bitmap));
-
     auto dump_file = TRY(Core::File::open(path.string(), Core::File::OpenMode::Write));
     TRY(dump_file->write_until_depleted(encoded));
 
-    return path;
+    return {};
+}
+
+static NonnullRefPtr<Core::Promise<LexicalPath>> write_screenshot(Gfx::Bitmap const* bitmap)
+{
+    if (!bitmap)
+        return Core::Promise<LexicalPath>::rejected(Error::from_string_literal("Failed to take a screenshot"));
+
+    // NB: The bitmap may be gone, or show something else, by the time a path is chosen.
+    auto encoded = Gfx::PNGWriter::encode(*bitmap);
+    if (encoded.is_error())
+        return Core::Promise<LexicalPath>::rejected(encoded.release_error());
+
+    auto destination = [] {
+        if (auto const& screenshot_path = Application::browser_options().screenshot_path; screenshot_path.has_value())
+            return Core::Promise<LexicalPath>::resolved(LexicalPath { *screenshot_path });
+
+        auto file = AK::UnixDateTime::now().to_byte_string("screenshot-%Y-%m-%d-%H-%M-%S.png"sv);
+        return Application::the().path_for_downloaded_file(file);
+    }();
+
+    auto promise = Core::Promise<LexicalPath>::construct();
+    destination
+        ->when_resolved([promise, encoded = encoded.release_value()](auto const& path) {
+            if (auto result = write_screenshot_to_path(encoded, path); result.is_error())
+                promise->reject(result.release_error());
+            else
+                promise->resolve(path);
+        })
+        .when_rejected([promise](auto& error) {
+            promise->reject(move(error));
+        });
+    return promise;
+}
+
+static void report_saved_screenshot(Core::Promise<LexicalPath>& screenshot)
+{
+    screenshot
+        .when_resolved([](auto const& path) {
+            Application::the().display_download_confirmation_dialog("Screenshot"sv, path);
+        })
+        .when_rejected([](auto const& error) {
+            if (error.is_errno() && error.code() == ECANCELED)
+                return;
+
+            auto error_message = MUST(String::formatted("{}", error));
+            Application::the().display_error_dialog(error_message);
+        });
 }
 
 NonnullRefPtr<Core::Promise<LexicalPath>> ViewImplementation::take_screenshot(ScreenshotType type)
 {
-    auto promise = Core::Promise<LexicalPath>::construct();
-
     if (m_pending_screenshot) {
         // For simplicity, only allow taking one screenshot at a time for now. Revisit if we need
         // to allow spamming screenshot requests for some reason.
-        promise->reject(Error::from_string_literal("A screenshot request is already in progress"));
-        return promise;
+        return Core::Promise<LexicalPath>::rejected(Error::from_string_literal("A screenshot request is already in progress"));
     }
 
     switch (type) {
     case ScreenshotType::Visible: {
         RefPtr<Gfx::Bitmap> visible_bitmap;
-        if (m_has_usable_bitmap) {
-            VERIFY(m_front_bitmap.shared_image_buffer);
-            visible_bitmap = m_front_bitmap.shared_image_buffer->bitmap_if_present();
-        } else if (m_backup_shared_image_buffer) {
-            visible_bitmap = m_backup_shared_image_buffer->bitmap_if_present();
-        }
-        if (visible_bitmap) {
-            if (auto result = save_screenshot(visible_bitmap.ptr()); result.is_error())
-                promise->reject(result.release_error());
-            else
-                promise->resolve(result.release_value());
-        } else {
-            // GPU-shared backing stores have no CPU-visible pixels, so ask WebContent to paint a screenshot for us.
-            m_pending_screenshot = promise;
-            page().async_take_document_screenshot();
-        }
+        if (auto frame = m_backing_stores->displayed_frame(); frame.has_value() && frame->shared_image_buffer)
+            visible_bitmap = frame->shared_image_buffer->bitmap_if_present();
+        if (visible_bitmap)
+            return write_screenshot(visible_bitmap.ptr());
+
+        // GPU-shared backing stores have no CPU-visible pixels, so ask WebContent to paint a screenshot for us.
         break;
     }
 
     case ScreenshotType::Full:
-        m_pending_screenshot = promise;
-        page().async_take_document_screenshot();
         break;
     }
 
+    auto promise = Core::Promise<LexicalPath>::construct();
+    m_pending_screenshot = promise;
+    page().async_take_document_screenshot();
     return promise;
+}
+
+void ViewImplementation::take_and_save_screenshot(ScreenshotType type)
+{
+    report_saved_screenshot(*take_screenshot(type));
+}
+
+// A screenshot the UI took itself, such as of the part of the page the user selected.
+void ViewImplementation::save_screenshot(Gfx::Bitmap const& bitmap)
+{
+    report_saved_screenshot(*write_screenshot(&bitmap));
 }
 
 NonnullRefPtr<Core::Promise<LexicalPath>> ViewImplementation::take_dom_node_screenshot(Web::UniqueNodeID node_id)
@@ -4037,10 +5631,13 @@ void ViewImplementation::did_receive_screenshot(Badge<WebContentPage>, Gfx::Shar
         return;
     }
 
-    if (auto result = save_screenshot(screenshot.bitmap()); result.is_error())
-        m_pending_screenshot->reject(result.release_error());
-    else
-        m_pending_screenshot->resolve(result.release_value());
+    write_screenshot(screenshot.bitmap())
+        ->when_resolved([pending_screenshot = m_pending_screenshot](auto const& path) {
+            pending_screenshot->resolve(path);
+        })
+        .when_rejected([pending_screenshot = m_pending_screenshot](auto& error) {
+            pending_screenshot->reject(move(error));
+        });
 
     m_pending_screenshot = nullptr;
 }
@@ -4096,428 +5693,53 @@ ErrorOr<LexicalPath> ViewImplementation::dump_gc_graph()
     return path;
 }
 
-void ViewImplementation::initialize_context_menus()
+void ViewImplementation::send_context_menu_request(ContextMenuRequest request, Gfx::IntPoint content_position)
 {
-    auto& application = Application::the();
-
-    m_navigate_back_action = Action::create("Go Back"sv, ActionID::NavigateBack, [this]() {
-        traverse_the_history_by_delta(-1);
-    });
-    m_navigate_forward_action = Action::create("Go Forward"sv, ActionID::NavigateForward, [this]() {
-        traverse_the_history_by_delta(+1);
-    });
-    m_navigate_back_action->set_enabled(false);
-    m_navigate_forward_action->set_enabled(false);
-
-    m_toggle_bookmark_action = Action::create("Toggle Bookmark"sv, ActionID::ToggleBookmarkViaToolbar, [this]() {
-        Application::the().toggle_bookmark_for_view(*this);
-    });
-    update_bookmark_action();
-
-    m_reset_zoom_action = Action::create("100%"sv, ActionID::ResetZoomViaToolbar, [this]() {
-        reset_zoom();
-    });
-    m_reset_zoom_action->set_tooltip("Reset zoom level"sv);
-    m_reset_zoom_action->set_visible(false);
-
-    m_search_selected_text_action = Action::create("Search Selected Text"sv, ActionID::SearchSelectedText, [this]() {
-        auto const& search_engine = Application::settings().search_engine_settings().engine;
-        if (!search_engine.has_value())
-            return;
-
-        auto url_string = search_engine->format_search_query_for_navigation(*m_search_text);
-        auto url = URL::Parser::basic_parse(url_string);
-        VERIFY(url.has_value());
-
-        Application::the().open_url_in_new_tab(*url, Web::HTML::ActivateTab::Yes);
-    });
-    m_search_selected_text_action->set_visible(false);
-
-    m_copy_link_to_highlight_action = Action::create("Copy Link to Highlight"sv, ActionID::CopyLinkToHighlight, [this] {
-        if (!m_text_fragment_url.has_value())
-            return;
-        Application::the().insert_clipboard_entry({ "text/plain"_string, url_text_to_copy(*m_text_fragment_url) });
-    });
-    m_copy_link_to_highlight_action->set_visible(false);
-    m_copy_link_to_highlight_action->set_enabled(false);
-
-    m_look_up_selected_text_action = Action::create("Look Up"sv, ActionID::LookUpSelectedText, [this] {
-        if (!m_look_up.has_value() || !on_request_dictionary_lookup)
-            return;
-
-        on_request_dictionary_lookup(*m_look_up, m_look_up_position);
-    });
-    m_look_up_selected_text_action->set_visible(false);
-
-    auto take_and_save_screenshot = [this](auto type) {
-        take_screenshot(type)
-            ->when_resolved([](auto const& path) {
-                Application::the().display_download_confirmation_dialog("Screenshot"sv, path);
-            })
-            .when_rejected([](auto const& error) {
-                if (error.is_errno() && error.code() == ECANCELED)
-                    return;
-
-                auto error_message = MUST(String::formatted("{}", error));
-                Application::the().display_error_dialog(error_message);
-            });
-    };
-
-    m_take_visible_screenshot_action = Action::create("Take Visible Screenshot"sv, ActionID::TakeVisibleScreenshot, [take_and_save_screenshot]() {
-        take_and_save_screenshot(ScreenshotType::Visible);
-    });
-    m_take_full_screenshot_action = Action::create("Take Full Screenshot"sv, ActionID::TakeFullScreenshot, [take_and_save_screenshot]() {
-        take_and_save_screenshot(ScreenshotType::Full);
-    });
-
-    m_report_website_issue_action = Action::create("Report Website Issue..."sv, ActionID::ReportWebsiteIssue, [this]() {
-        report_website_issue();
-    });
-    m_report_website_issue_action->set_enabled(false);
-
-    // A URL from the context menu is the page's — a link's or an image's — so it's navigated to from the page, unless
-    // the user selected it as text. Blink also starts a selected URL with no initiator (IDC_CONTENT_CONTEXT_GOTOURL).
-    m_open_in_new_tab_action = Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
-        if (m_context_menu_navigation.has_value())
-            open_navigation_in_new_tab(*m_context_menu_navigation, Web::HTML::ActivateTab::No);
-        else
-            open_url_in_new_tab(m_context_menu_url, Web::HTML::ActivateTab::No);
-    });
-    if (m_is_private == IsPrivate::No) {
-        m_open_in_new_window_action = Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, [this]() {
-            if (m_context_menu_navigation.has_value())
-                open_navigation_in_new_window(*m_context_menu_navigation, IsPrivate::No);
-            else
-                open_url_in_new_window(m_context_menu_url, IsPrivate::No);
-        });
-    }
-    if (application.supports_private_browsing_windows()) {
-        m_open_in_new_private_window_action = Action::create("Open in New Private Window"sv, ActionID::OpenInNewPrivateWindow, [this]() {
-            if (!m_context_menu_navigation.has_value()) {
-                open_url_in_new_window(m_context_menu_url, IsPrivate::Yes);
-                return;
-            }
-            // A private window still gets the page as the navigation's initiator, but never the page's URL as its
-            // referrer — as in Gecko/Blink (Gecko URILoadingHelper, Blink IDC_CONTENT_CONTEXT_OPENLINKOFFTHERECORD).
-            auto navigation = *m_context_menu_navigation;
-            navigation.referrer_policy = Web::ReferrerPolicy::ReferrerPolicy::NoReferrer;
-            open_navigation_in_new_window(move(navigation), IsPrivate::Yes);
-        });
-    }
-    m_download_linked_file_action = Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this]() {
-        download_context_menu_url(PromptForPath::No);
-    });
-    m_download_linked_file_as_action = Action::create("Download Linked File As..."sv, ActionID::DownloadLinkedFileAs, [this]() {
-        download_context_menu_url(PromptForPath::Yes);
-    });
-    m_copy_url_action = Action::create("Copy URL"sv, ActionID::CopyURL, [this]() {
-        Application::the().insert_clipboard_entry({ "text/plain"_string, url_text_to_copy(m_context_menu_url) });
-    });
-
-    m_open_image_action = Action::create("Open Image"sv, ActionID::OpenImage, [this]() {
-        load(*m_context_menu_navigation);
-    });
-    m_save_image_action = Action::create("Save Image As..."sv, ActionID::SaveImage, [this]() {
-        download_context_menu_url(PromptForPath::Yes);
-    });
-    m_copy_image_action = Action::create("Copy Image"sv, ActionID::CopyImage, [this]() {
-        if (!m_image_context_menu_bitmap.has_value())
-            return;
-
-        auto bitmap = m_image_context_menu_bitmap.release_value();
-        if (!bitmap.is_valid())
-            return;
-
-        auto encoded = Gfx::PNGWriter::encode(*bitmap.bitmap());
-        if (encoded.is_error())
-            return;
-
-        Application::the().insert_clipboard_entry({ "image/png"_string, ByteString { encoded.value().bytes() } });
-    });
-
-    m_open_audio_action = Action::create("Open Audio"sv, ActionID::OpenAudio, [this]() {
-        load(*m_context_menu_navigation);
-    });
-    m_open_video_action = Action::create("Open Video"sv, ActionID::OpenVideo, [this]() {
-        load(*m_context_menu_navigation);
-    });
-    m_media_play_action = Action::create("Play"sv, ActionID::PlayMedia, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_play_state(); });
-    });
-    m_media_pause_action = Action::create("Pause"sv, ActionID::PauseMedia, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_play_state(); });
-    });
-    m_media_mute_action = Action::create("Mute"sv, ActionID::MuteMedia, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_mute_state(); });
-    });
-    m_media_unmute_action = Action::create("Unmute"sv, ActionID::UnmuteMedia, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_mute_state(); });
-    });
-    m_media_show_controls_action = Action::create("Show Controls"sv, ActionID::ShowControls, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_controls_state(); });
-    });
-    m_media_hide_controls_action = Action::create("Hide Controls"sv, ActionID::HideControls, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_controls_state(); });
-    });
-    m_media_loop_action = Action::create_checkable("Loop"sv, ActionID::ToggleMediaLoopState, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_loop_state(); });
-    });
-    m_media_enter_fullscreen_action = Action::create("Full Screen"sv, ActionID::EnterFullscreen, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_fullscreen_state(); });
-    });
-    m_media_exit_fullscreen_action = Action::create("Exit Full Screen"sv, ActionID::ExitFullscreen, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_fullscreen_state(); });
-    });
-    m_media_enter_picture_in_picture_action = Action::create("Picture-in-Picture"sv, ActionID::EnterPictureInPicture, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_picture_in_picture_state(); });
-    });
-    m_media_exit_picture_in_picture_action = Action::create("Exit Picture-in-Picture"sv, ActionID::ExitPictureInPicture, [this]() {
-        send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_picture_in_picture_state(); });
-    });
-
-    auto add_open_url_actions = [this](Menu& menu) {
-        menu.add_action(*m_open_in_new_tab_action);
-        if (m_open_in_new_window_action)
-            menu.add_action(*m_open_in_new_window_action);
-        if (m_open_in_new_private_window_action)
-            menu.add_action(*m_open_in_new_private_window_action);
-    };
-
-    auto add_text_edit_actions = [&application](Menu& menu) {
-        menu.add_action(application.cut_selection_action());
-        menu.add_action(application.copy_selection_action());
-        menu.add_action(application.paste_action());
-        menu.add_action(application.select_all_action());
-    };
-
-    for (size_t index = 0; index < MAX_SPELLING_GUESSES; ++index) {
-        auto action = Action::create(""sv, ActionID::SpellingGuess, [this, index] {
-            if (index >= m_spelling_guesses.size() || !m_spelling_context_menu_page || !m_spelling_context_menu_page->is_open())
-                return;
-            m_spelling_context_menu_page->async_replace_context_menu_misspelling(m_spelling_guesses[index]);
-        });
-        action->set_visible(false);
-        m_spelling_guess_actions.append(move(action));
-    }
-    m_no_spelling_guesses_action = Action::create("No Guesses Found"sv, ActionID::NoSpellingGuesses, [] { });
-    m_no_spelling_guesses_action->set_enabled(false);
-    m_no_spelling_guesses_action->set_visible(false);
-    m_ignore_spelling_action = Action::create("Ignore Spelling"sv, ActionID::IgnoreSpelling, [this] { ignore_context_menu_misspelling(); });
-    m_ignore_spelling_action->set_visible(false);
-    m_learn_spelling_action = Action::create("Learn Spelling"sv, ActionID::LearnSpelling, [this] { learn_context_menu_misspelling(); });
-    m_learn_spelling_action->set_visible(false);
-
-    m_page_context_menu = Menu::create("Page Context Menu"sv);
-    for (auto& action : m_spelling_guess_actions)
-        m_page_context_menu->add_action(action);
-    m_page_context_menu->add_action(*m_no_spelling_guesses_action);
-    m_page_context_menu->add_separator();
-    m_page_context_menu->add_action(*m_ignore_spelling_action);
-    m_page_context_menu->add_action(*m_learn_spelling_action);
-    m_page_context_menu->add_separator();
-    m_page_context_menu->add_action(*m_look_up_selected_text_action);
-    m_page_context_menu->add_action(*m_navigate_back_action);
-    m_page_context_menu->add_action(*m_navigate_forward_action);
-    m_page_context_menu->add_action(application.reload_action());
-    m_page_context_menu->add_separator();
-    add_text_edit_actions(*m_page_context_menu);
-    m_page_context_menu->add_separator();
-    m_page_context_menu->add_action(*m_search_selected_text_action);
-    m_page_context_menu->add_action(*m_copy_link_to_highlight_action);
-    m_page_context_menu->add_separator();
-    m_page_context_menu->add_action(*m_take_visible_screenshot_action);
-    m_page_context_menu->add_action(*m_take_full_screenshot_action);
-    m_page_context_menu->add_separator();
-    m_page_context_menu->add_action(application.view_source_action());
-    m_page_context_menu->add_action(*m_report_website_issue_action);
-
-    m_link_context_menu = Menu::create("Link Context Menu"sv);
-    add_open_url_actions(*m_link_context_menu);
-    m_link_context_menu->add_separator();
-    m_link_context_menu->add_action(*m_download_linked_file_action);
-    m_link_context_menu->add_action(*m_download_linked_file_as_action);
-    m_link_context_menu->add_separator();
-    m_link_context_menu->add_action(*m_copy_url_action);
-    m_link_context_menu->add_action(*m_copy_link_to_highlight_action);
-
-    m_selected_text_link_context_menu = Menu::create("Selected Text Link Context Menu"sv);
-    m_selected_text_link_context_menu->add_action(*m_look_up_selected_text_action);
-    add_open_url_actions(*m_selected_text_link_context_menu);
-    m_selected_text_link_context_menu->add_separator();
-    add_text_edit_actions(*m_selected_text_link_context_menu);
-    m_selected_text_link_context_menu->add_separator();
-    m_selected_text_link_context_menu->add_action(*m_search_selected_text_action);
-    m_selected_text_link_context_menu->add_action(*m_copy_link_to_highlight_action);
-
-    m_image_context_menu = Menu::create("Image Context Menu"sv);
-    m_image_context_menu->add_action(*m_open_in_new_tab_action);
-    m_image_context_menu->add_action(*m_open_image_action);
-    m_image_context_menu->add_separator();
-    m_image_context_menu->add_action(*m_save_image_action);
-    m_image_context_menu->add_separator();
-    m_image_context_menu->add_action(*m_copy_image_action);
-    m_image_context_menu->add_action(*m_copy_url_action);
-
-    m_media_context_menu = Menu::create("Media Context Menu"sv);
-    m_media_context_menu->add_action(*m_media_play_action);
-    m_media_context_menu->add_action(*m_media_pause_action);
-    m_media_context_menu->add_action(*m_media_mute_action);
-    m_media_context_menu->add_action(*m_media_unmute_action);
-    m_media_context_menu->add_action(*m_media_show_controls_action);
-    m_media_context_menu->add_action(*m_media_hide_controls_action);
-    m_media_context_menu->add_action(*m_media_loop_action);
-    m_media_context_menu->add_action(*m_media_enter_fullscreen_action);
-    m_media_context_menu->add_action(*m_media_exit_fullscreen_action);
-    m_media_context_menu->add_action(*m_media_enter_picture_in_picture_action);
-    m_media_context_menu->add_action(*m_media_exit_picture_in_picture_action);
-    m_media_context_menu->add_separator();
-    m_media_context_menu->add_action(*m_open_in_new_tab_action);
-    m_media_context_menu->add_action(*m_open_audio_action);
-    m_media_context_menu->add_action(*m_open_video_action);
-    m_media_context_menu->add_separator();
-    m_media_context_menu->add_action(*m_copy_url_action);
-
-    auto add_bookmark_action = Action::create("Add Bookmark..."sv, ActionID::AddBookmark, []() {
-        auto& application = Application::the();
-
-        auto bookmark_id = application.bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        application.display_add_bookmark_dialog(bookmark_id->target_folder_id)
-            ->when_resolved([](Application::BookmarkDialogResult result) {
-                auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-                Application::bookmark_store().add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
-            });
-    });
-    auto add_bookmark_folder_action = Action::create("Add Folder..."sv, ActionID::AddBookmarkFolder, []() {
-        auto& application = Application::the();
-
-        auto bookmark_id = application.bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        application.display_add_bookmark_folder_dialog({}, bookmark_id->target_folder_id)
-            ->when_resolved([](Application::BookmarkDialogResult result) {
-                auto& folder = result.data.get<BookmarkItem::Folder>();
-                Application::bookmark_store().add_folder(move(folder.title), result.target_folder_id);
-            });
-    });
-
-    m_bookmarks_bar_context_menu = Menu::create("Bookmarks Bar Context Menu"sv);
-    m_bookmarks_bar_context_menu->add_action(add_bookmark_action);
-    m_bookmarks_bar_context_menu->add_action(add_bookmark_folder_action);
-
-    m_bookmark_context_menu = Menu::create("Bookmark Context Menu"sv);
-    m_bookmark_context_menu->add_action(Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, []() {
-        auto& application = Application::the();
-
-        if (auto bookmark_id = application.bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            application.open_bookmark_in_new_tab(bookmark_id->id, Web::HTML::ActivateTab::Yes);
-    }));
-    if (m_is_private == IsPrivate::No) {
-        m_bookmark_context_menu->add_action(Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, []() {
-            auto& application = Application::the();
-
-            if (auto bookmark_id = application.bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-                application.open_bookmark_in_new_window(bookmark_id->id, IsPrivate::No);
-        }));
-    }
-    if (application.supports_private_browsing_windows()) {
-        m_bookmark_context_menu->add_action(Action::create("Open in New Private Window"sv, ActionID::OpenInNewPrivateWindow, []() {
-            auto& application = Application::the();
-
-            if (auto bookmark_id = application.bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-                application.open_bookmark_in_new_window(bookmark_id->id, IsPrivate::Yes);
-        }));
-    }
-    m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(Action::create("Copy URL"sv, ActionID::CopyURL, []() {
-        auto& application = Application::the();
-
-        auto bookmark_id = application.bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto bookmark = Application::bookmark_store().find_item_by_id(bookmark_id->id);
-        if (!bookmark.has_value() || !bookmark->is_bookmark())
-            return;
-
-        application.insert_clipboard_entry({ "text/plain"_string, url_text_to_copy(bookmark->bookmark().url) });
-    }));
-    m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(Action::create("Edit Bookmark..."sv, ActionID::EditBookmark, []() {
-        auto& application = Application::the();
-
-        auto bookmark_id = application.bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto current_bookmark = Application::bookmark_store().find_item_by_id(bookmark_id->id);
-        if (!current_bookmark.has_value() || !current_bookmark->is_bookmark())
-            return;
-
-        application.display_edit_bookmark_dialog(*current_bookmark, bookmark_id->parent_folder_id)
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
-                auto& store = Application::bookmark_store();
-                auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-                store.edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
-                if (bookmark_id.parent_folder_id != result.target_folder_id)
-                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
-            });
-    }));
-    m_bookmark_context_menu->add_action(Action::create("Delete Bookmark"sv, ActionID::DeleteBookmark, []() {
-        if (auto bookmark_id = Application::the().bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            Application::bookmark_store().remove_item(bookmark_id->id);
-    }));
-    m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(add_bookmark_action);
-    m_bookmark_context_menu->add_action(add_bookmark_folder_action);
-
-    m_bookmark_folder_context_menu = Menu::create("Bookmark Folder Context Menu"sv);
-    m_bookmark_folder_context_menu->add_action(Action::create("Open All in Tabs"sv, ActionID::OpenAllBookmarksInTabs, []() {
-        auto& application = Application::the();
-
-        if (auto bookmark_id = application.bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            application.open_bookmark_folder_in_new_tabs(bookmark_id->id);
-    }));
-    m_bookmark_folder_context_menu->add_separator();
-    m_bookmark_folder_context_menu->add_action(Action::create("Edit Folder..."sv, ActionID::EditBookmarkFolder, []() {
-        auto& application = Application::the();
-
-        auto bookmark_id = application.bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto current_folder = Application::bookmark_store().find_item_by_id(bookmark_id->id);
-        if (!current_folder.has_value() || !current_folder->is_folder())
-            return;
-
-        application.display_edit_bookmark_folder_dialog(*current_folder, bookmark_id->parent_folder_id)
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
-                auto& store = Application::bookmark_store();
-                auto& folder = result.data.get<BookmarkItem::Folder>();
-                store.edit_folder(bookmark_id.id, move(folder.title));
-                if (bookmark_id.parent_folder_id != result.target_folder_id)
-                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
-            });
-    }));
-    m_bookmark_folder_context_menu->add_action(Action::create("Delete Folder"sv, ActionID::DeleteBookmarkFolder, []() {
-        if (auto bookmark_id = Application::the().bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            Application::bookmark_store().remove_item(bookmark_id->id);
-    }));
-    m_bookmark_folder_context_menu->add_separator();
-    m_bookmark_folder_context_menu->add_action(add_bookmark_action);
-    m_bookmark_folder_context_menu->add_action(add_bookmark_folder_action);
+    request.widget_position = to_widget_position(content_position);
+    request.can_inspect_element = static_cast<bool>(on_inspect_element_request);
+    did_request_context_menu(move(request));
 }
 
-void ViewImplementation::update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position)
+void ViewImplementation::inspect_context_menu_element()
 {
-    m_look_up = on_request_dictionary_lookup ? lookup : OptionalNone {};
-    m_look_up_position = to_widget_position(content_position);
-    if (m_look_up.has_value() && m_look_up->baseline_origin.has_value())
-        m_look_up_position = to_widget_position(*m_look_up->baseline_origin);
-    m_look_up_selected_text_action->set_visible(m_look_up.has_value());
+    if (m_inspect_element_hit_test_request_id.has_value())
+        m_inspect_element_activated_before_hit_test = true;
+    else if (m_inspect_element_node_id.has_value() && on_inspect_element_request)
+        on_inspect_element_request(*m_inspect_element_node_id);
+}
+
+void ViewImplementation::replace_context_menu_misspelling(Utf16String const& replacement)
+{
+    if (m_spelling_context_menu_page && m_spelling_context_menu_page->is_open())
+        m_spelling_context_menu_page->async_replace_context_menu_misspelling(replacement);
+}
+
+void ViewImplementation::do_context_menu_media_action(ContextMenuMediaAction action)
+{
+    if (!m_media_context_menu_page || !m_media_context_menu_page->is_open())
+        return;
+
+    auto& page = *m_media_context_menu_page;
+    switch (action) {
+    case ContextMenuMediaAction::TogglePlay:
+        page.async_toggle_media_play_state();
+        break;
+    case ContextMenuMediaAction::ToggleMute:
+        page.async_toggle_media_mute_state();
+        break;
+    case ContextMenuMediaAction::ToggleControls:
+        page.async_toggle_media_controls_state();
+        break;
+    case ContextMenuMediaAction::ToggleLoop:
+        page.async_toggle_media_loop_state();
+        break;
+    case ContextMenuMediaAction::TogglePictureInPicture:
+        page.async_toggle_media_picture_in_picture_state();
+        break;
+    case ContextMenuMediaAction::ToggleFullscreen:
+        page.async_toggle_media_fullscreen_state();
+        break;
+    }
 }
 
 void ViewImplementation::request_context_menu_dictionary_lookup(Function<void(Optional<DictionaryLookup> const&)> on_complete)
@@ -4571,6 +5793,19 @@ void ViewImplementation::did_request_spell_check(Badge<WebContentPage>, WebConte
     });
 }
 
+void ViewImplementation::did_request_writing_suggestion(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text, u32 caret_offset)
+{
+    auto* spell_checker = Application::the().spell_checker();
+    if (!spell_checker) {
+        requesting_page.async_did_get_writing_suggestion(request_id, {});
+        return;
+    }
+    spell_checker->suggest(spell_document_tag(), text, caret_offset, [page = NonnullRefPtr { requesting_page }, request_id](Optional<Web::WritingSuggestion> suggestion) {
+        if (page->is_open())
+            page->async_did_get_writing_suggestion(request_id, move(suggestion));
+    });
+}
+
 // Forgets what the user told the spellchecker to ignore or learn in this tab.
 void ViewImplementation::reset_spell_checking()
 {
@@ -4585,34 +5820,32 @@ void ViewImplementation::reset_spell_checking()
     }
 }
 
-void ViewImplementation::update_spelling_menu_actions(Optional<Utf16String> misspelled_word)
+void ViewImplementation::update_context_menu_misspelling(Optional<Utf16String> misspelled_word, Function<void()> on_complete)
 {
     auto* spell_checker = Application::the().spell_checker();
     m_context_menu_misspelled_word = spell_checker ? move(misspelled_word) : OptionalNone {};
     m_spelling_guesses.clear();
-    if (m_context_menu_misspelled_word.has_value())
-        m_spelling_guesses = spell_checker->guesses(spell_document_tag(), *m_context_menu_misspelled_word);
-    if (m_spelling_guesses.size() > MAX_SPELLING_GUESSES)
-        m_spelling_guesses.shrink(MAX_SPELLING_GUESSES);
-
-    auto shows_block = m_context_menu_misspelled_word.has_value();
-    for (size_t index = 0; index < m_spelling_guess_actions.size(); ++index) {
-        auto shows_guess = shows_block && index < m_spelling_guesses.size();
-        if (shows_guess)
-            m_spelling_guess_actions[index]->set_text(MUST(m_spelling_guesses[index].utf16_view().to_utf8()));
-        m_spelling_guess_actions[index]->set_visible(shows_guess);
+    if (!m_context_menu_misspelled_word.has_value()) {
+        on_complete();
+        return;
     }
-    m_no_spelling_guesses_action->set_visible(shows_block && m_spelling_guesses.is_empty());
-    m_ignore_spelling_action->set_visible(shows_block);
-    m_learn_spelling_action->set_visible(shows_block);
+
+    auto request_id = m_context_menu_request_id;
+    spell_checker->guesses(spell_document_tag(), *m_context_menu_misspelled_word, [weak_this = make_weak_ptr(), request_id, on_complete = move(on_complete)](Vector<Utf16String> guesses) {
+        if (!weak_this || request_id != weak_this->m_context_menu_request_id)
+            return;
+        if (guesses.size() > MAX_SPELLING_GUESSES)
+            guesses.shrink(MAX_SPELLING_GUESSES);
+        weak_this->m_spelling_guesses = move(guesses);
+        on_complete();
+    });
 }
 
-void ViewImplementation::ignore_context_menu_misspelling()
+void ViewImplementation::ignore_misspelling(Utf16String const& word)
 {
     auto* spell_checker = Application::the().spell_checker();
-    if (!spell_checker || !m_context_menu_misspelled_word.has_value())
+    if (!spell_checker)
         return;
-    auto word = *m_context_menu_misspelled_word;
     spell_checker->ignore(spell_document_tag(), word);
     // An ignored word holds for this tab, so every page of the tab drops its markers for it.
     traversable().for_each_hosting_page([&](WebContentPage& page) {
@@ -4620,12 +5853,11 @@ void ViewImplementation::ignore_context_menu_misspelling()
     });
 }
 
-void ViewImplementation::learn_context_menu_misspelling()
+void ViewImplementation::learn_misspelling(Utf16String const& word)
 {
     auto* spell_checker = Application::the().spell_checker();
-    if (!spell_checker || !m_context_menu_misspelled_word.has_value())
+    if (!spell_checker)
         return;
-    auto word = *m_context_menu_misspelled_word;
     spell_checker->learn(spell_document_tag(), word);
     // A learned word goes in the user's dictionary for every app, so every page of every tab drops its markers for it.
     // A spellchecker that learns for this tab's tag alone gets the word dropped from this tab alone.
@@ -4645,55 +5877,48 @@ void ViewImplementation::learn_context_menu_misspelling()
     });
 }
 
-String ViewImplementation::describe_spelling_menu_for_testing() const
-{
-    StringBuilder builder;
-    auto append = [&](Action const& action) {
-        if (!action.visible())
-            return;
-        if (!builder.is_empty())
-            builder.append(" | "sv);
-        builder.append(action.text());
-    };
-    for (auto const& action : m_spelling_guess_actions)
-        append(action);
-    append(*m_no_spelling_guesses_action);
-    append(*m_ignore_spelling_action);
-    append(*m_learn_spelling_action);
-    if (builder.is_empty())
-        return "(no spelling items)"_string;
-    return MUST(builder.to_string());
-}
-
 void ViewImplementation::activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting action, u32 guess_index)
 {
-    auto menu = describe_spelling_menu_for_testing();
+    // NB: This describes the spelling items a context menu offers, as the application shows them.
+    StringBuilder description;
+    if (m_context_menu_misspelled_word.has_value()) {
+        for (auto const& guess : m_spelling_guesses) {
+            if (!description.is_empty())
+                description.append(" | "sv);
+            description.append(guess);
+        }
+        if (m_spelling_guesses.is_empty())
+            description.append("No Guesses Found"sv);
+        description.append(" | Ignore Spelling | Learn Spelling"sv);
+    } else {
+        description.append("(no spelling items)"sv);
+    }
+
     switch (action) {
     case Web::SpellingMenuActionForTesting::None:
         break;
     case Web::SpellingMenuActionForTesting::Guess:
-        if (guess_index < m_spelling_guess_actions.size() && m_spelling_guess_actions[guess_index]->visible())
-            m_spelling_guess_actions[guess_index]->activate();
+        if (m_context_menu_misspelled_word.has_value() && guess_index < m_spelling_guesses.size())
+            replace_context_menu_misspelling(m_spelling_guesses[guess_index]);
         break;
     case Web::SpellingMenuActionForTesting::IgnoreSpelling:
-        if (m_ignore_spelling_action->visible())
-            m_ignore_spelling_action->activate();
+        if (m_context_menu_misspelled_word.has_value())
+            ignore_misspelling(*m_context_menu_misspelled_word);
         break;
     case Web::SpellingMenuActionForTesting::LearnSpelling:
-        if (m_learn_spelling_action->visible())
-            m_learn_spelling_action->activate();
+        if (m_context_menu_misspelled_word.has_value())
+            learn_misspelling(*m_context_menu_misspelled_word);
         break;
     }
     // The page gets this after whatever the action sent it, on the same connection.
-    requesting_page.async_did_complete_spelling_menu_action_for_testing(menu);
+    requesting_page.async_did_complete_spelling_menu_action_for_testing(MUST(description.to_string()));
 }
 
 void ViewImplementation::request_text_fragment_url(Optional<u64> generation_id)
 {
-    m_text_fragment_url.clear();
     m_pending_text_fragment_url_request_id.clear();
-    m_copy_link_to_highlight_action->set_enabled(false);
-    m_copy_link_to_highlight_action->set_visible(generation_id.has_value());
+    // NB: The link of an earlier context menu goes before the new menu is asked for, as the link can come first.
+    did_make_link_to_highlight({});
     if (!generation_id.has_value())
         return;
 
@@ -4707,66 +5932,67 @@ void ViewImplementation::did_generate_text_fragment_url(u64 request_id, Optional
     if (!m_pending_text_fragment_url_request_id.has_value() || *m_pending_text_fragment_url_request_id != request_id)
         return;
     m_pending_text_fragment_url_request_id.clear();
-    m_text_fragment_url = move(url);
-    m_copy_link_to_highlight_action->set_enabled(m_text_fragment_url.has_value());
+    did_make_link_to_highlight(move(url));
+}
+
+void ViewImplementation::prepare_inspect_element(Gfx::IntPoint content_position)
+{
+    m_inspect_element_node_id.clear();
+    m_inspect_element_hit_test_request_id.clear();
+    m_inspect_element_activated_before_hit_test = false;
+
+    if (!on_inspect_element_request)
+        return;
+
+    auto request_id = m_next_node_hit_test_request_id++;
+    m_inspect_element_hit_test_request_id = request_id;
+    page().async_get_node_id_at_position(request_id, { content_position.x(), content_position.y() });
 }
 
 void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id)
 {
     request_text_fragment_url(text_fragment_generation_id);
+    prepare_inspect_element(content_position);
     m_spelling_context_menu_page = requesting_page;
-    update_spelling_menu_actions(move(misspelled_word));
 
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, for_input_events_target](auto const& lookup) {
+    auto makes_link_to_highlight = text_fragment_generation_id.has_value();
+    // NB: The menu lists the guesses for a misspelled word, so it waits for them.
+    update_context_menu_misspelling(move(misspelled_word), [weak_this, request_id, content_position, for_input_events_target, makes_link_to_highlight] {
         if (!weak_this || request_id != weak_this->m_context_menu_request_id)
             return;
-
-        auto show_context_menu = [weak_this, request_id, content_position, for_input_events_target, lookup](Optional<String> selected_text) {
+        weak_this->request_context_menu_dictionary_lookup([weak_this, request_id, content_position, for_input_events_target, makes_link_to_highlight](auto const& lookup) {
             if (!weak_this || request_id != weak_this->m_context_menu_request_id)
                 return;
 
-            auto& cut_selection_action = Application::the().cut_selection_action();
-            cut_selection_action.set_visible(for_input_events_target == Web::ContextMenuForInputEventsTarget::Yes);
+            auto open_menu = [weak_this, request_id, content_position, for_input_events_target, lookup, makes_link_to_highlight](Optional<String> selected_text) {
+                if (!weak_this || request_id != weak_this->m_context_menu_request_id)
+                    return;
 
-            auto const& search_engine = Application::settings().search_engine_settings().engine;
-            weak_this->m_search_text = search_engine.has_value() ? selected_text : OptionalNone {};
-            auto selected_text_url = selected_text.has_value() ? url_from_text(*selected_text) : OptionalNone {};
-            weak_this->update_look_up_selected_text_action(lookup, content_position);
+                ContextMenuRequest request;
+                request.kind = ContextMenuKind::Page;
+                request.is_editable = for_input_events_target == Web::ContextMenuForInputEventsTarget::Yes;
+                request.selected_text = move(selected_text);
+                request.dictionary_lookup = lookup;
+                if (lookup.has_value() && weak_this->on_request_dictionary_lookup)
+                    request.dictionary_lookup_position = weak_this->to_widget_position(lookup->baseline_origin.value_or(content_position));
+                else
+                    request.dictionary_lookup.clear();
+                request.misspelled_word = weak_this->m_context_menu_misspelled_word;
+                request.spelling_guesses = weak_this->m_spelling_guesses;
+                request.makes_link_to_highlight = makes_link_to_highlight;
+                weak_this->send_context_menu_request(move(request), content_position);
+            };
 
-            ScopeGuard guard { [&]() {
-                cut_selection_action.set_visible(true);
-                weak_this->m_search_text.clear();
-            } };
-
-            if (weak_this->m_search_text.has_value()) {
-                weak_this->m_search_selected_text_action->set_text(search_engine->format_search_query_for_display(*weak_this->m_search_text));
-                weak_this->m_search_selected_text_action->set_visible(true);
-            } else {
-                weak_this->m_search_selected_text_action->set_visible(false);
-            }
-
-            if (selected_text_url.has_value() && weak_this->m_selected_text_link_context_menu->on_activation) {
-                weak_this->set_context_menu_url_actions_enabled(true);
-                weak_this->m_context_menu_url = selected_text_url.release_value();
-                weak_this->m_context_menu_navigation.clear();
-                weak_this->m_open_in_new_tab_action->set_text("Open in New Tab"sv);
-                weak_this->m_selected_text_link_context_menu->on_activation(weak_this->to_widget_position(content_position));
+            if (lookup.has_value()) {
+                open_menu(lookup->text);
                 return;
             }
 
-            if (weak_this->m_page_context_menu->on_activation)
-                weak_this->m_page_context_menu->on_activation(weak_this->to_widget_position(content_position));
-        };
-
-        if (lookup.has_value()) {
-            show_context_menu(lookup->text);
-            return;
-        }
-
-        weak_this->selected_text_with_whitespace_collapsed()->when_resolved([show_context_menu = move(show_context_menu)](auto& selected_text) mutable {
-            show_context_menu(selected_text);
+            weak_this->selected_text_with_whitespace_collapsed()->when_resolved([open_menu = move(open_menu)](auto& selected_text) mutable {
+                open_menu(selected_text);
+            });
         });
     });
 }
@@ -4774,115 +6000,65 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, We
 void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
 {
     request_text_fragment_url(text_fragment_generation_id);
+    prepare_inspect_element(content_position);
     ++m_context_menu_request_id;
 
-    set_context_menu_url_actions_enabled(true);
-    m_context_menu_url = navigation.url;
-    m_context_menu_navigation = move(navigation);
-
-    m_open_in_new_tab_action->set_text("Open in New Tab"sv);
-
-    switch (url_type(m_context_menu_url)) {
-    case URLType::Email:
-        m_copy_url_action->set_text("Copy Email Address"sv);
-        break;
-    case URLType::Telephone:
-        m_copy_url_action->set_text("Copy Phone Number"sv);
-        break;
-    case URLType::Other:
-        m_copy_url_action->set_text("Copy Link Address"sv);
-        break;
-    }
-
-    if (m_link_context_menu->on_activation)
-        m_link_context_menu->on_activation(to_widget_position(content_position));
+    ContextMenuRequest request;
+    request.kind = ContextMenuKind::Link;
+    request.link_navigation = move(navigation);
+    request.makes_link_to_highlight = text_fragment_generation_id.has_value();
+    send_context_menu_request(move(request), content_position);
 }
 
-void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path)
+void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_for_path, Optional<String> const& image_mime_type)
 {
     // URLs with an opaque path, such as data: URLs, do not contain a usable filename, so the default filename is
     // used instead.
-    auto suggested_filename = m_context_menu_url.has_an_opaque_path() ? ByteString {} : m_context_menu_url.basename();
-    auto download_path = prompt_for_path == PromptForPath::Yes
-        ? Application::the().path_for_downloaded_file(suggested_filename)
-        : Application::the().default_path_for_downloaded_file(suggested_filename);
-    if (download_path.is_error())
+    auto suggested_filename = url.has_an_opaque_path() ? ByteString {} : url.basename();
+    if (image_mime_type.has_value())
+        suggested_filename = image_filename_with_extension(move(suggested_filename), *image_mime_type);
+
+    if (prompt_for_path == PromptForPath::No) {
+        if (auto download_path = Application::the().default_path_for_downloaded_file(suggested_filename); !download_path.is_error())
+            Application::the().file_downloader().download_file(is_private(), url, download_path.release_value(), FileDownloader::MayReplaceDestination::No);
         return;
+    }
 
-    // NB: A file at a path the user chose was there when the user chose to replace it, as saving asks before replacing.
-    auto may_replace_destination = prompt_for_path == PromptForPath::Yes && FileSystem::exists(download_path.value().string())
-        ? FileDownloader::MayReplaceDestination::Yes
-        : FileDownloader::MayReplaceDestination::No;
-    Application::the().file_downloader().download_file(is_private(), m_context_menu_url, download_path.release_value(), may_replace_destination);
+    Application::the().path_for_downloaded_file(suggested_filename)->when_resolved([is_private = is_private(), url](auto const& download_path) {
+        // NB: A file at a path the user chose was there when the user chose to replace it, as saving asks before replacing.
+        auto may_replace_destination = FileSystem::exists(download_path.string())
+            ? FileDownloader::MayReplaceDestination::Yes
+            : FileDownloader::MayReplaceDestination::No;
+        Application::the().file_downloader().download_file(is_private, url, download_path, may_replace_destination);
+    });
 }
 
-void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)
+void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
+    prepare_inspect_element(content_position);
     ++m_context_menu_request_id;
 
-    set_context_menu_url_actions_enabled(true);
-    m_context_menu_url = navigation.url;
-    m_context_menu_navigation = move(navigation);
-    m_image_context_menu_bitmap = move(bitmap);
-
-    m_open_in_new_tab_action->set_text("Open Image in New Tab"sv);
-    m_copy_url_action->set_text("Copy Image URL"sv);
-
-    m_copy_image_action->set_enabled(m_image_context_menu_bitmap.has_value());
-
-    if (m_image_context_menu->on_activation)
-        m_image_context_menu->on_activation(to_widget_position(content_position));
+    ContextMenuRequest request;
+    request.kind = ContextMenuKind::Image;
+    request.navigation = move(navigation);
+    request.image_bitmap = move(bitmap);
+    request.link_navigation = move(link_navigation);
+    request.image_mime_type = move(image_mime_type);
+    send_context_menu_request(move(request), content_position);
 }
 
-void ViewImplementation::send_to_media_context_menu_page(Function<void(WebContentPage&)> const& send)
+void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu media, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
 {
-    NonnullRefPtr<WebContentPage> target = m_media_context_menu_page ? *m_media_context_menu_page : page();
-    if (target->is_open())
-        send(target);
-}
+    prepare_inspect_element(content_position);
+    ++m_context_menu_request_id;
 
-// The context menus share these actions, and only a media element can leave them without a URL to act on.
-void ViewImplementation::set_context_menu_url_actions_enabled(bool enabled)
-{
-    m_open_in_new_tab_action->set_enabled(enabled);
-    m_copy_url_action->set_enabled(enabled);
-    m_open_audio_action->set_enabled(enabled);
-    m_open_video_action->set_enabled(enabled);
-}
-
-void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
-{
     m_media_context_menu_page = requesting_page;
-    ++m_context_menu_request_id;
 
-    set_context_menu_url_actions_enabled(menu.media_url.has_value());
-    m_context_menu_url = move(menu.media_url).value_or({});
-    m_context_menu_navigation = move(navigation);
-
-    m_open_in_new_tab_action->set_text(menu.is_video ? "Open Video in New Tab"sv : "Open Audio in new Tab"sv);
-    m_copy_url_action->set_text(menu.is_video ? "Copy Video URL"sv : "Copy Audio URL"sv);
-
-    m_open_audio_action->set_visible(!menu.is_video);
-    m_open_video_action->set_visible(menu.is_video);
-
-    m_media_play_action->set_visible(!menu.is_playing);
-    m_media_pause_action->set_visible(menu.is_playing);
-
-    m_media_mute_action->set_visible(!menu.is_muted);
-    m_media_unmute_action->set_visible(menu.is_muted);
-
-    m_media_show_controls_action->set_visible(!menu.has_user_agent_controls);
-    m_media_hide_controls_action->set_visible(menu.has_user_agent_controls);
-
-    m_media_loop_action->set_checked(menu.is_looping);
-
-    m_media_enter_fullscreen_action->set_visible(menu.is_video && !menu.is_fullscreen);
-    m_media_exit_fullscreen_action->set_visible(menu.is_video && menu.is_fullscreen);
-    m_media_enter_picture_in_picture_action->set_visible(menu.can_enter_picture_in_picture && !menu.is_picture_in_picture);
-    m_media_exit_picture_in_picture_action->set_visible(menu.is_picture_in_picture);
-
-    if (m_media_context_menu->on_activation)
-        m_media_context_menu->on_activation(to_widget_position(content_position));
+    ContextMenuRequest request;
+    request.kind = ContextMenuKind::Media;
+    request.media = move(media);
+    request.navigation = move(navigation);
+    send_context_menu_request(move(request), content_position);
 }
 
 u64 ViewImplementation::add_navigation_listener(NavigationListener listener)
@@ -4945,7 +6121,7 @@ Function<void()> ViewImplementation::prepare_for_close_without_prompting()
     };
 }
 
-Function<void()> ViewImplementation::prepare_for_immediate_close()
+void ViewImplementation::prepare_for_immediate_close()
 {
     VERIFY(!needs_beforeunload_check());
 
@@ -4954,11 +6130,15 @@ Function<void()> ViewImplementation::prepare_for_immediate_close()
         set_debugger_paused(false);
     }
 
-    NonnullRefPtr closing_page = page();
-    closing_page->set_detached_close_pending(true);
-    return [closing_page = move(closing_page)] {
-        closing_page->async_request_close();
-    };
+    page().set_detached_close_pending(true);
+}
+
+// The way a frontend closes a tab with no beforeunload check to run: the view goes without waiting for its page.
+void ViewImplementation::close_tab_for_testing()
+{
+    prepare_for_immediate_close();
+    if (on_close)
+        on_close();
 }
 
 }

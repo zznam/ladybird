@@ -58,7 +58,7 @@ pub enum AsyncDisposeResourcesStep {
 
 impl DisposableResourceStack {
     pub fn create(vm: &Vm) -> Gc<DisposableResourceStack> {
-        vm.heap().allocate(DisposableResourceStack {
+        vm.heap().allocate(|_| DisposableResourceStack {
             header: CellHeader::for_class(Self::CLASS),
             dispose_capability: GcRefCell::new(new_dispose_capability()),
             async_disposal_started: Cell::new(false),
@@ -77,13 +77,18 @@ impl DisposableResourceStack {
     /// The stack a register holds, which must be one.
     pub fn from_value(value: Value) -> Gc<DisposableResourceStack> {
         assert!(value.is_cell());
-        // SAFETY: The value holds a cell, and every cell starts with its class, which is checked below.
+        // SAFETY: The value holds a cell, whose block holds its class, which is checked below.
         let stack = unsafe { value.cell::<DisposableResourceStack>() };
         assert!(
             class_of(stack).is_subclass_of(Self::CLASS),
             "the cell is not a disposable resource stack"
         );
         stack
+    }
+
+    /// Takes the resources of the given dispose capability, which is left with an empty stack.
+    pub fn take_dispose_capability(&self, dispose_capability: &GcRefCell<DisposeCapability>) {
+        self.dispose_capability.swap(dispose_capability);
     }
 
     pub fn add_disposable_resource(&self, vm: &Vm, value: Value, hint: InitializeBindingHint) -> ThrowCompletionOr<()> {
@@ -160,7 +165,7 @@ impl DisposableResourceStack {
             }
 
             self.dispose_capability
-                .borrow_mut()
+                .borrow_mut(vm)
                 .disposable_resource_stack
                 .as_mut()
                 .expect("the stack has the resource")
@@ -211,7 +216,7 @@ impl DisposableResourceStack {
 
         // 6. NOTE: At this point disposableResourceStack will never be used again. The contents of
         //    disposableResourceStack can be discarded in implementations, such as by garbage collection.
-        self.dispose_capability.borrow_mut().disposable_resource_stack = None;
+        self.dispose_capability.borrow_mut(vm).disposable_resource_stack = None;
 
         // 7. Return ? outputCompletion.
         let output_completion_value = self.output_completion_value.get();

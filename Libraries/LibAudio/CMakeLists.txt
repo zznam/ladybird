@@ -3,6 +3,7 @@ set(SOURCES
     AudioFrameRingBase.cpp
     ClientConnection.cpp
     NullPlaybackStream.cpp
+    OutputSession.cpp
     PlaybackStream.cpp
     RecordStream.cpp
     RemotePlaybackStream.cpp
@@ -21,6 +22,10 @@ set(GENERATED_SOURCES
 
 if (APPLE)
     list(APPEND SOURCES CoreAudioChannelLayout.cpp)
+endif()
+
+if (WIN32)
+    list(APPEND SOURCES WindowsChannelMask.cpp)
 endif()
 
 compile_ipc(AudioClient.ipc AudioClientEndpoint.h)

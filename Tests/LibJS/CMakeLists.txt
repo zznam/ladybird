@@ -1,5 +1,7 @@
 ladybird_utility(test-js-runtime SOURCES test-js-runtime.cpp LIBS LibJSStandalone LibMain)
 
+ladybird_test(TestVMThreads.cpp LibJS LIBS LibJSStandalone LibGC LibThreading)
+
 ladybird_utility(test-js SOURCES test-js-main.cpp LIBS LibMain)
 ladybird_windows_bin(test-js CONSOLE)
 target_compile_definitions(test-js PRIVATE TEST_JS_PYTHON="${Python3_EXECUTABLE}")
@@ -12,7 +14,16 @@ add_custom_command(
 )
 add_dependencies(test-js test-js-runtime test-js-script js)
 add_test(NAME test-js COMMAND test-js)
-set_tests_properties(test-js PROPERTIES ENVIRONMENT "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}")
+set_tests_properties(test-js PROPERTIES ENVIRONMENT "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}" RUN_SERIAL TRUE)
+
+set(module_host_test_arguments --js "$<TARGET_FILE:js>")
+if (NOT WIN32)
+    list(APPEND module_host_test_arguments --test262-runner "$<TARGET_FILE:test262-runner>")
+endif()
+add_test(
+    NAME test-js-module-hosts
+    COMMAND "${Python3_EXECUTABLE}" "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-module-hosts.py" ${module_host_test_arguments}
+)
 
 # The JIT's tests: the runtime tests (each run three times, so that the functions they call get compiled with
 # feedback) and the programs in Tests/LibJS/JIT/programs, under the fast tier of JIT stress modes and compared with the
@@ -25,6 +36,7 @@ if (ENABLE_JS_JIT)
             --modes fast --suites test-js,programs --results "${CMAKE_BINARY_DIR}/Testing/jit-matrix"
             --jobs ${logical_core_count}
     )
+    set_tests_properties(test-js-jit PROPERTIES RUN_SERIAL TRUE)
     add_test(
         NAME test-jit-ir
         COMMAND "${Python3_EXECUTABLE}" "${ladybird_SOURCE_DIR}/Tests/LibJS/JIT/irtest.py" --build "${CMAKE_BINARY_DIR}"

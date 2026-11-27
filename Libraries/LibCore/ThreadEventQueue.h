@@ -39,11 +39,18 @@ public:
     // Posts an event to the event queue.
     void post_event(EventReceiver*, Core::Event::Type);
 
+    // Posts a Timer event for the timer of the given generation to the event queue.
+    void post_timer_event(EventReceiver*, u64 timer_generation);
+
     // Post a deferred invocation to the event queue.
     void deferred_invoke(Function<void()>&&);
 
     // Returns true if there are events waiting to be flushed.
     bool has_pending_events() const;
+
+    // Returns true while process() runs inside an event that an outer process() dispatched, as it does when that event
+    // spins a nested event loop.
+    bool is_processing_nested() const;
 
 private:
     ThreadEventQueue();

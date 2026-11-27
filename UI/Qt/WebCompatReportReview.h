@@ -38,6 +38,7 @@ public:
 
     void set_screenshot(QImage);
     void set_page_dumps(String);
+    void set_platform_features(ByteString const&);
 
     void show_progress(WebView::ReportSubmission::Stage);
     void show_retry(String const& reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds);
@@ -46,7 +47,9 @@ public:
 
     Function<void()> on_select_screenshot;
     Function<void(QImage const&)> on_view_screenshot;
+    // Leaving the review returns to the site it is about; closing the tab once the report is sent need not.
     Function<void()> on_exit;
+    Function<void()> on_close_tab;
     Function<void(bool)> on_report_text_visibility_change;
 
 protected:
@@ -63,6 +66,7 @@ private:
     void update_chrome_style();
 
     WebView::WebCompatReport::IncludePageDumps include_page_dumps() const;
+    WebView::WebCompatReport::IncludePlatformFeatures include_platform_features() const;
 
     WebView::WebCompatReport m_report;
     QImage m_screenshot;
@@ -74,18 +78,22 @@ private:
     QPlainTextEdit* m_description_edit { nullptr };
     ScreenshotThumbnail* m_screenshot_preview { nullptr };
     QLabel* m_no_screenshot_note { nullptr };
+    QLabel* m_selected_area_label { nullptr };
     QPushButton* m_select_screenshot_button { nullptr };
     QPushButton* m_remove_screenshot_button { nullptr };
     QCheckBox* m_include_page_dumps { nullptr };
+    QCheckBox* m_include_platform_features { nullptr };
     QPushButton* m_show_report_button { nullptr };
     QPlainTextEdit* m_report_text { nullptr };
     QLabel* m_validation { nullptr };
 
+    QLabel* m_status_icon { nullptr };
     QLabel* m_status_title { nullptr };
     QProgressBar* m_progress { nullptr };
     QLabel* m_status_message { nullptr };
     QPushButton* m_retry_button { nullptr };
     QPushButton* m_cancel_button { nullptr };
+    QPushButton* m_back_to_site_button { nullptr };
     QPushButton* m_close_button { nullptr };
 
     bool m_is_updating_chrome_style { false };

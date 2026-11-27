@@ -15,7 +15,6 @@
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/HostArray.h>
 #include <LibJS/Runtime/HostFunction.h>
-#include <LibJS/Runtime/HostModule.h>
 #include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/PropertyDescriptor.h>
@@ -231,20 +230,20 @@ inline Utf16FlyString string_from_abi(u16 const* code_units, size_t length_in_co
     return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length_in_code_units });
 }
 
-// Strings cross the ABI as 16-bit code units, which an ASCII string only has once widened.
+// Strings cross the ABI as 16-bit code units, which a Latin-1 string only has once widened.
 template<typename Callback>
 void with_string_as_abi(Utf16FlyString const& string, Callback callback)
 {
     auto view = string.view();
-    if (!view.has_ascii_storage()) {
+    if (!view.has_latin1_storage()) {
         auto code_units = view.utf16_span();
         callback(reinterpret_cast<u16 const*>(code_units.data()), code_units.size());
         return;
     }
     Vector<u16, 64> widened_code_units;
     widened_code_units.ensure_capacity(view.length_in_code_units());
-    for (auto ascii_character : view.ascii_span())
-        widened_code_units.unchecked_append(static_cast<u8>(ascii_character));
+    for (auto latin1_character : view.latin1_span())
+        widened_code_units.unchecked_append(latin1_character);
     callback(widened_code_units.data(), widened_code_units.size());
 }
 
@@ -304,8 +303,22 @@ ThrowCompletionOr<T> completion_from_abi(JSCompletion completion)
     }
 }
 
+template<typename Traits, typename Host>
+struct HostDefineOwnPropertyHookThunk {
+    static JSCompletion define_own_property(JSObject* object, JSPropertyKey property_key, JSPropertyDescriptor* abi_descriptor, JSPropertyDescriptor const* abi_precomputed_get_own_property)
+    {
+        auto descriptor = property_descriptor_from_abi(*abi_descriptor).release_value();
+        Optional<PropertyDescriptor> precomputed_get_own_property;
+        if (abi_precomputed_get_own_property)
+            precomputed_get_own_property = property_descriptor_from_abi(*abi_precomputed_get_own_property);
+        auto result = Traits::define_own_property(static_cast<Host&>(*object_from_abi(object)), property_key_from_abi(property_key), descriptor, abi_precomputed_get_own_property ? &precomputed_get_own_property : nullptr);
+        *abi_descriptor = property_descriptor_to_abi(descriptor);
+        return completion_to_abi(result);
+    }
+};
+
 template<typename Traits>
-struct HostObjectHookThunks {
+struct HostObjectHookThunks : HostDefineOwnPropertyHookThunk<Traits, HostObject> {
     static HostObject& host_object_from_abi(JSObject* object)
     {
         return static_cast<HostObject&>(*object_from_abi(object));
@@ -338,17 +351,6 @@ struct HostObjectHookThunks {
             return throw_completion_to_abi(result.error_value());
         *out = property_descriptor_to_abi(result.value());
         return normal_completion_to_abi(0);
-    }
-
-    static JSCompletion define_own_property(JSObject* object, JSPropertyKey property_key, JSPropertyDescriptor* abi_descriptor, JSPropertyDescriptor const* abi_precomputed_get_own_property)
-    {
-        auto descriptor = property_descriptor_from_abi(*abi_descriptor).release_value();
-        Optional<PropertyDescriptor> precomputed_get_own_property;
-        if (abi_precomputed_get_own_property)
-            precomputed_get_own_property = property_descriptor_from_abi(*abi_precomputed_get_own_property);
-        auto result = Traits::define_own_property(host_object_from_abi(object), property_key_from_abi(property_key), descriptor, abi_precomputed_get_own_property ? &precomputed_get_own_property : nullptr);
-        *abi_descriptor = property_descriptor_to_abi(descriptor);
-        return completion_to_abi(result);
     }
 
     static JSCompletion has_property(JSObject* object, JSPropertyKey property_key)
@@ -400,6 +402,11 @@ struct HostObjectHookThunks {
     {
         return normal_completion_to_abi(value_to_abi(Traits::get_indexed_value(host_object_from_abi(object), index)));
     }
+
+    static void preserve_identity(JSObject* object)
+    {
+        Traits::preserve_identity(host_object_from_abi(object));
+    }
 };
 
 template<typename Traits>
@@ -426,7 +433,7 @@ struct HostFunctionHookThunks {
 };
 
 template<typename Traits>
-struct HostArrayHookThunks {
+struct HostArrayHookThunks : HostDefineOwnPropertyHookThunk<Traits, HostArray> {
     static HostArray& host_array_from_abi(JSObject* array)
     {
         return static_cast<HostArray&>(*object_from_abi(array));
@@ -440,39 +447,6 @@ struct HostArrayHookThunks {
     static JSCompletion delete_property(JSObject* array, JSPropertyKey property_key)
     {
         return completion_to_abi(Traits::delete_property(host_array_from_abi(array), property_key_from_abi(property_key)));
-    }
-};
-
-template<typename Traits>
-struct HostModuleHookThunks {
-    static HostModule& host_module_from_abi(JSModule* module)
-    {
-        return static_cast<HostModule&>(*module_from_abi(module));
-    }
-
-    static void get_exported_names(JSModule* module, JSStringSink* names)
-    {
-        for (auto const& name : Traits::get_exported_names(host_module_from_abi(module)))
-            append_string_to_abi_sink(*names, name);
-    }
-
-    static void resolve_export(JSModule* module, u16 const* export_name, size_t export_name_length, JSResolvedBinding* out)
-    {
-        auto binding = Traits::resolve_export(host_module_from_abi(module), string_from_abi(export_name, export_name_length));
-        out->type = resolved_binding_type_to_abi(binding.type);
-        out->module = module_to_abi(binding.module.ptr());
-        if (binding.type == ResolvedBinding::BindingName)
-            append_string_to_abi_sink(out->binding_name, binding.export_name);
-    }
-
-    static JSCompletion initialize_environment(JSModule* module)
-    {
-        return completion_to_abi(Traits::initialize_environment(host_module_from_abi(module)));
-    }
-
-    static JSCompletion execute_module(JSModule* module, JSPromiseCapability* capability)
-    {
-        return completion_to_abi(Traits::execute_module(host_module_from_abi(module), promise_capability_from_abi(capability)));
     }
 };
 
@@ -515,6 +489,8 @@ consteval JSHostObjectHooks make_host_object_hooks()
         hooks.finalize = &Thunks::finalize;
     if constexpr (requires { &Traits::get_indexed_value; })
         hooks.get_indexed_value = &Thunks::get_indexed_value;
+    if constexpr (requires { &Traits::preserve_identity; })
+        hooks.preserve_identity = &Thunks::preserve_identity;
     return hooks;
 }
 
@@ -537,24 +513,13 @@ consteval JSHostArrayHooks make_host_array_hooks()
 {
     using Thunks = HostABI::HostArrayHookThunks<Traits>;
     JSHostArrayHooks hooks {};
+    if constexpr (requires { &Traits::define_own_property; })
+        hooks.define_own_property = &Thunks::define_own_property;
     if constexpr (requires { &Traits::set; })
         hooks.set = &Thunks::set;
     if constexpr (requires { &Traits::delete_property; })
         hooks.delete_property = &Thunks::delete_property;
     return hooks;
-}
-
-// All four module hooks are required.
-template<typename Traits>
-consteval JSHostModuleHooks make_host_module_hooks()
-{
-    using Thunks = HostABI::HostModuleHookThunks<Traits>;
-    return JSHostModuleHooks {
-        .get_exported_names = &Thunks::get_exported_names,
-        .resolve_export = &Thunks::resolve_export,
-        .initialize_environment = &Thunks::initialize_environment,
-        .execute_module = &Thunks::execute_module,
-    };
 }
 
 consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass const* parent, void const* hooks, void const* user_data, u32 flags)
@@ -567,6 +532,7 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
     constexpr u32 host_object_flags = JS_HOST_CLASS_IMMUTABLE_PROTOTYPE
         | JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE
         | JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE
+        | JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS
         | JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH;
 
     u32 allowed_flags = JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT;
@@ -589,9 +555,7 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
     VERIFY(!(flags & JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT) || parent);
 
     return JSHostClass {
-        .abi_version = JS_HOST_ABI_VERSION,
         .kind = kind,
-        .reserved = 0,
         .flags = flags,
         .name = name.characters_without_null_termination(),
         .name_length = name.length(),

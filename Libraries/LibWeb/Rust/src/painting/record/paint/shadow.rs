@@ -58,6 +58,7 @@ pub(crate) fn paint_box_shadow<O: Observer>(
     if layers.is_empty() {
         return;
     }
+    let current_color = style.current_color();
     paint_box_shadow_layers(
         recorder,
         paintable,
@@ -65,7 +66,45 @@ pub(crate) fn paint_box_shadow<O: Observer>(
         borderless_content_rect,
         border_radii,
         layers,
+        current_color,
     );
+}
+
+pub(crate) struct BoxShadowLayerGeometry {
+    pub offset_x: CssPixels,
+    pub offset_y: CssPixels,
+    pub blur_radius: CssPixels,
+    pub spread_distance: CssPixels,
+    pub content_rect: CssPixelRect,
+}
+
+pub(crate) fn box_shadow_layer_geometry(
+    layer: &crate::css::computed_value_types::ComputedShadow,
+    bordered_content_rect: CssPixelRect,
+    borderless_content_rect: CssPixelRect,
+) -> BoxShadowLayerGeometry {
+    BoxShadowLayerGeometry {
+        offset_x: CssPixels::from_raw(layer.offset_x),
+        offset_y: CssPixels::from_raw(layer.offset_y),
+        blur_radius: CssPixels::from_raw(layer.blur_radius),
+        spread_distance: CssPixels::from_raw(layer.spread_distance),
+        content_rect: if layer.is_inner() {
+            borderless_content_rect
+        } else {
+            bordered_content_rect
+        },
+    }
+}
+
+pub(crate) fn outer_box_shadow_rect(geometry: &BoxShadowLayerGeometry, device_pixel_ratio: f64) -> IntRect {
+    let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(device_pixel_ratio);
+    let device_content_rect = converter.rounded_device_rect(geometry.content_rect);
+    let spread_distance = converter.rounded_device_pixels(geometry.spread_distance);
+    let mut shadow_rect =
+        device_content_rect.inflated_edges(spread_distance, spread_distance, spread_distance, spread_distance);
+    shadow_rect.x += converter.rounded_device_pixels(geometry.offset_x);
+    shadow_rect.y += converter.rounded_device_pixels(geometry.offset_y);
+    shadow_rect
 }
 
 fn paint_box_shadow_layers<O: Observer>(
@@ -75,6 +114,7 @@ fn paint_box_shadow_layers<O: Observer>(
     borderless_content_rect: CssPixelRect,
     border_radii: BorderRadii,
     layers: &[crate::css::computed_value_types::ComputedShadow],
+    current_color: u32,
 ) {
     let converter = recorder.converter;
     let corner_radii = border_radii.as_corners(&converter);
@@ -84,21 +124,20 @@ fn paint_box_shadow_layers<O: Observer>(
     // light glow — as Blink's ResolveShadowColor does, passing DarkModeFilter::ElementRole::kBackground.
     // Box-shadow layers are ordered front-to-back, so we paint them in reverse.
     for layer in layers.iter().rev() {
-        let offset_x = converter.rounded_device_pixels(CssPixels::from_raw(layer.offset_x));
-        let offset_y = converter.rounded_device_pixels(CssPixels::from_raw(layer.offset_y));
-        let blur_radius = converter.rounded_device_pixels(CssPixels::from_raw(layer.blur_radius));
-        let spread_distance = converter.rounded_device_pixels(CssPixels::from_raw(layer.spread_distance));
+        let geometry = box_shadow_layer_geometry(layer, bordered_content_rect, borderless_content_rect);
+        let offset_x = converter.rounded_device_pixels(geometry.offset_x);
+        let offset_y = converter.rounded_device_pixels(geometry.offset_y);
+        let blur_radius = converter.rounded_device_pixels(geometry.blur_radius);
+        let spread_distance = converter.rounded_device_pixels(geometry.spread_distance);
+        if offset_x == 0 && offset_y == 0 && blur_radius == 0 && spread_distance == 0 {
+            continue;
+        }
         let inner = layer.is_inner();
-
-        let device_content_rect = if inner {
-            converter.rounded_device_rect(borderless_content_rect)
-        } else {
-            converter.rounded_device_rect(bordered_content_rect)
-        };
+        let device_content_rect = converter.rounded_device_rect(geometry.content_rect);
 
         if let Some(shadow_shapes) = &shadow_shapes {
             recorder.recorder.paint_path_box_shadow(
-                Color(layer.color),
+                Color(layer.color.resolve(current_color)),
                 blur_radius,
                 spread_distance as f32,
                 FloatPoint {
@@ -142,15 +181,25 @@ fn paint_box_shadow_layers<O: Observer>(
                 blur_radius + offset_x,
             );
 
-            let mut inner_shadow_corner_radii = corner_radii;
+            // https://drafts.csswg.org/css-backgrounds/#shadow-shape
+            let padding_corner_radii = border_radii
+                .shrunken(
+                    borderless_content_rect.top() - bordered_content_rect.top(),
+                    bordered_content_rect.right() - borderless_content_rect.right(),
+                    bordered_content_rect.bottom() - borderless_content_rect.bottom(),
+                    borderless_content_rect.left() - bordered_content_rect.left(),
+                )
+                .as_corners(&converter);
+
+            let mut inner_shadow_corner_radii = padding_corner_radii;
             adjust_corners_for_spread_distance(&mut inner_shadow_corner_radii, -spread_distance);
 
             recorder.recorder.paint_inner_box_shadow(
                 PaintInnerBoxShadow {
-                    color: Color(layer.color),
+                    color: Color(layer.color.resolve(current_color)),
                     blur_radius,
                     device_content_rect,
-                    content_corner_radii: corner_radii,
+                    content_corner_radii: padding_corner_radii,
                     outer_shadow_rect,
                     inner_shadow_rect,
                     inner_shadow_corner_radii,
@@ -158,17 +207,14 @@ fn paint_box_shadow_layers<O: Observer>(
                 ForceDarkRole::Background,
             );
         } else {
-            let mut shadow_rect =
-                device_content_rect.inflated_edges(spread_distance, spread_distance, spread_distance, spread_distance);
-            shadow_rect.x += offset_x;
-            shadow_rect.y += offset_y;
+            let shadow_rect = outer_box_shadow_rect(&geometry, recorder.inputs.device_pixels_per_css_pixel);
 
             let mut shadow_corner_radii = corner_radii;
             adjust_corners_for_spread_distance(&mut shadow_corner_radii, spread_distance);
 
             recorder.recorder.paint_outer_box_shadow(
                 PaintOuterBoxShadow {
-                    color: Color(layer.color),
+                    color: Color(layer.color.resolve(current_color)),
                     blur_radius,
                     device_content_rect,
                     content_corner_radii: corner_radii,

@@ -5,7 +5,6 @@
  */
 
 #include <AK/CharacterTypes.h>
-#include <LibGfx/Path.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -47,10 +46,10 @@ void SVGAnimateMotionElement::update_referenced_motion_path()
     // NB: Only the first mpath child counts, as the content model allows one. Without a shape element that it refers to,
     //     the attributes of this element define the motion path.
     // FIXME: Follow changes to the geometry of the referenced element.
-    m_referenced_motion_path.clear();
+    m_referenced_motion_path_vertices.clear();
     if (auto* mpath_element = is_connected() ? first_child_of_type<SVGMPathElement>() : nullptr) {
         if (auto* geometry_element = as_if<SVGGeometryElement>(mpath_element->referenced_element().ptr()))
-            m_referenced_motion_path = geometry_element->computed_path();
+            m_referenced_motion_path_vertices = geometry_element->equivalent_path_vertices();
     }
     update_animation();
 }
@@ -189,13 +188,12 @@ static MotionRotation motion_rotation(DOM::Element const& element)
 }
 
 // https://svgwg.org/specs/animations/#AnimateMotionElement
-Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes_along_motion_path(Gfx::Path const& motion_path, CSS::PropertyID property_id) const
+Vector<SVGKeyframe> SVGAnimateMotionElement::keyframes_along_motion_path(ReadonlySpan<PathVertex> vertices, CSS::PropertyID property_id) const
 {
     // NB: Follow polylines through the motion path, with enough points along its curves to stay as close to them as the
     //     length of the motion path is measured.
     // FIXME: Animate a position along the motion path rather than points along it, so that the target follows its curves
     //        exactly, as other engines do.
-    auto vertices = motion_path.vertices();
     if (vertices.is_empty())
         return {};
 
@@ -208,7 +206,7 @@ Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes_along_motion
     MotionRotations rotations { rotation };
     auto length = vertices.last().distance;
     if (length == 0) {
-        Vector<Animations::BaseKeyframe> keyframes { keyframe(0, property_id, translation(vertices.first().point)), keyframe(1, property_id, translation(vertices.first().point)) };
+        Vector<SVGKeyframe> keyframes { keyframe(0, property_id, translation(vertices.first().point)), keyframe(1, property_id, translation(vertices.first().point)) };
         if (!rotation.is_none()) {
             for (auto& keyframe : keyframes)
                 set_keyframe_property(keyframe, CSS::PropertyID::Rotate, rotations.rotation_for(vertices.first().direction));
@@ -222,7 +220,7 @@ Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes_along_motion
     //     between them.
     // FIXME: Divide the duration between the points of the path for the other calcMode values.
     // NB: Where the motion path changes direction at once, its vertex appears twice, so the target turns at once.
-    Vector<Animations::BaseKeyframe> keyframes;
+    Vector<SVGKeyframe> keyframes;
     keyframes.ensure_capacity(vertices.size());
     for (auto const& vertex : vertices) {
         auto vertex_keyframe = keyframe(vertex.distance / length, property_id, translation(vertex.point));
@@ -234,16 +232,16 @@ Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes_along_motion
 }
 
 // https://svgwg.org/specs/animations/#AnimateMotionElement
-Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes(SVGElement const& target, CSS::PropertyID property_id) const
+Vector<SVGKeyframe> SVGAnimateMotionElement::keyframes(SVGElement const& target, CSS::PropertyID property_id) const
 {
     // Regarding the definition of the motion path, the ‘mpath’ element overrides the ‘path’ attribute, which overrides
     // ‘values’, which overrides ‘from’, ‘by’ and ‘to’.
     // FIXME: Take the motion path from the values and by attributes.
     // FIXME: Apply the keyPoints attribute.
-    if (m_referenced_motion_path.has_value())
-        return keyframes_along_motion_path(*m_referenced_motion_path, property_id);
+    if (m_referenced_motion_path_vertices.has_value())
+        return keyframes_along_motion_path(*m_referenced_motion_path_vertices, property_id);
     if (auto path = get_attribute(AttributeNames::path); path.has_value())
-        return keyframes_along_motion_path(parse_path_data(*path).to_gfx_path(), property_id);
+        return keyframes_along_motion_path(parse_path_data(*path).vertices(), property_id);
 
     auto to = get_attribute(AttributeNames::to);
     auto to_translation = to.has_value() ? parse_coordinate_pair_as_translation(target, *to) : nullptr;
@@ -260,7 +258,7 @@ Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes(SVGElement c
 
     // NB: Without a from value, this is a to animation, which animates from the underlying value. The keyframe effect
     //     takes its missing start keyframe from that value.
-    Vector<Animations::BaseKeyframe> keyframes;
+    Vector<SVGKeyframe> keyframes;
     if (from_translation)
         keyframes.append(keyframe(0, property_id, *from_translation));
     keyframes.append(keyframe(1, property_id, *to_translation));
@@ -278,9 +276,8 @@ Vector<Animations::BaseKeyframe> SVGAnimateMotionElement::keyframes(SVGElement c
     if (from_point.has_value() && to_point.has_value())
         direction = { to_point->x() - from_point->x(), to_point->y() - from_point->y() };
     if (!from_translation) {
-        Animations::BaseKeyframe rotation_keyframe;
+        SVGKeyframe rotation_keyframe;
         rotation_keyframe.offset = 0;
-        rotation_keyframe.properties = Animations::BaseKeyframe::ParsedProperties {};
         keyframes.prepend(move(rotation_keyframe));
     }
     MotionRotations rotations { rotation };

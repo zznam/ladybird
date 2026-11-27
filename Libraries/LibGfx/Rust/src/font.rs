@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ unsafe extern "C" {
         code_point: u32,
         next_code_point: u32,
         has_next_code_point: bool,
+        code_point_after_next: u32,
+        has_code_point_after_next: bool,
     ) -> u8;
 }
 
@@ -44,7 +47,9 @@ pub struct FfiFontSnapshot {
     pub id: u64,
     pub ascent: f32,
     pub descent: f32,
+    pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
@@ -57,16 +62,22 @@ pub struct FontId(pub u64);
 pub struct FontFacts {
     pub ascent: f32,
     pub descent: f32,
+    pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
 }
 
+// NB: Layout threads read every entry while they count references to it. The alignment puts the reference counts in
+//     front of the entry on a cache line of their own, so counting does not evict what the readers read.
+#[repr(align(128))]
 struct FontEntry {
     id: FontId,
     raw: NonNull<c_void>,
     facts: FontFacts,
+    character_advances: std::sync::OnceLock<(f32, f32)>,
     // What the font answers about itself that text chunking asks for every character: whether it is an emoji font,
     // and whether it has a glyph for U+0020 SPACE. Each is unknown until first asked.
     is_emoji_font: LazyVerdict,
@@ -136,11 +147,14 @@ impl FontHandle {
             facts: FontFacts {
                 ascent: snapshot.ascent,
                 descent: snapshot.descent,
+                line_gap: snapshot.line_gap,
                 x_height: snapshot.x_height,
+                cap_height: snapshot.cap_height,
                 zero_advance: snapshot.zero_advance,
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
             },
+            character_advances: std::sync::OnceLock::new(),
             is_emoji_font: LazyVerdict::default(),
             contains_space_glyph: LazyVerdict::default(),
         }))
@@ -168,6 +182,20 @@ impl FontHandle {
         &self.0.facts
     }
 
+    /// The average and maximum horizontal advances in pixels. A missing metric is zero.
+    pub fn character_advances(&self) -> (f32, f32) {
+        unsafe extern "C" {
+            fn ladybird_gfx_font_character_advances(font: *const c_void, average: *mut f32, maximum: *mut f32);
+        }
+        *self.0.character_advances.get_or_init(|| {
+            let mut average = 0.0;
+            let mut maximum = 0.0;
+            // SAFETY: The entry owns a reference to the font, and both out-pointers address local variables.
+            unsafe { ladybird_gfx_font_character_advances(self.as_raw(), &raw mut average, &raw mut maximum) };
+            (average, maximum)
+        })
+    }
+
     #[inline]
     pub fn as_raw(&self) -> *const c_void {
         self.0.raw.as_ptr()
@@ -191,7 +219,15 @@ impl FontHandle {
         let encoded = char::from_u32(code_point)
             .unwrap_or(char::REPLACEMENT_CHARACTER)
             .encode_utf16(&mut utf16);
-        crate::text_layout::shaped_text_width(self, encoded, crate::text_layout::TextType::Common, 0.0, 0.0)
+        crate::text_layout::shaped_text_width(
+            self,
+            encoded,
+            crate::text_layout::TextType::Common,
+            0.0,
+            0.0,
+            crate::text_layout::JoiningContext::default(),
+            false,
+        )
     }
 
     pub fn glyph_id_for_code_point(&self, code_point: u32) -> u32 {
@@ -243,13 +279,41 @@ pub struct EmojiPresentation {
     pub forced: bool,
 }
 
-pub fn emoji_presentation_for_code_point(code_point: u32, next_code_point: Option<u32>) -> EmojiPresentation {
+/// Whether `code_point` only ever extends the emoji sequence it follows: a zero width joiner, a variation selector, an
+/// emoji modifier, a tag character, or the combining enclosing keycap. The font that draws what it follows draws it
+/// too, where that font has a glyph for it.
+/// https://www.unicode.org/reports/tr51/#Emoji_Sequences
+pub fn code_point_extends_emoji_sequence(code_point: u32) -> bool {
+    matches!(
+        code_point,
+        0x200d | 0xfe0e | 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe0020..=0xe007f
+    )
+}
+
+/// Whether a zero width joiner right after `code_point` joins what follows it to an emoji sequence: `code_point` is an
+/// emoji by default, or it ends the emoji sequence it's in. A joiner after any other character, as in Indic or Arabic
+/// text, joins no emoji.
+/// https://www.unicode.org/reports/tr51/#def_emoji_zwj_element
+pub fn code_point_ends_emoji_zwj_element(code_point: u32) -> bool {
+    matches!(code_point, 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe007f)
+        || emoji_presentation_for_code_point(code_point, None, None).is_emoji
+}
+
+/// The presentation `code_point` takes, given the code point after it and the one after that, which can make it the
+/// start of an emoji sequence.
+pub fn emoji_presentation_for_code_point(
+    code_point: u32,
+    next_code_point: Option<u32>,
+    code_point_after_next: Option<u32>,
+) -> EmojiPresentation {
     // SAFETY: The lookup reads only immutable Unicode tables.
     let encoded = unsafe {
         ladybird_gfx_emoji_presentation_for_code_point(
             code_point,
             next_code_point.unwrap_or(0),
             next_code_point.is_some(),
+            code_point_after_next.unwrap_or(0),
+            code_point_after_next.is_some(),
         )
     };
     EmojiPresentation {
@@ -397,6 +461,10 @@ unsafe extern "C" {
         out_entries: *mut FfiCascadeSnapshotEntry,
         out_ranges: *mut FfiCascadeSnapshotRange,
     );
+    fn ladybird_gfx_cascade_snapshot_system_fallback_features(
+        snapshot: *const c_void,
+        out_features: *mut FfiShapeFeature,
+    );
     fn ladybird_gfx_cascade_snapshot_end(snapshot: *const c_void);
     fn ladybird_gfx_system_fallback_font(
         code_point: u32,
@@ -405,6 +473,8 @@ unsafe extern "C" {
         slope: u8,
         prefer_color_emoji: bool,
         point_size: f32,
+        features: *const FfiShapeFeature,
+        feature_count: usize,
     ) -> *const c_void;
     fn ladybird_gfx_font_invisible_variant(font: *const c_void) -> *const c_void;
 
@@ -430,6 +500,16 @@ struct FfiCascadeSnapshotHeader {
     system_fallback_width: u16,
     system_fallback_slope: u8,
     has_system_fallback: bool,
+    system_fallback_feature_count: usize,
+}
+
+/// A `Gfx::ShapeFeature`: an OpenType feature tag, its value, and whether font-feature-settings set it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct FfiShapeFeature {
+    tag: [u8; 4],
+    value: u32,
+    set_by_feature_settings: bool,
 }
 
 #[repr(C)]
@@ -490,21 +570,210 @@ struct FrozenEntry {
     /// Set once a render pass has wanted this face, so the document requests its load only once
     /// per frozen cascade.
     wanted: std::sync::atomic::AtomicBool,
+    /// The font a pending face's load filled in, after which the entry selects exactly as a loaded
+    /// face's would. A cascade keeps its identity across the load, so the styles naming it stay
+    /// the same and only what reads its fonts runs again.
+    loaded: std::sync::OnceLock<FontHandle>,
+}
+
+/// An entry as it selects now: its own font or the one a load filled in, and whether it still
+/// waits on a load.
+#[derive(Clone, Copy)]
+struct EntrySelection<'a> {
+    font: Option<&'a FontHandle>,
+    pending: Option<(u64, PendingFontState)>,
+    source_face_id: u64,
+    ranges: &'a [UnicodeRange],
 }
 
 /// How this cascade asks for a font no listed family covers.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SystemFallbackStyle {
     point_size: f32,
     weight: u16,
     width: u16,
     slope: u8,
+    /// The features the cascade's request asks of every font, which the system fallback font applies as well.
+    features: Box<[FfiShapeFeature]>,
+}
+
+/// The index of the first entry with a font and the ASCII code points it resolves, where one does.
+type FirstFontAsciiCodePoints = Option<(usize, u128)>;
+
+/// OPTIMIZATION: What text chunking asks of a cascade every time it starts, remembered for a fill generation without a
+///               lock. The answer takes more than one word, so its header says when the words after it are being
+///               written, and a read that finds the header moved under it counts as a miss. Only one thread at a time
+///               writes; another keeps the answer it computed to itself.
+#[derive(Default)]
+struct FirstFontAsciiCodePointsMemo {
+    /// The fill generation in the high half, and in the low half the bits below with the index of the entry.
+    header: std::sync::atomic::AtomicU64,
+    code_points: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl FirstFontAsciiCodePointsMemo {
+    const ANSWERED: u64 = 1 << 31;
+    const WRITING: u64 = 1 << 30;
+    const HAS_FIRST_FONT: u64 = 1 << 29;
+    const ENTRY_INDEX_MASK: u64 = Self::HAS_FIRST_FONT - 1;
+
+    fn answer_at(&self, generation: u32) -> Option<FirstFontAsciiCodePoints> {
+        use std::sync::atomic::{Ordering, fence};
+        let header = self.header.load(Ordering::Acquire);
+        if header & (Self::ANSWERED | Self::WRITING) != Self::ANSWERED || (header >> 32) as u32 != generation {
+            return None;
+        }
+        if header & Self::HAS_FIRST_FONT == 0 {
+            return Some(None);
+        }
+        let low = self.code_points[0].load(Ordering::Relaxed);
+        let high = self.code_points[1].load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if self.header.load(Ordering::Relaxed) != header {
+            return None;
+        }
+        let index = (header & Self::ENTRY_INDEX_MASK) as usize;
+        Some(Some((index, (u128::from(high) << 64) | u128::from(low))))
+    }
+
+    fn remember(&self, generation: u32, answer: FirstFontAsciiCodePoints) {
+        use std::sync::atomic::{Ordering, fence};
+        let header = self.header.load(Ordering::Relaxed);
+        if header & Self::WRITING != 0
+            || self
+                .header
+                .compare_exchange(header, header | Self::WRITING, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        fence(Ordering::Release);
+        let mut new_header = (u64::from(generation) << 32) | Self::ANSWERED;
+        if let Some((index, code_points)) = answer {
+            new_header |= Self::HAS_FIRST_FONT | (index as u64 & Self::ENTRY_INDEX_MASK);
+            self.code_points[0].store(code_points as u64, Ordering::Relaxed);
+            self.code_points[1].store((code_points >> 64) as u64, Ordering::Relaxed);
+        }
+        self.header.store(new_header, Ordering::Release);
+    }
+}
+
+/// A font a cascade answered with, named by where the cascade keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RememberedFont {
+    OwnFont(usize),
+    FilledEntry(usize),
+    SystemFallbackFont(usize),
+}
+
+impl RememberedFont {
+    const INDEX_BITS: u32 = 7;
+    const KIND_SHIFT: u32 = Self::INDEX_BITS;
+    const PRESENTATION_SHIFT: u32 = Self::KIND_SHIFT + 2;
+    const CODE_POINT_SHIFT: u32 = Self::PRESENTATION_SHIFT + 2;
+    const INDEX_MASK: u32 = (1 << Self::INDEX_BITS) - 1;
+    const KIND_OWN_FONT: u32 = 1;
+    const KIND_FILLED_ENTRY: u32 = 2;
+    const KIND_SYSTEM_FALLBACK_FONT: u32 = 3;
+
+    fn presentation_bits(presentation: EmojiPresentation) -> u32 {
+        u32::from(presentation.is_emoji) | u32::from(presentation.forced) << 1
+    }
+
+    /// The answer word of [`BeyondAsciiAnswers`]: the fill generation in the high half, and in the low half the code
+    /// point, its presentation and the font. None for a font whose index does not fit.
+    fn answer_word(self, generation: u32, code_point: u32, presentation: EmojiPresentation) -> Option<u64> {
+        let (kind, index) = match self {
+            Self::OwnFont(index) => (Self::KIND_OWN_FONT, index),
+            Self::FilledEntry(index) => (Self::KIND_FILLED_ENTRY, index),
+            Self::SystemFallbackFont(index) => (Self::KIND_SYSTEM_FALLBACK_FONT, index),
+        };
+        let index = u32::try_from(index).ok().filter(|index| *index <= Self::INDEX_MASK)?;
+        let low = code_point << Self::CODE_POINT_SHIFT
+            | Self::presentation_bits(presentation) << Self::PRESENTATION_SHIFT
+            | kind << Self::KIND_SHIFT
+            | index;
+        Some(u64::from(generation) << 32 | u64::from(low))
+    }
+
+    /// The font an answer word remembers for `code_point` in `presentation`, if it remembers one found at `generation`.
+    fn from_answer_word(word: u64, generation: u32, code_point: u32, presentation: EmojiPresentation) -> Option<Self> {
+        let low = word as u32;
+        if (word >> 32) as u32 != generation
+            || low >> Self::CODE_POINT_SHIFT != code_point
+            || (low >> Self::PRESENTATION_SHIFT) & 0b11 != Self::presentation_bits(presentation)
+        {
+            return None;
+        }
+        let index = (low & Self::INDEX_MASK) as usize;
+        match (low >> Self::KIND_SHIFT) & 0b11 {
+            Self::KIND_OWN_FONT => Some(Self::OwnFont(index)),
+            Self::KIND_FILLED_ENTRY => Some(Self::FilledEntry(index)),
+            Self::KIND_SYSTEM_FALLBACK_FONT => Some(Self::SystemFallbackFont(index)),
+            _ => None,
+        }
+    }
+}
+
+const BEYOND_ASCII_ANSWER_SLOTS: usize = 512;
+const MAX_REMEMBERED_SYSTEM_FALLBACK_FONTS: usize = 32;
+
+/// OPTIMIZATION: What a cascade answered for the code points its ASCII cache does not take: other code points, and
+///               ASCII ones in emoji or forced presentation. Each answer sits in the slot its code point maps to, and a
+///               later answer for another code point there replaces it, so reading takes no lock. The fonts the system
+///               fallback service answered with are kept here too, once each, so an answer can name them.
+struct BeyondAsciiAnswers {
+    words: [std::sync::atomic::AtomicU64; BEYOND_ASCII_ANSWER_SLOTS],
+    system_fallback_fonts: [std::sync::OnceLock<FontHandle>; MAX_REMEMBERED_SYSTEM_FALLBACK_FONTS],
+    system_fallback_font_appending: std::sync::Mutex<()>,
+}
+
+impl Default for BeyondAsciiAnswers {
+    fn default() -> Self {
+        Self {
+            words: [const { std::sync::atomic::AtomicU64::new(0) }; BEYOND_ASCII_ANSWER_SLOTS],
+            system_fallback_fonts: [const { std::sync::OnceLock::new() }; MAX_REMEMBERED_SYSTEM_FALLBACK_FONTS],
+            system_fallback_font_appending: std::sync::Mutex::new(()),
+        }
+    }
+}
+
+impl BeyondAsciiAnswers {
+    fn word_for(&self, code_point: u32, presentation: EmojiPresentation) -> &std::sync::atomic::AtomicU64 {
+        let slot = (code_point ^ RememberedFont::presentation_bits(presentation) << 8) as usize;
+        &self.words[slot % BEYOND_ASCII_ANSWER_SLOTS]
+    }
+
+    fn system_fallback_font_index(&self, font: &FontHandle) -> Option<usize> {
+        self.system_fallback_fonts
+            .iter()
+            .map_while(std::sync::OnceLock::get)
+            .position(|kept| kept == font)
+    }
+
+    /// The kept copy of a font the system fallback service answered with, keeping `font` if it is the first copy, or
+    /// `font` itself back once there is no room left.
+    fn keep_system_fallback_font(&self, font: FontHandle) -> Result<&FontHandle, FontHandle> {
+        let _appending = self
+            .system_fallback_font_appending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = self.system_fallback_font_index(&font) {
+            return Ok(self.system_fallback_fonts[index].get().expect("a found slot is filled"));
+        }
+        let Some(slot) = self.system_fallback_fonts.iter().find(|slot| slot.get().is_none()) else {
+            return Err(font);
+        };
+        Ok(slot.get_or_init(|| font))
+    }
 }
 
 /// A cascade list frozen at the moment the document published it: no caches to fill, no faces to
 /// resolve, nothing to ask the document. Everything a render pass needs to pick a font for a code
 /// point is here, and everything it decides that the document must act on is a number it leaves
 /// behind in [`take_wanted_pending_faces`].
+// NB: Aligned as FontEntry is, which keeps the reference counts off the line of the entry pointers every lookup reads.
+#[repr(align(128))]
 pub struct FrozenFontList {
     entries: Box<[FrozenEntry]>,
     fallback_entries: Box<[FrozenEntry]>,
@@ -515,13 +784,35 @@ pub struct FrozenFontList {
     /// Every font reachable without asking the system-fallback service, so an ASCII answer can be
     /// remembered as an index rather than as a pointer.
     fonts: Box<[FontHandle]>,
-    /// OPTIMIZATION: The list is immutable, so an answer for a code point is the same answer
-    ///               forever; a racing write stores the value the other thread computed.
-    ascii_cache: [std::sync::atomic::AtomicU32; 128],
+    /// OPTIMIZATION: An answer for a code point is the same answer until a load fills a face in, so
+    ///               each is remembered with the fill generation it was found at; a racing write
+    ///               stores the value the other thread computed.
+    ascii_cache: [std::sync::atomic::AtomicU64; 128],
+    /// The first font with a face and the ASCII code points it resolves.
+    ascii_code_points_resolved_by_first_font: FirstFontAsciiCodePointsMemo,
     /// https://drafts.csswg.org/css-fonts-4/#invisible-fallback
     /// Built on demand, and only for a cascade that has a face in its block period.
     invisible_variants: std::sync::Mutex<std::collections::HashMap<FontId, FontHandle>>,
+    /// The first available font, as an ASCII cache answer is remembered.
+    first_available: std::sync::atomic::AtomicU64,
+    /// Made on the first answer the ASCII cache does not take.
+    beyond_ascii_answers: std::sync::OnceLock<Box<BeyondAsciiAnswers>>,
+    /// How many times loads filled pending faces in, so a memo of what the cascade answered can
+    /// tell an answer from before a fill.
+    fill_generation: std::sync::atomic::AtomicU32,
 }
+
+/// The pending faces of a frozen cascade that loads filled in, each with the font it now selects:
+/// what a cascade resolved against the newer @font-face table answers in their places. Made where
+/// both cascades are live, and applied wherever the cascade's readers expect its change.
+pub struct FrozenFontFills {
+    list: Arc<FrozenFontList>,
+    fills: Vec<(usize, FontHandle)>,
+}
+
+/// A cached answer naming the font a load filled into an entry, by the entry's index, rather than
+/// one of [`FrozenFontList::fonts`].
+const CACHED_FILLED_ENTRY: u32 = 1 << 31;
 
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
@@ -550,6 +841,121 @@ impl FrozenEntry {
         ranges[self.ranges.clone()]
             .iter()
             .any(|range| range.contains(code_point))
+    }
+
+    /// The font the entry selects with: its own, or the one a load filled in.
+    fn font(&self) -> Option<&FontHandle> {
+        self.font.as_ref().or_else(|| self.loaded.get())
+    }
+
+    /// The face's load state while it still waits on its load.
+    fn pending(&self) -> Option<(u64, PendingFontState)> {
+        self.pending.filter(|_| self.loaded.get().is_none())
+    }
+
+    /// Whether the entry waits on a load with no font to select yet, which a fill can change.
+    fn awaits_fill(&self) -> bool {
+        self.font.is_none() && self.pending().is_some()
+    }
+
+    fn selection<'a>(&'a self, ranges: &'a [UnicodeRange]) -> EntrySelection<'a> {
+        EntrySelection {
+            font: self.font(),
+            pending: self.pending(),
+            source_face_id: self.source_face_id,
+            ranges: &ranges[self.ranges.clone()],
+        }
+    }
+}
+
+/// Whether two cascades' entries, as they select now, render every code point the same.
+fn selections_resolve_alike<'a>(
+    entries: impl ExactSizeIterator<Item = EntrySelection<'a>>,
+    other_entries: impl ExactSizeIterator<Item = EntrySelection<'a>>,
+) -> bool {
+    let mut has_earlier_pending_selection = false;
+    entries.len() == other_entries.len()
+        && entries.zip(other_entries).all(|(entry, other_entry)| {
+            if entry.font != other_entry.font || entry.ranges != other_entry.ranges {
+                return false;
+            }
+            if entry.font.is_some() {
+                // A preceding unresolved face can start fallback, which skips resident pending faces
+                // but still considers loaded entries. Without one, both entries render the same font.
+                return !has_earlier_pending_selection || entry.pending.is_some() == other_entry.pending.is_some();
+            }
+            has_earlier_pending_selection |= entry.pending.is_some();
+            match (entry.pending, other_entry.pending) {
+                (None, None) => true,
+                (Some((identity, state)), Some((other_identity, other_state))) => {
+                    state == other_state
+                        && if entry.source_face_id != 0 || other_entry.source_face_id != 0 {
+                            entry.source_face_id == other_entry.source_face_id
+                        } else {
+                            identity == other_identity
+                        }
+                }
+                _ => false,
+            }
+        })
+}
+
+impl FrozenFontFills {
+    /// The fills that make `list` select as `resolved` does, where loads of faces `list` still
+    /// waits on are all that tells them apart; none otherwise.
+    pub fn toward(list: Arc<FrozenFontList>, resolved: &FrozenFontList) -> Option<Self> {
+        if list.entries.len() != resolved.entries.len() {
+            return None;
+        }
+        let fills: Vec<(usize, FontHandle)> = list
+            .entries
+            .iter()
+            .zip(&resolved.entries)
+            .enumerate()
+            .filter_map(|(index, (entry, resolved_entry))| {
+                let font = resolved_entry.font()?;
+                (entry.awaits_fill() && resolved_entry.pending().is_none()).then(|| (index, font.clone()))
+            })
+            .collect();
+        if fills.is_empty() {
+            return None;
+        }
+        let filled = list.entries.iter().enumerate().map(|(index, entry)| {
+            match fills.binary_search_by_key(&index, |(filled_index, _)| *filled_index) {
+                Ok(fill) => EntrySelection {
+                    font: Some(&fills[fill].1),
+                    pending: None,
+                    ..entry.selection(&list.ranges)
+                },
+                Err(_) => entry.selection(&list.ranges),
+            }
+        });
+        let resolves_alike = list.last_resort == resolved.last_resort
+            && list.system_fallback == resolved.system_fallback
+            && selections_resolve_alike(
+                filled,
+                resolved.entries.iter().map(|entry| entry.selection(&resolved.ranges)),
+            )
+            && selections_resolve_alike(
+                list.fallback_entries
+                    .iter()
+                    .map(|entry| entry.selection(&list.fallback_ranges)),
+                resolved
+                    .fallback_entries
+                    .iter()
+                    .map(|entry| entry.selection(&resolved.fallback_ranges)),
+            );
+        resolves_alike.then_some(Self { list, fills })
+    }
+
+    /// Fills the faces in. A face some earlier fill already filled keeps the font it was given.
+    pub fn apply(self) {
+        for (index, font) in self.fills {
+            let _ = self.list.entries[index].loaded.set(font);
+        }
+        self.list
+            .fill_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -580,8 +986,12 @@ impl FrozenFontList {
             last_resort: None,
             system_fallback: None,
             fonts: Box::new([]),
-            ascii_cache: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            ascii_cache: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            ascii_code_points_resolved_by_first_font: FirstFontAsciiCodePointsMemo::default(),
             invisible_variants: std::sync::Mutex::new(std::collections::HashMap::new()),
+            first_available: std::sync::atomic::AtomicU64::new(0),
+            beyond_ascii_answers: std::sync::OnceLock::new(),
+            fill_generation: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -609,6 +1019,11 @@ impl FrozenFontList {
                 ffi_fallback_ranges.as_mut_ptr(),
             );
         }
+        let mut system_fallback_features = vec![FfiShapeFeature::default(); header.system_fallback_feature_count];
+        // SAFETY: The buffer is exactly the size the header asked for.
+        unsafe {
+            ladybird_gfx_cascade_snapshot_system_fallback_features(snapshot, system_fallback_features.as_mut_ptr())
+        };
         let last_resort = (!header.last_resort_font.is_null()).then(|| {
             // SAFETY: The list owns its last-resort font for the snapshot's duration.
             unsafe { FontHandle::intern(header.last_resort_font) }
@@ -664,6 +1079,7 @@ impl FrozenFontList {
                             .flatten(),
                         source_face_id: entry.source_face_id,
                         wanted: std::sync::atomic::AtomicBool::new(false),
+                        loaded: std::sync::OnceLock::new(),
                     }
                 })
                 .collect()
@@ -685,10 +1101,15 @@ impl FrozenFontList {
                 weight: header.system_fallback_weight,
                 width: header.system_fallback_width,
                 slope: header.system_fallback_slope,
+                features: system_fallback_features.into_boxed_slice(),
             }),
             fonts: fonts.into_boxed_slice(),
-            ascii_cache: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            ascii_cache: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            ascii_code_points_resolved_by_first_font: FirstFontAsciiCodePointsMemo::default(),
             invisible_variants: std::sync::Mutex::new(std::collections::HashMap::new()),
+            first_available: std::sync::atomic::AtomicU64::new(0),
+            beyond_ascii_answers: std::sync::OnceLock::new(),
+            fill_generation: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -700,53 +1121,32 @@ impl FrozenFontList {
     /// mutable faces those selections were built from. Load-request identities and lookup caches do not affect
     /// which glyphs a snapshot renders.
     pub fn resolves_like(&self, other: &Self) -> bool {
-        let entries_equal = |entries: &[FrozenEntry],
-                             ranges: &[UnicodeRange],
-                             other_entries: &[FrozenEntry],
-                             other_ranges: &[UnicodeRange]| {
-            let mut has_earlier_pending_selection = false;
-            entries.len() == other_entries.len()
-                && entries.iter().zip(other_entries).all(|(entry, other_entry)| {
-                    if entry.font != other_entry.font
-                        || ranges[entry.ranges.clone()] != other_ranges[other_entry.ranges.clone()]
-                    {
-                        return false;
-                    }
-                    if entry.font.is_some() {
-                        // A preceding unresolved face can start fallback, which skips resident pending faces
-                        // but still considers loaded entries. Without one, both entries render the same font.
-                        return !has_earlier_pending_selection
-                            || entry.pending.is_some() == other_entry.pending.is_some();
-                    }
-                    has_earlier_pending_selection |= entry.pending.is_some();
-                    match (entry.pending, other_entry.pending) {
-                        (None, None) => true,
-                        (Some((identity, state)), Some((other_identity, other_state))) => {
-                            state == other_state
-                                && if entry.source_face_id != 0 || other_entry.source_face_id != 0 {
-                                    entry.source_face_id == other_entry.source_face_id
-                                } else {
-                                    identity == other_identity
-                                }
-                        }
-                        _ => false,
-                    }
-                })
-        };
         std::ptr::eq(self, other)
             || (self.last_resort == other.last_resort
                 && self.system_fallback == other.system_fallback
-                && entries_equal(&self.entries, &self.ranges, &other.entries, &other.ranges)
-                && entries_equal(
-                    &self.fallback_entries,
-                    &self.fallback_ranges,
-                    &other.fallback_entries,
-                    &other.fallback_ranges,
+                && selections_resolve_alike(
+                    self.entries.iter().map(|entry| entry.selection(&self.ranges)),
+                    other.entries.iter().map(|entry| entry.selection(&other.ranges)),
+                )
+                && selections_resolve_alike(
+                    self.fallback_entries
+                        .iter()
+                        .map(|entry| entry.selection(&self.fallback_ranges)),
+                    other
+                        .fallback_entries
+                        .iter()
+                        .map(|entry| entry.selection(&other.fallback_ranges)),
                 ))
     }
 
+    /// How many times loads filled pending faces of the cascade in. What it answers for a code
+    /// point, and its first available font, only move when this does.
+    pub fn fill_generation(&self) -> u32 {
+        self.fill_generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn has_pending_faces(&self) -> bool {
-        self.entries.iter().any(|entry| entry.pending.is_some())
+        self.entries.iter().any(|entry| entry.pending().is_some())
     }
 
     fn invisible_variant(&self, font: &FontHandle) -> FontHandle {
@@ -765,7 +1165,7 @@ impl FrozenFontList {
     }
 
     fn system_fallback_font(&self, code_point: u32, presentation: EmojiPresentation) -> Option<FontHandle> {
-        let style = self.system_fallback?;
+        let style = self.system_fallback.as_ref()?;
         // SAFETY: The service answers with a font it transfers one reference to, or with null.
         let raw = unsafe {
             ladybird_gfx_system_fallback_font(
@@ -775,6 +1175,8 @@ impl FrozenFontList {
                 style.slope,
                 presentation.is_emoji,
                 style.point_size,
+                style.features.as_ptr(),
+                style.features.len(),
             )
         };
         // SAFETY: A non-null answer carries the reference this handle takes over.
@@ -785,17 +1187,106 @@ impl FrozenFontList {
     /// Mirrors `Gfx::FontCascadeList::font_for_code_point`, with every step that would have asked
     /// the document replaced by what the document decided before the pass began.
     pub fn font_for_code_point(&self, code_point: u32, presentation: EmojiPresentation) -> FontHandle {
-        let use_ascii_cache = code_point < 128 && !presentation.is_emoji && !presentation.forced;
-        if use_ascii_cache {
-            let cached = self.ascii_cache[code_point as usize].load(std::sync::atomic::Ordering::Relaxed);
-            if cached != 0 {
-                return self.fonts[cached as usize - 1].clone();
-            }
-        }
+        self.font_for_code_point_borrowed(code_point, presentation).into_owned()
+    }
 
+    #[inline]
+    pub fn font_for_code_point_borrowed(
+        &self,
+        code_point: u32,
+        presentation: EmojiPresentation,
+    ) -> Cow<'_, FontHandle> {
+        let remembered = if Self::ascii_cache_takes(code_point, presentation) {
+            self.cached_font(&self.ascii_cache[code_point as usize])
+        } else {
+            self.remembered_beyond_ascii_font(code_point, presentation)
+        };
+        match remembered {
+            Some(font) => Cow::Borrowed(font),
+            None => self.resolve_font_for_code_point(code_point, presentation),
+        }
+    }
+
+    #[inline]
+    fn ascii_cache_takes(code_point: u32, presentation: EmojiPresentation) -> bool {
+        code_point < 128 && !presentation.is_emoji && !presentation.forced
+    }
+
+    #[inline]
+    fn remembered_beyond_ascii_font(&self, code_point: u32, presentation: EmojiPresentation) -> Option<&FontHandle> {
+        let answers = self.beyond_ascii_answers.get()?;
+        let word = answers
+            .word_for(code_point, presentation)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match RememberedFont::from_answer_word(word, self.fill_generation(), code_point, presentation)? {
+            RememberedFont::OwnFont(index) => self.fonts.get(index),
+            RememberedFont::FilledEntry(index) => self.entries.get(index)?.loaded.get(),
+            RememberedFont::SystemFallbackFont(index) => answers.system_fallback_fonts.get(index)?.get(),
+        }
+    }
+
+    fn remember_beyond_ascii(
+        &self,
+        code_point: u32,
+        presentation: EmojiPresentation,
+        generation: u32,
+        font: &FontHandle,
+    ) {
+        let answers = self.beyond_ascii_answers.get_or_init(Box::default);
+        let remembered = if let Some(index) = self.fonts.iter().position(|owned| owned == font) {
+            RememberedFont::OwnFont(index)
+        } else if let Some(index) = self.entries.iter().position(|entry| entry.loaded.get() == Some(font)) {
+            RememberedFont::FilledEntry(index)
+        } else if let Some(index) = answers.system_fallback_font_index(font) {
+            RememberedFont::SystemFallbackFont(index)
+        } else {
+            return;
+        };
+        if let Some(word) = remembered.answer_word(generation, code_point, presentation) {
+            answers
+                .word_for(code_point, presentation)
+                .store(word, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn first_font_and_ascii_code_points_it_resolves_in_text_presentation(&self) -> Option<(&FontHandle, u128)> {
+        let generation = self.fill_generation();
+        // NB: Filling a face in moves which font resolves a code point, so an answer holds for its generation.
+        let memo = &self.ascii_code_points_resolved_by_first_font;
+        let (index, code_points) = memo.answer_at(generation).unwrap_or_else(|| {
+            let answer = self.ascii_code_points_resolved_by_the_first_font();
+            memo.remember(generation, answer);
+            answer
+        })?;
+        self.entries[index].font().map(|font| (font, code_points))
+    }
+
+    fn ascii_code_points_resolved_by_the_first_font(&self) -> Option<(usize, u128)> {
+        let index = self.entries.iter().position(|entry| entry.font().is_some())?;
+        let entry = &self.entries[index];
+        let font = entry.font()?;
+        if font.is_emoji_font() {
+            return None;
+        }
+        let is_resolved_by_first_font = |code_point: u32| {
+            entry.covers(code_point, &self.ranges)
+                && font.contains_glyph(code_point)
+                && !self.entries[..index]
+                    .iter()
+                    .any(|earlier| earlier.pending.is_some() && earlier.covers(code_point, &self.ranges))
+        };
+        let code_points = (0..128)
+            .filter(|&code_point| is_resolved_by_first_font(code_point))
+            .fold(0u128, |code_points, code_point| code_points | 1 << code_point);
+        Some((index, code_points))
+    }
+
+    #[inline(never)]
+    fn resolve_font_for_code_point(&self, code_point: u32, presentation: EmojiPresentation) -> Cow<'_, FontHandle> {
+        let generation = self.fill_generation();
         let presentation_matches = |font: &FontHandle| font.is_emoji_font() == presentation.is_emoji;
         let contains_glyph = |entry: &FrozenEntry, ranges: &[UnicodeRange]| -> bool {
-            let Some(font) = &entry.font else { return false };
+            let Some(font) = entry.font() else { return false };
             if entry.ranges.is_empty() {
                 return font.contains_glyph(code_point);
             }
@@ -808,7 +1299,7 @@ impl FrozenFontList {
         let mut selected: Option<&FontHandle> = None;
 
         for entry in &self.entries {
-            if let Some((face_id, state)) = entry.pending {
+            if let Some((face_id, state)) = entry.pending() {
                 if rendering_with_fallback || !entry.covers(code_point, &self.ranges) {
                     continue;
                 }
@@ -834,7 +1325,7 @@ impl FrozenFontList {
             if !contains_glyph(entry, &self.ranges) {
                 continue;
             }
-            let font = entry.font.as_ref().expect("an entry with a glyph has a font");
+            let font = entry.font().expect("an entry with a glyph has a font");
             if !presentation.forced || presentation_matches(font) {
                 selected = Some(font);
                 break;
@@ -848,7 +1339,7 @@ impl FrozenFontList {
                 if !contains_glyph(entry, &self.fallback_ranges) {
                     continue;
                 }
-                let font = entry.font.as_ref().expect("an entry with a glyph has a font");
+                let font = entry.font().expect("an entry with a glyph has a font");
                 if presentation_matches(font) {
                     selected = Some(font);
                     break;
@@ -858,24 +1349,98 @@ impl FrozenFontList {
         }
 
         if let Some(font) = selected {
-            return self.finish(code_point, use_ascii_cache, invisible, font.clone(), true);
+            return self.finish(code_point, presentation, generation, invisible, Cow::Borrowed(font));
         }
 
         if let Some(fallback) = self.system_fallback_font(code_point, presentation)
             && (presentation_matches(&fallback) || (author_glyph_match.is_none() && fallback_glyph_match.is_none()))
         {
-            return self.finish(code_point, use_ascii_cache, invisible, fallback, false);
+            return self.finish(code_point, presentation, generation, invisible, Cow::Owned(fallback));
         }
 
         let font = author_glyph_match
             .or(fallback_glyph_match)
-            .or(self.last_resort.as_ref())
-            .cloned();
+            .or(self.last_resort.as_ref());
         match font {
-            Some(font) => self.finish(code_point, use_ascii_cache, invisible, font, true),
+            Some(font) => self.finish(code_point, presentation, generation, invisible, Cow::Borrowed(font)),
             // A cascade with no fonts at all cannot answer; only a list nobody published can be
             // in that state, and the layout stage never receives one.
             None => panic!("frozen font cascade has no font for U+{code_point:04X}"),
+        }
+    }
+
+    /// https://drafts.csswg.org/css-fonts/#first-available-font
+    /// Mirrors `Gfx::FontCascadeList::first_available_font`: the first font whose `unicode-range`
+    /// does not exclude U+0020 SPACE, skipping faces still waiting on their loads, or the last
+    /// resort font.
+    pub fn first_available_font(&self) -> &FontHandle {
+        if let Some(font) = self.cached_font(&self.first_available) {
+            return font;
+        }
+        const SPACE: u32 = 0x20;
+        let generation = self.fill_generation();
+        let font = self
+            .entries
+            .iter()
+            .filter(|entry| entry.covers(SPACE, &self.ranges))
+            .find_map(FrozenEntry::font)
+            .or(self.last_resort.as_ref())
+            .expect("a published font cascade has a first available font");
+        self.remember(&self.first_available, generation, font);
+        font
+    }
+
+    /// The font a cache word remembers, if it remembers one found since the last fill.
+    fn cached_font(&self, cache: &std::sync::atomic::AtomicU64) -> Option<&FontHandle> {
+        let word = cache.load(std::sync::atomic::Ordering::Relaxed);
+        if (word >> 32) as u32 != self.fill_generation() {
+            return None;
+        }
+        match word as u32 {
+            0 => None,
+            token if token & CACHED_FILLED_ENTRY != 0 => {
+                self.entries[(token & !CACHED_FILLED_ENTRY) as usize].loaded.get()
+            }
+            token => Some(&self.fonts[token as usize - 1]),
+        }
+    }
+
+    /// Remembers `font`, found at the fill generation `generation`, in a cache word, where it is one
+    /// of the cascade's own fonts or a font a load filled in.
+    fn remember(&self, cache: &std::sync::atomic::AtomicU64, generation: u32, font: &FontHandle) {
+        if let Some(token) = self.cache_token(font) {
+            cache.store(
+                (u64::from(generation) << 32) | u64::from(token),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// How a cache word remembers one of the cascade's own fonts, or a font a load filled in.
+    fn cache_token(&self, font: &FontHandle) -> Option<u32> {
+        if let Some(index) = self.fonts.iter().position(|owned| owned == font) {
+            return Some(index as u32 + 1);
+        }
+        self.entries
+            .iter()
+            .position(|entry| entry.loaded.get() == Some(font))
+            .map(|index| index as u32 | CACHED_FILLED_ENTRY)
+    }
+
+    /// https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    /// Wants the loads of the faces still loading ahead of the first available font, as a length
+    /// relative to a metric of that font (ex, cap, ch, ic, lh) reads the first of them that covers
+    /// U+0020 once it loads. The document requests them once the pass ends, as it does those a
+    /// render pass wants.
+    pub fn want_first_available_font_loads(&self) {
+        const SPACE: u32 = 0x20;
+        for entry in self.entries.iter().filter(|entry| entry.covers(SPACE, &self.ranges)) {
+            if entry.font().is_some() {
+                return;
+            }
+            if let Some((face_id, _)) = entry.pending() {
+                self.note_wanted_pending_face(entry, face_id);
+            }
         }
     }
 
@@ -887,26 +1452,40 @@ impl FrozenFontList {
         unsafe { ladybird_gfx_process_note_wanted_pending_face(face_id) };
     }
 
-    fn finish(
-        &self,
+    /// Remembers the answer `font`, which is one of the cascade's own fonts, borrowed, or one the system fallback
+    /// service answered with, owned.
+    fn finish<'list>(
+        &'list self,
         code_point: u32,
-        use_ascii_cache: bool,
+        presentation: EmojiPresentation,
+        generation: u32,
         invisible: bool,
-        font: FontHandle,
-        is_own_font: bool,
-    ) -> FontHandle {
+        font: Cow<'list, FontHandle>,
+    ) -> Cow<'list, FontHandle> {
         if invisible {
             // An invisible answer is never cached: it is the rare path, and caching it would make
             // the memo depend on which pending face the walk happened to reach first.
-            return self.invisible_variant(&font);
+            return Cow::Owned(self.invisible_variant(&font));
         }
-        if use_ascii_cache
-            && is_own_font
-            && let Some(index) = self.fonts.iter().position(|owned| owned == &font)
-        {
-            self.ascii_cache[code_point as usize].store(index as u32 + 1, std::sync::atomic::Ordering::Relaxed);
+        let font = match font {
+            Cow::Borrowed(own_font) => own_font,
+            Cow::Owned(system_fallback_font) => {
+                match self
+                    .beyond_ascii_answers
+                    .get_or_init(Box::default)
+                    .keep_system_fallback_font(system_fallback_font)
+                {
+                    Ok(kept) => kept,
+                    Err(not_kept) => return Cow::Owned(not_kept),
+                }
+            }
+        };
+        if Self::ascii_cache_takes(code_point, presentation) {
+            self.remember(&self.ascii_cache[code_point as usize], generation, font);
+        } else {
+            self.remember_beyond_ascii(code_point, presentation, generation, font);
         }
-        font
+        Cow::Borrowed(font)
     }
 }
 
@@ -1060,6 +1639,44 @@ pub unsafe fn frozen_font_list_of(list: *const c_void) -> FrozenFontListRef {
     FrozenFontListRef::new(Arc::clone(&borrowed))
 }
 
+impl FrozenFontFills {
+    /// [`FrozenFontFills::toward`] for the frozen snapshots of two `Gfx::FontCascadeList`s.
+    ///
+    /// # Safety
+    ///
+    /// Both pointers must name live `Gfx::FontCascadeList`s.
+    pub unsafe fn toward_cascade(list: *const c_void, resolved: *const c_void) -> Option<Self> {
+        // SAFETY: The caller guarantees both cascades are live for this call.
+        let (frozen, resolved) = unsafe { (frozen_font_list_of(list), frozen_font_list_of(resolved)) };
+        let fills = Self::toward(frozen.to_arc()?, resolved.list()?)?;
+        // The cascade's own pending faces must resolve to the fonts filled in, so what it answers on the document
+        // thread agrees with what its frozen list answers once filled. A face sized by font-size-adjust, which the
+        // load moves, does not.
+        // SAFETY: As above.
+        let live = unsafe { FrozenFontList::from_cascade_list(list) };
+        fills
+            .fills
+            .iter()
+            .all(|(index, font)| live.entries.get(*index).and_then(|entry| entry.font.as_ref()) == Some(font))
+            .then_some(fills)
+    }
+}
+
+/// Whether loads of the faces the cascade `list` waits on are all that tells it apart from
+/// `resolved`, so filling them in makes it select as `resolved` does.
+///
+/// # Safety
+///
+/// Both pointers must name live `Gfx::FontCascadeList`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ladybird_gfx_font_cascade_list_fills_toward(
+    list: *const c_void,
+    resolved: *const c_void,
+) -> bool {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { FrozenFontFills::toward_cascade(list, resolved) }.is_some()
+}
+
 /// Requests the load of a face a render pass wanted, and answers whether the face was still around
 /// to request. This is the document-thread half of the pending-face handover: a pass records the
 /// number, and resolving it here is what starts the fetch, arms the display-period timer and
@@ -1110,4 +1727,67 @@ pub unsafe extern "C" fn ladybird_gfx_frozen_font_list_font_for_code_point(
     let font = list.font_for_code_point(code_point, EmojiPresentation { is_emoji, forced });
     // The frozen list owns every font it can answer with, so the borrowed pointer stays live.
     font.as_raw()
+}
+
+#[cfg(test)]
+mod first_font_ascii_code_points_memo_tests {
+    use super::FirstFontAsciiCodePointsMemo;
+
+    #[test]
+    fn an_answer_holds_for_its_fill_generation() {
+        let memo = FirstFontAsciiCodePointsMemo::default();
+        assert_eq!(memo.answer_at(0), None);
+
+        let code_points = (7_u128 << 64) | 9;
+        memo.remember(3, Some((5, code_points)));
+        assert_eq!(memo.answer_at(3), Some(Some((5, code_points))));
+        assert_eq!(memo.answer_at(4), None);
+
+        memo.remember(4, None);
+        assert_eq!(memo.answer_at(4), Some(None));
+        assert_eq!(memo.answer_at(3), None);
+    }
+}
+
+#[cfg(test)]
+mod beyond_ascii_answer_word_tests {
+    use super::{EmojiPresentation, RememberedFont};
+
+    const TEXT: EmojiPresentation = EmojiPresentation {
+        is_emoji: false,
+        forced: false,
+    };
+    const FORCED_EMOJI: EmojiPresentation = EmojiPresentation {
+        is_emoji: true,
+        forced: true,
+    };
+
+    #[test]
+    fn an_answer_holds_for_its_code_point_presentation_and_fill_generation() {
+        for font in [
+            RememberedFont::OwnFont(0),
+            RememberedFont::FilledEntry(5),
+            RememberedFont::SystemFallbackFont(127),
+        ] {
+            let word = font.answer_word(3, 0x4e2d, TEXT).unwrap();
+            assert_eq!(RememberedFont::from_answer_word(word, 3, 0x4e2d, TEXT), Some(font));
+            assert_eq!(RememberedFont::from_answer_word(word, 4, 0x4e2d, TEXT), None);
+            assert_eq!(RememberedFont::from_answer_word(word, 3, 0x4e2d + 512, TEXT), None);
+            assert_eq!(RememberedFont::from_answer_word(word, 3, 0x4e2d, FORCED_EMOJI), None);
+        }
+
+        let word = RememberedFont::OwnFont(1)
+            .answer_word(0, 0x10ffff, FORCED_EMOJI)
+            .unwrap();
+        assert_eq!(
+            RememberedFont::from_answer_word(word, 0, 0x10ffff, FORCED_EMOJI),
+            Some(RememberedFont::OwnFont(1))
+        );
+    }
+
+    #[test]
+    fn an_empty_word_or_a_font_index_that_does_not_fit_remembers_nothing() {
+        assert_eq!(RememberedFont::from_answer_word(0, 0, 0, TEXT), None);
+        assert_eq!(RememberedFont::OwnFont(128).answer_word(0, 0x4e2d, TEXT), None);
+    }
 }

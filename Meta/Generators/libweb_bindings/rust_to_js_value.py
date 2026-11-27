@@ -13,7 +13,10 @@ from Generators.libweb_bindings.context import GenerationContext
 from Generators.libweb_bindings.rust_names import rust_identifier
 from Generators.libweb_bindings.rust_names import rust_local_name
 from Generators.libweb_bindings.rust_types import UnsupportedByRustBindings
+from Generators.libweb_bindings.rust_types import dictionary_holds_sequence_of_cells
 from Generators.libweb_bindings.rust_types import holds_cells
+from Generators.libweb_bindings.rust_types import is_sequence_of_cells
+from Generators.libweb_bindings.rust_types import is_window_proxy
 from Generators.libweb_bindings.rust_types import member_other_than_undefined
 from Generators.libweb_bindings.rust_types import rust_dictionary_path
 from Generators.libweb_bindings.rust_types import rust_enumeration_path
@@ -51,12 +54,22 @@ def rust_to_js_value(
             Some(value) => {inner(optional_member)},
             None => Ok(Value::UNDEFINED),
         }}"""
-    if isinstance(idl_type, IDLParameterizedType) and idl_type.name == "sequence":
+    if isinstance(idl_type, IDLParameterizedType) and idl_type.name in ("sequence", "FrozenArray"):
         element_type = idl_type.parameters[0]
         # NB: The conversion of an element can allocate, as that of an object of an interface does for its wrapper,
-        #     and the elements after it must live through that.
-        function = "rooted_sequence_to_js" if holds_cells(element_type, context) else "sequence_to_js"
-        return f"{function}({call_context}, {expression}, |value| {inner(element_type)})"
+        #     and the elements after it must live through that, in the MarkedVec that holds them (see rust_type()).
+        if holds_cells(element_type, context):
+            dictionary = context.dictionaries.get(element_type.without_nullable().name)
+            if dictionary is not None and dictionary_holds_sequence_of_cells(dictionary, context):
+                conversion = rust_to_js_value(element_type, "value", call_context, context, what)
+            else:
+                conversion = rust_to_js_value(element_type, "ToOwned::to_owned(value)", call_context, context, what)
+            array = f"rooted_sequence_to_js({call_context}, {expression}, |value| {conversion})"
+        else:
+            array = f"sequence_to_js({call_context}, {expression}, |value| {inner(element_type)})"
+        if idl_type.name == "FrozenArray":
+            return f"frozen_array_to_js({call_context}, {array})"
+        return array
     if isinstance(idl_type, IDLParameterizedType) and idl_type.name == "record":
         value_type = idl_type.parameters[1]
         if holds_cells(value_type, context):
@@ -67,6 +80,8 @@ def rust_to_js_value(
                 "bindings do not convert yet"
             )
         return f"record_to_js({call_context}, {expression}, |value| {inner(value_type)})"
+    if is_window_proxy(idl_type):
+        return f"Ok(window_proxy_to_js({call_context}, {expression}))"
     return f"{expression}.to_js({call_context})"
 
 
@@ -133,46 +148,75 @@ def write_dictionary_to_js(out: TextIO, context: GenerationContext, dictionary: 
     fields = []
     keys = []
     conversions = []
-    for member in dictionary.members:
+    prepared_members = []
+    borrows_dictionary = dictionary_holds_sequence_of_cells(dictionary, context)
+    impl_type = f"&{path}" if borrows_dictionary else path
+    # NB: The least-derived dictionary comes first, as in the C++ bindings.
+    inheritance_chain = list(reversed(context.dictionary_inheritance_stack(dictionary)))
+    if any(dictionary_holds_sequence_of_cells(ancestor, context) for ancestor in inheritance_chain[:-1]):
+        raise UnsupportedByRustBindings(
+            f"the dictionary {dictionary.name} inherits from a dictionary that holds a sequence of values that are or "
+            "can hold cells, which the Rust bindings do not convert to a JS value yet"
+        )
+    if len(inheritance_chain) > 1:
+        fields.append(f"    //   parent: {rust_dictionary_path(inheritance_chain[-2], context)},\n")
+    for member, is_own_member in [
+        (member, item is dictionary) for item in inheritance_chain for member in item.members
+    ]:
         what = f"{dictionary.name}.{member.name}"
         member_type = rust_type(member.type, context, what)
-        if has_sequence_of_cells(member.type, context):
-            # NB: A sequence is kept alive from where its conversion starts, which is after the object of the
-            #     dictionary is created and the members before this one are converted.
-            raise UnsupportedByRustBindings(
-                f"{what} has the type {member.type}, with a sequence of values that are or can hold cells, which the "
-                "Rust bindings do not convert from a member of a dictionary yet"
-            )
         field = rust_identifier(member.name)
         local = rust_local_name(member.name)
+        if has_sequence_of_cells(member.type, context):
+            if not is_sequence_of_cells(member.type, context):
+                raise UnsupportedByRustBindings(
+                    f"{what} has the type {member.type}, with a nested sequence of values that are or can hold cells, "
+                    "which the Rust bindings do not convert from a member of a dictionary yet"
+                )
+            # Keep the original dictionary in its root while copying its sequence into a MarkedVec.
+            if member.required or member.default_value is not None:
+                prepared_members.append(
+                    f"            let {local} = crate::bindings::conversions::mark_sequence(cx, {local}.as_slice());\n"
+                )
+            else:
+                prepared_members.append(
+                    f"            let {local} = {local}.as_deref().map(|value| crate::bindings::conversions::mark_sequence(cx, value));\n"
+                )
+        elif borrows_dictionary:
+            prepared_members.append(f"            let {local} = ToOwned::to_owned({local});\n")
         key = f"{rust_identifier(member.name).removeprefix('r#').rstrip('_').upper()}_KEY"
         keys.append(
             f'            static {key}: LazyLock<PropertyKey> = LazyLock::new(|| PropertyKey::from_utf8("{member.name}"));\n'
         )
         always_present = member.required or member.default_value is not None
+        field_type = member_type if always_present else f"Option<{member_type}>"
+        if is_own_member:
+            fields.append(f"    //   {field}: {field_type},\n")
         if always_present:
             conversion = rust_to_js_value(member.type, local, "cx", context, what)
-            fields.append(f"    //   {field}: {member_type},\n")
             conversions.append(f"            set_dictionary_member(cx, object, &{key}, {conversion}?)?;\n")
         else:
             conversion = rust_to_js_value(member.type, "value", "cx", context, what)
-            fields.append(f"    //   {field}: Option<{member_type}>,\n")
             conversions.append(
                 f"""            if let Some(value) = {local} {{
                 set_dictionary_member(cx, object, &{key}, {conversion}?)?;
             }}
 """
             )
-    bindings = ", ".join(
-        f"{rust_identifier(member.name)}: {rust_local_name(member.name)}" for member in dictionary.members
-    )
+
+    pattern = None
+    for item in inheritance_chain:
+        bindings = [f"{rust_identifier(member.name)}: {rust_local_name(member.name)}" for member in item.members]
+        if pattern is not None:
+            bindings.insert(0, f"parent: {pattern}")
+        pattern = f"{rust_dictionary_path(item, context)} {{ {', '.join(bindings)} }}"
     out.write(
         f"""
     /// The conversion of the dictionary {dictionary.name}, a struct with the fields:
-{"".join(fields)}    impl ToJs for {path} {{
+{"".join(fields)}    impl ToJs for {impl_type} {{
         fn to_js(self, cx: &CallContext) -> ThrowCompletionOr<Value> {{
-{"".join(keys)}            let {path} {{ {bindings} }} = self;
-            let object = create_dictionary_object(cx);
+{"".join(keys)}            let {pattern} = self;
+{"".join(prepared_members)}            let object = create_dictionary_object(cx);
 {"".join(conversions)}            Ok(Value::from_object(object))
         }}
     }}

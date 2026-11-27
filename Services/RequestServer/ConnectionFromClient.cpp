@@ -100,7 +100,6 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     , m_connections(connections)
     , m_request_transfer_leases(request_transfer_leases)
     , m_disk_cache(disk_cache)
-    , m_curl_multi(curl_multi_init())
     , m_resolver(is_private == IsPrivate::Yes ? Resolver::private_resolver() : Resolver::default_resolver())
 {
     if (m_is_private == IsPrivate::Yes)
@@ -108,33 +107,44 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
 
     m_connections.set(client_id(), *this);
 
-    auto set_option = [this](auto option, auto value) {
-        auto result = curl_multi_setopt(m_curl_multi, option, value);
+    set_up_curl_multi(m_fetch_curl);
+    auto result = curl_multi_setopt(m_fetch_curl.handle, CURLMOPT_MAX_HOST_CONNECTIONS, 6L);
+    VERIFY(result == CURLM_OK);
+    set_up_curl_multi(m_websocket_curl);
+}
+
+void ConnectionFromClient::set_up_curl_multi(CurlMulti& multi)
+{
+    multi.client = this;
+    multi.handle = curl_multi_init();
+
+    auto set_option = [&multi](auto option, auto value) {
+        auto result = curl_multi_setopt(multi.handle, option, value);
         VERIFY(result == CURLM_OK);
     };
     set_option(CURLMOPT_SOCKETFUNCTION, &on_socket_callback);
-    set_option(CURLMOPT_SOCKETDATA, this);
+    set_option(CURLMOPT_SOCKETDATA, &multi);
     set_option(CURLMOPT_TIMERFUNCTION, &on_timeout_callback);
-    set_option(CURLMOPT_TIMERDATA, this);
+    set_option(CURLMOPT_TIMERDATA, &multi);
 
     // https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html
     // Your callback function timer_callback should install a single non-repeating timer with an expire time of
     // timeout_ms milliseconds.
-    m_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
+    multi.timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this, &multi] {
         auto now = MonotonicTime::now();
-        if (m_curl_timer_due_at.has_value() && now < *m_curl_timer_due_at) {
-            m_timer->restart(*m_curl_timer_due_at - now);
+        if (multi.timer_due_at.has_value() && now < *multi.timer_due_at) {
+            multi.timer->restart(*multi.timer_due_at - now);
             return;
         }
 
-        m_curl_timer_due_at = {};
+        multi.timer_due_at = {};
         note_event_tick("curl-timer-fired"sv);
         s_curl_timer_due_at = {};
 
         // When that timer fires, call either curl_multi_socket_action or curl_multi_perform, depending on which
         // interface you use.
-        auto result = time_curl_call("multi_socket_action(timeout)"sv, [this] {
-            return curl_multi_socket_action(m_curl_multi, CURL_SOCKET_TIMEOUT, 0, nullptr);
+        auto result = time_curl_call("multi_socket_action(timeout)"sv, [&multi] {
+            return curl_multi_socket_action(multi.handle, CURL_SOCKET_TIMEOUT, 0, nullptr);
         });
         VERIFY(result == CURLM_OK);
         check_active_requests();
@@ -145,8 +155,10 @@ ConnectionFromClient::~ConnectionFromClient()
 {
     cancel_owned_work();
 
-    curl_multi_cleanup(m_curl_multi);
-    m_curl_multi = nullptr;
+    curl_multi_cleanup(m_fetch_curl.handle);
+    m_fetch_curl.handle = nullptr;
+    curl_multi_cleanup(m_websocket_curl.handle);
+    m_websocket_curl.handle = nullptr;
 
     if (m_is_private == IsPrivate::Yes && --s_private_connection_count == 0) {
         clear_aia_state(IsPrivate::Yes);
@@ -184,7 +196,7 @@ void ConnectionFromClient::cancel_owned_work()
     m_websockets.clear();
 
     for (auto& fetch : m_aia_fetches) {
-        curl_multi_remove_handle(m_curl_multi, fetch.key);
+        curl_multi_remove_handle(m_fetch_curl.handle, fetch.key);
         curl_easy_cleanup(fetch.key);
         if (fetch.value->resolve_list)
             curl_slist_free_all(fetch.value->resolve_list);
@@ -196,9 +208,13 @@ void ConnectionFromClient::cancel_owned_work()
 void ConnectionFromClient::die()
 {
     Vector<Requests::RequestTransferLeaseKey> transfer_leases_to_cancel;
-    for (auto const& entry : m_request_transfer_leases) {
+    for (auto& entry : m_request_transfer_leases) {
         if (entry.value.owner.ptr() == this)
             transfer_leases_to_cancel.append(entry.key);
+
+        // A designation ends with the client it names.
+        if (entry.value.adopter_client_id == client_id())
+            entry.value.adopter_client_id = {};
     }
     for (auto const& transfer_lease : transfer_leases_to_cancel) {
         auto lease = m_request_transfer_leases.take(transfer_lease);
@@ -228,6 +244,10 @@ bool ConnectionFromClient::may_use_network_isolation_key(HTTP::NetworkIsolationK
 {
     if (m_site_binding == SiteBinding::Unrestricted)
         return true;
+
+    // A site's RequestServer makes no requests under any other top-level site.
+    if (auto const& site = process_top_level_site(); site.has_value() && key.top_level_site != *site)
+        return false;
 
     // FIXME: The process of the document that starts a navigation makes the navigation's requests, not the process that
     //        will host the new document. Until the UI process makes navigation requests itself, a client may make a
@@ -263,12 +283,6 @@ static bool is_fetchable_url(URL::URL const& url)
     return !url.port().has_value() || !HTTP::is_bad_port(*url.port());
 }
 
-// IPC does not validate enum values; the cache requires a known associated-data kind.
-static bool is_valid_associated_data(HTTP::CacheEntryAssociatedData associated_data)
-{
-    return HTTP::CACHE_ENTRY_ASSOCIATED_DATA_TYPES.contains_slow(associated_data);
-}
-
 // Headers go verbatim on the wire; newlines would allow request injection.
 static bool are_valid_headers(Vector<HTTP::Header> const& headers)
 {
@@ -293,7 +307,7 @@ bool ConnectionFromClient::is_live_request_id(u64 request_id) const
     return m_active_requests.contains(request_id) || m_request_transfer_leases.contains({ client_id(), request_id });
 }
 
-void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, Optional<HTTP::NetworkIsolationKey> network_isolation_key, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id)
+void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, Optional<HTTP::NetworkIsolationKey> network_isolation_key, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, u64 originating_page_id, HTTP::Cookie::SameSiteContext same_site_context)
 {
     note_event_tick("ipc-start-request"sv);
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_request({}, {})", request_id, url);
@@ -345,15 +359,15 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
     auto transfer_lease = create_transfer_lease
         ? Optional<Requests::RequestTransferLeaseKey> { lease_key }
         : Optional<Requests::RequestTransferLeaseKey> {};
-    auto request = Request::fetch(request_id, m_disk_cache, move(network_isolation_key), cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, transfer_lease, address_selection_hint, notify_on_cache_miss);
-    request->set_performance_origin(originating_process_id, originating_page_id);
+    auto request = Request::fetch(request_id, m_disk_cache, move(network_isolation_key), cache_mode, *this, m_fetch_curl.handle, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, same_site_context, transfer_lease, address_selection_hint, notify_on_cache_miss);
+    request->set_performance_origin(client_id(), originating_page_id);
     m_active_requests.set(request_id, move(request));
 
     if (transfer_lease.has_value())
         m_request_transfer_leases.set(*transfer_lease, RequestTransferLease { *this, request_id });
 }
 
-void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease)
+void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease, Optional<int> owner_client_id)
 {
     if (is_live_request_id(target_request_id)) {
         did_misbehave("reused live request ID");
@@ -362,7 +376,21 @@ void ConnectionFromClient::adopt_request(int source_client_id, u64 source_reques
 
     auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
     auto transfer_lease = m_request_transfer_leases.get(lease_key);
-    if (!transfer_lease.has_value()) {
+    auto may_adopt = [&] {
+        if (!transfer_lease.has_value())
+            return false;
+        // The UI process adopts from the owner it names, or from itself when it names the client it designated. A bound
+        // client adopts only what it was designated for.
+        if (m_site_binding == SiteBinding::Unrestricted) {
+            if (!owner_client_id.has_value())
+                return false;
+            if (*owner_client_id == transfer_lease->owner->client_id())
+                return true;
+            return transfer_lease->owner.ptr() == this && transfer_lease->adopter_client_id == *owner_client_id;
+        }
+        return transfer_lease->adopter_client_id == client_id();
+    }();
+    if (!may_adopt) {
         async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
@@ -398,6 +426,7 @@ void ConnectionFromClient::adopt_request(int source_client_id, u64 source_reques
     if (preserve_transfer_lease) {
         transfer_lease->owner = *this;
         transfer_lease->request_id = target_request_id;
+        transfer_lease->adopter_client_id = {};
     } else {
         m_request_transfer_leases.remove(lease_key);
     }
@@ -432,20 +461,21 @@ void ConnectionFromClient::release_request_transfer_lease(int source_client_id, 
     }
 }
 
-void ConnectionFromClient::start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey network_isolation_key, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
+void ConnectionFromClient::start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey network_isolation_key, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials, HTTP::Cookie::SameSiteContext same_site_context)
 {
     note_event_tick("ipc-start-revalidation"sv);
     auto request_id = m_next_revalidation_request_id++;
 
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_revalidation_request({}, {})", request_id, url);
 
-    auto request = Request::revalidate(request_id, m_disk_cache, move(network_isolation_key), *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials);
+    auto request = Request::revalidate(request_id, m_disk_cache, move(network_isolation_key), *this, m_fetch_curl.handle, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, same_site_context);
     m_active_revalidation_requests.set(request_id, move(request));
 }
 
 int ConnectionFromClient::on_socket_callback(CURL*, int sockfd, int what, void* user_data, void*)
 {
-    auto* client = static_cast<ConnectionFromClient*>(user_data);
+    auto* multi = static_cast<CurlMulti*>(user_data);
+    auto* client = multi->client;
 
     if (what == CURL_POLL_REMOVE) {
         client->m_read_notifiers.remove(sockfd);
@@ -453,14 +483,14 @@ int ConnectionFromClient::on_socket_callback(CURL*, int sockfd, int what, void* 
         return 0;
     }
 
-    auto update_notifier = [client, sockfd, what](auto& notifiers, Core::NotificationType type, int poll_flag, int select_flag) {
+    auto update_notifier = [client, multi_handle = multi->handle, sockfd, what](auto& notifiers, Core::NotificationType type, int poll_flag, int select_flag) {
         if (!(what & poll_flag)) {
             if (auto notifier = notifiers.get(sockfd); notifier.has_value())
                 notifier.value()->set_enabled(false);
             return;
         }
 
-        auto& notifier = notifiers.ensure(sockfd, [client, sockfd, multi = client->m_curl_multi, type, select_flag] {
+        auto& notifier = notifiers.ensure(sockfd, [client, sockfd, multi = multi_handle, type, select_flag] {
             auto notifier = Core::Notifier::construct(sockfd, type);
             notifier->on_activation = [client, sockfd, multi, select_flag] {
                 note_event_tick("curl-socket-ready"sv);
@@ -486,21 +516,21 @@ int ConnectionFromClient::on_socket_callback(CURL*, int sockfd, int what, void* 
 
 int ConnectionFromClient::on_timeout_callback(void*, long timeout_ms, void* user_data)
 {
-    auto* client = static_cast<ConnectionFromClient*>(user_data);
-    if (!client->m_timer)
+    auto* multi = static_cast<CurlMulti*>(user_data);
+    if (!multi->timer)
         return 0;
 
     // https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html
     // A timeout_ms value of -1 passed to this callback means you should delete the timer.
     if (timeout_ms == -1) {
-        client->m_timer->stop();
-        client->m_curl_timer_due_at = {};
+        multi->timer->stop();
+        multi->timer_due_at = {};
         s_curl_timer_due_at = {};
     } else {
         // All other values are valid expire times in number of milliseconds - including zero milliseconds.
         VERIFY(timeout_ms >= 0);
         auto due_at = MonotonicTime::now() + AK::Duration::from_milliseconds(timeout_ms);
-        client->m_curl_timer_due_at = due_at;
+        multi->timer_due_at = due_at;
         s_curl_timer_due_at = due_at;
 
         // If this callback is called when a timer is already running, this new expire time replaces the former timeout.
@@ -509,7 +539,7 @@ int ConnectionFromClient::on_timeout_callback(void*, long timeout_ms, void* user
         // WARNING: do not call libcurl directly from within the callback itself when the timeout_ms value is zero, since
         // it risks triggering an unpleasant recursive behavior that immediately calls another call to the callback with
         // a zero timeout...
-        client->m_timer->restart(AK::Duration::from_milliseconds(timeout_ms));
+        multi->timer->restart(AK::Duration::from_milliseconds(timeout_ms));
     }
 
     // The timer callback should return 0 on success, and -1 on error.
@@ -521,35 +551,37 @@ void ConnectionFromClient::check_active_requests()
     note_event_tick("check-active-requests"sv);
     int msgs_in_queue = 0;
     u64 completions_drained = 0;
-    while (auto* msg = curl_multi_info_read(m_curl_multi, &msgs_in_queue)) {
-        if (msg->msg != CURLMSG_DONE)
-            continue;
+    for (auto* multi_handle : { m_fetch_curl.handle, m_websocket_curl.handle }) {
+        while (auto* msg = curl_multi_info_read(multi_handle, &msgs_in_queue)) {
+            if (msg->msg != CURLMSG_DONE)
+                continue;
 
-        void* application_private = nullptr;
-        auto result = curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &application_private);
-        VERIFY(result == CURLE_OK);
-        VERIFY(application_private != nullptr);
+            void* application_private = nullptr;
+            auto result = curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &application_private);
+            VERIFY(result == CURLE_OK);
+            VERIFY(application_private != nullptr);
 
-        // FIXME: Come up with a unified way to track websockets and standard fetches instead of this nasty tagged pointer
-        if (reinterpret_cast<uintptr_t>(application_private) & websocket_private_tag) {
-            auto* websocket_impl = reinterpret_cast<WebSocketImplCurl*>(reinterpret_cast<uintptr_t>(application_private) & ~websocket_private_tag);
-            if (msg->data.result == CURLE_OK) {
-                if (!websocket_impl->did_connect())
+            // FIXME: Come up with a unified way to track websockets and standard fetches instead of this nasty tagged pointer
+            if (reinterpret_cast<uintptr_t>(application_private) & websocket_private_tag) {
+                auto* websocket_impl = reinterpret_cast<WebSocketImplCurl*>(reinterpret_cast<uintptr_t>(application_private) & ~websocket_private_tag);
+                if (msg->data.result == CURLE_OK) {
+                    if (!websocket_impl->did_connect())
+                        websocket_impl->on_connection_error();
+                } else {
                     websocket_impl->on_connection_error();
-            } else {
-                websocket_impl->on_connection_error();
+                }
+                continue;
             }
-            continue;
-        }
 
-        if (reinterpret_cast<uintptr_t>(application_private) & aia_fetch_private_tag) {
-            complete_aia_fetch(msg->easy_handle, msg->data.result);
-            continue;
-        }
+            if (reinterpret_cast<uintptr_t>(application_private) & aia_fetch_private_tag) {
+                complete_aia_fetch(msg->easy_handle, msg->data.result);
+                continue;
+            }
 
-        ++completions_drained;
-        auto* request = static_cast<Request*>(application_private);
-        request->notify_fetch_complete({}, msg->data.result);
+            ++completions_drained;
+            auto* request = static_cast<Request*>(application_private);
+            request->notify_fetch_complete({}, msg->data.result);
+        }
     }
 
     if (completions_drained > 1)
@@ -595,8 +627,25 @@ void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString con
     auto fetch_url = parsed->serialize().to_byte_string();
     auto weak_self = make_weak_ptr<ConnectionFromClient>();
 
-    // Avoid leaking hostnames resolved by the proxy.
     auto proxy = proxy_configuration().proxy_for(*parsed).copy();
+    resolve_proxy_host(proxy, [weak_self, url, fetch_url, host, port, proxy](ErrorOr<void> result) mutable {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return;
+        if (result.is_error()) {
+            dbgln_if(REQUESTSERVER_DEBUG, "AIA: Proxy lookup failed for {}: {}", url, result.error());
+            self->abandon_aia_lookup(url);
+            return;
+        }
+        self->look_up_aia_host(url, fetch_url, host, port, move(proxy));
+    });
+}
+
+void ConnectionFromClient::look_up_aia_host(ByteString const& url, ByteString const& fetch_url, ByteString const& host, u16 port, Optional<HTTP::Proxy> proxy)
+{
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (proxy.has_value() && proxy->resolves_hostnames()) {
         start_aia_fetch(url, fetch_url, move(proxy), {});
         return;
@@ -671,14 +720,17 @@ void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString con
     set_option(CURLOPT_WRITEDATA, fetch.ptr());
     set_option(CURLOPT_PROXY, proxy.has_value() ? proxy->to_curl_url().characters() : "");
 
-    if (resolve_entry.has_value()) {
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry->characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            fetch->resolve_list = resolve_list;
-        }
+    curl_slist* resolve_list = nullptr;
+    for (auto const& entry : { move(resolve_entry), curl_resolve_entry_for_proxy(proxy) }) {
+        if (entry.has_value())
+            resolve_list = curl_slist_append(resolve_list, entry->characters());
+    }
+    if (resolve_list) {
+        set_option(CURLOPT_RESOLVE, resolve_list);
+        fetch->resolve_list = resolve_list;
     }
 
-    auto result = curl_multi_add_handle(m_curl_multi, easy_handle);
+    auto result = curl_multi_add_handle(m_fetch_curl.handle, easy_handle);
     VERIFY(result == CURLM_OK);
 
     m_aia_fetches.set(easy_handle, move(fetch));
@@ -690,7 +742,7 @@ void ConnectionFromClient::complete_aia_fetch(void* easy_handle, int result_code
     curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
 
     auto fetch = m_aia_fetches.take(easy_handle);
-    curl_multi_remove_handle(m_curl_multi, easy_handle);
+    curl_multi_remove_handle(m_fetch_curl.handle, easy_handle);
     curl_easy_cleanup(easy_handle);
     if (!fetch.has_value())
         return;
@@ -796,6 +848,32 @@ void ConnectionFromClient::import_request(u64 request_id, Requests::ExportedRequ
     m_active_requests.set(request_id, move(request));
 }
 
+void ConnectionFromClient::resolve_host(u64 lookup_id, ByteString host)
+{
+    // Whatever connects to the host would bypass a proxy, and a proxy that resolves names would never see this lookup,
+    // so nothing is looked up while one is configured.
+    if (!proxy_configuration().is_empty() || host.is_empty() || host.length() > 253) {
+        async_host_resolved(lookup_id, {});
+        return;
+    }
+
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+    m_resolver->dns.lookup(host, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA }, { .validate_dnssec_locally = DNSInfo::the().validate_dnssec_locally })
+        ->when_rejected([weak_self, lookup_id](auto const&) {
+            if (auto self = weak_self.strong_ref())
+                self->async_host_resolved(lookup_id, {});
+        })
+        .when_resolved([weak_self, lookup_id](auto const& dns_result) {
+            auto self = weak_self.strong_ref();
+            if (!self)
+                return;
+            Vector<ByteString> addresses;
+            for (auto const& address : dns_result->cached_addresses())
+                addresses.append(address.visit([](auto const& address) { return ByteString { MUST(address.to_string()) }; }));
+            self->async_host_resolved(lookup_id, move(addresses));
+        });
+}
+
 void ConnectionFromClient::ensure_connection(u64 request_id, URL::URL url, ::RequestServer::CacheLevel cache_level)
 {
     if (is_live_request_id(request_id)) {
@@ -806,75 +884,8 @@ void ConnectionFromClient::ensure_connection(u64 request_id, URL::URL url, ::Req
     if (!is_fetchable_url(url))
         return;
 
-    auto request = Request::connect(request_id, *this, m_curl_multi, m_resolver, move(url), cache_level);
+    auto request = Request::connect(request_id, *this, m_fetch_curl.handle, m_resolver, move(url), cache_level);
     m_active_requests.set(request_id, move(request));
-}
-
-Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
-{
-    if (!is_valid_associated_data(associated_data)) {
-        did_misbehave("invalid cache associated data kind");
-        return { Optional<IPC::File> {}, 0 };
-    }
-
-    if (!are_valid_headers(request_headers)) {
-        did_misbehave("invalid request header");
-        return { Optional<IPC::File> {}, 0 };
-    }
-
-    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
-        return { Optional<IPC::File> {}, 0 };
-
-    auto partition = network_isolation_key.has_value() ? network_isolation_key->disk_cache_partition() : OptionalNone {};
-    if (!m_disk_cache.has_value() || !partition.has_value() || !data.is_valid())
-        return { Optional<IPC::File> {}, 0 };
-
-    auto result = m_disk_cache->store_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data, data.bytes());
-    if (result.is_error()) {
-        dbgln("Failed to store cache associated data for {}: {}", url, result.error());
-        return { Optional<IPC::File> {}, 0 };
-    }
-
-    if (!result.value().has_value())
-        return { Optional<IPC::File> {}, 0 };
-    return { IPC::File::adopt_fd(result.value()->fd), result.value()->size };
-}
-
-Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClient::retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
-{
-    if (!is_valid_associated_data(associated_data)) {
-        did_misbehave("invalid cache associated data kind");
-        return Optional<Core::AnonymousBuffer> {};
-    }
-
-    if (!are_valid_headers(request_headers)) {
-        did_misbehave("invalid request header");
-        return Optional<Core::AnonymousBuffer> {};
-    }
-
-    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
-        return Optional<Core::AnonymousBuffer> {};
-
-    auto partition = network_isolation_key.has_value() ? network_isolation_key->disk_cache_partition() : OptionalNone {};
-    if (!m_disk_cache.has_value() || !partition.has_value())
-        return Optional<Core::AnonymousBuffer> {};
-
-    auto data = m_disk_cache->retrieve_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data);
-    if (data.is_error()) {
-        dbgln("Failed to retrieve cache associated data for {}: {}", url, data.error());
-        return Optional<Core::AnonymousBuffer> {};
-    }
-    if (!data.value().has_value())
-        return Optional<Core::AnonymousBuffer> {};
-
-    auto buffer = Core::AnonymousBuffer::create_with_size(data.value()->size());
-    if (buffer.is_error()) {
-        dbgln("Failed to allocate cache associated data buffer for {}: {}", url, buffer.error());
-        return Optional<Core::AnonymousBuffer> {};
-    }
-
-    memcpy(buffer.value().data<void>(), data.value()->data(), data.value()->size());
-    return Optional<Core::AnonymousBuffer> { buffer.release_value() };
 }
 
 size_t ConnectionFromClient::websocket_count() const
@@ -890,7 +901,7 @@ size_t ConnectionFromClient::total_websocket_count() const
     return count;
 }
 
-void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Optional<HTTP::NetworkIsolationKey> network_isolation_key, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
+void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Optional<HTTP::NetworkIsolationKey> network_isolation_key, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, u64 originating_page_id, HTTP::Cookie::SameSiteContext same_site_context)
 {
     if (m_pending_websockets.contains(websocket_id) || m_websockets.contains(websocket_id)) {
         did_misbehave("reused live WebSocket ID");
@@ -948,18 +959,18 @@ void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Opt
 
     m_websocket_cookie_requests.set(websocket_id, {
                                                       .cookie_request_id = cookie_request_id,
-                                                      .continuation = [this, websocket_id, url, origin = move(origin), protocols = move(protocols), extensions = move(extensions), request_headers = move(additional_request_headers)](String cookie) mutable {
+                                                      .continuation = [this, websocket_id, originating_page_id, url, origin = move(origin), protocols = move(protocols), extensions = move(extensions), request_headers = move(additional_request_headers)](String cookie) mutable {
                                                           // Sent as UTF-8, like the Cookie header of a fetch.
                                                           if (!cookie.is_empty())
                                                               request_headers.append({ "Cookie"sv, cookie.to_byte_string() });
-                                                          connect_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(request_headers));
+                                                          connect_websocket(websocket_id, originating_page_id, move(url), move(origin), move(protocols), move(extensions), move(request_headers));
                                                       },
                                                   });
 
     Optional<HTTP::Cookie::PartitionContext> partition_context;
     if (network_isolation_key.has_value())
         partition_context = HTTP::Cookie::PartitionContext { network_isolation_key->top_level_site, network_isolation_key->has_cross_site_ancestor };
-    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url, move(partition_context));
+    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url, move(partition_context), same_site_context);
 }
 
 bool ConnectionFromClient::websocket_retrieved_http_cookie(Badge<ControlConnectionFromClient>, u64 websocket_id, u64 cookie_request_id, String cookie)
@@ -976,7 +987,7 @@ bool ConnectionFromClient::websocket_retrieved_http_cookie(Badge<ControlConnecti
     return true;
 }
 
-void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
+void ConnectionFromClient::connect_websocket(u64 websocket_id, u64 originating_page_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
 {
     auto host = url.serialized_host().to_byte_string();
     auto weak_self = make_weak_ptr<ConnectionFromClient>();
@@ -987,11 +998,30 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
         return;
     }
 
-    // Avoid leaking hostnames resolved by the proxy.
     auto proxy = proxy_configuration().proxy_for(url).copy();
+    resolve_proxy_host(proxy, [weak_self, websocket_id, originating_page_id, url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers), proxy](ErrorOr<void> result) mutable {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return;
+        if (result.is_error()) {
+            dbgln("WebSocketConnect: Proxy lookup failed: {}", result.error());
+            if (self->m_pending_websockets.remove(websocket_id))
+                self->fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+            return;
+        }
+        self->look_up_websocket_host(websocket_id, originating_page_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy));
+    });
+}
+
+void ConnectionFromClient::look_up_websocket_host(u64 websocket_id, u64 originating_page_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy> proxy)
+{
+    auto host = url.serialized_host().to_byte_string();
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (proxy.has_value() && proxy->resolves_hostnames()) {
         if (m_pending_websockets.remove(websocket_id))
-            open_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), nullptr);
+            open_websocket(websocket_id, originating_page_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), nullptr);
         return;
     }
 
@@ -1005,7 +1035,7 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
                 return;
             self->fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
         })
-        .when_resolved([weak_self, websocket_id, host = move(host), url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers), proxy = move(proxy)](auto const& dns_result) mutable {
+        .when_resolved([weak_self, websocket_id, originating_page_id, host = move(host), url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers), proxy = move(proxy)](auto const& dns_result) mutable {
             auto self = weak_self.strong_ref();
             if (!self)
                 return;
@@ -1021,11 +1051,11 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
             if (!self->m_pending_websockets.remove(websocket_id))
                 return;
 
-            self->open_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), dns_result);
+            self->open_websocket(websocket_id, originating_page_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), dns_result);
         });
 }
 
-void ConnectionFromClient::open_websocket(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy> proxy, RefPtr<DNS::LookupResult const> dns_result)
+void ConnectionFromClient::open_websocket(u64 websocket_id, u64 originating_page_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy> proxy, RefPtr<DNS::LookupResult const> dns_result)
 {
     auto weak_self = make_weak_ptr<ConnectionFromClient>();
 
@@ -1040,8 +1070,9 @@ void ConnectionFromClient::open_websocket(u64 websocket_id, URL::URL url, ByteSt
     if (auto const& path = default_certificate_path(); !path.is_empty())
         connection_info.set_root_certificates_path(path);
 
-    auto impl = WebSocketImplCurl::create(m_curl_multi);
+    auto impl = WebSocketImplCurl::create(m_websocket_curl.handle, m_is_private);
     impl->set_proxy(move(proxy));
+    impl->set_performance_origin(client_id(), originating_page_id);
     auto connection = WebSocket::WebSocket::create(move(connection_info), move(impl));
 
     connection->on_open = [self = weak_self, websocket_id]() {
@@ -1072,6 +1103,10 @@ void ConnectionFromClient::open_websocket(u64 websocket_id, URL::URL url, ByteSt
             return;
         }
         strong_self->async_websocket_received(websocket_id, message.is_text(), data);
+    };
+    connection->on_message_bytes_transmitted = [self = weak_self, websocket_id](u64 byte_count) {
+        if (auto strong_self = self.strong_ref())
+            strong_self->async_websocket_transmitted(websocket_id, byte_count);
     };
     connection->on_error = [self = weak_self, websocket_id](auto message) {
         if (auto strong_self = self.strong_ref())

@@ -8,8 +8,11 @@
 //!
 //! A JSExecutionContext is the runtime's ExecutionContext. LibJS/Embedding/Layout.h gives the offset and size of each
 //! of its fields as JS_LAYOUT_EXECUTION_CONTEXT_*, and its value slots, the arguments last, follow it directly. An
-//! embedder reads and writes the fields there, among them the realm, the ScriptOrModule, the this value and the
-//! skip-when-determining-incumbent counter. It also finds the running context at
+//! embedder reads and writes the fields there, among them the this value and the skip-when-determining-incumbent
+//! counter. The realm and the ScriptOrModule of a context with a function come from the function: it reads the realm
+//! of an ECMAScript function from its shape and that of another function with js_execution_context_realm(), and the
+//! ScriptOrModule of an ECMAScript function from its shared data at
+//! JS_LAYOUT_SHARED_FUNCTION_INSTANCE_DATA_SCRIPT_OR_MODULE_OFFSET. It also finds the running context at
 //! JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET in the VM, and with it the current realm and the arguments and this
 //! value of the running code, without a call.
 //!
@@ -19,61 +22,32 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use crate::bytecode::executable::Executable;
-use crate::embedding::abi_types::{JSOwnedUtf16String, owned_utf16_string_into_abi, vm_from_abi};
+use crate::embedding::abi_types::{
+    JSOwnedUtf16String, JSRealm, optional_cell_into_abi, owned_utf16_string_into_abi, vm_from_abi,
+};
 use crate::gc::capi::GCVisitor;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::execution_context::OwnedExecutionContext;
-use crate::layout::cell::Gc;
-use crate::layout::execution_context::{
-    ExecutionContext, SCRIPT_OR_MODULE_TAG_EMPTY, SCRIPT_OR_MODULE_TAG_MODULE, SCRIPT_OR_MODULE_TAG_SCRIPT,
-    ScriptOrModule,
-};
+use crate::layout::execution_context::{ExecutionContext, ScriptOrModule, ScriptOrModuleSlot};
 use crate::layout::host_class::JSVM;
-use crate::runtime::module::Module;
-use crate::script::Script;
 
 /// An execution context, laid out as the JS_LAYOUT_EXECUTION_CONTEXT_* values of LibJS/Embedding/Layout.h describe.
 pub struct JSExecutionContext {
     _opaque: [u8; 0],
 }
 
-/// A ScriptOrModule, laid out like the field of an execution context. The tag is one of the
-/// JS_LAYOUT_SCRIPT_OR_MODULE_TAG_* values of LibJS/Embedding/Layout.h, and the cell is the Script or the Module, or
-/// null for an empty one.
-#[repr(C)]
-pub struct JSScriptOrModule {
-    pub tag: u8,
-    pub cell: *mut c_void,
-}
+/// A ScriptOrModule, laid out like the field of an execution context: zero for null, otherwise the pointer to the
+/// Script or the Module, with JS_LAYOUT_SCRIPT_OR_MODULE_MODULE_BIT set for a module.
+#[repr(transparent)]
+pub struct JSScriptOrModule(u64);
 
-const _: () = assert!(size_of::<JSScriptOrModule>() == size_of::<ScriptOrModule>());
-const _: () = assert!(align_of::<JSScriptOrModule>() == align_of::<ScriptOrModule>());
-
-impl From<ScriptOrModule> for JSScriptOrModule {
-    fn from(script_or_module: ScriptOrModule) -> Self {
-        let (tag, cell) = match script_or_module {
-            ScriptOrModule::Empty => (SCRIPT_OR_MODULE_TAG_EMPTY, core::ptr::null_mut()),
-            ScriptOrModule::Script(script) => (SCRIPT_OR_MODULE_TAG_SCRIPT, script.as_ptr().cast()),
-            ScriptOrModule::Module(module) => (SCRIPT_OR_MODULE_TAG_MODULE, module.as_ptr().cast()),
-        };
-        Self { tag, cell }
-    }
-}
+const _: () = assert!(size_of::<JSScriptOrModule>() == size_of::<ScriptOrModuleSlot>());
 
 /// # Safety
 ///
-/// The cell of `script_or_module` must be a live Script or Module, as its tag says, unless the tag is the empty one.
+/// `script_or_module` must be empty or name a live Script or Module.
 pub unsafe fn script_or_module_from_abi(script_or_module: JSScriptOrModule) -> ScriptOrModule {
-    let cell = || NonNull::new(script_or_module.cell).expect("a script or module has its cell");
-    // SAFETY: The caller guarantees that the cell is a live record of the kind the tag names.
-    unsafe {
-        match script_or_module.tag {
-            SCRIPT_OR_MODULE_TAG_EMPTY => ScriptOrModule::Empty,
-            SCRIPT_OR_MODULE_TAG_SCRIPT => ScriptOrModule::Script(Gc::from_non_null(cell().cast::<Script>())),
-            SCRIPT_OR_MODULE_TAG_MODULE => ScriptOrModule::Module(Gc::from_non_null(cell().cast::<Module>())),
-            tag => panic!("{tag} is not the tag of a script or module"),
-        }
-    }
+    ScriptOrModuleSlot::from_word(script_or_module.0).get()
 }
 
 fn execution_context_from_abi(execution_context: *mut JSExecutionContext) -> NonNull<ExecutionContext> {
@@ -241,6 +215,20 @@ pub unsafe extern "C" fn js_execution_context_restore_stack(vm: *mut JSVM) {
     // SAFETY: The caller passes a live VM.
     let vm = unsafe { vm_from_abi(vm) };
     vm.restore_execution_context_stack();
+}
+
+/// ExecutionContext::realm(): the [[Realm]] of `execution_context`, or null. That of a context with a function is the
+/// function's, and the field holds it only for a context without one.
+///
+/// # Safety
+///
+/// `execution_context` must be a live execution context. Must be called on the thread that runs the VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_execution_context_realm(execution_context: *const JSExecutionContext) -> *mut JSRealm {
+    assert!(!execution_context.is_null(), "the embedder passes an execution context");
+    // SAFETY: The caller passes a live execution context.
+    let execution_context = unsafe { &*execution_context.cast::<ExecutionContext>() };
+    optional_cell_into_abi::<JSRealm>(execution_context.realm())
 }
 
 /// ExecutionContext::function_name(): the name of the function whose bytecode the context runs, as an owned

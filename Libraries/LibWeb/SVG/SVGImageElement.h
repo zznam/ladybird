@@ -48,6 +48,7 @@ public:
 
     // ^Layout::ImageProvider
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override;
+    virtual SVG::PreserveAspectRatio preserve_aspect_ratio() const override;
 
 protected:
     SVGImageElement(DOM::Document&, DOM::QualifiedName);
@@ -56,6 +57,7 @@ protected:
 
     void process_the_url(Optional<Utf16String> const& href);
     void fetch_the_document(URL::URL const& url);
+    void abandon_the_current_fetch();
 
 private:
     virtual void finalize() override;
@@ -64,11 +66,13 @@ private:
 
     virtual CSS::ElementBoxKind box_kind() const override;
     virtual void decoded_image_data_did_update() override;
+    virtual bool decoded_image_data_may_be_rendered() const override { return has_layout_box(); }
 
     Optional<URL::URL> m_href;
 
     GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
+    u64 m_current_fetch_id { 0 };
     GC::Ptr<SVGAnimatedPreserveAspectRatio> m_preserve_aspect_ratio;
 };
 

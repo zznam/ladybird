@@ -12,7 +12,6 @@ use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::paint_read::PaintRead;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
-use crate::painting::style_queries;
 use libgfx_rust::CornerRadii;
 use libgfx_rust::{
     AffineTransform, CompositingAndBlendingOperator, FloatPoint, IntRect, WindingRule, affine_to_matrix,
@@ -44,6 +43,7 @@ pub(crate) fn compute_svg_viewport_transform_data(
         role: TransformDataRole::SvgViewportTransform,
         synthetic_plane: false,
         establishes_sorting_context: false,
+        bounds: libgfx_rust::FloatRect::default(),
     }
 }
 
@@ -64,7 +64,8 @@ pub(crate) struct BoxFacts {
     /// The overflow clip's shape, when shaped corners make it a path rather than a rounded rectangle.
     pub overflow_clip_contour: Option<ClipPathData>,
     pub css_clip: Option<ClipData>,
-    pub line_clamp_float_clip: Option<ClipData>,
+    /// The clip that layout put on the box's link.
+    pub clip_decided_by_parent: Option<ClipData>,
     pub clip_path: Option<(std::sync::Arc<libgfx_rust::path::Path>, IntRect, WindingRule)>,
     pub mask_layers: Vec<MaskData>,
     pub establishes_absolute_containing_block: bool,
@@ -73,6 +74,9 @@ pub(crate) struct BoxFacts {
     pub establishes_or_extends_3d_rendering_context: bool,
     pub may_have_clip: bool,
     pub default_scroll_shift_anchor: NodeSlotId,
+    /// Whether the box's filter references an SVG `<filter>`, whose region and subregions are in the box's own
+    /// coordinate system.
+    pub filter_references_svg_filter: bool,
 }
 
 impl BoxFacts {
@@ -86,32 +90,60 @@ impl BoxFacts {
         })
     }
 
-    pub(crate) fn effects_layer_is_inside_transform_and_clips(&self) -> bool {
-        self.effects
-            .as_ref()
-            .is_some_and(|effects| effects.backdrop_filter.is_some())
+    /// Whether an SVG mask or clip path of the box covers no area, which leaves nothing of the box.
+    pub(crate) fn is_hidden_by_empty_svg_mask_or_clip(&self) -> bool {
+        self.mask_layers
+            .iter()
+            .any(|mask| mask.origin != super::MaskLayerOrigin::CssMaskLayers && mask.rect.is_empty())
     }
 
-    /// Gathers a box's facts for the visual context update, which keeps the bounds of the SVG
-    /// filter the box references on its row.
+    /// Whether the box's effects layer sits under its transform, clip and mask nodes, rather than above them: for a
+    /// backdrop filter, and for a filter the box's clip-path, clip or mask has to apply to.
+    pub(crate) fn effects_layer_is_inside_transform_and_clips(&self) -> bool {
+        self.effects.as_ref().is_some_and(|effects| {
+            // https://drafts.csswg.org/filter-effects-1/#placement
+            // "The compositing model follows the SVG compositing model: first any filter effect is applied, then any
+            // clipping, masking and opacity."
+            // https://drafts.csswg.org/filter-effects-1/#FilterEffectsRegion
+            // NB: An SVG filter's region and primitive subregions are rects in the box's local coordinate system, so
+            //     its graph has to run under the box's transform.
+            effects.backdrop_filter.is_some()
+                || (effects.filter.is_some()
+                    && (self.filter_references_svg_filter
+                        || self.clip_path.is_some()
+                        || self.css_clip.is_some()
+                        || !self.mask_layers.is_empty()))
+        })
+    }
+
+    /// Gathers a box's facts for the visual context update, with the bounds of the SVG filter the box references,
+    /// which the update keeps on its row.
     pub(crate) fn gather(
         layout_arena: &impl PaintableRowsRead,
         slot: NodeSlotId,
         pixel_ratio: f64,
         consults_default_scroll_shift_anchors: bool,
-    ) -> Self {
+    ) -> (Self, Option<crate::layout::used_values::FfiCssPixelRect>) {
         let default_scroll_shift_anchor = if consults_default_scroll_shift_anchors {
             layout_arena.default_scroll_shift_anchor(slot)
         } else {
             NodeSlotId::INVALID
         };
-        Self::gather_with_effects(
+        let mut svg_filter_bounds = None;
+        let facts = Self::gather_with_effects(
             layout_arena,
             slot,
             pixel_ratio,
             default_scroll_shift_anchor,
-            |layout_arena| super::node_values::compute_effects_data(layout_arena, slot, pixel_ratio),
-        )
+            |layout_arena| {
+                let Some(resolved) = super::node_values::resolve_effects_data(layout_arena, slot, pixel_ratio) else {
+                    return (None, false);
+                };
+                svg_filter_bounds = resolved.svg_filter_bounds;
+                (resolved.effects, resolved.references_svg_filter)
+            },
+        );
+        (facts, svg_filter_bounds)
     }
 
     /// Gathers the facts of a box painted inside an SVG resource, which the visual context update
@@ -123,9 +155,11 @@ impl BoxFacts {
     ) -> (Self, Option<crate::layout::used_values::FfiCssPixelRect>) {
         let mut svg_filter_bounds = None;
         let facts = Self::gather_with_effects(layout_arena, slot, pixel_ratio, NodeSlotId::INVALID, |layout_arena| {
-            let resolved = super::node_values::resolve_effects_data(layout_arena, slot, pixel_ratio)?;
+            let Some(resolved) = super::node_values::resolve_effects_data(layout_arena, slot, pixel_ratio) else {
+                return (None, false);
+            };
             svg_filter_bounds = resolved.svg_filter_bounds;
-            resolved.effects
+            (resolved.effects, resolved.references_svg_filter)
         });
         (facts, svg_filter_bounds)
     }
@@ -135,7 +169,7 @@ impl BoxFacts {
         slot: NodeSlotId,
         pixel_ratio: f64,
         default_scroll_shift_anchor: NodeSlotId,
-        effects: impl FnOnce(&Arena) -> Option<EffectsData>,
+        effects: impl FnOnce(&Arena) -> (Option<EffectsData>, bool),
     ) -> Self {
         let mut facts = Self {
             needs_compositor_background_color_effect: layout_arena.node_has_compositor_animation_frame(
@@ -148,7 +182,7 @@ impl BoxFacts {
             effects: None,
             overflow_clip: None,
             css_clip: None,
-            line_clamp_float_clip: None,
+            clip_decided_by_parent: None,
             clip_path: None,
             mask_layers: Vec::new(),
             overflow_clip_contour: None,
@@ -158,6 +192,7 @@ impl BoxFacts {
             establishes_or_extends_3d_rendering_context: false,
             may_have_clip: false,
             default_scroll_shift_anchor,
+            filter_references_svg_filter: false,
         };
         if let Some((transform, transform_is_invertible)) =
             super::node_values::compute_transform(layout_arena, slot, pixel_ratio)
@@ -166,7 +201,9 @@ impl BoxFacts {
             facts.transform_is_invertible = transform_is_invertible;
         }
         facts.perspective = super::node_values::compute_perspective_data(layout_arena, slot, pixel_ratio);
-        facts.effects = effects(layout_arena).map(std::rc::Rc::new);
+        let (effects, filter_references_svg_filter) = effects(layout_arena);
+        facts.effects = effects.map(std::rc::Rc::new);
+        facts.filter_references_svg_filter = filter_references_svg_filter;
         facts.backface_hidden = super::node_values::backface_hidden(layout_arena, slot);
         let node = slot;
         facts.establishes_or_extends_3d_rendering_context =
@@ -179,7 +216,7 @@ impl BoxFacts {
             .map(|(path, bounding_rect, fill_rule)| (std::sync::Arc::new(path), bounding_rect, fill_rule));
         let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
         let masks_backdrop = facts.effects_layer_is_inside_transform_and_clips();
-        facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot, true)
+        facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot)
             .into_iter()
             .map(|layer| MaskData {
                 rect: converter.enclosing_device_rect(layer.area),
@@ -189,18 +226,22 @@ impl BoxFacts {
             })
             .collect();
         facts.css_clip = super::node_values::compute_css_clip_data(layout_arena, slot, pixel_ratio);
-        if style_queries::is_floating(layout_arena, slot)
-            || style_queries::is_invisible_for_line_clamp(layout_arena, slot)
-        {
-            facts.line_clamp_float_clip = style_queries::line_clamp_float_clip_rect(layout_arena, slot).map(|rect| {
+        facts.clip_decided_by_parent = layout_arena
+            .with_committed_fragment_link(slot, |link| {
+                link.and_then(|link| link.placement.shown_as.facts.clip_decided_by_parent)
+            })
+            .map(|clip_relative_to_border_box| {
+                let border_box =
+                    crate::painting::paintable_geometry::first_fragment_border_box_rect(layout_arena, slot);
                 let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
                 ClipData {
-                    rect: converter.rounded_device_rect(rect).to_float(),
+                    rect: converter
+                        .rounded_device_rect(clip_relative_to_border_box.translated_by(border_box.location()))
+                        .to_float(),
                     corner_radii: CornerRadii::default(),
                     mode: ClipMode::Intersect,
                 }
             });
-        }
         facts.may_have_clip = super::node_values::may_have_clip(layout_arena, slot);
         facts.overflow_clip = if facts.may_have_clip {
             super::node_values::compute_clip_data(layout_arena, slot, pixel_ratio)
@@ -290,7 +331,6 @@ pub(crate) fn create_fresh_tree_with_viewport_nodes(
         SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: viewport,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         }),
         VISUAL_VIEWPORT_NODE_INDEX,
     );
@@ -300,14 +340,10 @@ pub(crate) fn create_fresh_tree_with_viewport_nodes(
         effect: root_isolation_effect,
     };
 
-    let viewport_nearest_scroll_nodes = NearestScrollNodeIndices {
-        stopping_at_fixed_position_ancestors: viewport_scroll_node,
-        continuing_through_fixed_position_ancestors: viewport_scroll_node,
-    };
     let scrolled = PositioningContext {
         spatial: viewport_scroll_node,
         clip: ClipNodeIndex::NONE,
-        nearest_scroll_nodes: viewport_nearest_scroll_nodes,
+        nearest_scroll_like_node: viewport_scroll_node,
         plane_root: viewport_scroll_node,
     };
     let viewport_contexts = DescendantVisualContexts {
@@ -334,7 +370,6 @@ pub(crate) fn create_fresh_tree_with_viewport_nodes(
             stacking_context: crate::painting::stacking_context::StackingContextFacts::for_viewport(),
         },
     );
-    viewport_assignment.enclosing_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     viewport_assignment.own_scroll_node_index = viewport_scroll_node;
     viewport_assignment.has_accumulated_visual_context = true;
     viewport_assignment.accumulated_visual_context = root_context;

@@ -24,21 +24,23 @@ namespace WebView {
 // https://html.spec.whatwg.org/multipage/webappapis.html#similar-origin-window-agent
 class WEBVIEW_API CanonicalSimilarOriginWindowAgent final : public RefCounted<CanonicalSimilarOriginWindowAgent> {
 public:
-    static NonnullRefPtr<CanonicalSimilarOriginWindowAgent> create(Web::HTML::CrossOriginIsolationMode);
+    static NonnullRefPtr<CanonicalSimilarOriginWindowAgent> create(Web::HTML::CrossOriginIsolationMode, bool agent_cluster_is_origin_keyed);
 
     RefPtr<WebContentClient> hosting_process() const;
     void set_hosting_process_if_unset(WebContentClient&);
 
     u64 agent_cluster_id() const { return m_agent_cluster_id; }
+    bool agent_cluster_is_origin_keyed() const { return m_agent_cluster_is_origin_keyed; }
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster-cross-origin-isolation
     Web::HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode() const { return m_agent_cluster_cross_origin_isolation_mode; }
 
 private:
-    explicit CanonicalSimilarOriginWindowAgent(Web::HTML::CrossOriginIsolationMode);
+    explicit CanonicalSimilarOriginWindowAgent(Web::HTML::CrossOriginIsolationMode, bool agent_cluster_is_origin_keyed);
 
     WeakPtr<WebContentClient> m_hosting_process;
     u64 m_agent_cluster_id { 0 };
+    bool m_agent_cluster_is_origin_keyed { false };
     Web::HTML::CrossOriginIsolationMode m_agent_cluster_cross_origin_isolation_mode { Web::HTML::CrossOriginIsolationMode::None };
 };
 
@@ -63,6 +65,11 @@ public:
     // https://html.spec.whatwg.org/multipage/webappapis.html#obtain-similar-origin-window-agent
     NonnullRefPtr<CanonicalSimilarOriginWindowAgent> obtain_similar_origin_window_agent(URL::Origin const&, bool requests_oac);
     RefPtr<CanonicalSimilarOriginWindowAgent> similar_origin_window_agent_for(URL::Origin const&) const;
+
+    // The process hosting this group's sandboxed documents of an origin, named by the serialized origin. It hosts no
+    // other documents of the origin, since a sandbox exists to keep its content away from them.
+    RefPtr<WebContentClient> process_hosting_sandboxed_documents_of_origin(String const&) const;
+    void set_process_hosting_sandboxed_documents_of_origin(String const&, WebContentClient&);
 
 private:
     CanonicalBrowsingContextGroup() = default;
@@ -99,6 +106,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#historical-agent-cluster-key-map
     HashMap<URL::Origin, AgentClusterKey> m_historical_agent_cluster_key_map;
+
+    HashMap<String, WeakPtr<WebContentClient>> m_processes_hosting_sandboxed_documents;
 };
 
 }

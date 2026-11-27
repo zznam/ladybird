@@ -13,6 +13,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::runtime::error::Error;
+use crate::runtime::function_object::FunctionObject;
 use crate::runtime::realm::Realm;
 
 #[repr(C)]
@@ -32,22 +33,26 @@ impl Deref for AggregateError {
 }
 
 impl AggregateError {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> AggregateError {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> AggregateError {
         AggregateError {
-            base: Error::new(vm, Self::CLASS, prototype),
+            base: Error::new(vm, realm, Self::CLASS, prototype),
         }
     }
 
-    pub fn new_in_constructor(vm: &Vm, prototype: Gc<Object>) -> AggregateError {
+    pub fn new_in_constructor(
+        vm: &Vm,
+        realm: Gc<Realm>,
+        prototype: Gc<Object>,
+        new_target: Gc<FunctionObject>,
+    ) -> AggregateError {
         AggregateError {
-            base: Error::new_in_constructor(vm, Self::CLASS, prototype),
+            base: Error::new_in_constructor(vm, realm, Self::CLASS, prototype, new_target),
         }
     }
 
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<AggregateError> {
-        realm.create_object(
-            vm,
-            AggregateError::new(vm, realm.intrinsics().aggregate_error_prototype(vm)),
-        )
+        realm.create_object(vm, |_| {
+            AggregateError::new(vm, realm, realm.intrinsics().aggregate_error_prototype(vm))
+        })
     }
 }

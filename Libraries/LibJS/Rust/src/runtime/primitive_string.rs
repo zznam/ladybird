@@ -5,14 +5,17 @@
  */
 
 use core::cell::{Cell, UnsafeCell};
+use core::hash::BuildHasher;
 
-use ak::{Utf16FlyString, Utf16String};
+use ak::{Utf16FlyString, Utf16String, Utf16StringUnits};
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Class, ExternalMemorySize, GcCell, define_cell};
+use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
-use crate::interpreter::vm::{StringToAtomCacheEntry, Vm};
+use crate::interpreter::vm::{CHARACTERS_TO_ATOM_CACHE_SIZE, StringToAtomCacheEntry, Vm};
 use crate::layout::cell::{CellHeader, Gc};
+use crate::layout::member::NullableMember;
 use crate::layout::primitive_string::{DEFERRED_KIND_MASK, INTERNED_FLAG};
 pub use crate::layout::primitive_string::{DeferredKind, INLINE_STRING_CAPACITY, InlineString, PrimitiveString};
 use crate::layout::value::Value;
@@ -49,9 +52,11 @@ unsafe impl Trace for PrimitiveString {
 #[derive(Trace)]
 pub struct RopeString {
     base: PrimitiveString,
-    lhs: Cell<Option<Gc<PrimitiveString>>>,
-    rhs: Cell<Option<Gc<PrimitiveString>>>,
+    lhs: NullableMember<PrimitiveString>,
+    rhs: NullableMember<PrimitiveString>,
 }
+
+const _: () = assert!(size_of::<RopeString>() == 32);
 
 /// Where a rope string keeps its two halves, for JIT code that creates rope strings itself.
 pub const ROPE_STRING_LHS_OFFSET: usize = core::mem::offset_of!(RopeString, lhs);
@@ -65,13 +70,18 @@ pub const ROPE_STRING_MIN_LENGTH: u32 = crate::utf16::MAX_SHORT_STRING_BYTE_COUN
 #[derive(Trace)]
 pub struct Substring {
     base: PrimitiveString,
-    source_string: Cell<Option<Gc<PrimitiveString>>>,
-    code_unit_offset: usize,
+    source_string: NullableMember<PrimitiveString>,
+    /// Strings are shorter than 2^32 code units, like their lengths.
+    code_unit_offset: u32,
 }
+
+const _: () = assert!(size_of::<Substring>() == 32);
 
 // SAFETY: The characters hold no cells.
 unsafe impl Trace for InlineString {
-    fn trace(&self, _: &mut Visitor) {}
+    fn trace(&self, visitor: &mut Visitor) {
+        self.base.trace(visitor);
+    }
 }
 
 /// OPTIMIZATION: Copies the at most INLINE_STRING_CAPACITY bytes of `source` to the start of `destination` with two
@@ -121,6 +131,14 @@ fn is_ascii(code_unit: u16) -> bool {
     code_unit < 0x80
 }
 
+/// The most ASCII characters of a string that the VM remembers the fly string of by its characters, see
+/// Vm::characters_to_atom_cache().
+pub const KEY_STRING_MAX_LENGTH: usize = INLINE_STRING_CAPACITY;
+
+/// How deep the ropes in a rope that becomes a property key are remembered as concatenations: enough for the ropes
+/// that a template literal with a few substitutions makes on the way to its string.
+const REMEMBERED_KEY_CONCATENATION_DEPTH: usize = 3;
+
 impl PrimitiveString {
     fn fly_string_cache_hash(string: &Utf16FlyString) -> usize {
         u64_hash(string.raw_identity() as u64) as usize
@@ -161,7 +179,7 @@ impl PrimitiveString {
             return Self::create_from_fly_string(vm, &to_utf16_fly_string(&string));
         }
 
-        vm.heap().allocate(Self::new(string))
+        vm.heap().allocate(|_| Self::new(string))
     }
 
     /// Creates a string of ASCII characters.
@@ -184,7 +202,7 @@ impl PrimitiveString {
         if length < size_of::<usize>() {
             return Self::create(vm, Utf16String::from_ascii(&characters[..length]));
         }
-        vm.heap().allocate(InlineString::new(characters, length)).upcast()
+        vm.heap().allocate(|_| InlineString::new(characters, length)).upcast()
     }
 
     pub fn create_from_utf16_view(vm: &Vm, string: Utf16View<'_>) -> Gc<PrimitiveString> {
@@ -225,7 +243,7 @@ impl PrimitiveString {
             return interned_string;
         }
 
-        let new_string = vm.heap().allocate(Self::new(Utf16String::from(string)));
+        let new_string = vm.heap().allocate(|_| Self::new(Utf16String::from(string)));
         cache_slot.set(Some(new_string));
         new_string
     }
@@ -262,7 +280,7 @@ impl PrimitiveString {
             {
                 cached_string
             }
-            _ => vm.heap().allocate(Self::new(Utf16String::from(string))),
+            _ => vm.heap().allocate(|_| Self::new(Utf16String::from(string))),
         };
         interned_string.set_interned();
         vm.interned_strings()
@@ -351,7 +369,7 @@ impl PrimitiveString {
 
     /// The rope string of the non-empty strings `lhs` and `rhs`, whose lengths add up to less than `u32::MAX`.
     pub(crate) fn create_rope(vm: &Vm, lhs: Gc<PrimitiveString>, rhs: Gc<PrimitiveString>) -> Gc<PrimitiveString> {
-        vm.heap().allocate(RopeString::new(lhs, rhs)).upcast()
+        vm.heap().allocate(|_| RopeString::new(lhs, rhs)).upcast()
     }
 
     pub fn create_from_substring(
@@ -398,13 +416,13 @@ impl PrimitiveString {
             return Self::create_from_substring(
                 vm,
                 substring.source_string(),
-                substring.code_unit_offset + code_unit_offset,
+                substring.code_unit_offset() + code_unit_offset,
                 code_unit_length,
             );
         }
 
         vm.heap()
-            .allocate(Substring::new(string, code_unit_offset, code_unit_length))
+            .allocate(|_| Substring::new(string, code_unit_offset, code_unit_length))
             .upcast()
     }
 
@@ -433,18 +451,23 @@ impl PrimitiveString {
     }
 
     pub fn utf16_string(&self) -> Utf16String {
+        self.utf16_string_in_place().clone()
+    }
+
+    /// The string's own UTF-16 string, resolving a deferred string first. It stays where it is, unchanged, for as long
+    /// as the string lives, since a resolved string never changes.
+    pub fn utf16_string_in_place(&self) -> &Utf16String {
         self.resolve_if_needed();
 
         self.resolved_utf16_string()
             .expect("a resolved string has its UTF-16 string")
-            .clone()
     }
 
     pub fn property_key(&self, vm: &Vm) -> PropertyKey {
         // OPTIMIZATION: A string that is not resolved yet resolves into the fly string of its key, so that every later
         //               key of it is its own storage. The keyed access caches of the JIT tell keys apart by that storage.
         if self.deferred_kind() != DeferredKind::None {
-            return PropertyKey::from(self.resolve_into_fly_string());
+            return PropertyKey::from(self.resolve_into_fly_string(vm));
         }
         let string = self
             .resolved_utf16_string()
@@ -531,7 +554,7 @@ impl PrimitiveString {
                 let source_string = unsafe { source_string.as_non_null().as_ref() };
                 return source_string
                     .utf16_string_view()
-                    .substring_view(substring.code_unit_offset, self.length_in_utf16_code_units());
+                    .substring_view(substring.code_unit_offset(), self.length_in_utf16_code_units());
             }
             self.resolve_if_needed();
         }
@@ -585,13 +608,33 @@ impl PrimitiveString {
     /// Resolves a deferred string into the fly string of its contents rather than into storage of its own, and
     /// returns that fly string.
     #[inline(never)]
-    fn resolve_into_fly_string(&self) -> Utf16FlyString {
-        let fly_string = match self.deferred_kind() {
-            DeferredKind::None => unreachable!("only deferred strings are resolved"),
-            DeferredKind::Rope => to_utf16_fly_string(&self.as_rope_string().concatenation()),
-            DeferredKind::Substring => to_utf16_fly_string(&self.utf16_string_view().to_utf16_string()),
-            // NB: The few characters of an inline string are looked up before they are copied into storage.
-            DeferredKind::Inline => self.utf16_string_view().to_utf16_fly_string(),
+    fn resolve_into_fly_string(&self, vm: &Vm) -> Utf16FlyString {
+        if self.deferred_kind() == DeferredKind::Rope {
+            self.as_rope_string()
+                .remember_key_concatenations(vm, REMEMBERED_KEY_CONCATENATION_DEPTH);
+        }
+        // NB: Only the pieces of a rope have to be put together to look at its characters.
+        let mut rope_characters = [0; KEY_STRING_MAX_LENGTH];
+        let length = self.length_in_utf16_code_units();
+        let few_ascii_characters = if length > KEY_STRING_MAX_LENGTH {
+            None
+        } else if self.deferred_kind() == DeferredKind::Rope {
+            self.append_ascii_characters(&mut rope_characters, &mut 0)
+                .then(|| &rope_characters[..length])
+        } else {
+            match self.utf16_string_view() {
+                Utf16View::Ascii(characters) => Some(characters),
+                Utf16View::Latin1(_) | Utf16View::Utf16(_) => None,
+            }
+        };
+        let fly_string = match few_ascii_characters {
+            Some(characters) => Self::fly_string_of_few_ascii_characters(vm, characters),
+            None => match self.deferred_kind() {
+                DeferredKind::None => unreachable!("only deferred strings are resolved"),
+                DeferredKind::Rope => to_utf16_fly_string(&self.as_rope_string().concatenation()),
+                DeferredKind::Substring => to_utf16_fly_string(&self.utf16_string_view().to_utf16_string()),
+                DeferredKind::Inline => self.utf16_string_view().to_utf16_fly_string(),
+            },
         };
         let string = Utf16String::from(&fly_string);
         match self.deferred_kind() {
@@ -603,6 +646,52 @@ impl PrimitiveString {
         fly_string
     }
 
+    /// Copies the characters of this string of at most KEY_STRING_MAX_LENGTH code units into `characters` from
+    /// `offset` on, and moves `offset` past them. Returns false, with some of them copied, if the string or a piece of
+    /// it is not kept as ASCII.
+    fn append_ascii_characters(&self, characters: &mut [u8; KEY_STRING_MAX_LENGTH], offset: &mut usize) -> bool {
+        if self.deferred_kind() == DeferredKind::Rope {
+            // NB: The halves of a rope are not empty, so a rope this short is not deep either.
+            let rope_string = self.as_rope_string();
+            return rope_string.lhs().append_ascii_characters(characters, offset)
+                && rope_string.rhs().append_ascii_characters(characters, offset);
+        }
+        let Utf16View::Ascii(own_characters) = self.utf16_string_view() else {
+            return false;
+        };
+        copy_few_bytes(&mut characters[*offset..], own_characters);
+        *offset += own_characters.len();
+        true
+    }
+
+    /// The fly string of the at most KEY_STRING_MAX_LENGTH ASCII `characters`.
+    ///
+    /// OPTIMIZATION: Programs put the same few keys together again and again, like "on" + type, and each time the key
+    ///               is a new string. The VM remembers the fly strings of such keys by their characters, so finding
+    ///               one again takes no storage for the characters and no lookup in AK's fly string table.
+    fn fly_string_of_few_ascii_characters(vm: &Vm, characters: &[u8]) -> Utf16FlyString {
+        let hash = foldhash::fast::FixedState::default().hash_one(characters);
+        let index = hash as usize & (CHARACTERS_TO_ATOM_CACHE_SIZE - 1);
+        let missed_before = {
+            let mut cache = vm.characters_to_atom_cache().borrow_mut();
+            let entry = &mut cache[index];
+            if let Some(fly_string) = &entry.fly_string
+                && matches!(fly_string.as_units(), Utf16StringUnits::Ascii(remembered) if remembered == characters)
+            {
+                entry.missed_hash = 0;
+                return fly_string.clone();
+            }
+            core::mem::replace(&mut entry.missed_hash, hash) == hash
+        };
+        // NB: The few characters are looked up in AK's fly string table before they are copied into storage.
+        let fly_string = Utf16View::Ascii(characters).to_utf16_fly_string();
+        // NB: Keys that are only used once leave the entry to the key that is used again and again.
+        if missed_before {
+            vm.characters_to_atom_cache().borrow_mut()[index].fly_string = Some(fly_string.clone());
+        }
+        fly_string
+    }
+
     /// The characters of a string that is inline or resolved and ASCII.
     #[inline(always)]
     fn flat_ascii_characters(&self) -> Option<&[u8]> {
@@ -610,7 +699,7 @@ impl PrimitiveString {
             DeferredKind::Inline => Some(self.as_inline_string().characters()),
             DeferredKind::None => match Utf16View::of_string(self.resolved_utf16_string()?) {
                 Utf16View::Ascii(characters) => Some(characters),
-                Utf16View::Utf16(_) => None,
+                Utf16View::Latin1(_) | Utf16View::Utf16(_) => None,
             },
             DeferredKind::Rope | DeferredKind::Substring => None,
         }
@@ -637,7 +726,7 @@ impl PrimitiveString {
     }
 
     fn header_class(&self) -> &'static Class {
-        self.header.class
+        self.header.class()
     }
 
     pub fn deferred_kind(&self) -> DeferredKind {
@@ -703,8 +792,8 @@ impl RopeString {
                 DeferredKind::Rope,
                 lhs.length_in_utf16_code_units() + rhs.length_in_utf16_code_units(),
             ),
-            lhs: Cell::new(Some(lhs)),
-            rhs: Cell::new(Some(rhs)),
+            lhs: NullableMember::new(Some(lhs)),
+            rhs: NullableMember::new(Some(rhs)),
         }
     }
 
@@ -739,6 +828,26 @@ impl RopeString {
         self.base.set_deferred_kind(DeferredKind::None);
         self.lhs.set(None);
         self.rhs.set(None);
+    }
+
+    /// Remembers this rope, which is about to become a property key, as the concatenation of its halves, and the
+    /// ropes among its halves as the concatenations of theirs, `depth` ropes deep.
+    ///
+    /// OPTIMIZATION: Programs put the same key together for every access, like "on" + type, and each time the key is
+    ///               a new rope that has to be resolved. JIT code looks up the two strings of a concatenation that is
+    ///               a key in the VM's cache of these concatenations, and takes the string that was the key before,
+    ///               which the caches of keyed accesses know by now.
+    fn remember_key_concatenations(&self, vm: &Vm, depth: usize) {
+        let (lhs, rhs) = (self.lhs(), self.rhs());
+        vm.remember_key_concatenation(lhs, rhs, Gc::from_ref(&self.base));
+        if depth == 0 {
+            return;
+        }
+        for half in [lhs, rhs] {
+            if half.deferred_kind() == DeferredKind::Rope {
+                half.as_rope_string().remember_key_concatenations(vm, depth - 1);
+            }
+        }
     }
 
     fn concatenate_pieces(&self) -> Utf16String {
@@ -778,15 +887,15 @@ impl RopeString {
     }
 
     fn concatenate_many_pieces(&self) -> Utf16String {
-        // This vector will hold all the pieces of the rope that need to be assembled
+        let vm = Vm::of_cell(self);
+
+        // This list will hold all the pieces of the rope that need to be assembled
         // into the resolved string.
-        // NB: Resolving takes no VM, so it cannot allocate cells or collect garbage while these vectors hold strings
-        //     that only the rope keeps alive.
-        let mut pieces: Vec<Gc<PrimitiveString>> = Vec::with_capacity(2);
+        let pieces = MarkedVec::with_capacity(vm, 2);
 
         // NOTE: We traverse the rope tree without using recursion, since we'd run out of
         //       stack space quickly when handling a long sequence of unresolved concatenations.
-        let mut stack: Vec<Gc<PrimitiveString>> = Vec::with_capacity(2);
+        let stack = MarkedVec::with_capacity(vm, 2);
         stack.push(self.rhs());
         stack.push(self.lhs());
         while let Some(current) = stack.pop() {
@@ -800,6 +909,7 @@ impl RopeString {
             pieces.push(current);
         }
 
+        let pieces = pieces.values();
         let views: Vec<Utf16View<'_>> = pieces.iter().map(|piece| piece.utf16_string_view()).collect();
         concatenate(&views)
     }
@@ -809,9 +919,13 @@ impl Substring {
     fn new(source_string: Gc<PrimitiveString>, code_unit_offset: usize, code_unit_length: usize) -> Self {
         Self {
             base: PrimitiveString::new_deferred(Self::CLASS, DeferredKind::Substring, code_unit_length),
-            source_string: Cell::new(Some(source_string)),
-            code_unit_offset,
+            source_string: NullableMember::new(Some(source_string)),
+            code_unit_offset: u32::try_from(code_unit_offset).expect("strings are shorter than 2^32 code units"),
         }
+    }
+
+    fn code_unit_offset(&self) -> usize {
+        self.code_unit_offset as usize
     }
 
     fn source_string(&self) -> Gc<PrimitiveString> {
@@ -824,7 +938,7 @@ impl Substring {
         let source_string = self.source_string();
         let source_view = source_string
             .utf16_string_view()
-            .substring_view(self.code_unit_offset, self.base.length_in_utf16_code_units());
+            .substring_view(self.code_unit_offset(), self.base.length_in_utf16_code_units());
 
         self.set_resolved_utf16_string(source_view.to_utf16_string());
     }

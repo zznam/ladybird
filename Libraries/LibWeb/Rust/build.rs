@@ -71,13 +71,15 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
          pub(crate) const MEDIA_FEATURE_VALUE_INTEGER: u8 = 1 << 1;\n\
          pub(crate) const MEDIA_FEATURE_VALUE_LENGTH: u8 = 1 << 2;\n\
          pub(crate) const MEDIA_FEATURE_VALUE_RATIO: u8 = 1 << 3;\n\
-         pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_NUMBER: u8 = 1 << 5;\n\n\
          pub(crate) struct MediaFeatureMetadata {\n\
              pub name: &'static str,\n\
              pub allows_range: bool,\n\
              pub accepted_value_types: u8,\n\
              pub accepted_keywords: &'static [u16],\n\
              pub false_keywords: &'static [u16],\n\
+             pub implied_keywords: &'static [(u16, u16)],\n\
          }\n\n\
          pub(crate) const MEDIA_FEATURES: &[MediaFeatureMetadata] = &[\n",
     );
@@ -97,6 +99,7 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             match value {
                 "<mq-boolean>" => value_types.push("MEDIA_FEATURE_VALUE_BOOLEAN"),
                 "<integer>" => value_types.push("MEDIA_FEATURE_VALUE_INTEGER"),
+                "<number>" => value_types.push("MEDIA_FEATURE_VALUE_NUMBER"),
                 "<length>" => value_types.push("MEDIA_FEATURE_VALUE_LENGTH"),
                 "<ratio>" => value_types.push("MEDIA_FEATURE_VALUE_RATIO"),
                 "<resolution>" => value_types.push("MEDIA_FEATURE_VALUE_RESOLUTION"),
@@ -130,9 +133,28 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             .transpose()?
             .unwrap_or_default()
             .join(", ");
+        // Each environment keyword maps to the queried keywords that it matches as well as itself.
+        let mut implied_keywords = Vec::new();
+        if let Some(implications) = feature.get("implied-keywords") {
+            let implications = implications.as_object().ok_or("implied keywords are not an object")?;
+            for (environment_keyword, queried_keywords) in implications {
+                let queried_keywords = queried_keywords
+                    .as_array()
+                    .ok_or("implied keywords of a keyword are not an array")?;
+                for queried_keyword in queried_keywords {
+                    let queried_keyword = queried_keyword.as_str().ok_or("implied keyword is not a string")?;
+                    implied_keywords.push(format!(
+                        "(crate::css::css_enums::keyword::{}, crate::css::css_enums::keyword::{})",
+                        keyword_constant(environment_keyword),
+                        keyword_constant(queried_keyword)
+                    ));
+                }
+            }
+        }
+        let implied_keywords = implied_keywords.join(", ");
         writeln!(
             output,
-            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
+            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}], implied_keywords: &[{implied_keywords}] }},"
         )?;
     }
     output.push_str("];\n");
@@ -235,7 +257,7 @@ fn generate_descriptor_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(
          pub(crate) enum DescriptorValueType { CounterStyleSystem, CounterStyleAdditiveSymbols, CounterStyleName, CounterStyleNegative, CounterStylePad, CounterStyleRange, CropOrCross, FamilyName, FontSrcList, FontWeightAbsolutePair, Length, OptionalDeclarationValue, PageSize, PositivePercentage, String, Symbol, Symbols, UnicodeRangeTokens }\n\n\
          pub(crate) struct DescriptorMetadata { pub id: u8, pub syntax: &'static [DescriptorSyntax], pub allow_arbitrary_substitution_functions: bool, pub allow_css_wide_keywords: bool }\n\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
-         pub(crate) struct DescriptorLonghand { pub descriptor_id: u8, pub property_id: u16 }\n\n\
+         pub(crate) struct DescriptorLonghand { pub descriptor_id: u8, pub property_id: u16, pub name: &'static str }\n\n\
          fn equals(value: &[u16], expected: &[u8]) -> bool { value.len() == expected.len() && value.iter().zip(expected).all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right))) }\n\n\
          pub(crate) fn descriptor_metadata(at_rule: u8, name: &[u16]) -> Option<DescriptorMetadata> {\n    match at_rule {\n",
     );
@@ -366,16 +388,17 @@ fn generate_descriptor_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(
                 generated_longhands.push((
                     descriptor_id(longhand)?,
                     longhand.replace('-', "_").to_ascii_uppercase(),
+                    longhand,
                 ));
             }
             if generated_longhands.is_empty() {
                 continue;
             }
             write!(output, "        ({at_rule_index}, {}) => &[", descriptor_id(name)?)?;
-            for (longhand_id, property_constant) in generated_longhands {
+            for (longhand_id, property_constant, longhand_name) in generated_longhands {
                 write!(
                     output,
-                    "DescriptorLonghand {{ descriptor_id: {longhand_id}, property_id: property_id::{property_constant} }},"
+                    "DescriptorLonghand {{ descriptor_id: {longhand_id}, property_id: property_id::{property_constant}, name: \"{longhand_name}\" }},"
                 )?;
             }
             output.push_str("],\n");
@@ -442,15 +465,13 @@ fn write_enum_and_from_ffi(output: &mut String, enum_name: &str, variants: &[Str
     }
     writeln!(output, "}}").unwrap();
     writeln!(output).unwrap();
-    // Only the pseudo-classes cross the boundary as numbers.
-    if enum_name != "PseudoClassType" {
-        return;
-    }
-    writeln!(
-        output,
-        "pub(crate) fn pseudo_class_from_ffi(value: u8) -> {enum_name} {{"
-    )
-    .unwrap();
+    // The pseudo-classes cross the boundary as numbers, and parsed selectors hold both kinds as numbers.
+    let function_name = match enum_name {
+        "PseudoClassType" => "pseudo_class_from_ffi",
+        "PseudoElementType" => "pseudo_element_from_ffi",
+        _ => return,
+    };
+    writeln!(output, "pub(crate) fn {function_name}(value: u8) -> {enum_name} {{").unwrap();
     writeln!(output, "    match value {{").unwrap();
     for (index, variant) in variants.iter().enumerate() {
         writeln!(output, "        {index} => {enum_name}::{variant},").unwrap();
@@ -663,7 +684,7 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
 
     let mut compiler_mapping = String::from(
         "// Generated by build.rs from CSS/PseudoClasses.json.\n\n\
-         fn state_fact_for(pseudo_class: PseudoClassType) -> Option<StateFact> {\n\
+         pub(super) fn state_fact_for(pseudo_class: PseudoClassType) -> Option<StateFact> {\n\
          \x20   match pseudo_class {\n",
     );
     for name in &state_fact_names {
@@ -844,14 +865,21 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         }
         Ok(result.into_iter().collect())
     };
-    let always_allowed_pseudo_properties = property_ids(
+    let transition_and_animation_pseudo_properties = property_ids(
         property_groups
-            .get("#always-allowed-properties")
-            .ok_or("missing always-allowed pseudo-element property group")?,
+            .get("#transition-and-animation-properties")
+            .ok_or("missing transition and animation pseudo-element property group")?,
     )?;
     let mut pseudo_property_whitelist_rows = Vec::new();
+    let mut pseudo_accepts_animations_rows = Vec::new();
     for name in ordered_pseudo_element_names(&pseudo_elements)? {
         let object = pseudo_elements[&name].as_object().unwrap();
+        pseudo_accepts_animations_rows.push(
+            object
+                .get("accepts-animations")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        );
         let Some(whitelist) = object.get("property-whitelist") else {
             pseudo_property_whitelist_rows.push("    None,".to_string());
             continue;
@@ -867,9 +895,12 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     }
     // UnknownWebKit follows the known pseudo-elements and accepts all properties.
     pseudo_property_whitelist_rows.push("    None,".to_string());
+    pseudo_accepts_animations_rows.push(true);
 
     // The longhands other longhands' computation reads, which are computed first.
     let manual_order = [
+        // zoom is required to compute every length, including font-size.
+        "zoom",
         // math-depth is required to compute font-size.
         "math-depth",
         // Font properties are required to absolutize font-relative units used in other properties, including line-height.
@@ -880,6 +911,8 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "font-size",
         "font-size-adjust",
         "font-style",
+        "font-synthesis-style",
+        "font-synthesis-weight",
         "font-variant-alternates",
         "font-variant-caps",
         "font-variant-east-asian",
@@ -927,7 +960,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let mut affects_hit_testing = vec![false; levels.len()];
     let mut style_group_indices = vec![u8::MAX; levels.len()];
     let mut initial_values = vec![String::new(); levels.len()];
-    let mut numeric_range_rows = vec![String::new(); levels.len()];
     let value_types = [
         "anchor",
         "anchor-size",
@@ -1025,29 +1057,28 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         affects_hit_testing[index] = metadata_flag("affects-hit-testing", false);
         let style_group = property_field(name, "style-group").and_then(|value| value.as_str().map(str::to_owned));
         style_group_indices[index] = match style_group.as_deref() {
-            Some("InheritedTableValues") => 0,
-            Some("InheritedListValues") => 1,
-            Some("InheritedUIValues") => 2,
-            Some("InheritedSVGValues") => 3,
-            Some("InheritedTextValues") => 4,
-            Some("InheritedBoxValues") => 5,
-            Some("FontValues") => 6,
-            Some("AnimationValues") => 7,
-            Some("SVGResetValues") => 8,
-            Some("GridValues") => 9,
-            Some("AnchorValues") => 10,
-            Some("EffectsValues") => 11,
-            Some("MaskValues") => 12,
-            Some("TextResetValues") => 13,
-            Some("ContentValues") => 14,
-            Some("TransformValues") => 15,
-            Some("BackgroundValues") => 16,
-            Some("BorderValues") => 17,
-            Some("AlignmentValues") => 18,
-            Some("MiscResetValues") => 19,
-            Some("SizingValues") => 20,
-            Some("SurroundValues") => 21,
-            Some("BoxValues") => 22,
+            Some("InheritedListTableValues") => 0,
+            Some("InheritedUIValues") => 1,
+            Some("InheritedSVGValues") => 2,
+            Some("InheritedTextValues") => 3,
+            Some("FontValues") => 4,
+            Some("AnimationValues") => 5,
+            Some("SVGResetValues") => 6,
+            Some("GridValues") => 7,
+            Some("AnchorValues") => 8,
+            Some("ContentValues") => 9,
+            Some("AlignmentValues") => 10,
+            Some("MiscLayoutValues") => 11,
+            Some("MiscInteractionValues") => 12,
+            Some("EffectsValues") => 13,
+            Some("MaskValues") => 14,
+            Some("TextResetValues") => 15,
+            Some("TransformValues") => 16,
+            Some("BackgroundValues") => 17,
+            Some("BorderValues") => 18,
+            Some("SizingValues") => 19,
+            Some("SurroundValues") => 20,
+            Some("BoxValues") => 21,
             Some(group) => return Err(format!("unknown style group '{group}' for {name}").into()),
             None => u8::MAX,
         };
@@ -1055,43 +1086,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         initial_values[index] = property_field(name, "initial")
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| format!("missing initial value for {name}"))?;
-
-        let mut ranges = Vec::new();
-        if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
-            for valid_type in valid_types {
-                let valid_type = valid_type.as_str().unwrap();
-                let Some((type_name, range)) = valid_type.split_once(' ') else {
-                    continue;
-                };
-                if !range.starts_with('[') || !range.ends_with(']') || !range.contains(',') {
-                    continue;
-                }
-                if type_name == "custom-ident" {
-                    continue;
-                }
-                let value_type = value_types
-                    .iter()
-                    .position(|candidate| *candidate == type_name)
-                    .ok_or_else(|| format!("unknown ranged value type '{type_name}' for {name}"))?;
-                let (min, max) = range[1..range.len() - 1]
-                    .split_once(',')
-                    .ok_or_else(|| format!("bad numeric range '{range}' for {name}"))?;
-                let format_bound = |bound: &str| match (type_name, bound) {
-                    ("integer", "-∞") => "i32::MIN as f64".to_string(),
-                    ("integer", "∞") => "i32::MAX as f64".to_string(),
-                    (_, "-∞") => "f32::MIN as f64".to_string(),
-                    (_, "∞") => "f32::MAX as f64".to_string(),
-                    _ if bound.contains('.') => bound.to_string(),
-                    _ => format!("{bound}.0"),
-                };
-                ranges.push(format!(
-                    "FfiPropertyNumericRange {{ value_type: {value_type}, min: {}, max: {} }}",
-                    format_bound(min),
-                    format_bound(max)
-                ));
-            }
-        }
-        numeric_range_rows[index] = ranges.join(", ");
     }
 
     let mut output = String::new();
@@ -1099,6 +1093,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     // Shorthand expansion tables for the cascade. The "all" shorthand expands to every
     // longhand except direction and unicode-bidi, mirroring the C++ generator.
     let mut shorthand_rows = Vec::new();
+    let mut immediate_longhands = Vec::new();
     for name in &shorthands {
         let longhand_names: Vec<String> = if name == "all" {
             properties
@@ -1123,6 +1118,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         };
         let ids_row: Vec<u16> = longhand_names.iter().map(|longhand| ids[longhand]).collect();
         shorthand_rows.push(format!("    &{ids_row:?},"));
+        immediate_longhands.push(longhand_names);
     }
     output.push_str(&format!(
         "pub(crate) static SHORTHAND_EXPANSIONS: [&[u16]; {}] = [\n{}\n];\n\n",
@@ -1479,6 +1475,68 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         .map(|name| logical_group_by_property.get(name).copied().unwrap_or(0))
         .collect();
     let expanded_longhand_counts: Vec<usize> = expanded_shorthand_longhands.iter().map(Vec::len).collect();
+    let expanded_longhand_rows: Vec<String> = expanded_shorthand_longhands
+        .iter()
+        .map(|longhands| {
+            let row: Vec<u16> = longhands.iter().map(|longhand| ids[longhand]).collect();
+            format!("    &{row:?},")
+        })
+        .collect();
+
+    // Each property's shorthands, in preferred order: the most longhands first, then those not starting with "-",
+    // then those starting with "-webkit-", then lexicographically.
+    // https://drafts.csswg.org/cssom/#concept-shorthands-preferred-order
+    let is_legacy_shorthand = |name: &str| {
+        properties[name]
+            .get("legacy-shorthand")
+            .and_then(|value| value.as_bool())
+    };
+    let mut immediate_shorthands = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (name, longhands) in shorthands.iter().zip(&immediate_longhands) {
+        if is_legacy_shorthand(name) == Some(true) {
+            continue;
+        }
+        for longhand in longhands {
+            immediate_shorthands.entry(longhand).or_default().push(name);
+        }
+    }
+    fn shorthands_of<'a>(
+        property: &str,
+        immediate_shorthands: &std::collections::HashMap<&str, Vec<&'a str>>,
+        result: &mut Vec<&'a str>,
+    ) {
+        for shorthand in immediate_shorthands.get(property).into_iter().flatten() {
+            result.push(shorthand);
+            shorthands_of(shorthand, immediate_shorthands, result);
+        }
+    }
+    let expanded_longhand_count = |shorthand: &str| {
+        let index = shorthands.iter().position(|name| name == shorthand).unwrap();
+        expanded_longhand_counts[index]
+    };
+    let shorthands_for_longhand_rows: Vec<String> = property_names
+        .iter()
+        .map(|name| {
+            let mut result = Vec::new();
+            shorthands_of(name, &immediate_shorthands, &mut result);
+            result.sort_by_key(|shorthand| {
+                (
+                    std::cmp::Reverse(expanded_longhand_count(shorthand)),
+                    shorthand.starts_with('-'),
+                    !shorthand.starts_with("-webkit-"),
+                    *shorthand,
+                )
+            });
+            let row: Vec<u16> = result.iter().map(|shorthand| ids[*shorthand]).collect();
+            format!("    &{row:?},")
+        })
+        .collect();
+    let mut legacy_shorthands: Vec<u16> = shorthands
+        .iter()
+        .filter(|name| is_legacy_shorthand(name) == Some(true))
+        .map(|name| ids[name])
+        .collect();
+    legacy_shorthands.sort_unstable();
 
     // Accepted property keywords are a property's valid identifiers and the
     // keywords of the enums in its valid types.
@@ -1490,6 +1548,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let mut coordinating_list_rows = Vec::new();
     let mut maximum_value_count_rows = Vec::new();
     let mut percentages_resolve_to_rows = Vec::new();
+    let mut numeric_range_rows = Vec::new();
     let mut unitless_length_quirk_rows = Vec::new();
     let mut hashless_hex_color_quirk_rows = Vec::new();
     for name in &property_names {
@@ -1593,6 +1652,42 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             }
             None => "    None,".to_string(),
         });
+        let mut ranges = Vec::new();
+        if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
+            for valid_type in valid_types {
+                let valid_type = valid_type.as_str().unwrap();
+                let Some((type_name, range)) = valid_type.split_once(' ') else {
+                    continue;
+                };
+                if !range.starts_with('[') || !range.ends_with(']') || !range.contains(',') {
+                    continue;
+                }
+                if type_name == "custom-ident" {
+                    continue;
+                }
+                let value_type = value_types
+                    .iter()
+                    .position(|candidate| *candidate == type_name)
+                    .ok_or_else(|| format!("unknown ranged value type '{type_name}' for {name}"))?;
+                let (min, max) = range[1..range.len() - 1]
+                    .split_once(',')
+                    .ok_or_else(|| format!("bad numeric range '{range}' for {name}"))?;
+                let format_bound = |bound: &str| match (type_name, bound) {
+                    ("integer", "-∞") => "i32::MIN as f64".to_string(),
+                    ("integer", "∞") => "i32::MAX as f64".to_string(),
+                    (_, "-∞") => "f32::MIN as f64".to_string(),
+                    (_, "∞") => "f32::MAX as f64".to_string(),
+                    _ if bound.contains('.') => bound.to_string(),
+                    _ => format!("{bound}.0"),
+                };
+                ranges.push(format!(
+                    "FfiPropertyNumericRange {{ value_type: {value_type}, min: {}, max: {} }}",
+                    format_bound(min),
+                    format_bound(max)
+                ));
+            }
+        }
+        numeric_range_rows.push(ranges.join(", "));
         unitless_length_quirk_rows.push(
             property_field(name, "quirks")
                 .and_then(|value| value.as_array().cloned())
@@ -1619,8 +1714,28 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         idl_names.len(),
         idl_names
     ));
+    // The IDL attribute names of the properties and of their legacy aliases, ASCII-lowercased and sorted, with the
+    // ids they name, as the C++ generator's case-insensitive table of them looks them up. A later name wins where two
+    // lowercase alike, as it does in that table.
+    let mut camel_case_lookup: Vec<(String, u16)> = Vec::new();
+    for (name, value) in &properties {
+        let object = value.as_object().unwrap();
+        let target = object
+            .get("legacy-alias-for")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(name);
+        let key = camel_case_property_name(name).to_ascii_lowercase();
+        camel_case_lookup.retain(|(existing, _)| *existing != key);
+        camel_case_lookup.push((key, ids[target]));
+    }
+    camel_case_lookup.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     output.push_str(&format!(
-        "pub(crate) static PROPERTY_IS_LOGICAL_ALIAS: [bool; {}] = {:?};\n\n",
+        "pub(crate) static PROPERTY_CAMEL_CASE_LOOKUP: [(&str, u16); {}] = {:?};\n",
+        camel_case_lookup.len(),
+        camel_case_lookup
+    ));
+    output.push_str(&format!(
+        "pub(crate) const PROPERTY_IS_LOGICAL_ALIAS: [bool; {}] = {:?};\n\n",
         logical_aliases.len(),
         logical_aliases
     ));
@@ -1630,7 +1745,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         logical_groups
     ));
     output.push_str(&format!(
-        "pub(crate) static LOGICAL_ALIAS_TO_PHYSICAL: [u16; {}] = {:?};\n\n",
+        "pub(crate) const LOGICAL_ALIAS_TO_PHYSICAL: [u16; {}] = {:?};\n\n",
         logical_alias_to_physical.len(),
         logical_alias_to_physical
     ));
@@ -1638,6 +1753,19 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static PHYSICAL_TO_LOGICAL_ALIAS: [u16; {}] = {:?};\n\n",
         physical_to_logical_alias.len(),
         physical_to_logical_alias
+    ));
+    output.push_str(&format!(
+        "pub(crate) static EXPANDED_LONGHANDS_FOR_SHORTHAND: [&[u16]; {}] = [\n{}\n];\n\n",
+        expanded_longhand_rows.len(),
+        expanded_longhand_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static SHORTHANDS_FOR_LONGHAND: [&[u16]; {}] = [\n{}\n];\n\n",
+        shorthands_for_longhand_rows.len(),
+        shorthands_for_longhand_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static LEGACY_SHORTHANDS: &[u16] = &{legacy_shorthands:?};\n\n"
     ));
     output.push_str(&format!(
         "pub(crate) static SHORTHAND_EXPANDED_LONGHAND_COUNTS: [usize; {}] = {:?};\n\n",
@@ -1771,7 +1899,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         affects_hit_testing
     ));
     output.push_str(&format!(
-        "pub(crate) static PROPERTY_STYLE_GROUP_INDICES: [u8; {}] = {:?};\n",
+        "pub(crate) const PROPERTY_STYLE_GROUP_INDICES: [u8; {}] = {:?};\n",
         style_group_indices.len(),
         style_group_indices
     ));
@@ -1790,7 +1918,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             .join("\n")
     ));
     output.push_str(&format!(
-        "\npub(crate) static PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES: &[u16] = &{always_allowed_pseudo_properties:?};\n"
+        "\npub(crate) static PSEUDO_ELEMENT_TRANSITION_AND_ANIMATION_PROPERTIES: &[u16] = &{transition_and_animation_pseudo_properties:?};\n"
     ));
     let positional_shorthands: Vec<u16> = properties
         .iter()
@@ -1811,6 +1939,10 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static PSEUDO_ELEMENT_PROPERTY_WHITELISTS: [Option<&[u16]>; {}] = [\n{}\n];\n",
         pseudo_property_whitelist_rows.len(),
         pseudo_property_whitelist_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PSEUDO_ELEMENT_ACCEPTS_ANIMATIONS: [bool; {}] = {pseudo_accepts_animations_rows:?};\n",
+        pseudo_accepts_animations_rows.len(),
     ));
     std::fs::write(out_dir.join("property_metadata_generated.rs"), output)?;
     Ok(())
@@ -2104,6 +2236,17 @@ fn generate_css_enums(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn
             output.push_str(&format!("        \"{value}\",\n"));
         }
         output.push_str("    ];\n");
+        // The keyword of each member, indexed by value code, as a style holding the code reads it.
+        output.push_str(&format!("    pub const KEYWORDS: [u16; {code}] = [\n"));
+        for value in values {
+            let value = value.as_str().ok_or("enum value is not a string")?;
+            if value.contains('=') {
+                continue;
+            }
+            let keyword_constant = value.replace('-', "_").to_uppercase();
+            output.push_str(&format!("        super::keyword::{keyword_constant},\n"));
+        }
+        output.push_str("    ];\n");
         output.push_str("}\n\n");
 
         // The keyword-to-enum-value mapping, mirroring the C++ keyword_to_<enum> generator,
@@ -2231,7 +2374,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
-            "FfiVisualViewportTransform",
         ]
         .map(String::from),
     );
@@ -2272,7 +2414,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
-        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -2295,7 +2436,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/Vector3.h",
             "LibGfx/WindingRule.h",
             "LibWeb/Forward.h",
-            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibCompositing/DisplayList/ContextRef.h",
             "LibWeb/Painting/ChromeMetrics.h",
             "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
         ]
@@ -2311,13 +2452,9 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
         "FfiFilterFunctionKind",
         "FfiVisualContextTreeInputs",
         "FfiVisualAnimationTargetKind",
-        "FfiVisualAnimationPlaybackDirection",
-        "FfiVisualAnimationFillMode",
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiAnimatedContentViewportEffect",
-        "FfiTestStickyConstraints",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -2329,7 +2466,41 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
             .rename
             .insert(name.to_string(), format!("Compositing::RustFFI::{name}"));
     }
+    config.export.exclude.push("SnapSelectionStrategyType".to_string());
+    config.export.rename.insert(
+        "SnapSelectionStrategyType".to_string(),
+        "Compositing::SnapSelectionStrategy::Type".to_string(),
+    );
     config.includes.push("LibCompositing/RustFFI.h".to_string());
+    config
+        .includes
+        .push("LibCompositing/Scrolling/ScrollSnapSelection.h".to_string());
+}
+
+/// Names an animation effect's identity as the animations header does, which declares it the same way.
+fn declare_animation_effect_id_of_animations_header(config: &mut cbindgen::Config) {
+    config.export.exclude.push("AnimationEffectId".to_string());
+    config.export.rename.insert(
+        "AnimationEffectId".to_string(),
+        "Web::Animations::RustFFI::AnimationEffectId".to_string(),
+    );
+    config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Animations::RustFFI { using AnimationEffectId = uint64_t; }");
+}
+
+/// Names the groups of a style record, which are opaque to C++, in the namespace of the computed values that C++ reads
+/// from them, for a header whose entries take them.
+fn declare_style_record_groups_of_computed_values_header(config: &mut cbindgen::Config) {
+    config.export.rename.insert(
+        "StyleRecordGroups".to_string(),
+        "Web::CSS::ComputedValuesFFI::StyleRecordGroups".to_string(),
+    );
+    config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::ComputedValuesFFI { struct StyleRecordGroups; }");
 }
 
 /// Names the document host and the begun read as the layout header declares them, for a header whose entries take them.
@@ -2367,6 +2538,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     generate_transform_functions(&manifest_dir, &out_dir)?;
 
     let base_config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))?;
+
+    let mut web_audio_config = base_config.clone();
+    web_audio_config.namespaces = Some(vec!["Web".into(), "WebAudio".into(), "RustFFI".into()]);
+    for name in ["NodeHandle", "ControlMessageQueue", "RealtimeAudioRenderer"] {
+        web_audio_config.export.rename.insert(name.into(), "void".into());
+        web_audio_config.export.exclude.push(name.into());
+    }
+    web_audio_config.export.include.push("AutomationRate".into());
+    web_audio_config.export.item_types = vec![
+        cbindgen::ItemType::Enums,
+        cbindgen::ItemType::Structs,
+        cbindgen::ItemType::Typedefs,
+        cbindgen::ItemType::OpaqueItems,
+        cbindgen::ItemType::Functions,
+    ];
+    generate_ffi_header(
+        web_audio_config,
+        &[
+            manifest_dir.join("src/web_audio/rendering/render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/audio_frame_ring.rs"),
+            manifest_dir.join("src/web_audio/rendering/media_stream_destination_render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/pipe_callbacks.rs"),
+            manifest_dir.join("src/web_audio/rendering/realtime_audio_renderer.rs"),
+            manifest_dir.join("src/web_audio/control_message.rs"),
+            manifest_dir.join("src/web_audio/control_thread.rs"),
+        ],
+        &out_dir,
+        Path::new("WebAudio/RustFFI.h"),
+    );
 
     // CSS tokenizer header — namespace Web::CSS::Parser::FFI, CSS types only.
     let mut css_config = base_config.clone();
@@ -2486,6 +2686,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiTransitionAction",
         "FfiColorResolutionStyle",
         "FfiLaneTransition",
+        "FfiCompositeOperation",
     ]
     .map(String::from)
     .to_vec();
@@ -2499,9 +2700,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         .export
         .exclude
         .push("CalcReificationStorage".to_string());
+    // A style value list keeps its element count in the word before its first element.
+    style_value_config.export.body.insert(
+        "RetainedStyleValueDataList".to_string(),
+        "    size_t length() const { return pointer ? reinterpret_cast<size_t const*>(pointer)[-1] : 0; }".to_string(),
+    );
+    // C++ reads a boxed variant payload through the box as through a pointer.
+    style_value_config.export.body.insert(
+        "StyleValueBox".to_string(),
+        "    T const* operator->() const { return pointer; }\n    T const& operator*() const { return *pointer; }"
+            .to_string(),
+    );
     // A compositor keyframe value is substituted by the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut style_value_config);
 
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut style_value_config);
     generate_ffi_header(
         style_value_config,
         &[
@@ -2516,6 +2730,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/calc.rs"),
             manifest_dir.join("src/css/serialize.rs"),
             manifest_dir.join("src/css/color_resolution.rs"),
+            manifest_dir.join("src/css/resolved_value.rs"),
             manifest_dir.join("src/css/absolutize.rs"),
             manifest_dir.join("src/css/ffi_stats.rs"),
         ],
@@ -2592,6 +2807,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/style_rule.rs"),
             manifest_dir.join("src/css/scope_selectors.rs"),
             manifest_dir.join("src/css/media_list.rs"),
+            manifest_dir.join("src/css/inline_style_blocks.rs"),
             manifest_dir.join("src/css/counter_representation.rs"),
             manifest_dir.join("src/css/counter_style.rs"),
             manifest_dir.join("src/css/namespace_rule.rs"),
@@ -2616,7 +2832,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     style_engine_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleEngineFFI".to_string()]);
     style_engine_config.export.include = vec![
         // Taken only by an entry of the boundary table, which cbindgen does not see.
-        "FfiAppliedAnimationDefinition".to_string(),
+        "FfiFrameSetDimension".to_string(),
+        "FfiFrameSetBorder".to_string(),
         // Named by no exported signature: a replaced content input crosses as its raw values.
         "FfiReplacedContentInputKind".to_string(),
         "FfiReplacedContentInputPresent".to_string(),
@@ -2629,10 +2846,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiResolvedFont".to_string(),
         "FontResolutionFeatureInput".to_string(),
     ];
-    // A published keyframe's composite operation is the one the animation sampler composes with.
+    // A published effect's composite operation is the one the animation sampler composes with.
     style_engine_config.export.rename.insert(
         "FfiCompositeOperation".to_string(),
         "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    // A published effect's default easing is described as the compositing header describes one.
+    style_engine_config
+        .export
+        .exclude
+        .push("FfiEasingDescriptor".to_string());
+    style_engine_config.export.rename.insert(
+        "FfiEasingDescriptor".to_string(),
+        "Compositing::RustFFI::FfiEasingDescriptor".to_string(),
     );
     // A transition step's decision is asked of the engine in the style value header's terms.
     for name in ["FfiTransitionInput", "FfiTransitionAction", "FfiLaneTransition"] {
@@ -2647,7 +2873,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     // The host queues the engine's changes on the document host, which the layout header declares.
     declare_document_host_of_layout_header(&mut style_engine_config);
-    // A style transaction flies only where nothing blocks it, which the layout header names as it does for a recording.
+    // A style update flies only where nothing blocks it, which the layout header names as it does for a recording.
     style_engine_config.export.rename.insert(
         "FfiFlightBlocker".to_string(),
         "Web::Layout::RustFFI::FfiFlightBlocker".to_string(),
@@ -2658,8 +2884,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .push_str("\nnamespace Web::Layout::RustFFI { enum class FfiFlightBlocker : uint8_t; }");
 
     // The host's objects a style reaction is applied through cross as the host's own types, except an element a struct
-    // holds, which crosses opaque.
+    // holds, which crosses opaque. A box kind crosses as the byte of the host's own enum.
     for (name, cpp_name) in [
+        ("ElementBoxKind", "uint8_t"),
         ("HostElement", "Web::DOM::Element"),
         ("HostElementPtr", "void*"),
         ("HostStyleReactionApplication", "Web::CSS::StyleReactionApplication"),
@@ -2689,14 +2916,38 @@ fn main() -> Result<(), Box<dyn Error>> {
             "\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlock; struct NativeRule; struct NativeStyleSheet; }",
         );
 
+    // An element's style record and the sizer of a memory report are opaque to C++, which holds each by pointer, and so
+    // is an element's animation overlay, which crosses as the computed values header declares it.
+    style_engine_config.export.rename.insert(
+        "AnimatedOverlay".to_string(),
+        "Web::CSS::ComputedValuesFFI::AnimatedOverlay".to_string(),
+    );
+    style_engine_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str(
+            "\nnamespace Web::CSS::StyleEngineFFI { struct Record; struct HeapSizer; }\nnamespace Web::CSS::ComputedValuesFFI { struct AnimatedOverlay; }",
+        );
+    // So are the groups of a record, which a view of one names.
+    declare_style_record_groups_of_computed_values_header(&mut style_engine_config);
+
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut style_engine_config);
     generate_ffi_header(
         style_engine_config,
         &[
             manifest_dir.join("src/css/style/bridge.rs"),
+            manifest_dir.join("src/css/style/bridge/animations.rs"),
+            manifest_dir.join("src/css/style/bridge/container_effects.rs"),
+            manifest_dir.join("src/css/style/bridge/native_rules.rs"),
+            manifest_dir.join("src/css/style/bridge/records.rs"),
             manifest_dir.join("src/css/style/identities.rs"),
             manifest_dir.join("src/css/style/engine_calls.rs"),
             manifest_dir.join("src/css/style/host_atoms.rs"),
             manifest_dir.join("src/css/style/reaction_application.rs"),
+            manifest_dir.join("src/css/style/pipeline/install.rs"),
+            manifest_dir.join("src/css/style/pipeline/main_effects.rs"),
+            manifest_dir.join("src/css/style/pipeline/matched_rules.rs"),
             manifest_dir.join("src/css/style/rule_writes.rs"),
             manifest_dir.join("src/css/style/style_job.rs"),
             manifest_dir.join("src/css/ffi_support.rs"),
@@ -2720,11 +2971,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "BoxValues".to_string(),
         "ComputedVerticalAlign".to_string(),
         "GridValues".to_string(),
-        "STYLE_GROUP_STATIC_REFCOUNT".to_string(),
-        "GENERATED_CONTENT_DEFINES_COUNTERS".to_string(),
         "GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER".to_string(),
         "GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER".to_string(),
-        "GENERATED_CONTENT_HAS_QUOTES".to_string(),
         "GRID_NO_INDEX".to_string(),
         "ComputedGridTrackEntryKind".to_string(),
         "ComputedGridPlacementKind".to_string(),
@@ -2744,8 +2992,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ComputedTextUnderlinePosition".to_string(),
         "ComputedTextUnderlineOffset".to_string(),
         "InheritedTextValues".to_string(),
-        "InheritedTableValues".to_string(),
-        "InheritedBoxValues".to_string(),
+        "InheritedListTableValues".to_string(),
+        "InheritedBits".to_string(),
+        "ResetBits".to_string(),
+        "InheritedSetValues".to_string(),
         "SizingValues".to_string(),
         "AlignmentValues".to_string(),
         "SVGResetValues".to_string(),
@@ -2755,18 +3005,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "MaskValues".to_string(),
         "BackgroundValues".to_string(),
         "BorderValues".to_string(),
-        "InheritedListValues".to_string(),
         "ContentValues".to_string(),
         "ComputedOverflowClipMarginSide".to_string(),
         "ComputedOverflowClipMargin".to_string(),
-        "MiscResetValues".to_string(),
+        "MiscLayoutValues".to_string(),
+        "MiscInteractionValues".to_string(),
         "FontValues".to_string(),
         "FontCascadeListHandle".to_string(),
         "FrozenFontListRef".to_string(),
         "FfiFontGroupBuildInputs".to_string(),
         "TextResetValues".to_string(),
         "AnchorValues".to_string(),
-        "FfiTableInheritanceDependentValue".to_string(),
         "FfiEffectiveLonghandValue".to_string(),
         "FfiUtf16View".to_string(),
         "EFFECTIVE_LONGHAND_SOURCE_TABLE".to_string(),
@@ -2776,19 +3025,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     expose_css_pixel_types_as_web_types(&mut computed_values_config);
     // An effect the host samples carries its easing as the compositing crate describes one.
     expose_compositing_types_as_cpp_types(&mut computed_values_config);
-    computed_values_config.export.exclude.push("OptionalF64".to_string());
-    computed_values_config
-        .export
-        .rename
-        .insert("OptionalF64".to_string(), "Optional<double>".to_string());
-    computed_values_config.includes.push("AK/Optional.h".to_string());
-    // The custom property registry and stores, a sample's animated custom properties and a shorthand expansion are
-    // opaque to C++, which holds each by pointer.
+    // The custom property registry and stores and a sample's animated custom properties are opaque to C++, which holds
+    // each by pointer.
     for name in [
         "CustomPropertyRegistry",
         "CustomPropertyStore",
         "AnimatedCustomPropertyResults",
-        "ShorthandExpansion",
     ] {
         computed_values_config
             .export
@@ -2796,14 +3038,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             .insert(name.to_string(), "void".to_string());
         computed_values_config.export.exclude.push(name.to_string());
     }
+    // The style record a computed value is read from is the style engine header's.
+    computed_values_config
+        .export
+        .rename
+        .insert("Record".to_string(), "Web::CSS::StyleEngineFFI::Record".to_string());
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleEngineFFI { struct Record; }");
     computed_values_config.export.rename.insert(
-        "DeclarationBlockData".to_string(),
-        "Web::CSS::Parser::ValueParserFFI::DeclarationBlockData".to_string(),
+        "DeclarationBlockHeader".to_string(),
+        "Web::CSS::Parser::ValueParserFFI::DeclarationBlockHeader".to_string(),
     );
     computed_values_config
         .after_includes
         .get_or_insert_with(String::new)
-        .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlockData; }");
+        .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlockHeader; }");
     // The computations C++ hands a style value take the value as the style value header declares it.
     computed_values_config.export.rename.insert(
         "StyleValueData".to_string(),
@@ -2824,9 +3075,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         .push_str("\nnamespace Web::CSS::StyleValueFFI { struct CssString; }");
     // An animation sample and plan read the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut computed_values_config);
+    // The effects the host samples, and the animations of the element they belong to, are as the animations header
+    // describes them.
+    for name in ["FfiSampledEffect", "ElementAnimations"] {
+        computed_values_config.export.exclude.push(name.to_string());
+        computed_values_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::Animations::RustFFI::{name}"));
+    }
+    computed_values_config
+        .includes
+        .push("LibWeb/Animations/RustFFI.h".to_string());
+
+    computed_values_config.export.rename.insert(
+        "FfiAnimationEffectDescriptions".to_string(),
+        "Web::CSS::StyleEngineFFI::FfiAnimationEffectDescriptions".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleEngineFFI { struct FfiAnimationEffectDescriptions; }");
 
     let libgfx_font_source = manifest_dir.join("../../LibGfx/Rust/src/font.rs");
     println!("cargo:rerun-if-changed={}", libgfx_font_source.display());
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut computed_values_config);
     generate_ffi_header(
         computed_values_config,
         &[
@@ -2834,6 +3108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/computed_values.rs"),
             manifest_dir.join("src/css/property_metadata.rs"),
             manifest_dir.join("src/css/style_compute.rs"),
+            manifest_dir.join("src/css/style_compute/adjustments.rs"),
             manifest_dir.join("src/css/display.rs"),
             manifest_dir.join("src/css/computed_value_types.rs"),
             manifest_dir.join("src/css/retained_fly_string.rs"),
@@ -2874,7 +3149,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiRenderedTextView".to_string(),
         "FfiRenderedTextOffset".to_string(),
         "FfiRenderedTextWithOffsetsView".to_string(),
-        "FfiReplacedContentFacts".to_string(),
         "FfiStylePayloads".to_string(),
         "FfiUtf16View".to_string(),
         // Lent and handed back through the layout header, which builds on this one.
@@ -2887,9 +3161,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     tree_builder_config.export.exclude = vec![
         "ladybird_layout_code_point_category_facts".to_string(),
         "ladybird_layout_node_shell_destroy".to_string(),
-        "rust_calc_node_create_numeric_dimension".to_string(),
         "rust_calc_resolve".to_string(),
     ];
+    // The groups of a style record are opaque to C++, which holds them by pointer.
+    declare_style_record_groups_of_computed_values_header(&mut tree_builder_config);
     expose_css_pixel_types_as_web_types(&mut tree_builder_config);
     expose_compositing_types_as_cpp_types(&mut tree_builder_config);
     generate_ffi_header(
@@ -2904,7 +3179,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/ffi_support.rs"),
             manifest_dir.join("src/layout/node_data.rs"),
             manifest_dir.join("src/layout/partial_relayout.rs"),
-            manifest_dir.join("src/layout/box_removal.rs"),
             manifest_dir.join("src/layout/tree_builder.rs"),
             manifest_dir.join("src/layout/tree_update_marks.rs"),
             manifest_dir.join("src/render_state.rs"),
@@ -2917,12 +3191,198 @@ fn main() -> Result<(), Box<dyn Error>> {
         Path::new("Layout/TreeBuilderRustFFI.h"),
     );
 
+    // The Web Animations timing model - namespace Web::Animations::RustFFI. An easing descriptor is the compositing
+    // header's.
+    let mut animations_config = base_config.clone();
+    animations_config.namespaces = Some(vec!["Web".to_string(), "Animations".to_string(), "RustFFI".to_string()]);
+    animations_config.export.exclude.push("FfiEasingDescriptor".to_string());
+    animations_config.export.rename.insert(
+        "FfiEasingDescriptor".to_string(),
+        "Compositing::RustFFI::FfiEasingDescriptor".to_string(),
+    );
+    animations_config.includes.push("LibCompositing/RustFFI.h".to_string());
+    // A keyframe set notes the attributes its values read through the document's host, and a scroll timeline measures
+    // the boxes it follows there.
+    declare_document_host_of_layout_header(&mut animations_config);
+    animations_config.export.exclude.push("NodeSlotId".to_string());
+    animations_config
+        .export
+        .rename
+        .insert("NodeSlotId".to_string(), "Compositing::RustFFI::NodeSlotId".to_string());
+    // An effect's composite operation is the style value header's.
+    animations_config
+        .export
+        .exclude
+        .push("FfiCompositeOperation".to_string());
+    animations_config.export.rename.insert(
+        "FfiCompositeOperation".to_string(),
+        "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; }");
+    // The definition a style computation applies to a CSS animation is the computed values header's.
+    animations_config
+        .export
+        .exclude
+        .push("FfiComputedAnimation".to_string());
+    animations_config.export.rename.insert(
+        "FfiComputedAnimation".to_string(),
+        "Web::CSS::ComputedValuesFFI::FfiComputedAnimation".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::ComputedValuesFFI { struct FfiComputedAnimation; }");
+    // A transition the hover of a clock lane leaves running, and one a style change event reads, are the style value
+    // header's.
+    for name in ["FfiLaneTransition", "FfiExistingTransition"] {
+        animations_config.export.exclude.push(name.to_string());
+        animations_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
+        animations_config
+            .after_includes
+            .get_or_insert_with(String::new)
+            .push_str(&format!("\nnamespace Web::CSS::StyleValueFFI {{ struct {name}; }}"));
+    }
+    // What an effect built for the compositor is opaque to C++, which hands it to the layout header's functions.
+    animations_config
+        .export
+        .exclude
+        .push("CompositorAnimationEffectState".to_string());
+    animations_config
+        .export
+        .rename
+        .insert("CompositorAnimationEffectState".to_string(), "void".to_string());
+    // The view of a `@keyframes` rule a keyframe set is made from is the value parser header's.
+    animations_config.export.rename.insert(
+        "NativeRuleView".to_string(),
+        "Web::CSS::Parser::ValueParserFFI::NativeRuleView".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct NativeRuleView; }");
+    // The host defines what the timeline records ask of documents, which the tests stub.
+    animations_config
+        .export
+        .exclude
+        .push("ladybird_animations_document_is_active".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("ladybird_animations_element_node_document".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_target_facts".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_note_rendering_trace_event".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_compute_css_keyframe_values".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_effective_zoom_of_target".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_set_needs_animated_style_update".to_string());
+    // The host defines what the timelines associated with a document ask of it.
+    for name in [
+        "web_animation_document_animations",
+        "web_animation_document_clock",
+        "web_animation_find_scroll_timeline_boxes",
+        "web_animation_scroll_timeline_source",
+    ] {
+        animations_config.export.exclude.push(name.to_string());
+    }
+    // The timing the host publishes of an effect it samples, an effect it samples, and a timeline it creates through
+    // the bindings, which no function here takes.
+    animations_config.export.include.extend(
+        [
+            "EffectTimingSnapshot",
+            "FfiSampledEffect",
+            "FfiTargetFacts",
+            "FfiTimelineDescription",
+            "FfiDocumentClock",
+            "FfiScrollTimelineBoxes",
+        ]
+        .map(String::from),
+    );
+    let animation_timing_dir = manifest_dir.join("../../LibCompositing/Rust/src/animation_timing");
+    println!("cargo:rerun-if-changed={}", animation_timing_dir.display());
+    generate_ffi_header(
+        animations_config,
+        &[
+            animation_timing_dir.join("time_value.rs"),
+            animation_timing_dir.join("effect_timing.rs"),
+            animation_timing_dir.join("playback.rs"),
+            manifest_dir.join("src/animations/animation.rs"),
+            manifest_dir.join("src/animations/effect.rs"),
+            manifest_dir.join("src/animations/compositor_update.rs"),
+            manifest_dir.join("src/animations/document_animations.rs"),
+            manifest_dir.join("src/animations/element_animations.rs"),
+            manifest_dir.join("src/animations/ffi.rs"),
+            manifest_dir.join("src/animations/host_effects.rs"),
+            manifest_dir.join("src/animations/host_timing.rs"),
+            manifest_dir.join("src/animations/css_events.rs"),
+            manifest_dir.join("src/animations/keyframes.rs"),
+            manifest_dir.join("src/animations/pending_animation_events.rs"),
+            manifest_dir.join("src/animations/rendering_update.rs"),
+            manifest_dir.join("src/animations/snapshot.rs"),
+            manifest_dir.join("src/animations/throttling.rs"),
+            manifest_dir.join("src/animations/timeline.rs"),
+            manifest_dir.join("src/animations/timeline_host.rs"),
+            manifest_dir.join("src/animations/transitions.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
+        ],
+        &out_dir,
+        Path::new("Animations/RustFFI.h"),
+    );
+
+    // The lanes of the render clock - namespace Web::Compositor::RustFFI, layered on the layout header for the ticks
+    // the lanes hand on.
+    let mut render_clock_config = base_config.clone();
+    render_clock_config.namespaces = Some(vec!["Web".to_string(), "Compositor".to_string(), "RustFFI".to_string()]);
+    for (rust_name, cpp_name) in [
+        ("ArcRef", "Web::Layout::RustFFI::ArcRef"),
+        ("ClockTicks", "Web::Layout::RustFFI::ClockTicks"),
+        ("FfiThreadSafeMessagePoster", "IPC::FfiThreadSafeMessagePoster"),
+        ("RawMessage", "IPC::FfiRawMessage"),
+    ] {
+        render_clock_config
+            .export
+            .rename
+            .insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    render_clock_config.includes.extend(
+        [
+            "LibIPC/RawMessage.h",
+            "LibIPC/ThreadSafeMessagePoster.h",
+            "LibWeb/Layout/LayoutRustFFI.h",
+        ]
+        .map(String::from),
+    );
+    generate_ffi_header(
+        render_clock_config,
+        &[manifest_dir.join("src/render_state/clock/render_clock.rs")],
+        &out_dir,
+        Path::new("Compositor/RenderClockRustFFI.h"),
+    );
+
     // Layout engine header - namespace Web::Layout::RustFFI, layered on the tree-builder
     // header.
     let mut layout_config = base_config;
     layout_config.namespaces = Some(vec!["Web".to_string(), "Layout".to_string(), "RustFFI".to_string()]);
     layout_config.export.exclude = vec![
-        "rust_calc_node_create_numeric_dimension".to_string(),
         "rust_calc_resolve".to_string(),
         "rust_calc_root_from_calculated".to_string(),
         "rust_calc_external_resolutions".to_string(),
@@ -2934,12 +3394,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
-    // A compositor animation effect state is opaque to C++, which holds it by pointer, and so is the paint server an
-    // SVG paint resource callback fills.
-    for name in ["CompositorAnimationEffectState", "PublishedSvgPaintServer"] {
+    // Rust posts to the compositor through a poster C++ made.
+    layout_config
+        .export
+        .exclude
+        .push("FfiThreadSafeMessagePoster".to_string());
+    layout_config.export.rename.insert(
+        "FfiThreadSafeMessagePoster".to_string(),
+        "IPC::FfiThreadSafeMessagePoster".to_string(),
+    );
+    layout_config
+        .includes
+        .push("LibIPC/ThreadSafeMessagePoster.h".to_string());
+    // Rust sends synchronous requests to the compositor through the connection C++ made.
+    layout_config.export.exclude.push("FfiConnection".to_string());
+    layout_config
+        .export
+        .rename
+        .insert("FfiConnection".to_string(), "IPC::FfiConnection".to_string());
+    layout_config.includes.push("LibIPC/FfiConnection.h".to_string());
+    // A compositor animation carries its effect's timing as the animations header describes it.
+    layout_config.export.exclude.push("AnimationEffectTiming".to_string());
+    layout_config.export.rename.insert(
+        "AnimationEffectTiming".to_string(),
+        "Web::Animations::RustFFI::AnimationEffectTiming".to_string(),
+    );
+    layout_config.includes.push("LibWeb/Animations/RustFFI.h".to_string());
+    // The render clock's plan takes the scroll timelines it follows as the animations header declares them.
+    layout_config.export.exclude.push("TimelineCell".to_string());
+    layout_config.export.rename.insert(
+        "TimelineCell".to_string(),
+        "Web::Animations::RustFFI::TimelineCell".to_string(),
+    );
+    // A compositor animation effect state is opaque to C++, which holds it by pointer, and so are the paint server an
+    // SVG paint resource callback fills and a parsed SVG path.
+    for name in [
+        "CompositorAnimationEffectState",
+        "PublishedSvgPaintServer",
+        "ParsedPath",
+    ] {
         layout_config.export.rename.insert(name.to_string(), "void".to_string());
         layout_config.export.exclude.push(name.to_string());
     }
+    // The host fills in a compositor animation request, and the host its keyframes resolve with, as the animation
+    // records ask it to, which no function here takes.
+    layout_config
+        .export
+        .include
+        .extend(["FfiCompositorAnimationRequest", "FfiCompositorAnimationHost"].map(String::from));
+    // The line content of a text geometry source is opaque to C++, which holds it by pointer.
+    layout_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { struct InlineContent; }");
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut layout_config);
     generate_ffi_header(
         layout_config,
         &[
@@ -2966,7 +3475,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/layout/line_box.rs"),
             manifest_dir.join("src/layout/line_box_fragment.rs"),
             manifest_dir.join("src/painting/paintable_data.rs"),
-            manifest_dir.join("src/painting/paintable_build.rs"),
             manifest_dir.join("src/painting/host/mod.rs"),
             manifest_dir.join("src/painting/host/visual_context.rs"),
             manifest_dir.join("src/painting/host/hit_test.rs"),
@@ -2975,12 +3483,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/painting/stacking_context/dump.rs"),
             manifest_dir.join("src/painting/layout_tree_dump.rs"),
             manifest_dir.join("src/painting/ffi.rs"),
+            manifest_dir.join("src/painting/viewport_mapping.rs"),
             manifest_dir.join("src/render_state/clock.rs"),
             manifest_dir.join("src/render_state/clock/hover.rs"),
             manifest_dir.join("src/layout/script_entries.rs"),
+            manifest_dir.join("src/layout/query/inline_cursor.rs"),
             manifest_dir.join("src/painting/paint_changes.rs"),
             manifest_dir.join("src/painting/ffi/main_thread_entries.rs"),
             manifest_dir.join("src/painting/paint_passes.rs"),
+            manifest_dir.join("src/painting/presentation.rs"),
+            manifest_dir.join("src/painting/vector_image_cache.rs"),
+            manifest_dir.join("src/painting/recorded_scrolling.rs"),
+            manifest_dir.join("src/painting/rasterize.rs"),
         ],
         &out_dir,
         Path::new("Layout/LayoutRustFFI.h"),

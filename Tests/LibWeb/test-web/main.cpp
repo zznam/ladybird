@@ -60,6 +60,9 @@ static HashMap<WebView::ViewImplementation const*, size_t> s_view_index_by_view;
 static RefPtr<Core::Promise<Empty>> s_all_tests_complete;
 static Vector<ByteString> s_skipped_tests;
 static Vector<ByteString> s_loaded_from_http_server;
+static Vector<ByteString> s_loaded_from_https_server;
+static Vector<ByteString> s_frame_rate_capped;
+static Vector<ByteString> s_loaded_from_insecure_origin;
 static HashMap<WebView::ViewImplementation const*, size_t> s_current_test_index_by_view;
 
 struct TestRunContext {
@@ -118,9 +121,9 @@ static ErrorOr<void> add_config_paths(StringView test_root_path, Vector<ByteStri
     return {};
 }
 
-static ByteString unique_localhost_hostname(StringView prefix)
+static ByteString unique_hostname_within(StringView domain, StringView prefix)
 {
-    return ByteString::formatted("{}-{}.localhost", prefix, generate_random_uuid().to_byte_string());
+    return ByteString::formatted("{}-{}.{}", prefix, generate_random_uuid().to_byte_string(), domain);
 }
 
 static ErrorOr<void> load_test_config(StringView test_root_path)
@@ -139,8 +142,17 @@ static ErrorOr<void> load_test_config(StringView test_root_path)
     for (auto const& group : config->groups()) {
         if (group == "Skipped"sv) {
             TRY(add_config_paths(test_root_path, config->keys(group), s_skipped_tests));
+        } else if (group == "RequiresPDFJS"sv) {
+            if (!HAS_PDFJS)
+                TRY(add_config_paths(test_root_path, config->keys(group), s_skipped_tests));
         } else if (group == "LoadFromHttpServer"sv) {
             TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_http_server));
+        } else if (group == "LoadFromHttpsServer"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_https_server));
+        } else if (group == "CapFrameRate"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_frame_rate_capped));
+        } else if (group == "LoadFromInsecureOrigin"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_insecure_origin));
         } else {
             warnln("Unknown group '{}' in config {}", group, config_path);
         }
@@ -257,8 +269,17 @@ static void try_write_harness_status(StringView reason)
         warnln("Failed to write test-web harness status: {}", result.error());
 }
 
-static String generate_wait_for_test_string(StringView wait_class, StringView on_finish_script = ""sv)
+enum class WaitForImages {
+    No,
+    Yes,
+};
+
+static String generate_wait_for_test_string(StringView wait_class, WaitForImages wait_for_images = WaitForImages::No, StringView on_finish_script = ""sv)
 {
+    // A reference test's screenshot has to show the images the page uses. But a CSS image only starts loading once
+    // layout reaches the element that uses it, which can be after the test is otherwise done. So a reference test
+    // forces a layout, then waits until no image is loading. It polls with timers rather than animation frames, since
+    // a test may hold rendering back, and the capture itself updates the layout.
     return MUST(String::formatted(R"(
 function hasTestWaitClass() {{
     return document.documentElement.classList.contains('{}');
@@ -268,13 +289,27 @@ function afterFontsAndPaint(callback) {{
     document.fonts.ready.then(() => requestAnimationFrame(() => requestAnimationFrame(callback)));
 }}
 
+const waitForImages = {};
+
+function afterImagesLoad(callback) {{
+    if (!waitForImages) {{
+        callback();
+        return;
+    }}
+    document.documentElement.getBoundingClientRect();
+    if (internals.hasPendingImageLoads)
+        setTimeout(() => afterImagesLoad(callback), 10);
+    else
+        callback();
+}}
+
 if (!hasTestWaitClass()) {{
-    afterFontsAndPaint(() => internals.signalTestIsDone("PASS"));
+    afterFontsAndPaint(() => afterImagesLoad(() => internals.signalTestIsDone("PASS")));
 }} else {{
     const observer = new MutationObserver(() => {{
         if (!hasTestWaitClass()) {{
             observer.disconnect();
-            internals.signalTestIsDone("PASS");
+            afterImagesLoad(() => internals.signalTestIsDone("PASS"));
         }}
     }});
 
@@ -285,44 +320,69 @@ if (!hasTestWaitClass()) {{
     {}
 }}
 )"sv,
-        wait_class, on_finish_script));
+        wait_class, wait_for_images == WaitForImages::Yes ? "true"sv : "false"sv, on_finish_script));
 }
 
 static auto wait_for_test_completion = generate_wait_for_test_string("test-wait"sv);
 
 // https://web-platform-tests.org/writing-tests/reftests.html#waiting-for-content-to-render
-static auto wait_for_reftest_completion = generate_wait_for_test_string("reftest-wait"sv, R"(
+static auto wait_for_reftest_completion = generate_wait_for_test_string("reftest-wait"sv, WaitForImages::Yes, R"(
     afterFontsAndPaint(() => document.documentElement.dispatchEvent(new Event("TestRendered", { bubbles: true })));
 )"sv);
 
-// For PDF tests: by the time this runs (after on_load_finish), ladybirdpdf has already fired
-// and openPdf() is in progress; initializedPromise lets us hook in at the right moment.
-// This script ensures we wait until the text and annotation layers are rendered for the first page.
+// For PDF tests: this script waits until the text and annotation layers are rendered for the first page.
+// It runs once the viewer document has loaded. But ladybirdpdf has already fired by then, so openPdf() may have gone on
+// to render the page and send the events below before this script listens for them. So it also checks pdf.js's public
+// state for what it has already done.
 // pdf.js renders pages lazily, so only those pages visible in the viewport are rendered. We currently fail for PDFs
 // with more than one page, as we don't currently guarantee rendering of all pages.
 static auto const wait_for_pdf_done = R"(
-window.PDFViewerApplication.initializedPromise.then(() => {
-    const eventBus = window.PDFViewerApplication.eventBus;
+window.PDFViewerApplication.initializedPromise.then(async () => {
+    const { eventBus, pdfViewer } = window.PDFViewerApplication;
     let pagesCount = null;
     let textRendered = false;
     let annotationRendered = false;
-    const checkDone = () => {
-        if (pagesCount !== null && textRendered && annotationRendered) {
-            internals.signalTestIsDone(`Pages: ${pagesCount}`);
-        }
+    let signaled = false;
+    const signalDone = () => {
+        if (signaled)
+            return;
+        signaled = true;
+        internals.signalTestIsDone(`Pages: ${pagesCount}`);
     };
-    eventBus.on("pagesloaded", evt => {
-        pagesCount = evt.pagesCount;
+    const checkDone = () => {
+        if (pagesCount !== null && textRendered && annotationRendered)
+            signalDone();
+    };
+    const pagesLoaded = count => {
+        if (pagesCount !== null)
+            return;
+        pagesCount = count;
         if (pagesCount !== 1) {
             const message = `PDF tests must use a single-page PDF (got ${pagesCount} pages).`;
             document.body.replaceChildren(document.createTextNode(message));
-            internals.signalTestIsDone(`Pages: ${pagesCount}`);
+            signalDone();
             return;
         }
         checkDone();
-    });
+    };
+    eventBus.on("pagesloaded", evt => pagesLoaded(evt.pagesCount));
     eventBus.on("textlayerrendered", evt => { if (evt.pageNumber === 1) { textRendered = true; checkDone(); } });
     eventBus.on("annotationlayerrendered", evt => { if (evt.pageNumber === 1) { annotationRendered = true; checkDone(); } });
+
+    // pagesPromise is null until a document is set, and then settles when pagesloaded is sent.
+    if (!pdfViewer.pagesPromise)
+        return;
+    await pdfViewer.pagesPromise;
+    pagesLoaded(pdfViewer.pagesCount);
+    const pageView = pdfViewer.getPageView(0);
+    // The text layer gets its endOfContent element once it's rendered.
+    if (pageView?.textLayer?.div.querySelector(".endOfContent"))
+        textRendered = true;
+    // The annotation layer creates its element before it renders any annotations, but for a page without any, it's
+    // done once the element exists.
+    if (pageView?.annotationLayer?.div && (await pageView.pdfPage.getAnnotations()).length === 0)
+        annotationRendered = true;
+    checkDone();
 });
 )"_string;
 
@@ -626,7 +686,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
         };
     }
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static ErrorOr<void> dump_screenshot_to_file(Gfx::Bitmap const& bitmap, StringView path)
@@ -665,7 +725,12 @@ static ErrorOr<void> write_screenshot_failure_results(Test& test, Gfx::Bitmap co
     return {};
 }
 
-static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url)
+enum class WriteFailureResults {
+    No,
+    Yes,
+};
+
+static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url, WriteFailureResults write_failure_results)
 {
     VERIFY(test.ref_test_expectation_index < test.ref_test_expectations.size());
 
@@ -676,7 +741,8 @@ static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL c
     if (should_match == screenshot_matches)
         return true;
 
-    TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
+    if (write_failure_results == WriteFailureResults::Yes)
+        TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
     return false;
 }
 
@@ -715,11 +781,33 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
                 auto& test = context.tests[test_index];
                 test.expectation_screenshot = move(screenshot);
                 view.reset_zoom();
-
-                auto expectation_passed = compare_current_ref_test_expectation(test, url);
-                if (expectation_passed.is_error() || !expectation_passed.value()) {
+                if (!test.expectation_screenshot) {
                     view.on_test_complete({ test_index, TestResult::Fail });
                     return;
+                }
+
+                // A test passes if at least one of its match references matches, and all of its mismatch references
+                // mismatch. https://web-platform-tests.org/writing-tests/reftests.html#multiple-references
+                auto is_match = [](RefTestExpectation const& expectation) { return expectation.type == RefTestExpectationType::Match; };
+                auto const& expectations = test.ref_test_expectations;
+                auto current_is_match = is_match(expectations[test.ref_test_expectation_index]);
+                auto another_match_follows = current_is_match
+                    && any_of(expectations.span().slice(test.ref_test_expectation_index + 1), is_match);
+
+                // NB: A failed match is only a failure of the test if no other match reference remains to try.
+                auto expectation_passed = compare_current_ref_test_expectation(test, url,
+                    another_match_follows ? WriteFailureResults::No : WriteFailureResults::Yes);
+                if (expectation_passed.is_error() || !expectation_passed.value()) {
+                    if (expectation_passed.is_error() || !another_match_follows) {
+                        view.on_test_complete({ test_index, TestResult::Fail });
+                        return;
+                    }
+                } else if (current_is_match) {
+                    // NB: One matching reference is enough, so only the mismatch references remain to be checked.
+                    for (size_t index = expectations.size() - 1; index > test.ref_test_expectation_index; --index) {
+                        if (is_match(expectations[index]))
+                            test.ref_test_expectations.remove(index);
+                    }
                 }
 
                 ++test.ref_test_expectation_index;
@@ -730,13 +818,17 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
                 test.expectation_screenshot.clear();
                 test.did_inject_js = false;
-                view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
+                view.load_from_browser_ui(test.ref_test_expectations[test.ref_test_expectation_index].url);
             });
         } else {
             // When the test initially finishes, we take a screenshot and request the reference test metadata.
             view.take_screenshot()->when_resolved([&view, &context, test_index](RefPtr<Gfx::Bitmap const> screenshot) {
                 context.tests[test_index].actual_screenshot = move(screenshot);
                 view.reset_zoom();
+                if (!context.tests[test_index].actual_screenshot) {
+                    view.on_test_complete({ test_index, TestResult::Fail });
+                    return;
+                }
                 view.run_javascript("internals.loadReferenceTestMetadata();"_string);
             });
         }
@@ -794,10 +886,10 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
         // Clear flag so we can inject the JS into the reference page.
         test.did_inject_js = false;
-        view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
+        view.load_from_browser_ui(test.ref_test_expectations[test.ref_test_expectation_index].url);
     };
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
@@ -806,6 +898,8 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
 
     auto handle_completed_test = [&context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
+        if (!test.actual_screenshot)
+            return Error::from_string_literal("The compositor did not take the screenshot");
         auto& actual = *test.actual_screenshot;
 
         // Try to load and compare against existing expected PNG first.
@@ -906,7 +1000,7 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
         });
     };
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static void run_test(TestWebView& view, TestRunContext& context, size_t test_index, Application& app, TestRunCapture& test_run_capture)
@@ -948,30 +1042,37 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     view.on_test_finish = {};
 
     promise->when_resolved([&view, test_index, &app, &context](auto) {
-        view.reset_session_history()->when_resolved([&view, test_index, &app, &context](auto) {
+        view.reset_state_for_next_test()->when_resolved([&view, test_index, &app, &context](auto) {
             auto& test = context.tests[test_index];
             test.did_start_test = true;
+
+            view.set_frame_rate_capped(s_frame_rate_capped.contains_slow(test.input_path));
 
             auto real_path = MUST(FileSystem::real_path(test.input_path));
             auto headers_path = ByteString::formatted("{}.headers", real_path);
 
             Optional<URL::URL> url;
-            if (FileSystem::exists(headers_path) || s_loaded_from_http_server.contains_slow(test.input_path)) {
+            auto is_loaded_from_insecure_origin = s_loaded_from_insecure_origin.contains_slow(test.input_path);
+            auto is_loaded_over_https = s_loaded_from_https_server.contains_slow(test.input_path);
+            if (FileSystem::exists(headers_path) || is_loaded_from_insecure_origin || is_loaded_over_https || s_loaded_from_http_server.contains_slow(test.input_path)) {
                 // Some tests need to be served via the echo server so, for example, HTTP headers from .headers
                 // files are sent, or so that the resulting HTML document has a HTTP based origin (e.g for testing
-                // cookies).
-                auto echo_server_port = Application::web_content_options().echo_server_port;
+                // cookies), or one that is not potentially trustworthy.
+                auto const& options = Application::web_content_options();
+                auto echo_server_port = is_loaded_over_https ? options.https_echo_server_port : options.echo_server_port;
                 VERIFY(echo_server_port.has_value());
                 auto relative_path = LexicalPath::relative_path(real_path, app.test_root_path);
                 VERIFY(relative_path.has_value());
-                url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", unique_localhost_hostname("test-web"sv), echo_server_port.value(), relative_path.value())).release_value();
+                auto hostname = unique_hostname_within(is_loaded_from_insecure_origin ? "test"sv : "localhost"sv, "test-web"sv);
+                url = URL::Parser::basic_parse(ByteString::formatted("{}://{}:{}/static/{}", is_loaded_over_https ? "https"sv : "http"sv, hostname, echo_server_port.value(), relative_path.value())).release_value();
             } else {
                 url = URL::create_with_file_scheme(real_path).release_value();
             }
 
-            // Append variant query string if present (variant is "?foo=bar", set_query expects "foo=bar")
+            // Append variant query string if present (variant is "?foo=bar"). Parsing it against the URL
+            // percent-encodes it, as it is in the URL that the test's request fetches.
             if (test.variant.has_value())
-                url->set_query(test.variant->bytes_as_string_view().substring_view(1));
+                url = URL::Parser::basic_parse(*test.variant, *url).release_value();
 
             switch (test.mode) {
             case TestMode::Crash:
@@ -992,7 +1093,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
         });
     });
 
-    view.load(URL::about_blank());
+    view.load_from_browser_ui(URL::about_blank());
 }
 
 static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& context, TestRunCapture& test_run_capture)
@@ -1261,6 +1362,8 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                 view->reset_line_box_borders();
                 view->reset_user_style();
                 view->reset_geolocation_emulated_position();
+                view->reset_permissions();
+                view->reset_notifications();
                 view->reset_viewport_size(window_size);
             }
 
@@ -1420,7 +1523,11 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             outln("Results: file://{}/index.html", app.results_directory);
     }
 
-    return display.fail_count + display.timeout_count + display.crashed_count + tests_remaining;
+    auto crashed_worker_count = test_run_capture.crashed_worker_count();
+    if (crashed_worker_count > 0)
+        warnln("test-web: {} worker(s) crashed, see the helper process logs", crashed_worker_count);
+
+    return display.fail_count + display.timeout_count + display.crashed_count + tests_remaining + crashed_worker_count;
 }
 
 static void handle_signal(int signal)

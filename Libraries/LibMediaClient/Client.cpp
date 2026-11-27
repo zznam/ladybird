@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <AK/Checked.h>
 #include <AK/NeverDestroyed.h>
 #include <LibCore/Timer.h>
@@ -15,13 +16,16 @@ namespace MediaClient {
 
 static constexpr int IDLE_EXIT_DELAY_MS = 30'000;
 
-static NeverDestroyed<Client::TransportFactory> s_transport_factory;
-static NeverDestroyed<RefPtr<Client>> s_client;
-static u64 s_next_generation { 1 };
+// A connection serves the thread that made it, so each agent has one of its own.
+static thread_local NeverDestroyed<Client::TransportFactory> s_transport_factory;
+static thread_local NeverDestroyed<RefPtr<Client>> s_client;
+static Atomic<u64, AK::MemoryOrder::memory_order_relaxed> s_next_generation { 1 };
 
 void Client::set_transport_factory(TransportFactory factory)
 {
     *s_transport_factory = move(factory);
+    if (!*s_transport_factory)
+        *s_client = nullptr;
 }
 
 ErrorOr<NonnullRefPtr<Client>> Client::acquire()
@@ -40,7 +44,7 @@ ErrorOr<NonnullRefPtr<Client>> Client::acquire()
 
 Client::Client(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<MediaClientEndpoint, MediaServerEndpoint>(*this, move(transport))
-    , m_generation(s_next_generation++)
+    , m_generation(s_next_generation.fetch_add(1))
 {
 }
 
@@ -100,6 +104,15 @@ void Client::request_video_decoder_server_connection(u64 request_id)
         }
         self->async_video_decoder_server_connection_ready(request_id, handle.release_value());
     });
+}
+
+void Client::video_decoder_server_unresponsive()
+{
+    if (!on_video_decoder_server_unresponsive) {
+        dbgln("A MediaServer reported an unresponsive VideoDecoderServer to a non-controller");
+        return;
+    }
+    on_video_decoder_server_unresponsive();
 }
 
 u64 Client::allocate_id()
@@ -296,10 +309,10 @@ void Client::playback_session_clock_changed(u64 session_id, Media::MediaTimeRead
         playback_manager->clock_changed({}, move(time_reader));
 }
 
-void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, Media::DemuxerScanState scan_state)
+void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, AK::Duration earliest_possible_position, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, move(scan_state));
+        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, earliest_possible_position, move(scan_state));
 }
 
 void Client::playback_session_media_stream_source_failed(u64 session_id, u64 stream_id, Media::DecoderError error)
@@ -314,14 +327,20 @@ void Client::playback_session_duration_changed(u64 session_id, AK::Duration dura
         playback_manager->duration_changed({}, duration);
 }
 
-void Client::playback_session_state_changed(u64 session_id, u64 applied_seek_request_id, Media::PlaybackState state, bool is_playing, Media::AvailableData available_data, AK::Duration current_time)
+void Client::playback_session_seek_decided(u64 session_id, u64 seek_request_id, Media::SeekDecision decision)
+{
+    if (auto* playback_manager = find_playback_manager(session_id))
+        playback_manager->seek_decided({}, seek_request_id, decision);
+}
+
+void Client::playback_session_state_changed(u64 session_id, u64 applied_seek_request_id, Media::PlaybackState state, bool is_playing, Media::AvailableData available_data, bool playback_state_is_settled, AK::Duration current_time)
 {
     if (state > Media::PlaybackState::Ended || available_data > Media::AvailableData::Future) {
         dbgln("MediaClient: Ignoring invalid playback state");
         return;
     }
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->state_changed({}, applied_seek_request_id, state, is_playing, available_data, current_time);
+        playback_manager->state_changed({}, applied_seek_request_id, state, is_playing, available_data, playback_state_is_settled, current_time);
 }
 
 void Client::playback_session_media_stream_scan_state_changed(u64 session_id, u64 stream_id, Media::DemuxerScanState scan_state)

@@ -17,11 +17,7 @@
 
 namespace Web::Painting {
 
-using Compositing::MomentumFlingEstimator;
-using Compositing::SnapAreaGeometry;
 using Compositing::SnapAreaIdentity;
-using Compositing::SnapAxes;
-using Compositing::SnapContainerGeometry;
 using Compositing::SnapDestination;
 using Compositing::SnappedAreas;
 using Compositing::SnapSelectionStrategy;

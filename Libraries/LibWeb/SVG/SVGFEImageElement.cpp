@@ -54,8 +54,27 @@ void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<U
     }
 }
 
+void SVGFEImageElement::adopted_from(DOM::Document& old_document)
+{
+    Base::adopted_from(old_document);
+
+    // NB: See process_href().
+    if (old_document.is_temporary_document_for_fragment_parsing()) {
+        auto href = get_attribute_ns(Optional<Utf16FlyString> {}, SVG::AttributeNames::href);
+        if (!href.has_value())
+            href = get_attribute_ns(Namespace::XLink, SVG::AttributeNames::href);
+        process_href(href);
+    }
+}
+
 void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
 {
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The URL is processed once the element is adopted into another document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return;
+
     if (!href.has_value()) {
         m_href = {};
         return;
@@ -65,18 +84,18 @@ void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
     if (!m_href.has_value())
         return;
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href, HTML::CORSSettingAttribute::NoCORS);
     m_resource_request->add_callbacks(
-        [this, resource_request = GC::Root { m_resource_request }] {
-            document().note_svg_paint_resources_changed();
-            document().schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::EveryBox);
-            document().set_needs_repaint(Badge<SVGFEImageElement> {}, InvalidateDisplayList::PaintCommands);
-        },
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](SVGFEImageElement& self) {
+            self.document().note_svg_paint_resources_changed();
+            self.document().schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::EveryBox);
+            self.document().set_needs_repaint(Badge<SVGFEImageElement> {}, InvalidateDisplayList::PaintCommands);
+        }),
         nullptr);
 
     if (m_resource_request->needs_fetching()) {
         auto request = HTML::create_potential_CORS_request(*m_href, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
-        request->set_client(&document().relevant_settings_object());
+        request->set_client(document().relevant_settings_object().address());
         m_resource_request->fetch_resource(request);
     }
 }

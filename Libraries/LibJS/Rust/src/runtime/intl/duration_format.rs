@@ -4,15 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 
 use ak::Utf16String;
+use ak::math;
 use libjs_runtime_macros::Trace;
 use num_traits::FromPrimitive;
 
 use crate::gc::class::{GcCell, define_cell};
-use crate::gc::gc_ref_cell::GcRefCell;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
@@ -30,6 +30,7 @@ use crate::runtime::intl::number_format::{NumberFormat, partition_number_pattern
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_key::PropertyKey;
+use crate::runtime::realm::Realm;
 use crate::runtime::temporal::duration::{Duration, duration_sign};
 use crate::unicode::intl::{self as unicode, Style as UnicodeStyle};
 use crate::utf16::{Utf16StringBuilder, Utf16View};
@@ -98,13 +99,13 @@ impl Default for DurationUnitOptions {
 pub struct DurationFormat {
     base: Object,
     #[gc(untraced)]
-    locale: GcRefCell<Utf16String>, // [[Locale]]
+    locale: RefCell<Utf16String>, // [[Locale]]
     #[gc(untraced)]
-    numbering_system: GcRefCell<Utf16String>, // [[NumberingSystem]]
+    numbering_system: RefCell<Utf16String>, // [[NumberingSystem]]
     #[gc(untraced)]
-    hour_minute_separator: GcRefCell<Utf16String>, // [[HourMinutesSeparator]]
+    hour_minute_separator: RefCell<Utf16String>, // [[HourMinutesSeparator]]
     #[gc(untraced)]
-    minute_second_separator: GcRefCell<Utf16String>, // [[MinutesSecondsSeparator]]
+    minute_second_separator: RefCell<Utf16String>, // [[MinutesSecondsSeparator]]
 
     #[gc(untraced)]
     style: Cell<Style>, // [[Style]]
@@ -158,13 +159,19 @@ macro_rules! duration_unit_options_accessors {
 }
 
 impl DurationFormat {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> DurationFormat {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> DurationFormat {
         DurationFormat {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-            locale: GcRefCell::default(),
-            numbering_system: GcRefCell::default(),
-            hour_minute_separator: GcRefCell::default(),
-            minute_second_separator: GcRefCell::default(),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            locale: RefCell::default(),
+            numbering_system: RefCell::default(),
+            hour_minute_separator: RefCell::default(),
+            minute_second_separator: RefCell::default(),
             style: Cell::new(Style::Long),
             years_options: Cell::new(DurationUnitOptions::default()),
             months_options: Cell::new(DurationUnitOptions::default()),
@@ -733,8 +740,11 @@ pub fn compute_fractional_digits(duration_format: &DurationFormat, duration: &Du
             let value = (duration_instances_component.value_slot)(duration);
 
             // iv. Set result to result + (value / 10**exponent).
-            result =
-                &result + &BigFraction::new(big_integer_of_field(value), big_integer_of_field(10f64.powf(exponent)));
+            result = &result
+                + &BigFraction::new(
+                    big_integer_of_field(value),
+                    big_integer_of_field(math::pow(10f64, exponent)),
+                );
 
             // v. Set exponent to exponent + 3.
             exponent += 3.0;

@@ -11,8 +11,6 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontStyleMapping.h>
-#include <LibWeb/CSS/CSSKeywordValue.h>
-#include <LibWeb/CSS/CSSStyleValue.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputeFFI.h>
@@ -90,14 +88,6 @@ ColorResolutionStyle ColorResolutionStyle::for_layout_node(Layout::NodeWithStyle
     return {
         .inherited_ui_values = &layout_node.style_group<ComputedValues::InheritedUIValues>(),
         .inherited_text_values = &layout_node.style_group<ComputedValues::InheritedTextValues>(),
-    };
-}
-
-ColorResolutionStyle ColorResolutionStyle::for_computed_values(ComputedValues const& computed_values)
-{
-    return {
-        .inherited_ui_values = computed_values.style_group_payload(StyleGroupIndex::InheritedUIValues),
-        .inherited_text_values = computed_values.style_group_payload(StyleGroupIndex::InheritedTextValues),
     };
 }
 
@@ -281,8 +271,18 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
 
 ValueComparingNonnullRefPtr<StyleValue const> StyleValue::create_guaranteed_invalid()
 {
-    static auto& instance = adopt_ref(*new (nothrow) StyleValue(Type::GuaranteedInvalid, StyleValueFFI::rust_style_value_create_guaranteed_invalid())).leak_ref();
+    static auto& instance = *make_immortal(new (nothrow) StyleValue(Type::GuaranteedInvalid, StyleValueFFI::rust_style_value_create_guaranteed_invalid()));
     return instance;
+}
+
+NonnullRefPtr<StyleValue const> StyleValue::intern(Atomic<StyleValue const*>& slot, NonnullRefPtr<StyleValue const> value)
+{
+    // NB: Two threads can get here for the same slot. The one that loses has built a value that nothing will free.
+    auto const* candidate = make_immortal(value.ptr());
+    StyleValue const* winner = nullptr;
+    if (slot.compare_exchange_strong(winner, candidate, AK::MemoryOrder::memory_order_acq_rel))
+        return *candidate;
+    return *winner;
 }
 
 void StyleValue::set_style_sheet(StyleSheetState* style_sheet)
@@ -332,10 +332,6 @@ bool StyleValue::equals(StyleValue const& other) const
         // The value of a pending-substitution value is unknown, so they never compare equal
         // (not even to themselves).
         return false;
-    case Type::Unresolved:
-        // Unresolved values compare by their normalized comparison text (and attr taint), not
-        // by the raw source text and cached parse state the data also carries.
-        return as_unresolved().equals(other);
     case Type::Calculated:
         // Calculations compare by tree structure alone; the data also carries parse-context
         // fields (resolved type, accepted ranges) that must not affect equality.
@@ -343,17 +339,6 @@ bool StyleValue::equals(StyleValue const& other) const
     default:
         return StyleValueFFI::rust_style_value_equals(m_value.data(), other.m_value.data());
     }
-}
-
-bool StyleValue::is_color_function() const
-{
-    return type() == Type::Color && m_value->tag == StyleValueFFI::StyleValueData::Tag::ColorFunction;
-}
-
-bool StyleValue::depends_on_current_color() const
-{
-    // The recursion over nested colors lives in the Rust style value graph.
-    return StyleValueFFI::rust_style_value_depends_on_current_color(m_value.operator->());
 }
 
 bool StyleValue::has_color() const
@@ -469,80 +454,6 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::absolutized(Computatio
 bool StyleValue::has_auto() const
 {
     return is_keyword() && as_keyword().keyword() == Keyword::Auto;
-}
-
-// https://drafts.css-houdini.org/css-typed-om-1/#reify-as-a-cssstylevalue
-GC::Ref<CSSStyleValue> StyleValue::reify(Utf16FlyString const& associated_property) const
-{
-    switch (type()) {
-    case Type::ConicGradient:
-    case Type::Image:
-    case Type::ImageSet:
-    case Type::LinearGradient:
-    case Type::RadialGradient:
-        return as_abstract_image().reify(associated_property);
-    case Type::Angle:
-    case Type::Flex:
-    case Type::Frequency:
-    case Type::Length:
-    case Type::Percentage:
-    case Type::Resolution:
-    case Type::Time:
-        return as_dimension().reify(associated_property);
-    case Type::BackgroundSize:
-        // NB: A background size whose height is `auto` serializes as just its width, so reify it as that width. For
-        //     example, the `auto` keyword is parsed as a size of `auto auto`.
-        if (as_background_size().size_y()->has_auto())
-            return as_background_size().size_x()->reify(associated_property);
-        break;
-    case Type::Calculated:
-        return as_calculated().reify(associated_property);
-    case Type::CustomIdent:
-        return as_custom_ident().reify(associated_property);
-    case Type::Display:
-        return as_display().reify(associated_property);
-    case Type::Integer:
-        return as_integer().reify(associated_property);
-    case Type::Keyword:
-        return as_keyword().reify(associated_property);
-    case Type::Number:
-        return as_number().reify(associated_property);
-    case Type::OpacityValue:
-        return as_opacity_value().reify(associated_property);
-    case Type::GridTrackSizeList:
-        // NB: A track list that is just one track size, as for `grid-auto-columns: 10px`, is that track size.
-        if (auto const* track_size = StyleValueFFI::rust_style_value_grid_track_size_list_single_size(rust_style_value_data()))
-            return adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(track_size))->reify(associated_property);
-        break;
-    case Type::TextIndent:
-        // NB: A text-indent without the `hanging` or `each-line` keywords is just its length-percentage.
-        if (!m_value->text_indent.hanging && !m_value->text_indent.each_line)
-            return wrap_rust_child(m_value->text_indent.length_percentage)->reify(associated_property);
-        break;
-    case Type::Unresolved:
-        return as_unresolved().reify(associated_property);
-    case Type::ValueList:
-        return as_value_list().reify(associated_property);
-    default:
-        break;
-    }
-
-    // AD-HOC: Some values that are just a single keyword are represented by a more specific type, for example
-    //         `font-style: italic`, `grid-auto-flow: row` or `font-variant-numeric: ordinal`. Reify those as the
-    //         keyword. Colors and shorthands are left alone, as they are not keywords on their own.
-    if (type() != Type::Color && type() != Type::Shorthand) {
-        auto serialized_value = to_utf16_string(SerializationMode::Normal);
-        if (keyword_from_string(serialized_value).has_value())
-            return CSSKeywordValue::create(Utf16FlyString { serialized_value });
-    }
-
-    return default_reify(associated_property);
-}
-
-GC::Ref<CSSStyleValue> StyleValue::default_reify(Utf16FlyString const& associated_property) const
-{
-    // 1. Return a new CSSStyleValue object representing value whose [[associatedProperty]] internal slot is set to property.
-    return CSSStyleValue::create(associated_property, *this);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#subdivide-into-iterations

@@ -90,6 +90,8 @@ TEST_CASE(a_stored_report_is_named_after_the_time_of_the_crash)
 TEST_CASE(unrelated_files_are_not_reports)
 {
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("notes.txt"sv));
+    EXPECT(!WebView::CrashReportStore::is_saved_report_name("WebContent-abc123.txt"sv));
+    EXPECT(!WebView::CrashReportStore::is_saved_report_name("2026-03-04X05-06-07Z-WebContent-abc123.txt"sv));
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("2026-03-04T05-06-07Z-Firefox-abc123.txt"sv));
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("2026-03-04T05-06-07Z-WebContent-abc123.log"sv));
     EXPECT(WebView::CrashReportStore::is_saved_report_name("2026-03-04T05-06-07Z-WebContent-abc123.txt"sv));
@@ -100,6 +102,22 @@ TEST_CASE(a_name_cannot_reach_outside_the_store)
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("WebContent-x/../a.txt"sv));
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("2026-03-04T05-06-07Z-WebContent-ab/c12.txt"sv));
     EXPECT(!WebView::CrashReportStore::is_saved_report_name("2026-03-04T05-06-07Z-WebContent-abc.12.txt"sv));
+}
+
+TEST_CASE(a_website_left_without_its_report_is_removed)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto store = test_store();
+    auto name = report_name("2026-10-05T12-00-00Z"sv);
+    write_file(name, "A report\n"sv);
+    write_file(ByteString::formatted("{}.website", name), "https://example.com/"sv);
+    write_file(ByteString::formatted("{}.website", report_name("2026-10-05T12-00-01Z"sv)), "https://example.org/"sv);
+
+    MUST(store.remove_expired_reports(now));
+    EXPECT(store.website(name).has_value());
+    EXPECT_EQ(directory_entries().size(), 2u);
 }
 
 TEST_CASE(pending_reports_are_listed_newest_first)
@@ -128,7 +146,7 @@ TEST_CASE(a_name_the_store_rejects_is_never_read_or_marked)
     EXPECT(MUST(test_store().pending_report_names(now)).is_empty());
     EXPECT(test_store().saved_report("notes.txt"sv).is_error());
     EXPECT(test_store().mark_seen("../escape.txt"sv).is_error());
-    EXPECT(test_store().remove_sent_report("notes.txt"sv).is_error());
+    EXPECT(test_store().remove_report("notes.txt"sv).is_error());
 }
 
 TEST_CASE(a_seen_report_is_no_longer_pending)
@@ -140,10 +158,10 @@ TEST_CASE(a_seen_report_is_no_longer_pending)
     write_file(name, "A report\n"sv);
     auto store = test_store();
 
-    EXPECT(store.has_pending_reports(now));
+    EXPECT(!MUST(store.pending_report_names(now)).is_empty());
     MUST(store.mark_seen(name));
     MUST(store.mark_seen(name));
-    EXPECT(!store.has_pending_reports(now));
+    EXPECT(MUST(store.pending_report_names(now)).is_empty());
     EXPECT(directory_entries().is_empty());
     EXPECT_EQ(directory_entries("Seen"sv), Vector<ByteString> { name });
 
@@ -151,53 +169,10 @@ TEST_CASE(a_seen_report_is_no_longer_pending)
     EXPECT_EQ(MUST(store.saved_report(name)).text, "A report\n"sv);
 
     write_file(report_name("2026-03-05T05-06-07Z"sv), "Another report\n"sv);
-    EXPECT(store.has_pending_reports(now));
+    EXPECT(!MUST(store.pending_report_names(now)).is_empty());
 }
 
-TEST_CASE(marking_all_reports_seen_leaves_none_pending)
-{
-    cleanup();
-    ScopeGuard guard = cleanup;
-
-    auto older = report_name("2026-03-04T05-06-07Z"sv);
-    auto newer = report_name("2026-03-05T05-06-07Z"sv);
-    auto stale = report_name("2026-03-03T05-06-07Z"sv);
-    write_file(older, "Older report\n"sv);
-    write_file(newer, "Newer report\n"sv);
-    write_file(stale, "Stale report\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 1, 0, 0, 0, 0));
-    auto store = test_store();
-
-    MUST(store.mark_all_seen(now));
-    EXPECT(!store.has_pending_reports(now));
-    EXPECT_EQ(directory_entries(), Vector<ByteString> { stale });
-    EXPECT_EQ(directory_entries("Seen"sv).size(), 2u);
-    EXPECT_EQ(MUST(store.saved_report(older)).text, "Older report\n"sv);
-    EXPECT_EQ(MUST(store.saved_report(newer)).text, "Newer report\n"sv);
-
-    MUST(store.mark_all_seen(now));
-    EXPECT_EQ(directory_entries("Seen"sv).size(), 2u);
-}
-
-TEST_CASE(a_report_from_before_the_hard_cutoff_date_is_not_pending)
-{
-    cleanup();
-    ScopeGuard guard = cleanup;
-
-    auto before = report_name("2026-10-02T19-59-59Z"sv);
-    auto at = report_name("2026-10-02T20-00-00Z"sv, "Browser"sv);
-    write_file(before, "Too old\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 2, 19, 59, 59, 0));
-    write_file(at, "Recent enough\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 2, 20, 0, 0, 0));
-    auto store = test_store();
-
-    auto soon_after = UnixDateTime::from_unix_time_parts(2026, 10, 3, 0, 0, 0, 0);
-    EXPECT_EQ(MUST(store.pending_report_names(soon_after)), Vector<ByteString> { at });
-
-    // The report is only ignored, so it can still be read.
-    EXPECT_EQ(MUST(store.saved_report(before)).text, "Too old\n"sv);
-    EXPECT_EQ(directory_entries().size(), 2u);
-}
-
-TEST_CASE(a_report_older_than_14_days_is_not_pending)
+TEST_CASE(a_report_older_than_30_days_is_not_pending)
 {
     cleanup();
     ScopeGuard guard = cleanup;
@@ -208,13 +183,35 @@ TEST_CASE(a_report_older_than_14_days_is_not_pending)
     write_file(fresh, "Recent enough\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 5, 12, 0, 0, 0));
     auto store = test_store();
 
-    auto in_two_weeks = UnixDateTime::from_unix_time_parts(2026, 10, 19, 12, 0, 0, 0);
-    EXPECT_EQ(MUST(store.pending_report_names(in_two_weeks)), Vector<ByteString> { fresh });
-    EXPECT(store.has_pending_reports(in_two_weeks));
+    auto in_30_days = UnixDateTime::from_unix_time_parts(2026, 11, 4, 12, 0, 0, 0);
+    EXPECT_EQ(MUST(store.pending_report_names(in_30_days)), Vector<ByteString> { fresh });
+    EXPECT(!MUST(store.pending_report_names(in_30_days)).is_empty());
 
-    auto later = in_two_weeks + AK::Duration::from_seconds(1);
+    auto later = in_30_days + AK::Duration::from_seconds(1);
     EXPECT(MUST(store.pending_report_names(later)).is_empty());
-    EXPECT(!store.has_pending_reports(later));
+    EXPECT(MUST(store.pending_report_names(later)).is_empty());
+}
+
+TEST_CASE(unsent_reports_are_deleted_after_30_days)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto stale = report_name("2026-10-05T11-59-59Z"sv);
+    auto stale_and_seen = report_name("2026-10-05T11-59-58Z"sv);
+    auto fresh = report_name("2026-10-05T12-00-00Z"sv, "Browser"sv);
+    auto fresh_and_seen = report_name("2026-10-05T12-00-01Z"sv);
+    write_file(stale, "Too old\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 5, 11, 59, 59, 0));
+    write_file(stale_and_seen, "Too old\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 5, 11, 59, 58, 0));
+    write_file(fresh, "Recent enough\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 5, 12, 0, 0, 0));
+    write_file(fresh_and_seen, "Recent enough\n"sv, UnixDateTime::from_unix_time_parts(2026, 10, 5, 12, 0, 1, 0));
+    auto store = test_store();
+    MUST(store.mark_seen(stale_and_seen));
+    MUST(store.mark_seen(fresh_and_seen));
+
+    MUST(store.remove_expired_reports(UnixDateTime::from_unix_time_parts(2026, 11, 4, 12, 0, 0, 0)));
+    EXPECT_EQ(directory_entries(), Vector<ByteString> { fresh });
+    EXPECT_EQ(directory_entries("Seen"sv), Vector<ByteString> { fresh_and_seen });
 }
 
 TEST_CASE(a_stored_report_is_as_old_as_its_crash)
@@ -224,11 +221,11 @@ TEST_CASE(a_stored_report_is_as_old_as_its_crash)
 
     // A crash recovered at a later launch is still as old as when it happened.
     auto store = test_store();
-    auto crashed_at = UnixDateTime::from_unix_time_parts(2026, 10, 3, 0, 0, 0, 0);
+    auto crashed_at = UnixDateTime::from_unix_time_parts(2026, 2, 25, 0, 0, 0, 0);
     auto name = MUST(store.store_report(WebView::ProcessType::Browser, "A report\n"sv, crashed_at));
 
-    EXPECT_EQ(MUST(store.pending_report_names(crashed_at + AK::Duration::from_seconds(14 * 24 * 60 * 60))), Vector<ByteString> { name });
-    EXPECT(MUST(store.pending_report_names(crashed_at + AK::Duration::from_seconds(14 * 24 * 60 * 60 + 1))).is_empty());
+    EXPECT_EQ(MUST(store.pending_report_names(crashed_at + AK::Duration::from_seconds(30 * 24 * 60 * 60))), Vector<ByteString> { name });
+    EXPECT(MUST(store.pending_report_names(crashed_at + AK::Duration::from_seconds(30 * 24 * 60 * 60 + 1))).is_empty());
 }
 
 TEST_CASE(a_missing_report_cannot_be_moved)
@@ -254,8 +251,8 @@ TEST_CASE(sending_a_report_removes_it_wherever_it_is)
     auto store = test_store();
     MUST(store.mark_seen(seen_name));
 
-    MUST(store.remove_sent_report(pending_name));
-    MUST(store.remove_sent_report(seen_name));
+    MUST(store.remove_report(pending_name));
+    MUST(store.remove_report(seen_name));
     EXPECT(directory_entries().is_empty());
     EXPECT(directory_entries("Seen"sv).is_empty());
 }
@@ -281,16 +278,6 @@ TEST_CASE(retention_only_drops_the_oldest_seen_reports)
     for (u32 i = 0; i < 3; ++i)
         awaiting_review.append(store_report_modified_at(i, 500 + i));
 
-    // Reports saved before names began with the crash time are seen reports like any other.
-    auto legacy_name = "WebContent-legacy.txt"sv;
-    write_file(legacy_name, "A legacy report\n"sv);
-    {
-        timespec times[2] { { 1, 0 }, { 1, 0 } };
-        auto file = MUST(directory.open(legacy_name, Core::File::OpenMode::Read));
-        VERIFY(futimens(file->fd(), times) == 0);
-    }
-    MUST(store.mark_seen(legacy_name));
-
     Vector<ByteString> seen;
     for (u32 i = 0; i < 21; ++i) {
         seen.append(store_report_modified_at(100 + i, 1000 + i));
@@ -304,7 +291,6 @@ TEST_CASE(retention_only_drops_the_oldest_seen_reports)
 
     auto seen_entries = directory_entries("Seen"sv);
     EXPECT_EQ(seen_entries.size(), 20u);
-    EXPECT(!seen_entries.contains_slow(legacy_name));
     EXPECT(!seen_entries.contains_slow(seen[0]));
     for (auto const& name : seen.span().slice(1))
         EXPECT(seen_entries.contains_slow(name));
@@ -497,4 +483,25 @@ TEST_CASE(a_browser_that_crashes_is_recovered_by_the_next_launch)
     EXPECT(text.contains(WebView::CrashReport::describe_current_build(WebView::ProcessType::Browser)));
     EXPECT(text.contains("Termination signal: SIGSEGV\nTermination signal number: 11\n"sv));
     EXPECT(text.contains("Native stack"sv));
+}
+
+TEST_CASE(waiting_reports_are_limited_and_the_oldest_go_first)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto store = test_store();
+    Vector<ByteString> names;
+    for (i64 index = 0; index <= 100; ++index) {
+        auto crashed_at = now - AK::Duration::from_seconds(1000 - index);
+        names.append(MUST(store.store_report(WebView::ProcessType::WebContent, "A report\n"sv, crashed_at)));
+        if (index == 0)
+            MUST(store.save_website(names.first(), "https://example.com/"sv));
+    }
+
+    auto waiting = MUST(store.pending_report_names(now));
+    EXPECT_EQ(waiting.size(), 100u);
+    EXPECT(!waiting.contains_slow(names.first()));
+    EXPECT(waiting.contains_slow(names.last()));
+    EXPECT(!store.website(names.first()).has_value());
 }

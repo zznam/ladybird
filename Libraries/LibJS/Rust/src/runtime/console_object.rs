@@ -49,18 +49,16 @@ fn console_of_current_realm(vm: &Vm) -> Gc<Console> {
 impl ConsoleObject {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<ConsoleObject> {
         let prototype = create_console_prototype(vm, realm);
-        realm.create_object(
-            vm,
-            ConsoleObject {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    prototype.upcast(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-                console: Cell::new(None),
-            },
-        )
+        realm.create_object(vm, |_| ConsoleObject {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype.upcast()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            console: Cell::new(None),
+        })
     }
 
     pub fn console(&self) -> Gc<Console> {
@@ -94,6 +92,11 @@ impl ConsoleObject {
         define(&names.time, raw_native!(ConsoleObject::time));
         define(&names.timeLog, raw_native!(ConsoleObject::time_log));
         define(&names.timeEnd, raw_native!(ConsoleObject::time_end));
+        // AD-HOC: The spec has no profile(), profileEnd() or timeStamp(), but scripts call them, and they throw if
+        //         they're missing. They're for a profiler to act on, and do nothing without one.
+        define(&names.profile, raw_native!(ConsoleObject::do_nothing));
+        define(&names.profileEnd, raw_native!(ConsoleObject::do_nothing));
+        define(&names.timeStamp, raw_native!(ConsoleObject::do_nothing));
 
         object.define_direct_property(
             vm,
@@ -202,5 +205,10 @@ impl ConsoleObject {
     // 1.4.3. timeEnd(label), https://console.spec.whatwg.org/#timeend
     fn time_end(vm: &Vm) -> ThrowCompletionOr<Value> {
         console_of_current_realm(vm).time_end(vm)
+    }
+
+    #[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
+    fn do_nothing(_vm: &Vm) -> ThrowCompletionOr<Value> {
+        Ok(Value::UNDEFINED)
     }
 }

@@ -9,7 +9,7 @@
 
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
-#include <LibGC/Root.h>
+#include <LibGC/RootHashMap.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/Agent.h>
 #include <LibWeb/Export.h>
@@ -23,6 +23,8 @@ struct SimilarOriginWindowAgent : public Agent {
     AK_ALLOC_WITH_KMALLOC;
 
     static WEB_API NonnullOwnPtr<SimilarOriginWindowAgent> create(GC::Heap&);
+
+    virtual bool is_similar_origin_window_agent() const override { return true; }
 
     // https://dom.spec.whatwg.org/#mutation-observer-compound-microtask-queued-flag
     // Each similar-origin window agent has a mutation observer microtask queued (a boolean), which is initially false. [HTML]
@@ -52,7 +54,7 @@ struct SimilarOriginWindowAgent : public Agent {
     // https://html.spec.whatwg.org/multipage/custom-elements.html#active-custom-element-constructor-map
     // Each similar-origin window agent has an associated active custom element constructor map, which is a map of
     // constructors to CustomElementRegistry objects.
-    HashMap<GC::Ref<JS::FunctionObject>, GC::Root<CustomElementRegistry>> active_custom_element_constructor_map;
+    GC::RootHashMap<GC::Ref<JS::FunctionObject>, GC::Ptr<CustomElementRegistry>> active_custom_element_constructor_map;
 
 private:
     SimilarOriginWindowAgent(CanBlock);

@@ -136,6 +136,7 @@ fn timed_compile(module: &Arc<libwasm_engine::Module>, functions: &[u32], thread
                             break;
                         };
                         let request = CompileRequest {
+                            stack_limit: 0,
                             osr: None,
                             module: module.clone(),
                             function,
@@ -182,6 +183,7 @@ fn main() {
             options.dump_ir = !arguments.quiet;
             options.stats = true;
             let request = CompileRequest {
+                stack_limit: 0,
                 osr: arguments.osr,
                 module: module.clone(),
                 function,
@@ -192,6 +194,7 @@ fn main() {
             let mut best = None::<Vec<u64>>;
             for _ in 1..arguments.runs {
                 let quiet = CompileRequest {
+                    stack_limit: 0,
                     osr: None,
                     module: module.clone(),
                     function,
@@ -242,6 +245,7 @@ fn main() {
         let mut failures: BTreeMap<&'static str, usize> = BTreeMap::new();
         for index in 0..module.code.len() as u32 {
             let request = CompileRequest {
+                stack_limit: 0,
                 osr: None,
                 module: module.clone(),
                 function: first + index,
@@ -269,6 +273,7 @@ fn main() {
         for run in 0..arguments.runs.max(1) {
             for (position, &function) in compiled.iter().enumerate() {
                 let request = CompileRequest {
+                    stack_limit: 0,
                     osr: None,
                     module: module.clone(),
                     function,
@@ -289,6 +294,7 @@ fn main() {
                 stats.slots += result.stats.slots;
                 stats.moves += result.stats.moves;
                 stats.hoisted += result.stats.hoisted;
+                stats.allocation_passes += result.stats.allocation_passes;
             }
         }
         let mut worst = (0.0, 0, 0);
@@ -375,11 +381,12 @@ fn main() {
             );
         }
         println!(
-            "  per byte: {:.2} nodes, {:.3} slots, {:.3} moves; {} nodes hoisted out of loops",
+            "  per byte: {:.2} nodes, {:.3} slots, {:.3} moves; {} nodes hoisted out of loops; {} allocation passes",
             stats.nodes as f64 / compiled_bytes.max(1) as f64,
             stats.slots as f64 / compiled_bytes.max(1) as f64,
             stats.moves as f64 / compiled_bytes.max(1) as f64,
-            stats.hoisted
+            stats.hoisted,
+            stats.allocation_passes
         );
         for (what, count) in &failures {
             println!("  unsupported: {count} x {what}");

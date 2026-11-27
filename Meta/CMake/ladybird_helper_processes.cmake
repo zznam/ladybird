@@ -1,12 +1,14 @@
 set(ladybird_helper_processes
     AudioServer
     Compositor
+    Hub
     ImageDecoder
     MediaServer
     RequestServer
+    SystemProbe
     VideoDecoderServer
     WebContent
-    WebWorker
+    WebRTCClient
 )
 
 # Kills the helpers when the Browser is gone, which the kernel cannot do on macOS.
@@ -33,9 +35,9 @@ function(ladybird_sign_helper_process target)
     if (NOT APPLE)
         return()
     endif()
-    cmake_parse_arguments(PARSE_ARGV 1 ARG "ALLOW_JIT" "" "")
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "ALLOW_JIT" "" "ENTITLEMENTS")
 
-    set(entitlements com.apple.security.cs.disable-library-validation)
+    set(entitlements com.apple.security.cs.disable-library-validation ${ARG_ENTITLEMENTS})
     if (ARG_ALLOW_JIT)
         list(APPEND entitlements com.apple.security.cs.allow-jit)
     endif()
@@ -46,14 +48,14 @@ function(ladybird_sign_helper_process target)
     set(entitlements_file "${CMAKE_CURRENT_BINARY_DIR}/${target}.entitlements")
     ladybird_write_entitlements("${entitlements_file}" ${entitlements})
 
-    set(release_entitlements)
+    set(release_entitlements ${ARG_ENTITLEMENTS})
     if (ARG_ALLOW_JIT)
         list(APPEND release_entitlements com.apple.security.cs.allow-jit)
     endif()
     ladybird_write_entitlements("${CMAKE_CURRENT_BINARY_DIR}/${target}.release.entitlements" ${release_entitlements})
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${target}.release.entitlements" DESTINATION entitlements
+        COMPONENT ladybird_Runtime)
 
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND codesign -s - -f -o runtime --entitlements "${entitlements_file}" "$<TARGET_FILE:${target}>"
-        VERBATIM
-    )
+    ladybird_codesign_command(codesign_command "${target}" --entitlements "${entitlements_file}" -o runtime "$<TARGET_FILE:${target}>")
+    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${codesign_command} VERBATIM)
 endfunction()

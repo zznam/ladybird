@@ -9,6 +9,7 @@
 #include <AK/LexicalPath.h>
 #include <AK/ScopeGuard.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <LibCore/IOSurface.h>
 #include <LibCore/System.h>
 #include <LibTest/TestCase.h>
 #include <Security/Security.h>
@@ -33,6 +34,10 @@ enum class Outcome {
 
 static Outcome run_in_helper_sandbox(Function<ErrorOr<void>()> const& apply_sandbox, Function<bool()> const& operation)
 {
+    // These tests fork without exec, so initialize the native runtime in the parent. Objective-C cannot initialize
+    // classes in a child forked from a multithreaded process, such as one that has already queried CoreGraphics.
+    Core::IOSurfaceHandle::initialize();
+
     auto child = fork();
     VERIFY(child >= 0);
     if (child == 0) {
@@ -193,13 +198,13 @@ TEST_CASE(helpers_run_with_the_hardened_runtime)
 {
     // With the hardened runtime, the kernel refuses to run code from memory that was writable, unless the process may
     // map JIT memory. Only the renderers run code that they compile at runtime.
-    for (auto name : { "AudioServer"sv, "Compositor"sv, "ImageDecoder"sv, "MediaServer"sv, "ProcessReaper"sv, "RequestServer"sv, "WebContent"sv, "WebWorker"sv }) {
+    for (auto name : { "AudioServer"sv, "Compositor"sv, "ImageDecoder"sv, "MediaServer"sv, "ProcessReaper"sv, "RequestServer"sv, "WebContent"sv }) {
         auto signature = signature_of_helper(name);
         if (!signature.has_value()) {
             warnln("Skipping {}, which was not built", name);
             continue;
         }
         EXPECT(signature->uses_hardened_runtime);
-        EXPECT_EQ(signature->may_map_jit_memory, name == "WebContent"sv || name == "WebWorker"sv);
+        EXPECT_EQ(signature->may_map_jit_memory, name == "WebContent"sv);
     }
 }

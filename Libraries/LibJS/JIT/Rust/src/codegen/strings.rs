@@ -19,7 +19,7 @@ use crate::ir::NodeId;
 use crate::ir::TypeofKind;
 use crate::ir::value;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// `StringsEqual`: strings with the same bits are equal. Others are not
     /// if both are interned (two interned strings are equal only if they are
     /// the same string, like the interpreter's `string_compare`) or if their
@@ -194,14 +194,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             u32::from(self.runtime.object_flag_is_function),
             no,
         );
-        self.masm.load8(
-            scratch,
-            &Address::new(function, layout.function_object_has_builtin as i32),
-        );
-        self.masm.branch_test32(Condition::Zero, scratch, 0xFF, no);
         self.masm
             .load8(scratch, &Address::new(function, layout.function_object_builtin as i32));
-        self.masm.branch32_imm(Condition::Equal, scratch, i32::from(id), yes);
+        self.masm
+            .branch32_imm(Condition::Equal, scratch, i32::from(id) + 1, yes);
         self.masm.jump(no);
     }
 

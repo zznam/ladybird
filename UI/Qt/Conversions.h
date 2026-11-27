@@ -17,17 +17,17 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
 #include <LibURL/URL.h>
+#include <LibWebView/StringConversionsMacOS.h>
 
 #import <Cocoa/Cocoa.h>
 
 namespace Ladybird {
 
-String ns_string_to_string(NSString*);
-NSString* string_to_ns_string(StringView);
-
-NSData* string_to_ns_data(StringView);
-
-Gfx::Color ns_color_to_gfx_color(NSColor*);
+using WebView::ns_string_to_string;
+using WebView::ns_string_to_utf16_string;
+using WebView::string_to_ns_data;
+using WebView::string_to_ns_string;
+using WebView::utf16_string_to_ns_string;
 
 NSURL* url_to_ns_url(URL::URL const&);
 

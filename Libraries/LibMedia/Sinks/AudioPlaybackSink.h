@@ -10,7 +10,6 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/ThreadSafeWeakable.h>
-#include <LibAudio/AudioOutput.h>
 #include <LibAudio/Forward.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
@@ -20,6 +19,7 @@
 #include <LibMedia/MediaTime.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Producers/AudioProducer.h>
+#include <LibMedia/Sinks/AudioOutputFactory.h>
 #include <LibMedia/Sinks/AudioSink.h>
 
 namespace Media {
@@ -31,8 +31,8 @@ private:
     class OutputThreadData;
 
 public:
-    static ErrorOr<NonnullRefPtr<AudioPlaybackSink>> try_create(PipelineStateChangeHandler on_state_changed, Audio::AudioOutput = Audio::AudioOutput::Platform);
-    AudioPlaybackSink(NonnullRefPtr<OutputThreadData>, MediaTimeReader, PipelineStateChangeHandler, Audio::AudioOutput);
+    static ErrorOr<NonnullRefPtr<AudioPlaybackSink>> try_create(PipelineStateChangeHandler on_state_changed, NonnullRefPtr<AudioOutputFactory>);
+    AudioPlaybackSink(NonnullRefPtr<OutputThreadData>, MediaTimeReader, PipelineStateChangeHandler, NonnullRefPtr<AudioOutputFactory>);
     virtual ~AudioPlaybackSink() override;
 
     virtual ErrorOr<void> connect_input(NonnullRefPtr<AudioProducer> const&) override;
@@ -57,6 +57,8 @@ public:
 private:
     enum class StreamState {
         Suspended,
+        // Playback is wanted, but the stream is still stopping for a seek or has yet to open. The clock holds meanwhile.
+        Resuming,
         Playing,
     };
 
@@ -64,20 +66,21 @@ private:
     bool playback_stream_is_current(Audio::PlaybackStream const&) const;
 
     void create_playback_stream();
-    bool effectively_paused() const;
+    bool playback_is_wanted() const;
+    void set_stream_state(StreamState);
     void update_playback_stream_state();
     void resume_playback_stream();
     void pause_playback_stream();
+    void hold_clock_until_stream_can_resume();
     void resume_input_from_suspension();
     void dispatch_waiting_status_once_played_out();
 
     Core::EventLoop& m_main_thread_event_loop;
     PipelineStateChangeHandler m_on_state_changed;
-    Audio::AudioOutput m_audio_output { Audio::AudioOutput::Platform };
+    NonnullRefPtr<AudioOutputFactory> m_output_factory;
 
     bool m_started_creating_playback_stream { false };
     bool m_playing { false };
-    StreamState m_stream_state { StreamState::Suspended };
     double m_volume { 1 };
 
     Optional<AK::Duration> m_seek_target_awaiting_discard;

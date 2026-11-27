@@ -200,28 +200,6 @@ GC::Ptr<JS::HostObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_r
     return wrap(wrapper_world, preferred_realm, GC::Ref { *wrappable });
 }
 
-JS::Realm& this_value_realm(JS::Realm& fallback_realm, JS::Value this_value)
-{
-    // Generated native-function prologues normally validate and unwrap their
-    // receiver before asking for its realm. Keep this helper total for callers
-    // that pass an arbitrary JS::Value; the fallback is their explicit realm.
-    if (!this_value.is_object())
-        return fallback_realm;
-
-    auto& object = this_value.as_object();
-    if (auto* window_proxy = HTML::WindowProxy::from_object(object)) {
-        // NB: A Window hosted by another process has no realm in this one, so the caller's realm stands in.
-        if (window_proxy->remote_window())
-            return fallback_realm;
-
-        auto& proxy_realm = object.shape().realm();
-        if (!proxy_realm.host_defined())
-            return fallback_realm;
-    }
-
-    return object.shape().realm();
-}
-
 JS::ThrowCompletionOr<void> set_prototype_of_cached_main_world_wrapper(Wrappable& wrappable, JS::Object& prototype)
 {
     if (auto wrapper = wrappable.m_main_world_wrapper.ptr()) {
@@ -242,6 +220,10 @@ JS::ThrowCompletionOr<void> set_prototype_of_cached_main_world_wrapper(Wrappable
 
 void preserve_wrapper(Wrappable& wrappable, JS::HostObject& wrapper)
 {
+    // An object of an interface implemented in Rust keeps its wrappers alive itself, as wrapper_is_preserved() says.
+    if (wrappable.is_owned_by_rust_interface_object())
+        return;
+
     auto& gc_allocated_wrappable = as<GCAllocatedWrappable>(wrappable);
     auto& world = host_defined_wrapper_world(wrapper.shape().realm());
 
@@ -278,6 +260,11 @@ bool wrapper_is_preserved(JS::HostObject const& wrapper)
     auto const* wrappable = wrappable_impl_from(&wrapper);
     if (!wrappable)
         return false;
+
+    // NB: The wrappers of a Rust object that inherits from a C++ interface hold the C++ object it owns as their
+    //     wrappable.
+    if (wrappable->is_owned_by_rust_interface_object())
+        return host_defined_wrapper_world(wrapper.shape().realm()).is_main_world();
     auto const& gc_allocated_wrappable = as<GCAllocatedWrappable>(*wrappable);
 
     auto& world = host_defined_wrapper_world(wrapper.shape().realm());

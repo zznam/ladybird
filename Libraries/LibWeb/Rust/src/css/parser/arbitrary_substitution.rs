@@ -8,8 +8,6 @@ use crate::css::css_tokenizer::ParserTokenKind;
 use crate::css::parser::component_value::{ComponentKind, ComponentValue};
 use crate::css::parser::value_parser::equals_ascii_case_insensitive;
 use std::collections::HashSet;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ArbitrarySubstitutionFunction {
@@ -57,6 +55,18 @@ pub(crate) fn arbitrary_substitution_function(name: &[u16]) -> Option<ArbitraryS
         return Some(ArbitrarySubstitutionFunction::Var);
     }
     None
+}
+
+/// Stops at the first arbitrary substitution function.
+/// Does not validate argument syntax: a matching function with invalid arguments still returns true.
+pub(crate) fn contains_arbitrary_substitution_function(values: &[ComponentValue]) -> bool {
+    values.iter().any(|value| match &value.kind {
+        ComponentKind::Function { name, values } => {
+            arbitrary_substitution_function(name).is_some() || contains_arbitrary_substitution_function(values)
+        }
+        ComponentKind::SimpleBlock { values, .. } => contains_arbitrary_substitution_function(values),
+        ComponentKind::Token(_) => false,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -139,7 +149,7 @@ fn parse_declaration_value_then_optional_declaration_value(
         return false;
     }
     if *position == values.len() {
-        return true;
+        return matches!(separator, EndToken::Comma);
     }
     if !is_end_token(&values[*position], separator) {
         return false;
@@ -182,15 +192,69 @@ fn parse_dashed_function_argument(values: &[ComponentValue], position: &mut usiz
 
 // This mirrors parse_according_to_argument_grammar() in
 // CSS/Parser/ArbitrarySubstitutionFunctions.cpp.
+/// The argument of a `var()` or `env()` before its first comma, without the whitespace around it.
+fn first_argument(values: &[ComponentValue]) -> &[ComponentValue] {
+    let comma = values.iter().position(ComponentValue::is_comma).unwrap_or(values.len());
+    crate::css::parser::component_value::trim_whitespace(&values[..comma])
+}
+
+// https://drafts.csswg.org/css-variables-1/#using-variables
+// var() = var( <custom-property-name> , <declaration-value>? )
+// AD-HOC: The argument grammar of var() takes any <declaration-value> as the name, which only the replacement algorithm
+//         checks, at computed-value time. A name that isn't a <custom-property-name> makes the declaration invalid at
+//         parse time instead, so that a var() with a typo in it doesn't override an earlier declaration.
+// FIXME: Remove this check, and the one for env() below, once checking the name only at substitution time, as the
+//        argument grammar does, is web-compatible.
+fn names_a_custom_property(values: &[ComponentValue]) -> bool {
+    let name = first_argument(values);
+    name.len() == 1
+        && name[0]
+            .ident()
+            .is_some_and(|ident| ident.len() > 2 && ident[0] == b'-' as u16 && ident[1] == b'-' as u16)
+}
+
+// https://drafts.csswg.org/css-env-1/#env-function
+// env() = env( <custom-ident> <integer [0,inf]>*, <declaration-value>? )
+// AD-HOC: As for var(), a name that doesn't match this grammar makes the declaration invalid at parse time.
+fn names_an_environment_variable(values: &[ComponentValue]) -> bool {
+    let mut parts = first_argument(values).iter().filter(|value| !value.is_whitespace());
+    let Some(name) = parts.next().and_then(ComponentValue::ident) else {
+        return false;
+    };
+    crate::css::parser::value_parser::is_valid_custom_ident(name, &[])
+        && parts.all(|value| {
+            matches!(
+                value.kind,
+                ComponentKind::Token(ParserTokenKind::Number {
+                    value,
+                    number_type: crate::css::css_tokenizer::CssNumberType::Integer
+                        | crate::css::css_tokenizer::CssNumberType::IntegerWithExplicitSign,
+                }) if value >= 0.0
+            )
+        })
+}
+
 pub(crate) fn arguments_are_valid(function: ArbitrarySubstitutionFunction, values: &[ComponentValue]) -> bool {
     let mut position = 0;
     match function {
-        ArbitrarySubstitutionFunction::Attr
-        | ArbitrarySubstitutionFunction::Env
-        | ArbitrarySubstitutionFunction::Inherit
-        | ArbitrarySubstitutionFunction::Var => {
+        ArbitrarySubstitutionFunction::Attr => {
             parse_declaration_value_then_optional_declaration_value(values, &mut position, EndToken::Comma)
                 && position == values.len()
+                && crate::css::custom_properties::literal_attr_arguments_are_valid(values)
+        }
+        ArbitrarySubstitutionFunction::Env => {
+            parse_declaration_value_then_optional_declaration_value(values, &mut position, EndToken::Comma)
+                && position == values.len()
+                && names_an_environment_variable(values)
+        }
+        ArbitrarySubstitutionFunction::Inherit => {
+            parse_declaration_value_then_optional_declaration_value(values, &mut position, EndToken::Comma)
+                && position == values.len()
+        }
+        ArbitrarySubstitutionFunction::Var => {
+            parse_declaration_value_then_optional_declaration_value(values, &mut position, EndToken::Comma)
+                && position == values.len()
+                && names_a_custom_property(values)
         }
         ArbitrarySubstitutionFunction::DashedFunction => {
             discard_whitespace(values, &mut position);
@@ -215,10 +279,11 @@ pub(crate) fn arguments_are_valid(function: ArbitrarySubstitutionFunction, value
             true
         }
         ArbitrarySubstitutionFunction::If => {
+            discard_whitespace(values, &mut position);
             let mut branch_count = 0;
             while position < values.len() {
                 if !parse_declaration_value_then_optional_declaration_value(values, &mut position, EndToken::Colon) {
-                    break;
+                    return false;
                 }
                 branch_count += 1;
                 if !values
@@ -228,6 +293,7 @@ pub(crate) fn arguments_are_valid(function: ArbitrarySubstitutionFunction, value
                     break;
                 }
                 position += 1;
+                discard_whitespace(values, &mut position);
             }
             branch_count != 0 && position == values.len()
         }
@@ -245,19 +311,6 @@ pub(crate) fn arguments_are_valid_for_ffi(function: u8, values: &[ComponentValue
         _ => return false,
     };
     arguments_are_valid(function, values)
-}
-
-pub(crate) fn substitution_function_presence_bits(values: &[ComponentValue]) -> Option<u8> {
-    let mut presence = SubstitutionFunctionsPresence::default();
-    collect_arbitrary_substitution_function_presence(values, &mut presence).ok()?;
-    Some(
-        u8::from(presence.attr)
-            | (u8::from(presence.dashed_function) << 1)
-            | (u8::from(presence.env) << 2)
-            | (u8::from(presence.if_) << 3)
-            | (u8::from(presence.inherit) << 4)
-            | (u8::from(presence.var) << 5),
-    )
 }
 
 fn collect_presence_from_value(value: &ComponentValue, presence: &mut SubstitutionFunctionsPresence) -> Result<(), ()> {
@@ -294,27 +347,56 @@ pub(crate) fn collect_arbitrary_substitution_function_presence(
     Ok(())
 }
 
-/// The attribute names an `attr()` anywhere in the process can read, ASCII-lowercased, or every
-/// name once one computes its name. A style engine copies an attribute's value text only for names
+/// The attribute names the `attr()`s a document holds can read, ASCII-lowercased, or every name
+/// once one computes its name. The document's host copies an attribute's value text only for names
 /// a selector or this set can read, and backfills its elements when the set grows.
-struct AttrNamesRead {
+#[derive(Default)]
+pub(crate) struct AttrNamesRead {
     any_name: bool,
     names: HashSet<Box<[u16]>>,
+    generation: u64,
 }
 
-static ATTR_NAMES_READ: RwLock<Option<AttrNamesRead>> = RwLock::new(None);
-static ATTR_NAMES_READ_GENERATION: AtomicU64 = AtomicU64::new(0);
+impl AttrNamesRead {
+    /// Grows with every name an `attr()` can newly read.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 
-/// Grows with every name an `attr()` can newly read.
-pub(crate) fn attr_names_read_generation() -> u64 {
-    ATTR_NAMES_READ_GENERATION.load(Ordering::Acquire)
-}
+    /// Whether an `attr()` may read an attribute with this local name.
+    pub(crate) fn may_read(&self, local_name: &[u16]) -> bool {
+        self.any_name || self.names.contains(ascii_lowercase(local_name).as_slice())
+    }
 
-/// Whether an `attr()` may read an attribute with this local name.
-pub(crate) fn attr_may_read_name(local_name: &[u16]) -> bool {
-    let read = ATTR_NAMES_READ.read().expect("attr() name set poisoned");
-    read.as_ref()
-        .is_some_and(|read| read.any_name || read.names.contains(ascii_lowercase(local_name).as_slice()))
+    /// Record what the `attr()` functions of a declared value can read.
+    pub(crate) fn note(&mut self, values: &[ComponentValue]) {
+        let mut names = Vec::new();
+        let mut any_name = false;
+        collect_attr_names_read(values, &mut names, &mut any_name);
+        let mut grew = any_name && !self.any_name;
+        self.any_name |= any_name;
+        for name in names {
+            grew |= self.names.insert(name.into_boxed_slice());
+        }
+        if grew {
+            self.generation += 1;
+        }
+    }
+
+    pub(crate) fn include(&mut self, other: &Self) {
+        let count = self.names.len();
+        self.names.extend(other.names.iter().cloned());
+        if self.names.len() != count || (other.any_name && !self.any_name) {
+            self.generation += 1;
+        }
+        self.any_name |= other.any_name;
+    }
+
+    /// The bytes the names hold on the heap.
+    pub(crate) fn heap_size(&self) -> usize {
+        crate::heap_size::set_bytes(&self.names)
+            + self.names.iter().map(|name| size_of_val::<[u16]>(name)).sum::<usize>()
+    }
 }
 
 fn ascii_lowercase(text: &[u16]) -> Vec<u16> {
@@ -364,34 +446,6 @@ fn collect_attr_names_read(values: &[ComponentValue], names: &mut Vec<Vec<u16>>,
             ComponentKind::Token(_) => continue,
         };
         collect_attr_names_read(nested, names, any_name);
-    }
-}
-
-/// Record what the `attr()` functions of a declared value can read, before any engine resolves it.
-pub(crate) fn note_attr_names_read_by(values: &[ComponentValue]) {
-    let mut names = Vec::new();
-    let mut any_name = false;
-    collect_attr_names_read(values, &mut names, &mut any_name);
-    {
-        let read = ATTR_NAMES_READ.read().expect("attr() name set poisoned");
-        if read.as_ref().is_some_and(|read| {
-            read.any_name || (!any_name && names.iter().all(|name| read.names.contains(name.as_slice())))
-        }) {
-            return;
-        }
-    }
-    let mut read = ATTR_NAMES_READ.write().expect("attr() name set poisoned");
-    let read = read.get_or_insert_with(|| AttrNamesRead {
-        any_name: false,
-        names: HashSet::new(),
-    });
-    let mut grew = any_name && !read.any_name;
-    read.any_name |= any_name;
-    for name in names {
-        grew |= read.names.insert(name.into_boxed_slice());
-    }
-    if grew {
-        ATTR_NAMES_READ_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -467,10 +521,11 @@ mod tests {
         for source in [
             "var(--name)",
             "var(--name,)",
+            "var( --name ,fallback)",
+            "env(name 0 1, fallback)",
             "attr(data-name type(<string>), fallback)",
             "env(safe-area-inset-top, 0px)",
             "inherit(color, red)",
-            "if(value)",
             "if(style(--flag): one; else: two;)",
             "--mix()",
             "--mix({ value }, fallback)",
@@ -480,10 +535,20 @@ mod tests {
         for source in [
             "var()",
             "var(,--fallback)",
+            "var(--name 0px)",
+            "var(name)",
+            "var(--)",
+            "var(var(--name))",
+            "env(name 0px)",
+            "env(name -1)",
+            "env(name 1.5, fallback)",
+            "env(\"name\", fallback)",
+            "env(1px)",
             "attr(data-name ! invalid)",
             "env(name, fallback ! invalid)",
             "inherit(value; fallback)",
             "if()",
+            "if(value)",
             "if(condition: value ! invalid)",
             "--mix(, value)",
             "--mix({})",

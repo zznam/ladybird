@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Checked.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
@@ -41,12 +42,21 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     s_connections->set(client_id(), *this);
 }
 
-ConnectionFromClient::~ConnectionFromClient() = default;
+ConnectionFromClient::~ConnectionFromClient()
+{
+    for (auto& [stream_id, stream] : m_media_streams) {
+        stream->set_data_request_callback(nullptr);
+        stream->make_missing_data_permanently_unavailable();
+    }
+}
 
 void ConnectionFromClient::die()
 {
-    s_connections->remove(client_id());
-    Core::Process::terminate_immediately(0);
+    auto connection = s_connections->take(client_id());
+    // A renderer can be connected while the previous one is going away, and the server must stay up for it.
+    auto a_renderer_remains = any_of(*s_connections, [](auto const& entry) { return entry.value->m_role == Role::Renderer; });
+    if (m_role == Role::Controller || !a_renderer_remains)
+        Core::Process::terminate_immediately(0);
 }
 
 ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_server_transport()
@@ -64,6 +74,12 @@ void ConnectionFromClient::request_video_decoder_server_transport(VideoDecoderSe
     auto request_id = m_next_video_decoder_server_transport_request_id++;
     m_video_decoder_server_transport_requests.set(request_id, move(callback));
     async_request_video_decoder_server_connection(request_id);
+}
+
+void ConnectionFromClient::report_unresponsive_video_decoder_server()
+{
+    VERIFY(m_role == Role::Controller);
+    async_video_decoder_server_unresponsive();
 }
 
 void ConnectionFromClient::video_decoder_server_connection_ready(u64 request_id, Optional<IPC::TransportHandle> handle)
@@ -230,10 +246,11 @@ static Media::DecoderErrorOr<DecodedAudioSamples> decode_audio_data_to_shared_bu
     auto planar_samples = planar_samples_or_error.release_value();
 
     auto* destination = planar_samples.data<float>();
-    for (auto const& channel : decoded.channels) {
+    for (auto& channel : decoded.channels) {
         VERIFY(channel.size() == frame_count);
         memcpy(destination, channel.data(), frame_count * sizeof(float));
         destination += frame_count;
+        channel.clear();
     }
     return DecodedAudioSamples { decoded.sample_specification.sample_rate(), static_cast<u32>(decoded.channels.size()), frame_count, move(planar_samples) };
 }
@@ -292,7 +309,7 @@ void ConnectionFromClient::destroy_media_stream(u64 stream_id)
     if (!stream.has_value())
         return;
     (*stream)->set_data_request_callback(nullptr);
-    (*stream)->close();
+    (*stream)->make_missing_data_permanently_unavailable();
 }
 
 void ConnectionFromClient::add_media_stream_chunk(u64 stream_id, u64 offset, ByteBuffer data)
@@ -327,7 +344,7 @@ PlaybackSession* ConnectionFromClient::find_playback_session(u64 session_id)
     return it->value.ptr();
 }
 
-void ConnectionFromClient::create_playback_session(u64 session_id)
+void ConnectionFromClient::create_playback_session(u64 session_id, Audio::PlaybackGroupId audio_group)
 {
     if (!verify_renderer_role())
         return;
@@ -335,7 +352,7 @@ void ConnectionFromClient::create_playback_session(u64 session_id)
         did_misbehave("Duplicate playback session ID");
         return;
     }
-    m_playback_sessions.set(session_id, make<PlaybackSession>(*this, session_id));
+    m_playback_sessions.set(session_id, make<PlaybackSession>(*this, session_id, audio_group));
 }
 
 void ConnectionFromClient::destroy_playback_session(u64 session_id)
@@ -352,10 +369,10 @@ void ConnectionFromClient::add_media_stream_source(u64 session_id, u64 stream_id
     session->add_media_stream_source(stream_id, NonnullRefPtr<Media::MediaStream>(*stream));
 }
 
-void ConnectionFromClient::start_playback(u64 session_id)
+void ConnectionFromClient::start_playback(u64 session_id, u64 seek_request_id)
 {
     if (auto* session = find_playback_session(session_id))
-        session->manager().start();
+        session->start(seek_request_id);
 }
 
 void ConnectionFromClient::play(u64 session_id)
@@ -396,10 +413,22 @@ void ConnectionFromClient::set_playback_rate(u64 session_id, float rate)
         session->manager().set_playback_rate(rate);
 }
 
+void ConnectionFromClient::set_audio_group(u64 session_id, Audio::PlaybackGroupId audio_group)
+{
+    if (auto* session = find_playback_session(session_id))
+        session->set_audio_group(audio_group);
+}
+
 void ConnectionFromClient::set_duration(u64 session_id, AK::Duration duration)
 {
     if (auto* session = find_playback_session(session_id))
         session->manager().set_duration(duration);
+}
+
+void ConnectionFromClient::set_live_seekable_range(u64 session_id, Optional<Media::TimeRanges::Range> range)
+{
+    if (auto* session = find_playback_session(session_id))
+        session->manager().set_live_seekable_range(range);
 }
 
 void ConnectionFromClient::set_audio_track_enabled(u64 session_id, u64 seek_request_id, Media::Track track, bool enabled, bool resume_ended_playback)

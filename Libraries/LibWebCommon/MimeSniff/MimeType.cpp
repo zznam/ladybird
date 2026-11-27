@@ -18,16 +18,16 @@ namespace Web::MimeSniff {
 
 static FFI::FfiStringInput ffi_string_input(StringView string)
 {
-    return { reinterpret_cast<u8 const*>(string.characters_without_null_termination()), nullptr, string.length() };
+    return { reinterpret_cast<u8 const*>(string.characters_without_null_termination()), nullptr, nullptr, string.length() };
 }
 
 static FFI::FfiStringInput ffi_string_input(Utf16View string)
 {
-    return {
-        string.has_ascii_storage() ? reinterpret_cast<u8 const*>(string.ascii_span().data()) : nullptr,
-        string.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(string.utf16_span().data()),
-        string.length_in_code_units(),
-    };
+    if (string.has_ascii_storage())
+        return { string.ascii_bytes().data(), nullptr, nullptr, string.length_in_code_units() };
+    if (string.has_latin1_storage())
+        return { nullptr, string.latin1_span().data(), nullptr, string.length_in_code_units() };
+    return { nullptr, nullptr, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units() };
 }
 
 static String string_from_ffi(ReadonlyBytes bytes)
@@ -154,12 +154,6 @@ String MimeType::serialized() const
     return serialization;
 }
 
-// https://mimesniff.spec.whatwg.org/#serialize-a-mime-type
-Utf16String MimeType::serialized_as_utf16() const
-{
-    return Utf16String::from_utf8_without_validation(serialized());
-}
-
 void MimeType::set_parameter(String name, String value)
 {
     // https://mimesniff.spec.whatwg.org/#parameters
@@ -212,10 +206,10 @@ bool MimeType::is_json() const
 }
 
 // https://mimesniff.spec.whatwg.org/#minimize-a-supported-mime-type
-String minimise_a_supported_mime_type(MimeType const& mime_type)
+String minimise_a_supported_mime_type(MimeType const& mime_type, bool is_supported_by_the_user_agent)
 {
     String minimized;
-    FFI::mime_sniff_minimize_a_supported_mime_type(mime_type.type().bytes(), mime_type.subtype().bytes(), &minimized, set_string_from_ffi);
+    FFI::mime_sniff_minimize_a_supported_mime_type(mime_type.type().bytes(), mime_type.subtype().bytes(), is_supported_by_the_user_agent, &minimized, set_string_from_ffi);
     return minimized;
 }
 

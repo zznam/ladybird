@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/GenericShorthands.h>
+#include <AK/Math.h>
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
 #include <LibGfx/Point.h>
@@ -42,6 +43,8 @@ struct WEBCOMMON_API KeyEvent {
 
     OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
+    // How many scrolls for user input the compositor had made when it found nothing to scroll for this key.
+    Optional<u64> user_input_scroll_count_with_nothing_to_scroll {};
 
     // The UI process numbers the events it sends, and a completion names the event it finished.
     u64 id { 0 };
@@ -102,6 +105,56 @@ enum class ScrollGesturePhase : u8 {
     Ended,
 };
 
+enum class PointerType : u8 {
+    Mouse,
+    Pen,
+    Touch,
+};
+
+// https://w3c.github.io/pointerevents/#pointerevent-interface
+struct PointerProperties {
+    AK_ALLOC_WITH_KMALLOC;
+
+    i32 pointer_id { 0 };
+    PointerType pointer_type { PointerType::Mouse };
+    double width { 1 };
+    double height { 1 };
+    double pressure { 0 };
+    double tangential_pressure { 0 };
+    i32 tilt_x { 0 };
+    i32 tilt_y { 0 };
+    i32 twist { 0 };
+    double altitude_angle { AK::Pi<double> / 2 };
+    double azimuth_angle { 0 };
+};
+
+// NB: Native mouse input leaves this empty, avoiding an allocation and keeping the input event small.
+class WEBCOMMON_API PointerInputData {
+public:
+    PointerInputData() = default;
+    explicit PointerInputData(Optional<PointerProperties>);
+    PointerInputData(PointerInputData const&);
+    PointerInputData(PointerInputData&&) = default;
+    PointerInputData& operator=(PointerInputData&&) = default;
+
+    Optional<PointerProperties> properties() const;
+    PointerProperties const* ptr() const { return m_properties.ptr(); }
+
+private:
+    OwnPtr<PointerProperties> m_properties;
+};
+
+// What the compositor found of a wheel event's gesture as it passed the event on, which WebContent follows rather
+// than deciding again.
+struct WheelGestureMark {
+    // The gesture the event is in. The events of one gesture carry the same id, and no other gesture has it.
+    u64 gesture_id { 0 };
+    // Whether the gesture goes on for as long as its fingers rest on the touchpad, which the platform reports the lift
+    // of, rather than until its events pause.
+    bool lasts_until_fingers_lift { false };
+    u64 step_number { 0 };
+};
+
 struct WEBCOMMON_API MouseEvent {
     enum class Type : u8 {
         MouseDown,
@@ -132,12 +185,20 @@ struct WEBCOMMON_API MouseEvent {
     bool async_scroll_performed_default_action { false };
     u64 id { 0 };
     Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
+    PointerInputData pointer_data {};
+    Optional<WheelGestureMark> wheel_gesture_mark {};
 };
 
 struct WEBCOMMON_API PinchEvent {
     Web::DevicePixelPoint position;
     Web::UIEvents::KeyModifier modifiers { Web::UIEvents::KeyModifier::Mod_None };
     double scale_delta;
+    bool async_zoom_performed_default_action { false };
+    // The page dispatched the pinch's ctrl+wheel event and did not cancel it, which leaves only the zoom of the page's
+    // visual viewport to do.
+    bool wheel_event_was_dispatched { false };
+    // The fingers have not left the touchpad since an earlier step of the pinch.
+    bool continues_gesture { false };
     u64 id { 0 };
 };
 

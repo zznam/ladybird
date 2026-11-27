@@ -8,10 +8,10 @@
 
 #include <AK/Optional.h>
 #include <AK/String.h>
+#include <AK/Vector.h>
 #include <LibCompositing/Export.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCompositing/PictureInPictureControls.h>
-#include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/InputEvent.h>
 
 namespace Compositing {
@@ -31,11 +31,24 @@ struct PictureInPictureControlsState {
     bool operator==(PictureInPictureControlsState const&) const = default;
 };
 
+struct CompositorLayersOverlayState {
+    Optional<String> font_family;
+    Vector<u64> hidden_layer_ids;
+    // The layers the overlay shows the tiles of.
+    Vector<u64> selected_layer_ids;
+    Optional<u64> hovered_layer_id;
+    // Each new value zeroes the counts of tiles rastered.
+    u64 raster_count_reset_generation { 0 };
+
+    bool operator==(CompositorLayersOverlayState const&) const = default;
+};
+
 // What the browser draws over a context's page, on top of anything the page draws, with each overlay the view has
 // present. The browser handles their input before the page sees any of it.
 struct UIOverlays {
     Optional<PausedDebuggerOverlayState> paused_debugger;
     Optional<PictureInPictureControlsState> picture_in_picture_controls;
+    Optional<CompositorLayersOverlayState> compositor_layers;
 
     bool operator==(UIOverlays const&) const = default;
 };
@@ -101,21 +114,4 @@ private:
 
 }
 
-namespace IPC {
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::PausedDebuggerOverlayState const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::PausedDebuggerOverlayState> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::PictureInPictureControlsState const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::PictureInPictureControlsState> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::UIOverlays const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::UIOverlays> decode(Decoder&);
-
-}
+#include <LibCompositing/UIOverlaysCodecs.h>

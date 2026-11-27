@@ -13,16 +13,17 @@ use ak::Utf16FlyString;
 use libjs_abi::PutKind;
 use libjs_abi::value as nan_box;
 
-use crate::bytecode::encoding::{IdentifierTableIndex, OptionalIndex};
+use super::strict_at;
 use crate::bytecode::executable::{
     Executable, KeyedPropertyLookup, KeyedPropertyLookupCache, ObjectPropertyIteratorCache,
     ObjectPropertyIteratorCacheData, ObjectPropertyIteratorFastPath, PropertyLookupCache, PropertyLookupCacheEntryType,
 };
 use crate::bytecode::op;
+use crate::bytecode::operand::UNCACHED_SITE;
 use crate::bytecode::property_access::{
-    self, GetByIdMode, Strict, base_object_for_get, get_by_value_with_keyed_cache, get_cached_property_value,
+    self, GetByIdMode, base_object_for_get, get_by_value_with_keyed_cache, get_cached_property_value,
     get_with_property_lookup_cache, object_can_cache_property_additions, property_addition_is_cacheable,
-    put_by_property_key,
+    put_by_property_key, throw_if_nullish_put_base,
 };
 use crate::gc::class::GcCell;
 use crate::gc::class::class_of;
@@ -43,15 +44,12 @@ use crate::runtime::error_types::ErrorType;
 use crate::runtime::object::{IndexedStorageKind, Object};
 use crate::runtime::private_environment::{PrivateEnvironment, PrivateName};
 use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, PropertyAttributes};
-use crate::runtime::property_key::PropertyKey;
+use crate::runtime::property_key::{NonSymbolPropertyKey, PropertyKey};
 use crate::runtime::reference::Reference;
+use crate::runtime::shape::ShapeKey;
 use crate::runtime::typed_array::{Kind, is_valid_integer_index, typed_array_of_object};
 
-fn strict_of(header_strict: bool) -> Strict {
-    if header_strict { Strict::Yes } else { Strict::No }
-}
-
-pub(crate) fn put_kind_from_operand(kind: u32) -> PutKind {
+pub(crate) fn put_kind_from_operand(kind: u8) -> PutKind {
     match kind {
         0 => PutKind::Normal,
         1 => PutKind::Getter,
@@ -66,16 +64,16 @@ fn is_non_negative_int32(value: Value) -> bool {
     value.is_int32() && value.as_i32() >= 0
 }
 
-fn optional_identifier(vm: &Vm, index: &OptionalIndex<IdentifierTableIndex>) -> Option<Utf16FlyString> {
-    let index = index.get()?;
-    Some(vm.current_executable().get_identifier(index).clone())
+/// The source text of the base of the member access that is running, for the error of a null or undefined base.
+fn base_text(vm: &Vm) -> Option<Utf16FlyString> {
+    let program_counter = vm.running_execution_context_ref().program_counter.get();
+    vm.current_executable().base_text_at(program_counter)
 }
 
 fn running_private_environment(vm: &Vm) -> Gc<PrivateEnvironment> {
     vm.running_execution_context_if_any()
         .expect("private names are used in an execution context")
-        .private_environment
-        .get()
+        .private_environment()
         .expect("private names are used where a private environment is active")
 }
 
@@ -132,14 +130,14 @@ pub fn get_by_id(vm: &Vm, pc: u32, instruction: &op::GetById, values: &mut op::G
     let base_value = values.base;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let value = asm_try!(
         vm,
         pc,
         property_access::get_by_id(
             vm,
             GetByIdMode::Normal,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             base_value,
             base_value,
@@ -173,7 +171,7 @@ pub fn get_by_id_cached_accessor(
         && let Some(completed_entry) = cache.first_entry_slot()
     {
         let completed = completed_entry.get();
-        if completed.shape == Some(object.shape()) {
+        if completed.shape == Some(ShapeKey::of(object.shape())) {
             let completed_holder = completed.prototype.unwrap_or(object);
             let completed_value = completed_holder.get_direct(completed.property_offset);
             if completed_value.is_accessor() && completed_value.as_accessor().getter() == Some(getter) {
@@ -195,7 +193,7 @@ pub fn get_by_id_with_this(
     let this_value = values.this_value;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let value = asm_try!(
         vm,
         pc,
@@ -217,8 +215,23 @@ pub fn put_by_id(vm: &Vm, pc: u32, instruction: &op::PutById, values: &mut op::P
     let value = values.src;
     let base = values.base;
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
+    // NB: A megamorphic put sees more shapes than its hash tables hold, so it goes through the VM's keyed property
+    //     store cache, which has room for many more.
+    if cache.is_megamorphic()
+        && base.is_object()
+        && base.as_object().is_cacheable_across_realms()
+        && property_key.is_string()
+        && put_kind_from_operand(instruction.kind) == PutKind::Normal
+    {
+        asm_try!(
+            vm,
+            pc,
+            put_by_value_with_keyed_store_cache(vm, pc, base, 0, value, property_key, Some(cache))
+        );
+        return SlowPathControl::continue_at(pc + op::PutById::LENGTH);
+    }
     asm_try!(
         vm,
         pc,
@@ -227,10 +240,10 @@ pub fn put_by_id(vm: &Vm, pc: u32, instruction: &op::PutById, values: &mut op::P
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             Some(cache),
             0,
         )
@@ -247,7 +260,7 @@ pub fn put_by_id_with_this(
     let value = values.src;
     let base = values.base;
     let executable = vm.current_executable();
-    let name = executable.get_property_key(instruction.property);
+    let name = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     asm_try!(
         vm,
@@ -260,7 +273,7 @@ pub fn put_by_id_with_this(
             || None,
             name,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             Some(cache),
             0,
         )
@@ -337,12 +350,7 @@ pub fn get_by_value(
     let object = asm_try!(
         vm,
         pc,
-        base_object_for_get(
-            vm,
-            base_value,
-            || optional_identifier(vm, &instruction.base_identifier),
-            &property_key_value,
-        )
+        base_object_for_get(vm, base_value, || base_text(vm), &property_key_value)
     );
     let property_key = asm_try!(vm, pc, property_key_value.to_property_key(vm));
     if base_value.is_string() {
@@ -387,9 +395,9 @@ pub fn get_by_value_with_this(vm: &Vm, pc: u32, values: &mut op::GetByValueWithT
 }
 
 fn length_property_key(executable: &Executable) -> &PropertyKey {
-    executable.get_property_key(
+    executable.property_key(
         executable
-            .length_identifier
+            .length_identifier()
             .expect("an executable that reads a length has the length in its property key table"),
     )
 }
@@ -404,7 +412,7 @@ pub fn get_length(vm: &Vm, pc: u32, instruction: &op::GetLength, values: &mut op
         property_access::get_by_id(
             vm,
             GetByIdMode::Length,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             length_property_key(&executable),
             base_value,
             base_value,
@@ -444,7 +452,7 @@ pub fn get_length_with_this(
 
 pub fn get_method(vm: &Vm, pc: u32, instruction: &op::GetMethod, values: &mut op::GetMethodValues) -> SlowPathControl {
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     let method = asm_try!(vm, pc, values.object.get_method_with_cache(vm, property_key, cache));
     values.dst = method.map_or(Value::UNDEFINED, Value::from_object);
@@ -461,6 +469,12 @@ pub fn put_by_value(
     let value = values.src;
     let base = values.base;
     let property = values.property;
+    // NB: PutValue converts the base to an object before it converts the key to a property key.
+    asm_try!(
+        vm,
+        pc,
+        throw_if_nullish_put_base(vm, base, || base_text(vm), &property, strict_at(vm, pc))
+    );
     let property_key = asm_try!(vm, pc, property.to_property_key(vm));
     let cache_key = match site_cache {
         KeyedSiteCache::Use => keyed_property_lookup_cache_key(property, &property_key),
@@ -477,21 +491,25 @@ pub fn put_by_value(
                 base,
                 base,
                 value,
-                || optional_identifier(vm, &instruction.base_identifier),
+                || base_text(vm),
                 &property_key,
                 put_kind_from_operand(instruction.kind),
-                strict_of(instruction.header.strict),
+                strict_at(vm, pc),
                 Some(cache),
                 cache_key,
             )
         );
         return SlowPathControl::continue_at(pc + op::PutByValue::LENGTH);
     }
-    if base.is_object() && property_key.is_string() && put_kind_from_operand(instruction.kind) == PutKind::Normal {
+    if base.is_object()
+        && base.as_object().is_cacheable_across_realms()
+        && property_key.is_string()
+        && put_kind_from_operand(instruction.kind) == PutKind::Normal
+    {
         asm_try!(
             vm,
             pc,
-            put_by_value_with_keyed_store_cache(vm, instruction, base, property, value, &property_key)
+            put_by_value_with_keyed_store_cache(vm, pc, base, property.0, value, &property_key, None)
         );
         return SlowPathControl::continue_at(pc + op::PutByValue::LENGTH);
     }
@@ -503,10 +521,10 @@ pub fn put_by_value(
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             &property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             None,
             0,
         )
@@ -518,14 +536,17 @@ pub fn put_by_value(
 /// property store cache, which remembers the writable own data properties such puts change and the properties they
 /// add by shape and name, like the keyed property lookup cache does for gets. A put it does not know is made with an
 /// empty cache of its own, and remembered: as a change or an addition if that cache could have made it, or as a put
-/// to make generically otherwise, so that other puts it cannot make only pay for the lookup.
+/// to make generically otherwise, so that other puts it cannot make only pay for the lookup. `cache_key` is the key the
+/// entries of that cache are for (see PropertyLookupCacheEntry::key; 0 for named puts). The changes and additions it
+/// makes or learns are also remembered in `site_cache`, the instruction's own cache, if one is given.
 fn put_by_value_with_keyed_store_cache(
     vm: &Vm,
-    instruction: &op::PutByValue,
+    pc: u32,
     base: Value,
-    key: Value,
+    cache_key: u64,
     value: Value,
     property_key: &PropertyKey,
+    site_cache: Option<&PropertyLookupCache>,
 ) -> ThrowCompletionOr<()> {
     let object = base.as_object();
     let name = property_key.as_string();
@@ -538,21 +559,36 @@ fn put_by_value_with_keyed_store_cache(
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             PutKind::Normal,
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             cache,
             cache_key,
         )
     };
-    if let Some(entry) = store_cache.lookup(index, shape, name) {
+    let shape_key = ShapeKey::of(shape);
+    // NB: The instruction's own cache learns the puts this cache makes for it, like the caches of megamorphic gets do
+    //     (see `get_by_value_with_keyed_cache()`), so that its compiled code finds the entry inline again.
+    let remember = |entry: &KeyedPropertyLookup| {
+        if let Some(site_cache) = site_cache {
+            site_cache.update(entry.entry_type, |site_entry| {
+                site_entry.shape = Some(shape_key);
+                site_entry.property_offset = entry.property_offset;
+                site_entry.writes_data_property = entry.entry_type == PropertyLookupCacheEntryType::ChangeOwnProperty;
+                site_entry.new_shape = entry.new_shape;
+                site_entry.prototype_chain_validity = entry.prototype_chain_validity;
+            });
+        }
+    };
+    if let Some(entry) = store_cache.lookup(index, shape, name)
+        && entry.shape_key() == Some(shape_key)
+    {
         match entry.entry_type {
             PropertyLookupCacheEntryType::ChangeOwnProperty => {
-                if (!shape.is_dictionary() || shape.dictionary_generation() == entry.shape_dictionary_generation)
-                    && !object.get_direct(entry.property_offset).is_accessor()
-                {
+                if !object.get_direct(entry.property_offset).is_accessor() {
                     object.put_direct_from_cache(entry.property_offset, value);
+                    remember(&entry);
                     return Ok(());
                 }
             }
@@ -560,49 +596,45 @@ fn put_by_value_with_keyed_store_cache(
                 // NB: These are the checks of an addition through the cache of a put (see put_by_property_key()).
                 let new_shape = entry.new_shape.expect("additions have a new shape");
                 if property_addition_is_cacheable(vm, &object, property_key)
-                    && object.internal_is_extensible(vm)?
-                    && (!new_shape.is_dictionary()
-                        || shape.dictionary_generation() == entry.shape_dictionary_generation)
                     && entry
                         .prototype_chain_validity
                         .is_none_or(|validity| validity.is_valid())
                 {
                     object.unsafe_set_shape(new_shape);
                     object.initialize_direct(entry.property_offset, value);
+                    remember(&entry);
                     return Ok(());
                 }
             }
-            _ => {
-                if !shape.is_dictionary() || shape.dictionary_generation() == entry.shape_dictionary_generation {
-                    return generic_put(None, 0);
-                }
-            }
+            _ => return generic_put(None, 0),
         }
     }
 
-    let shape_dictionary_generation = shape.dictionary_generation();
     let scratch_cache = vm.keyed_property_store_scratch_cache();
     scratch_cache.forget_entries();
-    generic_put(Some(scratch_cache), key.0)?;
+    generic_put(Some(scratch_cache), cache_key)?;
     let entry = scratch_cache.first_entry().unwrap_or_default();
     scratch_cache.forget_entries();
+    // NB: Two names whose entries share a slot of this cache would otherwise miss both caches all the time.
+    if let Some(site_cache) = site_cache
+        && entry.entry_type != PropertyLookupCacheEntryType::Empty
+    {
+        site_cache.update(entry.entry_type, |site_entry| *site_entry = entry);
+    }
     // NB: Puts the cache does not make are remembered with another type, for the shape they found.
-    let mut lookup = KeyedPropertyLookup {
-        shape_dictionary_generation,
-        shape: Some(shape),
-        ..Default::default()
-    };
+    let mut lookup = KeyedPropertyLookup::for_shape(shape_key);
     match entry.entry_type {
-        PropertyLookupCacheEntryType::ChangeOwnProperty if entry.writes_data_property && entry.shape == Some(shape) => {
+        PropertyLookupCacheEntryType::ChangeOwnProperty
+            if entry.writes_data_property && entry.shape == Some(shape_key) =>
+        {
             lookup.entry_type = PropertyLookupCacheEntryType::ChangeOwnProperty;
             lookup.property_offset = entry.property_offset;
         }
-        PropertyLookupCacheEntryType::AddOwnProperty if entry.from_shape == Some(shape) && entry.shape.is_some() => {
+        PropertyLookupCacheEntryType::AddOwnProperty if entry.shape == Some(shape_key) && entry.new_shape.is_some() => {
             lookup.entry_type = PropertyLookupCacheEntryType::AddOwnProperty;
             lookup.property_offset = entry.property_offset;
-            lookup.shape_dictionary_generation = entry.shape_dictionary_generation;
             lookup.prototype_chain_validity = entry.prototype_chain_validity;
-            lookup.new_shape = entry.shape;
+            lookup.new_shape = entry.new_shape;
         }
         _ => {}
     }
@@ -619,6 +651,12 @@ pub fn put_by_value_with_this(
     let value = values.src;
     let base = values.base;
     let this_value = values.this_value;
+    // NB: PutValue converts the base to an object before it converts the key to a property key.
+    asm_try!(
+        vm,
+        pc,
+        throw_if_nullish_put_base(vm, base, || None, &values.property, strict_at(vm, pc))
+    );
     let property_key = asm_try!(vm, pc, values.property.to_property_key(vm));
     asm_try!(
         vm,
@@ -631,7 +669,7 @@ pub fn put_by_value_with_this(
             || None,
             &property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             None,
             0,
         )
@@ -660,11 +698,11 @@ pub fn delete_by_id(
     instruction: &op::DeleteById,
     values: &mut op::DeleteByIdValues,
 ) -> SlowPathControl {
-    let property_key = vm.current_executable().get_property_key(instruction.property).clone();
+    let property_key = vm.current_executable().get_property_key(&instruction.property).clone();
     let result = asm_try!(
         vm,
         pc,
-        Reference::with_base_value(values.base, property_key, None, strict_of(instruction.header.strict)).delete_(vm)
+        Reference::with_base_value(values.base, property_key, None, strict_at(vm, pc)).delete_(vm)
     );
     values.dst = Value::from_bool(result);
     SlowPathControl::continue_at(pc + op::DeleteById::LENGTH)
@@ -673,14 +711,18 @@ pub fn delete_by_id(
 pub fn delete_by_value(
     vm: &Vm,
     pc: u32,
-    instruction: &op::DeleteByValue,
+    _instruction: &op::DeleteByValue,
     values: &mut op::DeleteByValueValues,
 ) -> SlowPathControl {
+    // NB: delete converts the base to an object before it converts the key to a property key.
+    if values.base.is_nullish() {
+        asm_try!(vm, pc, values.base.to_object(vm));
+    }
     let property_key = asm_try!(vm, pc, values.property.to_property_key(vm));
     let result = asm_try!(
         vm,
         pc,
-        Reference::with_base_value(values.base, property_key, None, strict_of(instruction.header.strict)).delete_(vm)
+        Reference::with_base_value(values.base, property_key, None, strict_at(vm, pc)).delete_(vm)
     );
     values.dst = Value::from_bool(result);
     SlowPathControl::continue_at(pc + op::DeleteByValue::LENGTH)
@@ -693,6 +735,9 @@ pub fn copy_object_excluding_properties(
     values: &mut op::CopyObjectExcludingPropertiesValues,
     excluded_names: &[Value],
 ) -> SlowPathControl {
+    let excluded_names = super::operand_list(vm, instruction.excluded_names_are_in_array, excluded_names);
+    let excluded_names = excluded_names.values();
+    let excluded_names = &*excluded_names;
     let realm = vm.current_realm().expect("there is a current realm");
     let from_object = values.from_object;
     let to_object = Object::create(vm, realm, Some(realm.object_prototype()));
@@ -726,9 +771,9 @@ pub fn create_data_property_or_throw(
 pub fn new_object(vm: &Vm, pc: u32, instruction: &op::NewObject, values: &mut op::NewObjectValues) -> SlowPathControl {
     let realm = vm.current_realm().expect("there is a current realm");
 
-    if instruction.cache != u32::MAX {
+    if u32::from(instruction.cache) != UNCACHED_SITE {
         let executable = vm.current_executable();
-        let cache = executable.object_shape_cache(instruction.cache);
+        let cache = executable.object_shape_cache(instruction.cache.into());
         if let Some(cached_shape) = cache.shape.get() {
             values.dst = Value::from_object(Object::create_with_premade_shape(vm, cached_shape));
             return SlowPathControl::continue_at(pc + op::NewObject::LENGTH);
@@ -755,8 +800,11 @@ pub fn cache_object_shape(
     instruction: &op::CacheObjectShape,
     values: &mut op::CacheObjectShapeValues,
 ) -> SlowPathControl {
+    if u32::from(instruction.cache) == UNCACHED_SITE {
+        return SlowPathControl::continue_at(pc + op::CacheObjectShape::LENGTH);
+    }
     let executable = vm.current_executable();
-    let cache = executable.object_shape_cache(instruction.cache);
+    let cache = executable.object_shape_cache(instruction.cache.into());
     if cache.shape.get().is_none() {
         let object = values.object.as_object();
         if !object.shape().is_dictionary() {
@@ -775,7 +823,7 @@ pub fn init_object_literal_property(
     let object = values.object.as_object();
     let value = values.src;
     let executable = vm.current_executable();
-    let cache = executable.object_shape_cache(instruction.shape_cache_index);
+    let cache = executable.object_shape_cache(instruction.shape_cache_index.into());
     let property_slot = instruction.property_slot as usize;
 
     let cached_shape = cache.shape.get();
@@ -788,7 +836,7 @@ pub fn init_object_literal_property(
         return SlowPathControl::continue_at(pc + op::InitObjectLiteralProperty::LENGTH);
     }
 
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     object.define_direct_property(
         vm,
         property_key,
@@ -822,14 +870,14 @@ pub fn has_private_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     values.dst = Value::from_bool(base.as_object().private_element_find(&private_name).is_some());
     SlowPathControl::continue_at(pc + op::HasPrivateId::LENGTH)
 }
 
 pub fn add_private_name(vm: &Vm, pc: u32, instruction: &op::AddPrivateName) -> SlowPathControl {
-    let name = vm.current_executable().get_identifier(instruction.name).clone();
-    running_private_environment(vm).add_private_name(name);
+    let name = vm.current_executable().get_identifier(&instruction.name).clone();
+    running_private_environment(vm).add_private_name(vm, name);
     SlowPathControl::continue_at(pc + op::AddPrivateName::LENGTH)
 }
 
@@ -844,7 +892,7 @@ pub fn get_private_by_id(
 
     if !base_value.is_object() {
         asm_try!(vm, pc, base_value.to_object(vm));
-        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(instruction.property));
+        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(&instruction.property));
         let result = asm_try!(vm, pc, get_private_reference_value(vm, base_value, &private_name));
         values.dst = result;
         return SlowPathControl::continue_at(pc + op::GetPrivateById::LENGTH);
@@ -852,7 +900,7 @@ pub fn get_private_by_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     let result = asm_try!(vm, pc, base_value.as_object().private_get(vm, &private_name));
     values.dst = result;
     SlowPathControl::continue_at(pc + op::GetPrivateById::LENGTH)
@@ -870,7 +918,7 @@ pub fn put_private_by_id(
 
     if !base_value.is_object() {
         let object = asm_try!(vm, pc, base_value.to_object(vm));
-        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(instruction.property));
+        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(&instruction.property));
         asm_try!(
             vm,
             pc,
@@ -881,7 +929,7 @@ pub fn put_private_by_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     asm_try!(vm, pc, base_value.as_object().private_set(vm, &private_name, value));
     SlowPathControl::continue_at(pc + op::PutPrivateById::LENGTH)
 }
@@ -952,11 +1000,7 @@ fn object_property_iterator_cache_matches(object: Gc<Object>, cache: &ObjectProp
     }
 
     let shape = object.shape();
-    if Some(shape) != cache.shape() {
-        return false;
-    }
-
-    if shape.is_dictionary() && shape.dictionary_generation() != cache.shape_dictionary_generation() {
+    if cache.shape_key() != Some(ShapeKey::of(shape)) {
         return false;
     }
 
@@ -1000,11 +1044,10 @@ impl<'vm> SeenObjects<'vm> {
     }
 }
 
-/// The keys a for-in has already decided about while it walks up the prototype chain. The keys are never symbols,
-/// so a plain set may hold them.
+/// The keys a for-in has already decided about while it walks up the prototype chain.
 struct ShadowingState {
-    seen_non_enumerable_properties: HashSet<PropertyKey>,
-    seen_properties: Option<HashSet<PropertyKey>>,
+    seen_non_enumerable_properties: HashSet<NonSymbolPropertyKey>,
+    seen_properties: Option<HashSet<NonSymbolPropertyKey>>,
 }
 
 impl ShadowingState {
@@ -1015,14 +1058,21 @@ impl ShadowingState {
         }
     }
 
-    fn ensure_seen_properties(&mut self, properties: &MarkedVec<'_, PropertyKey>) -> &mut HashSet<PropertyKey> {
+    fn key(property_key: &PropertyKey) -> NonSymbolPropertyKey {
+        NonSymbolPropertyKey::new(property_key.clone()).expect("a for-in visits no symbols")
+    }
+
+    fn ensure_seen_properties(
+        &mut self,
+        properties: &MarkedVec<'_, PropertyKey>,
+    ) -> &mut HashSet<NonSymbolPropertyKey> {
         self.seen_properties.get_or_insert_with(|| {
             // Prototype shadowing ignores enumerability, so once we start looking
             // above the receiver we need an explicit visited set for names we have
             // already decided to expose from lower objects.
             let mut seen_properties = HashSet::with_capacity(properties.len());
             for index in 0..properties.len() {
-                seen_properties.insert(properties.get(index).expect("the index is in bounds"));
+                seen_properties.insert(Self::key(&properties.get(index).expect("the index is in bounds")));
             }
             seen_properties
         })
@@ -1037,7 +1087,7 @@ impl ShadowingState {
         in_prototype_chain: bool,
     ) {
         if !enumerable {
-            self.seen_non_enumerable_properties.insert(property_key.clone());
+            self.seen_non_enumerable_properties.insert(Self::key(property_key));
         }
         if in_prototype_chain && enumerable {
             if self.seen_non_enumerable_properties.contains(property_key) {
@@ -1051,7 +1101,7 @@ impl ShadowingState {
             properties.push(property_key.clone());
         }
         if let Some(seen_properties) = &mut self.seen_properties {
-            seen_properties.insert(property_key.clone());
+            seen_properties.insert(Self::key(property_key));
         }
     }
 }
@@ -1145,7 +1195,9 @@ fn try_get_fast_property_name_iterator_data(
         // table, but it still shadows enumerable `length` properties higher up the
         // prototype chain during for-in.
         if current.has_magical_length_property() {
-            shadowing.seen_non_enumerable_properties.insert(vm.names.length.clone());
+            shadowing
+                .seen_non_enumerable_properties
+                .insert(ShadowingState::key(&vm.names.length));
         }
 
         current
@@ -1418,7 +1470,7 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
         return false;
     };
 
-    if !getter_function.can_inline_call() {
+    if !getter_function.can_inline_call() || !vm.is_in_current_realm(getter_function.as_function_object_gc()) {
         return false;
     }
 
@@ -1429,7 +1481,7 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
         getter_function.inline_call_executable(),
         &[],
         pc + instruction.length(),
-        instruction.dst.0,
+        instruction.dst.0.into(),
         Value::from_object(object),
         None,
         false,
@@ -1437,78 +1489,16 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
     .is_some()
 }
 
-// Fast cache-only PutById. Tries all cache entries for ChangeOwnProperty and
-// AddOwnProperty. Returns whether the cache handled the put; if not, the caller
-// uses the full slow path.
+// Fast cache-only PutById. Returns whether the cache handled the put; if not, the caller uses the full slow path.
 pub fn try_put_by_id_cache(vm: &Vm, instruction: &op::PutById, values: &op::PutByIdValues) -> bool {
     let base = values.base;
     if !base.is_object() {
         return false;
     }
-    let object = base.as_object();
-    let value = values.src;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-
-    for entry in cache.entry_slots_for_shape(object.shape(), 0) {
-        match entry.entry_type.get() {
-            PropertyLookupCacheEntryType::ChangeOwnProperty => {
-                let Some(cached_shape) = entry.shape.get() else {
-                    continue;
-                };
-                if cached_shape != object.shape() {
-                    continue;
-                }
-                if cached_shape.is_dictionary()
-                    && cached_shape.dictionary_generation() != entry.shape_dictionary_generation.get()
-                {
-                    continue;
-                }
-                let current = object.get_direct(entry.property_offset.get());
-                if current.is_accessor() || !entry.writes_data_property.get() {
-                    return false;
-                }
-                object.put_direct_from_cache(entry.property_offset.get(), value);
-                return true;
-            }
-            PropertyLookupCacheEntryType::AddOwnProperty => {
-                if entry.from_shape.get() != Some(object.shape()) {
-                    continue;
-                }
-                if !object_can_cache_property_additions(&object) {
-                    continue;
-                }
-                if object.has_magical_length_property()
-                    && !property_addition_is_cacheable(vm, &object, executable.get_property_key(instruction.property))
-                {
-                    continue;
-                }
-                let Some(cached_shape) = entry.shape.get() else {
-                    continue;
-                };
-                if !object.extensible() {
-                    continue;
-                }
-                if cached_shape.is_dictionary()
-                    && object.shape().dictionary_generation() != entry.shape_dictionary_generation.get()
-                {
-                    continue;
-                }
-                if entry
-                    .prototype_chain_validity
-                    .get()
-                    .is_some_and(|validity| !validity.is_valid())
-                {
-                    continue;
-                }
-                object.unsafe_set_shape(cached_shape);
-                object.initialize_direct(entry.property_offset.get(), value);
-                return true;
-            }
-            _ => continue,
-        }
-    }
-    false
+    let property_key = executable.get_property_key(&instruction.property);
+    try_put_by_property_lookup_cache(vm, base.as_object(), values.src, cache, 0, Some(property_key))
 }
 
 // Fast cache-only GetById. Returns the cached value on hit, or Empty on miss.
@@ -1525,7 +1515,7 @@ pub fn try_get_by_id_cache_on_primitive(vm: &Vm, instruction: &op::GetById, valu
         return false;
     }
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     // NB: Strings have own properties for their indices and their length.
     if base.is_string()
         && (property_key.is_number()
@@ -1563,35 +1553,36 @@ pub fn try_get_by_value_cache(vm: &Vm, instruction: &op::GetByValue, values: &mu
 }
 
 // Fast cache-only PutByValue with a string or symbol key, which the cache's entries match by identity (see
-// PropertyLookupCacheEntry::key). Tries all of them for ChangeOwnProperty and AddOwnProperty. Returns whether it hit;
-// on a miss, the caller falls to the slow path.
+// PropertyLookupCacheEntry::key). Returns whether it hit; on a miss, the caller falls to the slow path.
 pub fn try_put_by_value_cache(vm: &Vm, instruction: &op::PutByValue, values: &op::PutByValueValues) -> bool {
     let base = values.base;
     let key = values.property;
     if !base.is_object() || (!key.is_string() && !key.is_symbol()) {
         return false;
     }
-    let object = base.as_object();
-    let value = values.src;
-    let cache_key = key.0;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
+    try_put_by_property_lookup_cache(vm, base.as_object(), values.src, cache, key.0, None)
+}
 
+/// Puts `value` into `object` through a ChangeOwnProperty or AddOwnProperty entry of `cache`, and returns whether one
+/// applied. Additions to objects with a magical length need `property_key`.
+fn try_put_by_property_lookup_cache(
+    vm: &Vm,
+    object: Gc<Object>,
+    value: Value,
+    cache: &PropertyLookupCache,
+    cache_key: u64,
+    property_key: Option<&PropertyKey>,
+) -> bool {
     for entry in cache.entry_slots_for_shape(object.shape(), cache_key) {
-        if entry.key.get() != cache_key {
+        // NB: Only the caches of keyed accesses have keys, and named accesses pass a constant 0.
+        if cache_key != 0 && entry.key.get() != cache_key {
             continue;
         }
         match entry.entry_type.get() {
             PropertyLookupCacheEntryType::ChangeOwnProperty => {
-                let Some(cached_shape) = entry.shape.get() else {
-                    continue;
-                };
-                if cached_shape != object.shape() {
-                    continue;
-                }
-                if cached_shape.is_dictionary()
-                    && cached_shape.dictionary_generation() != entry.shape_dictionary_generation.get()
-                {
+                if entry.shape_key() != Some(ShapeKey::of(object.shape())) {
                     continue;
                 }
                 let current = object.get_direct(entry.property_offset.get());
@@ -1602,24 +1593,21 @@ pub fn try_put_by_value_cache(vm: &Vm, instruction: &op::PutByValue, values: &op
                 return true;
             }
             PropertyLookupCacheEntryType::AddOwnProperty => {
-                if entry.from_shape.get() != Some(object.shape()) {
+                if entry.shape_key() != Some(ShapeKey::of(object.shape())) {
                     continue;
                 }
-                // NB: Objects with a magical length property are left to the slow path, which knows the key.
-                if !object_can_cache_property_additions(&object) || object.has_magical_length_property() {
+                if !object_can_cache_property_additions(&object) {
                     continue;
                 }
-                let Some(cached_shape) = entry.shape.get() else {
-                    continue;
-                };
-                if !object.extensible() {
-                    continue;
-                }
-                if cached_shape.is_dictionary()
-                    && object.shape().dictionary_generation() != entry.shape_dictionary_generation.get()
+                if object.has_magical_length_property()
+                    && !property_key
+                        .is_some_and(|property_key| property_addition_is_cacheable(vm, &object, property_key))
                 {
                     continue;
                 }
+                let Some(new_shape) = entry.new_shape.get() else {
+                    continue;
+                };
                 if entry
                     .prototype_chain_validity
                     .get()
@@ -1627,7 +1615,7 @@ pub fn try_put_by_value_cache(vm: &Vm, instruction: &op::PutByValue, values: &op
                 {
                     continue;
                 }
-                object.unsafe_set_shape(cached_shape);
+                object.unsafe_set_shape(new_shape);
                 object.initialize_direct(entry.property_offset.get(), value);
                 return true;
             }
@@ -1668,73 +1656,10 @@ fn try_get_by_property_lookup_cache_with(
     if !base.is_object() {
         return Value::EMPTY;
     }
-    let object = base.as_object();
-    let shape = object.shape();
-
-    for entry in cache.entry_slots_for_shape(shape, cache_key) {
-        // NB: Only the caches of keyed accesses have keys, and named accesses pass a constant 0.
-        if cache_key != 0 && entry.key.get() != cache_key {
-            continue;
-        }
-        let entry_type = entry.entry_type.get();
-        if entry_type == PropertyLookupCacheEntryType::GetMissingProperty {
-            if !object.is_cacheable_for_property_absence() {
-                continue;
-            }
-            if Some(shape) != entry.shape.get() {
-                continue;
-            }
-            if shape.is_dictionary() && shape.dictionary_generation() != entry.shape_dictionary_generation.get() {
-                continue;
-            }
-            if shape.prototype().is_some()
-                && !entry
-                    .prototype_chain_validity
-                    .get()
-                    .is_some_and(|validity| validity.is_valid())
-            {
-                continue;
-            }
-            return Value::UNDEFINED;
-        }
-
-        if entry_type != PropertyLookupCacheEntryType::GetOwnProperty
-            && entry_type != PropertyLookupCacheEntryType::GetPropertyInPrototypeChain
-        {
-            continue;
-        }
-
-        if let Some(cached_prototype) = entry.prototype.get() {
-            if Some(shape) != entry.shape.get() {
-                continue;
-            }
-            if shape.is_dictionary() && shape.dictionary_generation() != entry.shape_dictionary_generation.get() {
-                continue;
-            }
-            if !entry
-                .prototype_chain_validity
-                .get()
-                .is_some_and(|validity| validity.is_valid())
-            {
-                continue;
-            }
-            let value = cached_prototype.get_direct(entry.property_offset.get());
-            if value.is_accessor() && accessors == CachedAccessors::Skip {
-                return Value::EMPTY;
-            }
-            return value;
-        } else if Some(shape) == entry.shape.get() {
-            if shape.is_dictionary() && shape.dictionary_generation() != entry.shape_dictionary_generation.get() {
-                continue;
-            }
-            let value = object.get_direct(entry.property_offset.get());
-            if value.is_accessor() && accessors == CachedAccessors::Skip {
-                return Value::EMPTY;
-            }
-            return value;
-        }
+    match property_access::cached_property_slot(base.as_object(), cache, cache_key) {
+        Some(value) if !value.is_accessor() || accessors == CachedAccessors::Return => value,
+        _ => Value::EMPTY,
     }
-    Value::EMPTY
 }
 
 // Fast path for GetByValue on typed arrays.
@@ -1765,7 +1690,7 @@ pub fn try_get_by_value_typed_array(vm: &Vm, values: &mut op::GetByValueValues) 
     }
 
     let length = array_length.length();
-    if index >= length {
+    if index as usize >= length {
         values.dst = Value::UNDEFINED;
         return true;
     }
@@ -1777,8 +1702,8 @@ pub fn try_get_by_value_typed_array(vm: &Vm, values: &mut op::GetByValueValues) 
 
     let buffer = typed_array.viewed_array_buffer();
     let Some(byte_index) = (index as usize)
-        .checked_mul(typed_array.element_size() as usize)
-        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset() as usize))
+        .checked_mul(typed_array.element_size())
+        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset()))
     else {
         return false;
     };
@@ -1828,7 +1753,7 @@ pub fn try_put_by_value_typed_array(vm: &Vm, values: &op::PutByValueValues) -> b
     // NB: An out-of-bounds write is not simply a no-op: TypedArraySetElement still
     //     evaluates ToNumber(value) for its side effects before discarding the store.
     //     Fall back to the slow path so those side effects happen.
-    if index >= array_length.length() {
+    if index as usize >= array_length.length() {
         return false;
     }
 
@@ -1838,8 +1763,8 @@ pub fn try_put_by_value_typed_array(vm: &Vm, values: &op::PutByValueValues) -> b
 
     let buffer = typed_array.viewed_array_buffer();
     let Some(byte_index) = (index as usize)
-        .checked_mul(typed_array.element_size() as usize)
-        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset() as usize))
+        .checked_mul(typed_array.element_size())
+        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset()))
     else {
         return false;
     };

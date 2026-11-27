@@ -12,6 +12,7 @@ pub mod allocation;
 pub mod calls;
 pub mod code;
 pub mod compile_queue;
+pub mod data_memory;
 pub mod dependencies;
 pub mod dispatch_tables;
 pub mod entry_exit;
@@ -26,23 +27,28 @@ pub mod testing;
 pub mod tier_up;
 pub mod translate;
 
-pub use libjs_jit::options;
+pub use crate::jit_options as options;
 
 use core::cell::{Cell, OnceCell, RefCell};
+use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
+use libjs_runtime_macros::Trace;
+
 use crate::bytecode::executable::Executable;
-use crate::gc::capi;
+use crate::gc::defer_gc::{DeferGc, Deferred};
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::dispatch_tables::DispatchTable;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::execution_context::ExecutionContext;
+use code::DetachedJitCode;
 use code::EntryTrampoline;
 use code::SnapshotExecutable;
 use compile_queue::{CompileQueue, CompileResult};
+use data_memory::DataAllocator;
 use executable_memory::{CodeAllocator, ExecutableMemory};
 use options::Options;
 
@@ -82,7 +88,8 @@ fn frames_above(vm: &Vm, frame: NonNull<ExecutionContext>) -> Option<Vec<NonNull
 
 /// What calls of an executable without JIT code enter through its slot in the JIT entry table.
 pub fn not_compiled_call_entry() -> *const core::ffi::c_void {
-    entry_exit::libjs_jit_not_compiled_call_entry as *const core::ffi::c_void
+    libjs_runtime_macros::jit_function_address!(entry_exit::libjs_jit_not_compiled_call_entry)
+        as *const core::ffi::c_void
 }
 
 /// Which interpreter handlers an executable's frames run with. Each tier's value is the index of its dispatch table
@@ -111,10 +118,13 @@ impl InterpreterTier {
 
 /// A compile job running on a compile thread. The VM keeps the executable and every cell its snapshot refers to
 /// alive until the job's code is installed or the job is abandoned.
+#[derive(Trace)]
 pub struct CompileJob {
     pub executable: Gc<Executable>,
     pub cells: Vec<Gc<CellHeader>>,
     pub snapshot_executables: Vec<SnapshotExecutable>,
+    #[gc(untraced = "the cells keep the samples alive and in place until the code is installed")]
+    pub sample_slots: allocation::SampleSlots,
 }
 
 /// With the "stress-install" option, finished compile jobs wait for at most this many tier-up checks.
@@ -158,6 +168,11 @@ pub struct JitState {
     /// With the "stress-install" option, the results of finished compile jobs that are not installed yet, with how
     /// many more tier-up checks they wait for.
     held_compile_results: RefCell<Vec<(u32, u64, CompileResult)>>,
+    /// The code detached while drops were deferred (see `defer_code_drops_until_collection_is_over()`), which a
+    /// post-GC task drops.
+    codes_detached_in_collection: RefCell<DetachedJitCode>,
+    /// Whether code that is detached now goes into `codes_detached_in_collection`.
+    defers_code_drops: Cell<bool>,
     /// With the "stress-invalidate" option, how many more tier-up checks happen before the next invalidation.
     stress_invalidation_countdown: Cell<u32>,
     /// With the "coverage" option, how often each coverage key was counted.
@@ -174,6 +189,8 @@ pub struct JitState {
     pub(crate) function_environment_free_lists: allocation::FunctionEnvironmentFreeLists,
     /// The memory the VM's JIT code lives in.
     code_allocator: Rc<RefCell<CodeAllocator>>,
+    /// The memory the tables of the VM's JIT code live in.
+    data_allocator: Rc<RefCell<DataAllocator>>,
     /// The compile threads, started by the first asynchronous compile job.
     compile_queue: OnceCell<CompileQueue>,
     /// The compile jobs that run on the compile threads, by id.
@@ -186,6 +203,8 @@ pub struct JitState {
     /// The call stub JIT code shares (see `libjs_jit::codegen::generate_call_stub()`), generated the first time a
     /// compile job needs it, if there is one.
     call_stub: OnceCell<Option<ExecutableMemory>>,
+    /// The construct stub JIT code shares (see `libjs_jit::codegen::generate_construct_stub()`).
+    construct_stub: OnceCell<Option<ExecutableMemory>>,
     /// The installed code that depends on things staying as they are.
     pub(crate) dependents: dependencies::Dependents,
     /// The id the next installed code gets (see `JitCode::id()`).
@@ -195,6 +214,10 @@ pub struct JitState {
 }
 
 impl JitState {
+    #[cfg_attr(
+        ladybird_gc_lints,
+        expect(gc_container_on_stack, reason = "the VM makes its JIT state before its heap")
+    )]
     pub fn new(options: Options) -> Self {
         translate::RegisterDump::assert_layout();
         let warming_up_dispatch_table = options
@@ -217,6 +240,8 @@ impl JitState {
             stress_random,
             stress_exit_countdown,
             held_compile_results: RefCell::default(),
+            codes_detached_in_collection: RefCell::default(),
+            defers_code_drops: Cell::new(false),
             stress_invalidation_countdown,
             coverage: RefCell::default(),
             warming_up_dispatch_table,
@@ -224,12 +249,14 @@ impl JitState {
             entry_table,
             function_environment_free_lists: allocation::FunctionEnvironmentFreeLists::default(),
             code_allocator: Rc::default(),
+            data_allocator: Rc::default(),
             compile_queue: OnceCell::new(),
             jobs: RefCell::default(),
             next_job_id: Cell::new(1),
             runtime_function_addresses: OnceCell::new(),
             entry_trampoline: OnceCell::new(),
             call_stub: OnceCell::new(),
+            construct_stub: OnceCell::new(),
             dependents: dependencies::Dependents::default(),
             next_code_id: Cell::new(1),
             htmldda_objects_exist: Cell::new(false),
@@ -310,6 +337,30 @@ impl JitState {
         true
     }
 
+    /// Where code that is detached from its executable now goes to be dropped once the collection in progress is
+    /// over, while drops are deferred. Otherwise it is dropped right away.
+    pub(crate) fn parking_for_detached_code(&self) -> Option<&RefCell<DetachedJitCode>> {
+        self.defers_code_drops
+            .get()
+            .then_some(&self.codes_detached_in_collection)
+    }
+
+    /// Has the code detached until the returned guard goes away kept until the collection in progress is over, for
+    /// the sweep callback of a collection that may still rewrite slots in the code.
+    pub(crate) fn defer_code_drops_until_collection_is_over<'a>(&'a self, vm: &Vm) -> CodeDropDeferral<'a> {
+        assert!(!self.defers_code_drops.replace(true));
+        if self.codes_detached_in_collection.borrow().is_empty() {
+            // SAFETY: The VM outlives its heap, whose collections run the task.
+            unsafe {
+                vm.heap().enqueue_post_gc_task(
+                    drop_codes_detached_in_collection,
+                    core::ptr::from_ref(vm).cast_mut().cast(),
+                );
+            }
+        }
+        CodeDropDeferral(self)
+    }
+
     /// With the "coverage" option, counts `key`, which is only formatted then: what compiled code contained when it was
     /// installed (see `libjs_jit::coverage`), and what happened to it ("exit.BadShape", "discard", "osr-entry", ...).
     #[inline]
@@ -369,6 +420,10 @@ impl JitState {
         &self.code_allocator
     }
 
+    pub(crate) fn data_allocator(&self) -> &Rc<RefCell<DataAllocator>> {
+        &self.data_allocator
+    }
+
     pub(crate) fn compile_queue(&self) -> &CompileQueue {
         self.compile_queue
             .get_or_init(|| CompileQueue::start(self.options.compile_thread_count()))
@@ -379,11 +434,16 @@ impl JitState {
         self.compile_queue.get()
     }
 
-    pub(crate) fn add_job(&self, job: CompileJob) -> u64 {
+    pub(crate) fn add_job(&self, job: CompileJob, _defer_gc: &DeferGc<'_>) -> u64 {
         let id = self.next_job_id.get();
         self.next_job_id.set(id + 1);
         self.jobs.borrow_mut().insert(id, job);
         id
+    }
+
+    /// Whether compile jobs run on the compile threads.
+    pub(crate) fn has_compile_jobs(&self) -> bool {
+        !self.jobs.borrow().is_empty()
     }
 
     /// Forgets every compile job, whose results are dropped when they finish.
@@ -398,8 +458,8 @@ impl JitState {
             .retain(|_, job| !core::ptr::eq(job.executable.as_ptr(), executable));
     }
 
-    pub(crate) fn take_job(&self, id: u64) -> Option<CompileJob> {
-        self.jobs.borrow_mut().remove(&id)
+    pub(crate) fn take_job<'d>(&self, id: u64, defer_gc: &'d DeferGc<'_>) -> Option<Deferred<'d, CompileJob>> {
+        self.jobs.borrow_mut().remove(&id).map(|job| defer_gc.cover(job))
     }
 
     /// The entry trampoline (see `libjs_jit::codegen::generate_entry_trampoline()`).
@@ -408,14 +468,17 @@ impl JitState {
             .get_or_init(|| {
                 let code = libjs_jit::codegen::generate_entry_trampoline::<libjs_jit::asm::MacroAssembler>()
                     .expect("the entry trampoline can be generated");
-                let memory = ExecutableMemory::allocate(
-                    &self.code_allocator,
-                    &[code.as_slice()],
-                    &["entry trampoline"],
-                    self.options.perf_map,
-                )
-                .pop()
-                .expect("one code was allocated");
+                // NB: On Windows, the trampoline goes first in a chunk of its own, whose unwind info then describes
+                //     its prologue: native code calls it, and keeps no frame pointer that a stack walk from the
+                //     prologue could take for the trampoline's.
+                #[cfg(windows)]
+                let allocator = Rc::new(RefCell::new(CodeAllocator::default()));
+                #[cfg(not(windows))]
+                let allocator = Rc::clone(&self.code_allocator);
+                let memory =
+                    ExecutableMemory::allocate(&allocator, &[&code[..]], &["entry trampoline"], self.options.perf_map)
+                        .pop()
+                        .expect("one code was allocated");
                 // SAFETY: The code is the entry trampoline, with its calling convention.
                 let trampoline = unsafe { core::mem::transmute::<*const u8, EntryTrampoline>(memory.address()) };
                 (memory, trampoline)
@@ -431,8 +494,26 @@ impl JitState {
                     .expect("the call stub compiles")?;
                 ExecutableMemory::allocate(
                     &self.code_allocator,
-                    &[code.as_slice()],
+                    &[&code[..]],
                     &["call stub"],
+                    self.options.perf_map,
+                )
+                .pop()
+            })
+            .as_ref()
+            .map_or(0, |memory| memory.address() as u64)
+    }
+
+    /// The address of the construct stub for code with this runtime info, or 0.
+    pub(crate) fn construct_stub(&self, runtime: &libjs_jit::snapshot::RuntimeInfo) -> u64 {
+        self.construct_stub
+            .get_or_init(|| {
+                let code = libjs_jit::codegen::generate_construct_stub::<libjs_jit::asm::MacroAssembler>(runtime)
+                    .expect("the construct stub compiles")?;
+                ExecutableMemory::allocate(
+                    &self.code_allocator,
+                    &[&code[..]],
+                    &["construct stub"],
                     self.options.perf_map,
                 )
                 .pop()
@@ -456,34 +537,8 @@ impl Drop for JitState {
 unsafe impl Trace for JitState {
     fn trace(&self, visitor: &mut Visitor) {
         for job in self.jobs.borrow().values() {
-            visitor.visit(job.executable);
-            for cell in &job.cells {
-                visitor.visit(*cell);
-            }
-            for executable in &job.snapshot_executables {
-                visitor.visit(executable.executable);
-                if let Some(function) = executable.function {
-                    function.visit(visitor);
-                }
-            }
+            job.trace(visitor);
         }
-    }
-}
-
-/// Keeps the heap from collecting garbage while it lives.
-pub(crate) struct DeferGc<'vm>(&'vm Vm);
-
-impl<'vm> DeferGc<'vm> {
-    pub(crate) fn new(vm: &'vm Vm) -> Self {
-        capi::gc_heap_defer_gc(vm.heap().handle());
-        Self(vm)
-    }
-}
-
-impl Drop for DeferGc<'_> {
-    fn drop(&mut self) {
-        // NB: This undoes the deferral of new().
-        capi::gc_heap_undefer_gc(self.0.heap().handle());
     }
 }
 
@@ -496,7 +551,7 @@ pub fn describe_executable(executable: &Executable) -> String {
     } else {
         name
     };
-    let Some(entry) = executable.source_map.iter().find(|entry| entry.line != 0) else {
+    let Some(entry) = executable.source_positions().find(|entry| entry.line != 0) else {
         return name;
     };
     let filename = executable.source_code().map_or(String::new(), |source_code| {
@@ -506,4 +561,19 @@ pub fn describe_executable(executable: &Executable) -> String {
         return format!("{name} ({}:{})", entry.line, entry.column);
     }
     format!("{name} ({filename}:{}:{})", entry.line, entry.column)
+}
+
+/// Defers drops of detached code while it lives (see `JitState::defer_code_drops_until_collection_is_over()`).
+pub(crate) struct CodeDropDeferral<'a>(&'a JitState);
+
+impl Drop for CodeDropDeferral<'_> {
+    fn drop(&mut self) {
+        self.0.defers_code_drops.set(false);
+    }
+}
+
+unsafe extern "C" fn drop_codes_detached_in_collection(context: *mut c_void) {
+    // SAFETY: The task was enqueued with the VM as its context.
+    let vm = unsafe { &*context.cast::<Vm>() };
+    vm.jit.codes_detached_in_collection.borrow_mut().clear();
 }

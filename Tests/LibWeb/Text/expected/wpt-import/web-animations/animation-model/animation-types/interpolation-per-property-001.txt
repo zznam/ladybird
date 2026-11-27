@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 446 tests
+Found 454 tests
 
-436 Pass
+444 Pass
 10 Fail
 Pass	Setup
 Pass	alignment-baseline (type: discrete) has testInterpolation function
@@ -356,6 +356,10 @@ Pass	font-language-override (type: discrete) has testInterpolation function
 Pass	font-language-override uses discrete animation when animating between ""eng"" and "normal" with linear easing
 Pass	font-language-override uses discrete animation when animating between ""eng"" and "normal" with effect easing
 Pass	font-language-override uses discrete animation when animating between ""eng"" and "normal" with keyframe easing
+Pass	font-synthesis (type: discrete) has testInterpolation function
+Pass	font-synthesis uses discrete animation when animating between "none" and "weight style" with linear easing
+Pass	font-synthesis uses discrete animation when animating between "none" and "weight style" with effect easing
+Pass	font-synthesis uses discrete animation when animating between "none" and "weight style" with keyframe easing
 Pass	font-variant-alternates (type: discrete) has testInterpolation function
 Pass	font-variant-alternates uses discrete animation when animating between "swash(unknown)" and "stylistic(unknown)" with linear easing
 Pass	font-variant-alternates uses discrete animation when animating between "swash(unknown)" and "stylistic(unknown)" with effect easing
@@ -450,3 +454,7 @@ Pass	grid-template-areas (type: discrete) has testInterpolation function
 Pass	grid-template-areas uses discrete animation when animating between "". . a b" ". . a b"" and "none" with linear easing
 Pass	grid-template-areas uses discrete animation when animating between "". . a b" ". . a b"" and "none" with effect easing
 Pass	grid-template-areas uses discrete animation when animating between "". . a b" ". . a b"" and "none" with keyframe easing
+Pass	hyphens (type: discrete) has testInterpolation function
+Pass	hyphens uses discrete animation when animating between "manual" and "none" with linear easing
+Pass	hyphens uses discrete animation when animating between "manual" and "none" with effect easing
+Pass	hyphens uses discrete animation when animating between "manual" and "none" with keyframe easing

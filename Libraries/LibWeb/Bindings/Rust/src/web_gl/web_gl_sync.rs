@@ -22,8 +22,8 @@ pub(crate) struct WebGLSync {
 }
 
 impl Wrappable for WebGLSync {
-    fn relevant_realm(&self, vm: &Vm) -> Option<Gc<Realm>> {
-        self.object.relevant_realm(vm)
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
+        self.object.relevant_realm()
     }
 }
 
@@ -35,13 +35,10 @@ impl Inherits<WebGLObject> for WebGLSync {
 
 impl WebGLSync {
     pub(crate) fn create(vm: &Vm, context: &ContextState, sync_handle: u32) -> Ref<Self> {
-        allocate(
-            vm,
-            Self {
-                object: WebGLObject::new(context, 0),
-                sync_handle,
-            },
-        )
+        allocate(vm, |_| Self {
+            object: WebGLObject::new(context, 0),
+            sync_handle,
+        })
     }
 
     pub(crate) fn sync_handle(&self, context: &ContextState) -> Result<u32, InvalidOperation> {

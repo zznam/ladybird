@@ -19,6 +19,7 @@ use core::ptr::NonNull;
 
 use super::class::{Class, ExternalMemorySize, GcCell, MIN_CELL_SIZE, class_of};
 use super::class_id::ClassId;
+use super::defer_gc::DeferGc;
 use super::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, CellKind, Gc};
@@ -107,6 +108,12 @@ impl<T: Trace + 'static> EmbedderClass<T> {
         self.class.type_info.finalize = Some(finalize);
         self
     }
+
+    /// The class with its cells traced on the thread that owns their heap only, see Class::traced_on_owner_thread_only().
+    pub const fn traced_on_owner_thread_only(mut self) -> Self {
+        self.class = self.class.traced_on_owner_thread_only();
+        self
+    }
 }
 
 impl<T: Trace + ExternalMemorySize + 'static> EmbedderClass<T> {
@@ -141,19 +148,15 @@ unsafe impl<T: EmbedderValue> GcCell for EmbedderCell<T> {
 }
 
 impl<T: EmbedderValue> EmbedderClass<T> {
-    /// Moves `value` into a new cell of the class, from the allocator of the class, which the first allocation for
-    /// the class creates.
-    pub fn allocate(&'static self, vm: &Vm, value: T) -> Gc<EmbedderCell<T>> {
+    /// Moves the value that `build` returns into a new cell of the class, as Heap::allocate() does.
+    pub fn allocate(&'static self, vm: &Vm, build: impl FnOnce(&DeferGc<'_>) -> T) -> Gc<EmbedderCell<T>> {
         let allocator = vm.heap().embedder_class_allocator(&self.class);
-        vm.heap().allocate_in(
-            allocator,
-            EmbedderCell {
-                header: CellHeader::for_class(&self.class),
-                value: ValueWithRoomForFreeListLink {
-                    value: ManuallyDrop::new(value),
-                },
+        vm.heap().allocate_in(allocator, |defer_gc| EmbedderCell {
+            header: CellHeader::for_class(&self.class),
+            value: ValueWithRoomForFreeListLink {
+                value: ManuallyDrop::new(build(defer_gc)),
             },
-        )
+        })
     }
 
     /// The cell behind the pointer, if it is a cell of this class.
@@ -161,7 +164,7 @@ impl<T: EmbedderValue> EmbedderClass<T> {
     /// # Safety
     ///
     /// `cell` must be a live cell that an embedder class allocated, such as the host data of a host object the
-    /// embedder created with such a cell, whose first word is therefore its class.
+    /// embedder created with such a cell, whose block therefore holds its class.
     pub unsafe fn downcast(&'static self, cell: NonNull<c_void>) -> Option<Gc<EmbedderCell<T>>> {
         // SAFETY: The caller passes a live cell of an embedder class.
         let cell = unsafe { Gc::<EmbedderCell<T>>::from_non_null(cell.cast()) };

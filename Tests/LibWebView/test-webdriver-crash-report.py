@@ -31,12 +31,14 @@ def crash_helper(webdriver_pid, process_name):
     targets = []
     while pending:
         for pid, command in children.get(pending.pop(), []):
-            pending.append(pid)
             arguments = shlex.split(command)
+            # A helper's own children, such as its file broker, carry the helper's command line but are not the helper.
             if arguments and Path(arguments[0]).name == process_name:
                 assert "--crash-report-fd" in arguments, f"{process_name} has no capture descriptor"
                 assert "--disable-sandbox" not in arguments, f"{process_name} is not sandboxed"
                 targets.append(pid)
+            else:
+                pending.append(pid)
     assert len(targets) == 1, f"Expected one {process_name} child, found {len(targets)}"
     os.kill(targets[0], signal.SIGSEGV)
 
@@ -50,12 +52,11 @@ def run_test(webdriver_binary, process_name):
             ("XDG_CACHE_HOME", "cache"),
         ):
             environment[variable] = str(Path(temporary) / directory)
-        port = webdriver_helpers.unused_port()
-        webdriver = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port)], env=environment
+        profile = Path(temporary) / "profile"
+        webdriver, port = webdriver_helpers.launch_webdriver(
+            webdriver_binary, "--headless", f"--profile-path={profile}", env=environment
         )
         try:
-            webdriver_helpers.wait_for_port(port)
             status, payload, body = webdriver_helpers.request(
                 port,
                 "POST",
@@ -77,7 +78,8 @@ def run_test(webdriver_binary, process_name):
                 )
                 assert status == 200, body
             else:
-                if process_name == "WebWorker":
+                if process_name == "ImageDecoder":
+                    # A process gets its decoder when it first has an image to decode.
                     status, payload, body = webdriver_helpers.request(
                         port,
                         "POST",
@@ -85,18 +87,19 @@ def run_test(webdriver_binary, process_name):
                         {
                             "script": """
                             const done = arguments[0];
-                            window.worker = new Worker(URL.createObjectURL(new Blob([
-                                "postMessage('ready'); onmessage = () => {};"
-                            ], {type: 'text/javascript'})));
-                            worker.onmessage = () => done();
-                            worker.onerror = () => done('worker failed');
+                            window.image = new Image();
+                            image.onload = () => done();
+                            image.onerror = () => done('image failed');
+                            image.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
                         """,
                             "args": [],
                         },
                     )
                     assert status == 200 and payload == {"value": None}, body
+                elif process_name == "Compositor":
+                    webdriver_helpers.wait_for_compositor(port, session)
                 crash_helper(webdriver.pid, process_name)
-            directory = Path(temporary) / "data/Ladybird/CrashReports"
+            directory = profile / "data/CrashReports"
             deadline = time.monotonic() + webdriver_helpers.EVENT_TIMEOUT_SECONDS
             while True:
                 reports = list(directory.glob(f"*-{process_name}-*.txt"))
@@ -149,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--process",
         default="WebContent",
-        choices=["WebContent", "WebWorker", "RequestServer", "ImageDecoder", "Compositor"],
+        choices=["WebContent", "RequestServer", "ImageDecoder", "Compositor"],
     )
     args = parser.parse_args()
     run_test(args.webdriver_binary, args.process)

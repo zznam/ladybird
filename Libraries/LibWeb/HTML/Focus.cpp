@@ -10,6 +10,7 @@
 #include <AK/TypeCasts.h>
 #include <AK/Vector.h>
 #include <LibGC/Root.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -28,6 +29,7 @@
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Page/Page.h>
@@ -64,6 +66,36 @@ static void fire_a_focus_event(GC::Ptr<DOM::EventTarget> focus_event_target, GC:
     focus_event_target->dispatch_event(focus_event);
 }
 
+void dispatch_system_focus_events(DOM::Document& document, bool has_focus)
+{
+    TemporaryExecutionContext execution_context { document.relevant_settings_object() };
+
+    GC::Ptr<DOM::Element> element = as_if<DOM::Element>(document.focused_area().ptr());
+
+    auto dispatch_element_events = [&] {
+        if (!element || document.focused_area() != element)
+            return;
+
+        fire_a_focus_event(element, nullptr, has_focus ? EventNames::focus : EventNames::blur, false);
+
+        if (document.focused_area() == element && document.page().client().has_focus() == has_focus)
+            fire_a_focus_event(element, nullptr, has_focus ? EventNames::focusin : EventNames::focusout, true);
+    };
+
+    if (!has_focus)
+        dispatch_element_events();
+
+    if (document.page().client().has_focus() != has_focus)
+        return;
+
+    fire_a_focus_event(document.window(), nullptr, has_focus ? EventNames::focus : EventNames::blur, false);
+
+    auto navigable = document.page().hosted_focused_navigable();
+
+    if (has_focus && document.page().client().has_focus() && navigable && navigable->active_document().ptr() == &document)
+        dispatch_element_events();
+}
+
 static void designate_document_viewport_as_focused_area(DOM::Document& document)
 {
     if (document.focused_area() == nullptr)
@@ -86,6 +118,16 @@ static GC::Ptr<Navigable> focus_root(DOM::Document& document)
     return navigable->top_level_traversable();
 }
 
+// The currently focused area of root, or without system focus, the area the tab's focused navigable shows: where focus
+// would be with system focus. Starting at the focused navigable means a focused area another process took focus from
+// doesn't count as focused.
+static GC::Ptr<DOM::Node> currently_or_otherwise_focused_area(Navigable& root)
+{
+    if (root.page().client().has_focus())
+        return root.currently_focused_area();
+    return root.focused_area_shown_by_focused_navigable_regardless_of_system_focus();
+}
+
 static GC::Ptr<Navigable> navigable_of_focused_area(DOM::Node& focused_area)
 {
     if (auto* container = as_if<NavigableContainer>(focused_area)) {
@@ -101,8 +143,29 @@ static bool is_top_level_document_viewport(DOM::Node const* node)
     return document && document->navigable() && !document->navigable()->parent();
 }
 
+// Whether a listener can run on `element` as its blur and focusout events are dispatched: on its flat tree path, or on
+// its document or window.
+static bool a_handler_may_read_style_during_blur(DOM::Element& element)
+{
+    auto listens = [](DOM::EventTarget const& target) {
+        return target.has_event_listener(HTML::EventNames::blur) || target.has_event_listener(HTML::EventNames::focusout);
+    };
+    for (DOM::Node* node = &element; node; node = node->flat_tree_parent()) {
+        if (listens(*node))
+            return true;
+    }
+    return listens(element.document()) || listens(relevant_window(element));
+}
+
+static bool container_has_explicit_focus(GC::Ptr<NavigableContainer> container)
+{
+    return container
+        && container->document().focused_area() == container
+        && container->document().focused_container_has_explicit_focus();
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps
-void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Root<DOM::Node>> new_chain, GC::Ptr<DOM::Node> new_focus_target)
+void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Root<DOM::Node>> new_chain, GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<NavigableContainer> explicitly_focused_container)
 {
     // The focus update steps, given an old chain, a new chain, and a new focus target respectively, are as follows:
 
@@ -118,19 +181,44 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
     auto new_focus_target_is_document_viewport = new_focus_target && new_focus_target->is_document();
     GC::Ptr<DOM::Node> focus_transition_source;
     Vector<GC::Root<DOM::Element>> old_focus_within_chain;
+    bool focus_transition_source_indicated_focus = false;
+    bool focus_state_published_for_blur_handlers = false;
 
     auto build_focus_within_chain = [](GC::Ptr<DOM::Node> source) {
         Vector<GC::Root<DOM::Element>> chain;
         for (auto* node = source.ptr(); node; node = node->flat_tree_parent()) {
-            if (auto* element = as_if<DOM::Element>(*node))
+            if (auto* element = as_if<DOM::Element>(*node)) {
                 chain.append(*element);
+                if (element->rendered_in_top_layer())
+                    break;
+            }
         }
         return chain;
+    };
+
+    // AD-HOC: What a blur handler reads of the old area's style is what it matches now, while the focusability check of
+    //         the new area runs over the state the old area left, so that a selector keeping the new area rendered
+    //         does not hide it first.
+    auto publish_focus_state_of_transition_source = [&](bool focused) {
+        auto* element = as_if<DOM::Element>(focus_transition_source.ptr());
+        if (!element)
+            return;
+        CSS::record_element_state_changed(*element, CSS::PseudoClass::Focus, focused);
+        if (focus_transition_source_indicated_focus)
+            CSS::record_element_state_changed(*element, CSS::PseudoClass::FocusVisible, focused);
+        for (auto& ancestor : old_focus_within_chain)
+            CSS::record_element_state_changed(*ancestor, CSS::PseudoClass::FocusWithin, focused);
+    };
+
+    auto restore_focus_state_for_focusability_check = [&] {
+        if (exchange(focus_state_published_for_blur_handlers, false))
+            publish_focus_state_of_transition_source(true);
     };
 
     auto finish_focus_transition = [&](GC::Ptr<DOM::Node> destination) {
         if (!focus_transition_source)
             return;
+        restore_focus_state_for_focusability_check();
 
         CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::Focus, focus_transition_source, destination);
         CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::FocusVisible, focus_transition_source, destination);
@@ -165,6 +253,25 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
         return nullptr;
     };
 
+    // AD-HOC: Chromium and WebKit fire element focus/blur events on a navigable container only when it was itself
+    //         focused. The specification does not distinguish this from focus in the container's contents:
+    //         https://github.com/whatwg/html/issues/11873
+    auto dispatch_explicit_container_focus_events = [&]() {
+        if (!container_has_explicit_focus(explicitly_focused_container) || !explicitly_focused_container->document().page().client().has_focus())
+            return;
+
+        GC::Ptr<DOM::EventTarget> related_focus_target;
+        if (!new_chain.is_empty() && new_chain.last().ptr() == explicitly_focused_container.ptr() && !old_chain.is_empty() && is<DOM::Element>(*old_chain.last()))
+            related_focus_target = old_chain.last();
+
+        fire_a_focus_event(explicitly_focused_container, related_focus_target, HTML::EventNames::focus, false);
+
+        if (!container_has_explicit_focus(explicitly_focused_container) || !explicitly_focused_container->document().page().client().has_focus())
+            return;
+
+        fire_a_focus_event(explicitly_focused_container, related_focus_target, HTML::EventNames::focusin, true);
+    };
+
     // 2. For each entry entry in old chain, in order, run these substeps:
     for (auto& entry : old_chain) {
         // 1. If entry is an input element
@@ -190,7 +297,10 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
         //    If entry is a Document object, let blur event target be that Document object's relevant global object.
         //    Otherwise, let blur event target be null.
         GC::Ptr<DOM::EventTarget> blur_event_target;
-        if (is<DOM::Element>(*entry))
+        if (is<NavigableContainer>(*entry) && !entry->document().focused_container_has_explicit_focus()) {
+            // AD-HOC: Suppress events for containers designated only by descendant focus.
+            //         https://github.com/whatwg/html/issues/11873
+        } else if (is<DOM::Element>(*entry))
             blur_event_target = entry;
         else if (is<DOM::Document>(*entry))
             blur_event_target = &relevant_window(*entry);
@@ -217,8 +327,13 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
             if (preserve_focus_state) {
                 focus_transition_source = element;
                 old_focus_within_chain = build_focus_within_chain(element);
+                focus_transition_source_indicated_focus = element->should_indicate_focus();
             }
             element->document().set_focused_area(nullptr, preserve_focus_state ? DOM::Document::InvalidateFocusPseudoClasses::No : DOM::Document::InvalidateFocusPseudoClasses::Yes);
+            if (preserve_focus_state && a_handler_may_read_style_during_blur(*element)) {
+                publish_focus_state_of_transition_source(false);
+                focus_state_published_for_blur_handlers = true;
+            }
         }
 
         // 4. If blur event target is not null, fire a focus event named blur at blur event target, with related blur
@@ -250,12 +365,18 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
     if (new_focus_target_is_document_viewport)
         designate_document_viewport_as_focused_area(as<DOM::Document>(*new_focus_target));
 
+    // NB: The container may have been removed with the common chain tail, e.g. after contentWindow.focus(). Record
+    //     explicit focus before content Window handlers run, and dispatch its events after them.
+    if (explicitly_focused_container && explicitly_focused_container->document().focused_area() == explicitly_focused_container)
+        explicitly_focused_container->document().set_focused_container_has_explicit_focus(true);
+
     // 4. For each entry entry in new chain, in reverse order, run these substeps:
     for (auto& entry : new_chain.in_reverse()) {
         // 1. If entry is a focusable area, and the focused area of the document is not entry:
         if (entry->is_document()) {
             designate_document_viewport_as_focused_area(entry->document());
         } else if (entry->document().focused_area().ptr() != entry.ptr()) {
+            restore_focus_state_for_focusability_check();
             if (entry->is_focusable()) {
                 relevant_window(*entry).navigation()->set_focus_changed_during_ongoing_navigation(true);
 
@@ -268,6 +389,9 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
             }
         }
 
+        if (entry.ptr() == explicitly_focused_container.ptr() && entry->document().focused_area().ptr() == entry.ptr())
+            entry->document().set_focused_container_has_explicit_focus(true);
+
         // 2. If entry is an element, let focus event target be entry.
         //    If entry is a Document object, let focus event target be that Document object's relevant global object.
         //    Otherwise, let focus event target be null.
@@ -276,6 +400,8 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
             // The viewport does not fire a focus event. The Document object is only its surrogate.
         } else if (is<DOM::Document>(*entry)) {
             focus_event_target = &relevant_window(*entry);
+        } else if (is<NavigableContainer>(*entry)) {
+            // Container element events are dispatched after this loop.
         } else if (is<DOM::Element>(*entry)) {
             focus_event_target = *entry;
         }
@@ -296,7 +422,10 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
         //    focus target as the related target.
         // FIXME: NOTE: In some cases, e.g. if entry is an area element's shape, a scrollable region, or a viewport, no event
         //       is fired.
-        if (focus_event_target) {
+        // AD-HOC: Script can change the designated focus chain without system focus. Match other browsers by
+        //         deferring focus events until system focus returns:
+        //         https://w3c.github.io/uievents/#events-focusevent-doc-focus
+        if (focus_event_target && entry->document().page().client().has_focus()) {
             auto focused_before_dispatch = currently_focused_area();
             fire_a_focus_event(focus_event_target, related_focus_target, HTML::EventNames::focus, false);
 
@@ -306,19 +435,24 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
             //         listener that focus arrived here from there, when it went the other way. The spec's steps
             //         don't account for a handler moving focus at all:
             //         https://github.com/whatwg/html/issues/12329
-            if (currently_focused_area() != focused_before_dispatch)
+            if (currently_focused_area() != focused_before_dispatch) {
+                dispatch_explicit_container_focus_events();
                 return;
+            }
 
             // AD-HOC: dispatch focusin
             fire_a_focus_event(focus_event_target, related_focus_target, HTML::EventNames::focusin, true);
 
             // AD-HOC: A handler moved focus; the nested update owns the designation. See above.
-            if (currently_focused_area() != focused_before_dispatch)
+            if (currently_focused_area() != focused_before_dispatch) {
+                dispatch_explicit_container_focus_events();
                 return;
+            }
         }
     }
 
     finish_focus_transition(new_focus_target);
+    dispatch_explicit_container_focus_events();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focus-chain
@@ -396,6 +530,35 @@ static bool is_focusable_area(DOM::Node& node)
         return false;
 
     return node.is_focusable();
+}
+
+// NB: Whether the document has a focused area that the focus fixup rule may find not focusable. The viewport is
+//     focusable, and a container stands for its child navigable's viewport in the parent's focus chain. The child
+//     document handles its own focused area; an inert container does not make that document inert.
+bool focus_fixup_rule_may_apply(DOM::Document const& document)
+{
+    auto focused_area = document.focused_area();
+    if (!focused_area)
+        return false;
+    auto const* container = as_if<NavigableContainer>(focused_area.ptr());
+    return !container || !container->content_navigable();
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#focus-fixup-rule
+bool focus_fixup_rule_applies(DOM::Document& document)
+{
+    return focus_fixup_rule_may_apply(document) && !is_focusable_area(*document.focused_area());
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#focus-fixup-rule
+void run_focus_fixup_rule(DOM::Document& document)
+{
+    if (!focus_fixup_rule_applies(document))
+        return;
+
+    TemporaryExecutionContext execution_context { document.relevant_settings_object() };
+    run_focusing_steps(&document);
+    relevant_window(document).navigation()->set_focus_changed_during_ongoing_navigation(false);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#get-the-focusable-area
@@ -484,6 +647,53 @@ GC::Ptr<DOM::Node> focus_delegate(DOM::Node& focus_target, FocusTrigger focus_tr
     return nullptr;
 }
 
+// https://html.spec.whatwg.org/multipage/popover.html#popover-focusing-steps
+void run_popover_focusing_steps(HTMLElement& subject)
+{
+    // 1. If the allow focus steps given subject's node document return false, then return.
+    if (!subject.document().allow_focus())
+        return;
+
+    // 2. If subject is a dialog element, then run the dialog focusing steps given subject and return.
+    if (auto* dialog = as_if<HTMLDialogElement>(subject)) {
+        dialog->run_dialog_focusing_steps();
+        return;
+    }
+
+    // 3. If subject has the autofocus attribute, then let control be subject.
+    // 4. Otherwise, let control be the autofocus delegate for subject given "other".
+    GC::Ptr<DOM::Node> control = subject.has_attribute(AttributeNames::autofocus)
+        ? GC::Ptr<DOM::Node> { subject }
+        : autofocus_delegate(subject, FocusTrigger::Other);
+
+    // 5. If control is null, then return.
+    if (!control)
+        return;
+
+    // 6. Run the focusing steps given control.
+    run_focusing_steps(control);
+
+    // 7. Let topDocument be control's node navigable's top-level traversable's active document.
+    // NB: Focus event handlers can detach the document from its navigable.
+    auto navigable = control->navigable();
+    if (!navigable)
+        return;
+    auto* top_level_traversable = as_if<LocalNavigable>(*navigable->top_level_traversable());
+    if (!top_level_traversable)
+        return;
+    auto top_document = top_level_traversable->active_document();
+
+    // 8. If control's node document's origin is not the same as the origin of topDocument, then return.
+    if (!top_document || !control->document().origin().is_same_origin(top_document->origin()))
+        return;
+
+    // 9. Empty topDocument's autofocus candidates.
+    top_document->autofocus_candidates().clear();
+
+    // 10. Set topDocument's autofocus processed flag to true.
+    top_document->set_autofocus_processed_flag(true);
+}
+
 static GC::Ptr<DOM::Node> get_focusable_area(DOM::Node& focus_target, FocusTrigger focus_trigger)
 {
     // FIXME: Implement the rest of the get the focusable area algorithm.
@@ -516,8 +726,10 @@ static GC::Ptr<DOM::Node> get_focusable_area(DOM::Node& focus_target, FocusTrigg
             return nullptr;
 
         // 1. Let focusedElement be the currently focused area of a top-level traversable's DOM anchor.
+        // AD-HOC: Without system focus, that's null; take the area it would be with system focus instead, so the
+        //         shadow host keeps the delegate that has focus (see the focusing steps' step 5).
         if (auto root = focus_root(element->document())) {
-            if (auto focused_element = root->currently_focused_area()) {
+            if (auto focused_element = currently_or_otherwise_focused_area(*root)) {
                 // 2. If focus target is a shadow-including inclusive ancestor of focusedElement, then
                 //    return focusedElement.
                 if (element->is_shadow_including_inclusive_ancestor_of(*focused_element))
@@ -534,7 +746,7 @@ static GC::Ptr<DOM::Node> get_focusable_area(DOM::Node& focus_target, FocusTrigg
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focusing-steps
 // FIXME: This should accept more types.
-void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> fallback_target, FocusTrigger focus_trigger, ScrollIntoView scroll_into_view)
+void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> fallback_target, FocusTrigger focus_trigger, ScrollIntoView scroll_into_view, Optional<bool> focus_visible)
 {
     // 1. If new focus target is not a focusable area, then set new focus target to the result of getting the focusable
     //    area for new focus target, given focus trigger if it was passed.
@@ -560,16 +772,20 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
             return;
     }
 
+    GC::Ptr<NavigableContainer> explicitly_focused_container = as_if<NavigableContainer>(new_focus_target.ptr());
+
     // 3. If new focus target is a navigable container with non-null content navigable, then set new focus target to the content navigable's active document.
     GC::Ptr<RemoteNavigable> remote_content_navigable;
-    if (auto* navigable_container = as_if<NavigableContainer>(*new_focus_target)) {
-        if (auto content_navigable = navigable_container->content_navigable()) {
+    if (explicitly_focused_container) {
+        if (auto content_navigable = explicitly_focused_container->content_navigable()) {
             // NB: The active document of a navigable another process hosts is there, and that process runs these steps
             //     for it. The container stands for it in the rest of these steps, as the focused area of its node
             //     document.
-            if (auto* local_navigable = as_if<LocalNavigable>(*content_navigable))
+            if (auto* local_navigable = as_if<LocalNavigable>(*content_navigable)) {
                 new_focus_target = local_navigable->active_document();
-            else
+                if (!new_focus_target)
+                    return;
+            } else
                 remote_content_navigable = as<RemoteNavigable>(*content_navigable);
         }
     }
@@ -578,6 +794,14 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
     if (is_inert_for_focus(*new_focus_target))
         return;
 
+    // AD-HOC: Match Chromium and WebKit: refocusing the container preserves descendant focus.
+    //         https://github.com/whatwg/html/issues/11873
+    if (container_has_explicit_focus(explicitly_focused_container)) {
+        if (focus_visible.has_value())
+            explicitly_focused_container->document().request_focus_visibility_for_focused_element(*focus_visible);
+        return;
+    }
+
     if (remote_content_navigable)
         new_focus_target->document().page().client().request_focusing_steps_for_remote_navigable(*remote_content_navigable, focus_trigger);
 
@@ -585,8 +809,17 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
     auto root = focus_root(new_focus_target->document());
     if (!root)
         return;
-    if (new_focus_target.ptr() == root->currently_focused_area().ptr())
+    // AD-HOC: Without system focus, the currently focused area of the top-level traversable is null, so the spec's
+    //         check never matches. Focusing the area that keeps focus then fires the focus events again, and a page
+    //         whose focus handler focuses its own target again recurses until the stack runs out. Compare against the
+    //         area that would be focused with system focus.
+    if (new_focus_target.ptr() == currently_or_otherwise_focused_area(*root).ptr() && !explicitly_focused_container) {
+        // NB: focus()'s focusVisible option still applies to the element that already has focus, e.g. the delegate a
+        //     shadow host resolved to.
+        if (focus_visible.has_value())
+            new_focus_target->document().request_focus_visibility_for_focused_element(*focus_visible);
         return;
+    }
 
     // 6. Let old chain be the current focus chain of the top-level browsing context in which
     //    new focus target finds itself.
@@ -597,6 +830,9 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
 
     // AD-HOC: Remember last focus trigger for :focus-visible / focus indication.
     new_focus_target->document().set_last_focus_trigger(focus_trigger);
+    new_focus_target->document().set_requested_focus_visibility(new_focus_target, focus_visible);
+    if (focus_trigger == FocusTrigger::Click || focus_trigger == FocusTrigger::Key)
+        new_focus_target->document().set_last_user_focus_was_by_pointer(focus_trigger == FocusTrigger::Click);
 
     // NB: The tab's focused navigable shows the walk below a top-level traversable another process hosts, and the other
     //     pages of the tab follow it, so it moves to the navigable of new focus target before any focus event fires.
@@ -604,7 +840,7 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
         navigable->page().set_focused_navigable(*navigable);
 
     // 8. Run the focus update steps with old chain, new chain, and new focus target respectively.
-    run_focus_update_steps(move(old_chain), move(new_chain), new_focus_target);
+    run_focus_update_steps(move(old_chain), move(new_chain), new_focus_target, explicitly_focused_container);
 
     // INTEROP: Keyboard input follows the deepest focused navigable. Focus event handlers can move focus reentrantly,
     //          so derive the input target from the final focused area instead of the target which began this update.
@@ -637,9 +873,20 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
         return;
 
     Bindings::ScrollIntoViewOptions scroll_options;
-    scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
-    scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
-    (void)focused_element->scroll_into_view(scroll_options, {});
+    auto scroll_mode = DOM::ScrollIntoViewMode::Always;
+    if (focus_trigger == FocusTrigger::Script || focus_trigger == FocusTrigger::Key) {
+        // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+        // 4. If options["preventScroll"] is false, then scroll a target into view given this, "auto",
+        //    "center", and "center".
+        // AD-HOC: Use the same alignment for sequential keyboard focus, for interoperability.
+        scroll_options.block = Bindings::ScrollLogicalPosition::Center;
+        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Center;
+        scroll_mode = DOM::ScrollIntoViewMode::IfNeeded;
+    } else {
+        scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
+        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
+    }
+    (void)focused_element->scroll_into_view(scroll_options, {}, scroll_mode);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#unfocusing-steps
@@ -777,13 +1024,13 @@ static void append_focus_navigation_scope_descendants(DOM::Node& parent, Vector<
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focus-navigation-scope
-static GC::ConservativeVector<GC::Ref<DOM::Element>> focus_navigation_scope(DOM::Node& owner)
+static GC::RootVector<GC::Ref<DOM::Element>> focus_navigation_scope(DOM::Node& owner)
 {
     // The contents of a given focus navigation scope owner owner's focus navigation scope are all elements whose
     // associated focus navigation owner is owner.
     // NB: We collect them in tree order by walking down from owner, instead of computing the associated focus
     //     navigation owner of every element.
-    GC::ConservativeVector<GC::Ref<DOM::Element>> scope;
+    GC::RootVector<GC::Ref<DOM::Element>> scope;
 
     if (auto* document = as_if<DOM::Document>(owner)) {
         // NB: We treat the document element as being in its document's scope.
@@ -852,7 +1099,7 @@ static bool is_sequentially_focusable(DOM::Node const& node)
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#tabindex-ordered-focus-navigation-scope
-static GC::ConservativeVector<GC::Ref<DOM::Element>> tabindex_ordered_focus_navigation_scope(DOM::Node& owner)
+static GC::RootVector<GC::Ref<DOM::Element>> tabindex_ordered_focus_navigation_scope(DOM::Node& owner)
 {
     // A tabindex-ordered focus navigation scope is a list of focusable areas and focus navigation scope owners.
     // Every focus navigation scope owner owner has tabindex-ordered focus navigation scope, whose contents are
@@ -868,9 +1115,11 @@ static GC::ConservativeVector<GC::Ref<DOM::Element>> tabindex_ordered_focus_navi
         GC::Ref<DOM::Element> element;
         i32 tabindex;
         size_t tree_index;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<Item> positive_items;
-    GC::ConservativeVector<GC::Ref<DOM::Element>> result;
+    GC::RootVector<Item> positive_items;
+    GC::RootVector<GC::Ref<DOM::Element>> result;
 
     for (auto const& element : focus_navigation_scope(owner)) {
         if (!is_focus_navigation_scope_owner(*element) && !is_sequential_focus_navigation_focusable_area(*element))
@@ -893,7 +1142,7 @@ static GC::ConservativeVector<GC::Ref<DOM::Element>> tabindex_ordered_focus_navi
         return a.tree_index < b.tree_index;
     });
 
-    GC::ConservativeVector<GC::Ref<DOM::Element>> ordered;
+    GC::RootVector<GC::Ref<DOM::Element>> ordered;
     ordered.ensure_capacity(positive_items.size() + result.size());
     for (auto const& item : positive_items)
         ordered.unchecked_append(item.element);
@@ -927,12 +1176,12 @@ static void append_flattened_tabindex_ordered_focus_navigation_scope(DOM::Node& 
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation-order
-GC::ConservativeVector<GC::Ref<DOM::Element>> sequential_focus_navigation_order(DOM::Document& document)
+GC::RootVector<GC::Ref<DOM::Element>> sequential_focus_navigation_order(DOM::Document& document)
 {
     // Each Document has a sequential focus navigation order, which orders some or all of the focusable areas in the
     // Document relative to each other. Its contents and ordering are given by the flattened tabindex-ordered focus
     // navigation scope of the Document.
-    GC::ConservativeVector<GC::Ref<DOM::Element>> order;
+    GC::RootVector<GC::Ref<DOM::Element>> order;
     append_flattened_tabindex_ordered_focus_navigation_scope(document, order);
     return order;
 }

@@ -18,6 +18,7 @@
 #include <LibWeb/HTML/TimeRanges.h>
 #include <LibWeb/HTML/TrackEvent.h>
 #include <LibWeb/HTML/VideoTrackList.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/MediaSourceExtensions/EventNames.h>
 #include <LibWeb/MediaSourceExtensions/MediaSource.h>
@@ -29,11 +30,9 @@
 
 namespace Web::MediaSourceExtensions {
 
-static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::NullableTrackType const& track)
+static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::TrackType const& track)
 {
-    HTML::TrackEventInit event_init {};
-    event_init.track = track;
-    auto event = HTML::TrackEvent::create(HTML::EventNames::addtrack, event_init, HighResolutionTime::current_high_resolution_time(global_object));
+    auto event = HTML::create_track_event(HTML::relevant_realm(global_object), HTML::EventNames::addtrack, track);
     track_list.dispatch_event(event);
 }
 
@@ -333,6 +332,15 @@ bool SourceBuffer::updating() const
     return m_updating;
 }
 
+void SourceBuffer::set_updating(bool updating)
+{
+    m_updating = updating;
+
+    // NB: The operation's events may still begin playback, so they keep this, its MediaSource and the media element
+    //     alive.
+    HTML::relevant_window_or_worker_global_scope(m_media_source->relevant_global_object()).set_has_pending_activity(*this, updating);
+}
+
 // https://w3c.github.io/media-source/#dom-sourcebuffer-buffered
 GC::Ref<HTML::TimeRanges> SourceBuffer::buffered()
 {
@@ -491,19 +499,19 @@ WebIDL::ExceptionOr<void> SourceBuffer::append_buffer(WebIDL::BufferSourceVarian
     }
 
     // 3. Set the updating attribute to true.
-    m_updating = true;
+    set_updating(true);
 
     // 4. Queue a task to fire an event named updatestart at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updatestart));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updatestart));
     }));
 
     // 5. Asynchronously run the buffer append algorithm.
     // NB: The queued task captures the current append generation, so a bump by abort_buffer_append_algorithm()
     //     before the task runs makes the task do nothing; see run_buffer_append_algorithm().
     m_remote_source_buffer->enqueue_append(move(appended_data));
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this, append_generation = m_append_generation] {
-        run_buffer_append_algorithm(append_generation);
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this, m_append_generation), [](auto& self, auto& append_generation) {
+        self.run_buffer_append_algorithm(append_generation);
     }));
 
     return {};
@@ -531,16 +539,16 @@ void SourceBuffer::abort_if_updating(Badge<MediaSource>)
     abort_buffer_append_algorithm();
 
     // 2.2. Set the sourceBuffer.updating attribute to false.
-    m_updating = false;
+    set_updating(false);
 
     // 2.3. Queue a task to fire an event named abort at sourceBuffer.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::abort));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::abort));
     }));
 
     // 2.4. Queue a task to fire an event named updateend at sourceBuffer.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updateend));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updateend));
     }));
 }
 
@@ -567,16 +575,16 @@ WebIDL::ExceptionOr<void> SourceBuffer::abort()
         abort_buffer_append_algorithm();
 
         // 4.2. Set the updating attribute to false.
-        m_updating = false;
+        set_updating(false);
 
         // 4.3. Queue a task to fire an event named abort at this SourceBuffer object.
-        m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-            dispatch_event(m_media_source->create_associated_event(EventNames::abort));
+        m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.dispatch_event(self.m_media_source->create_associated_event(EventNames::abort));
         }));
 
         // 4.4. Queue a task to fire an event named updateend at this SourceBuffer object.
-        m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-            dispatch_event(m_media_source->create_associated_event(EventNames::updateend));
+        m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updateend));
         }));
     }
 
@@ -724,25 +732,25 @@ void SourceBuffer::run_range_removal(AK::Duration start, AK::Duration end)
     m_range_removal_running = true;
 
     // 3. Set the updating attribute to true.
-    m_updating = true;
+    set_updating(true);
 
     // 4. Queue a task to fire an event named updatestart at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(heap(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updatestart));
+    m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updatestart));
     }));
 
     // 5. Return control to the caller and run the rest of the steps asynchronously.
-    m_media_source->queue_a_media_source_task(GC::create_function(heap(), [this, start, end] {
+    m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(*this, start, end), [](auto& self, auto& start, auto& end) {
         // NB: Removing this SourceBuffer from the parent media source runs the removeSourceBuffer() steps, which abort
         //     this algorithm and fire the abort and updateend events in place of the ones below.
-        if (!m_media_source->source_buffers()->contains(*this)) {
-            m_range_removal_running = false;
+        if (!self.m_media_source->source_buffers()->contains(self)) {
+            self.m_range_removal_running = false;
             return;
         }
 
         // 6. Run the coded frame removal algorithm with start and end as the start and end of the removal range.
         // NB: The media server reports its completion, which runs finish_range_removal() for the remaining steps.
-        m_remote_source_buffer->remove_coded_frames(start, end);
+        self.m_remote_source_buffer->remove_coded_frames(start, end);
     }));
 }
 
@@ -761,16 +769,16 @@ void SourceBuffer::finish_range_removal()
     m_range_removal_running = false;
 
     // 7. Set the updating attribute to false.
-    m_updating = false;
+    set_updating(false);
 
     // 8. Queue a task to fire an event named update at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(heap(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::update));
+    m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::update));
     }));
 
     // 9. Queue a task to fire an event named updateend at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(heap(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updateend));
+    m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updateend));
     }));
 }
 
@@ -781,16 +789,16 @@ void SourceBuffer::run_append_error_algorithm()
     m_remote_source_buffer->reset_parser_state();
 
     // 2. Set the updating attribute to false.
-    m_updating = false;
+    set_updating(false);
 
     // 3. Queue a task to fire an event named error at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::error));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::error));
     }));
 
     // 4. Queue a task to fire an event named updateend at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updateend));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updateend));
     }));
 
     // 5. Run the end of stream algorithm with the error parameter set to "decode".
@@ -850,10 +858,11 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
 
                 // 8. Add new audio track to the audioTracks attribute on this SourceBuffer object.
                 m_audio_tracks->add_track(new_audio_track);
+                new_audio_track->set_source_buffer({}, *this);
                 // NOTE: This should trigger AudioTrackList [HTML] logic to queue a task to fire an event named
                 //       addtrack using TrackEvent with the track attribute initialized to new audio track, at the
                 //       AudioTrackList object referenced by the audioTracks attribute on this SourceBuffer object.
-                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, audio_tracks = m_audio_tracks, new_audio_track] {
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(m_media_source, m_audio_tracks, new_audio_track), [](auto& media_source, auto& audio_tracks, auto& new_audio_track) {
                     dispatch_addtrack_event(media_source->relevant_global_object(), audio_tracks, new_audio_track);
                 }));
 
@@ -869,9 +878,9 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 //       addtrack using TrackEvent with the track attribute initialized to mirrored audio track or new
                 //       audio track, at the AudioTrackList object referenced by the audioTracks attribute on the
                 //       HTMLMediaElement.
-                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_audio_track](HTML::HTMLMediaElement& media_element) {
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(new_audio_track), [](auto& new_audio_track, HTML::HTMLMediaElement& media_element) {
                     dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.audio_tracks(), new_audio_track);
-                });
+                }));
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -921,10 +930,11 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
 
                 // 8. Add new video track to the videoTracks attribute on this SourceBuffer object.
                 m_video_tracks->add_track(new_video_track);
+                new_video_track->set_source_buffer({}, *this);
                 // NOTE: This should trigger VideoTrackList [HTML] logic to queue a task to fire an event named addtrack
                 //       using TrackEvent with the track attribute initialized to new video track, at the VideoTrackList
                 //       object referenced by the videoTracks attribute on this SourceBuffer object.
-                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, video_tracks = m_video_tracks, new_video_track] {
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(m_media_source, m_video_tracks, new_video_track), [](auto& media_source, auto& video_tracks, auto& new_video_track) {
                     dispatch_addtrack_event(media_source->relevant_global_object(), video_tracks, new_video_track);
                 }));
 
@@ -940,9 +950,9 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 //       using TrackEvent with the track attribute initialized to mirrored video track or new video
                 //       track, at the VideoTrackList object referenced by the videoTracks attribute on the
                 //       HTMLMediaElement.
-                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_video_track](HTML::HTMLMediaElement& media_element) {
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(new_video_track), [](auto& new_video_track, HTML::HTMLMediaElement& media_element) {
                     dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.video_tracks(), new_video_track);
-                });
+                }));
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -1000,7 +1010,7 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 // NOTE: This should trigger TextTrackList [HTML] logic to queue a task to fire an event named addtrack
                 //       using TrackEvent with the track attribute initialized to new text track, at the TextTrackList
                 //       object referenced by the textTracks attribute on this SourceBuffer object.
-                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, text_tracks = m_text_tracks, new_text_track] {
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), GC::captures(m_media_source, m_text_tracks, new_text_track), [](auto& media_source, auto& text_tracks, auto& new_text_track) {
                     dispatch_addtrack_event(media_source->relevant_global_object(), text_tracks, new_text_track);
                 }));
 
@@ -1015,9 +1025,9 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 // NOTE: This should trigger TextTrackList [HTML] logic to queue a task to fire an event named addtrack
                 //       using TrackEvent with the track attribute initialized to mirrored text track or new text track,
                 //       at the TextTrackList object referenced by the textTracks attribute on the HTMLMediaElement.
-                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_text_track](HTML::HTMLMediaElement& media_element) {
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(new_text_track), [](auto& new_text_track, HTML::HTMLMediaElement& media_element) {
                     dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.text_tracks(), new_text_track);
-                });
+                }));
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -1028,13 +1038,14 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
         // 5. If active track flag equals true, then run the following steps:
         if (active_track_flag) {
             // 1. Add this SourceBuffer to activeSourceBuffers.
-            m_media_source->active_source_buffers()->append(*this);
+            // NB: activeSourceBuffers must keep the order of sourceBuffers, see
+            //     https://w3c.github.io/media-source/#dom-mediasource-activesourcebuffers
+            m_media_source->active_source_buffers()->insert_in_order_of(*this, m_media_source->source_buffers());
 
             // 2. Queue a task to fire an event named addsourcebuffer at activeSourceBuffers.
-            m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(),
-                [media_source = GC::Ref(*m_media_source), source_buffers = m_media_source->active_source_buffers()] {
-                    source_buffers->dispatch_event(media_source->create_associated_event(EventNames::addsourcebuffer));
-                }));
+            m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*m_media_source), m_media_source->active_source_buffers()), [](auto& media_source, auto& source_buffers) {
+                source_buffers->dispatch_event(media_source->create_associated_event(EventNames::addsourcebuffer));
+            }));
         }
 
         // 6. Set [[first initialization segment received flag]] to true.
@@ -1081,20 +1092,25 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
     }
 }
 
+bool SourceBuffer::is_associated_with_an_enabled_or_selected_track() const
+{
+    return m_audio_tracks->has_enabled_track() || m_video_tracks->selected_index() != -1;
+}
+
 // https://w3c.github.io/media-source/#sourcebuffer-buffer-append
 void SourceBuffer::finish_buffer_append()
 {
     // 3. Set the updating attribute to false.
-    m_updating = false;
+    set_updating(false);
 
     // 4. Queue a task to fire an event named update at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::update));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::update));
     }));
 
     // 5. Queue a task to fire an event named updateend at this SourceBuffer object.
-    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(m_media_source->create_associated_event(EventNames::updateend));
+    m_media_source->queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.m_media_source->create_associated_event(EventNames::updateend));
     }));
 }
 

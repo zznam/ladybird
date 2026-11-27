@@ -11,7 +11,7 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/Weak.h>
 #include <LibWeb/Bindings/ElementInternals.h>
 #include <LibWeb/Bindings/HTMLFormElement.h>
@@ -20,6 +20,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/XHR/FormDataEntry.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -38,7 +39,7 @@ using ValidityStateFlags = Bindings::ValidityStateFlags;
 class WEB_API FormAssociatedElement {
 public:
     // NB: FACE stands for form-associated custom element.
-    using FACESubmissionValue = Variant<GC::Ref<FileAPI::File>, Utf16String, GC::ConservativeVector<XHR::FormDataEntry>, Empty>;
+    using FACESubmissionValue = Variant<GC::Ref<FileAPI::File>, Utf16String, GC::RootVector<XHR::FormDataEntry>, Empty>;
 
     virtual bool is_form_associated_element() const;
 
@@ -118,6 +119,8 @@ public:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-reportvalidity
     bool report_validity();
 
+    bool show_validation_message();
+
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-checkvalidity
     bool check_validity();
 
@@ -131,7 +134,7 @@ public:
     GC::Ref<ValidityState const> validity() const;
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-setcustomvalidity
-    void set_custom_validity(Utf16String& error);
+    void set_custom_validity(Utf16String error);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#mutability
     virtual bool is_mutable() const { return true; }
@@ -227,6 +230,8 @@ private:
 enum class SelectionSource {
     UI,
     DOM,
+    // The selection moved because the value changed, as when an edit or the value setter moves the cursor.
+    ValueChange,
 };
 
 class WEB_API FormAssociatedTextControlElement
@@ -263,7 +268,7 @@ public:
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement);
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
     WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement);
-    WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
+    WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve, SelectionSource = SelectionSource::DOM);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setselectionrange
     void set_the_selection_range(Optional<WebIDL::UnsignedLong> start, Optional<WebIDL::UnsignedLong> end, SelectionDirection direction = SelectionDirection::None, SelectionSource source = SelectionSource::DOM);
@@ -278,7 +283,7 @@ public:
     virtual HTMLElement& text_control_to_html_element() = 0;
     HTMLElement const& text_control_to_html_element() const { return const_cast<FormAssociatedTextControlElement&>(*this).text_control_to_html_element(); }
 
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) = 0;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) = 0;
 
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() = 0;
     virtual GC::Ptr<DOM::Text const> form_associated_element_to_text_node() const { return const_cast<FormAssociatedTextControlElement&>(*this).form_associated_element_to_text_node(); }
@@ -324,14 +329,13 @@ protected:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
     void relevant_value_was_changed();
 
-    static void set_own_inline_style(DOM::Element&, CSS::CSSStyleProperties const& defaults);
-
 private:
     virtual GC::Ref<JS::Cell> as_cell() override;
 
     void collapse_selection_to_offset(size_t, TextAffinity = TextAffinity::Downstream);
     void move_selection_end_to(size_t offset, TextAffinity, CollapseSelection);
     void move_cursor_by_page(bool forward, CollapseSelection);
+    void move_cursor_on_lines(Layout::RustFFI::FfiTextCaretMovement, CollapseSelection, CSSPixels page_distance = 0);
     void scroll_cursor_into_view();
     void reveal_cursor_after_edit();
     void selection_was_changed(SelectionSource);
@@ -343,6 +347,10 @@ private:
 
     // Disambiguates which visual line the selection end renders on when it sits at a soft wrap boundary.
     TextAffinity m_selection_end_affinity { TextAffinity::Downstream };
+
+    // The inline coordinate that consecutive moves of the selection end to other lines keep, until the selection changes
+    // another way.
+    Optional<CSSPixels> m_line_move_inline_coordinate;
 
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };

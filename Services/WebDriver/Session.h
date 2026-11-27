@@ -32,6 +32,7 @@
 #include <LibWebCommon/WebDriver/Response.h>
 #include <LibWebCommon/WebDriver/SessionBrowsingContext.h>
 #include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
+#include <WebDriver/BiDiSession.h>
 #include <WebDriver/BrowserConnection.h>
 #include <WebDriver/Client.h>
 
@@ -95,11 +96,25 @@ public:
     NonnullRefPtr<WebDriverPromise> wait_for_navigation_completion();
     NonnullRefPtr<WebDriverPromise> traverse_history(i32 delta, HandleUserPrompts);
     NonnullRefPtr<WebDriverPromise> session_history();
+    NonnullRefPtr<WebDriverPromise> set_permission(JsonValue parameters);
     NonnullRefPtr<WebDriverPromise> load_url(URL::URL);
     NonnullRefPtr<WebDriverPromise> switch_to_parent_frame();
     NonnullRefPtr<WebDriverPromise> run_content_command(StringView name, JsonValue payload = {}, Vector<String> arguments = {});
     NonnullRefPtr<WebDriverPromise> run_top_level_content_command(StringView name, JsonValue payload = {}, Vector<String> arguments = {});
     ErrorOr<void, Web::WebDriver::Error> ensure_current_window_handle_is_valid() const;
+
+    // https://w3c.github.io/webdriver-bidi/#bidi-flag
+    BiDiSession* bidi_session() { return m_bidi_session.ptr(); }
+
+    // https://w3c.github.io/webdriver/#dfn-active-session
+    bool is_active() const;
+
+    Vector<String> top_level_traversable_ids() const;
+
+    NonnullRefPtr<WebDriverPromise> perform_bidi_browser_command(StringView method, JsonValue params);
+    NonnullRefPtr<WebDriverPromise> get_bidi_top_level_traversables(Vector<String> navigable_ids);
+    NonnullRefPtr<WebDriverPromise> run_bidi_subscribe_steps(String const& event_name, Vector<String> top_level_traversable_ids);
+    void set_bidi_enabled_events(Vector<String> event_names, HashMap<String, Optional<Vector<String>>> event_contexts);
 
 private:
     Session(NonnullRefPtr<Client> client, JsonObject const& capabilities, String session_id, Web::WebDriver::SessionFlags flags);
@@ -134,6 +149,8 @@ private:
 
     RefPtr<BrowserConnection> m_browser_connection;
     bool m_closing { false };
+
+    OwnPtr<BiDiSession> m_bidi_session;
 
     u64 m_next_browser_command_id { 1 };
     HashMap<u64, NonnullRefPtr<WebDriverPromise>> m_pending_browser_commands;

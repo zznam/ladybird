@@ -52,9 +52,12 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
+    if (namespace_.has_value())
+        return;
+
     if (name == HTML::AttributeNames::sandbox) {
         if (m_sandbox)
-            m_sandbox->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+            m_sandbox->associated_attribute_changed(value);
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:process-the-iframe-attributes-2
@@ -88,7 +91,7 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
         // A content navigable whose document another process hosts reads these attributes through its replicated
         // state, which the UI process keeps current from these reports.
-        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy || name == AttributeNames::allow || name == AttributeNames::allowfullscreen)
+        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy || name == AttributeNames::allow || name == AttributeNames::allowfullscreen || name == AttributeNames::name)
             document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
     }
 
@@ -158,12 +161,12 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         // 2. If the will lazy load element steps given element return true, then:
         if (will_lazy_load_element()) {
             // 1. Set element's lazy load resumption steps to the rest of this algorithm starting with the step labeled navigate to the srcdoc resource.
-            set_lazy_load_resumption_steps([this]() {
+            set_lazy_load_resumption_steps(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
                 // 3. Navigate to the srcdoc resource: navigate an iframe or frame given element, about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-                navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute_ns({}, HTML::AttributeNames::srcdoc));
+                self.navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, self.get_attribute_ns({}, HTML::AttributeNames::srcdoc));
 
                 // FIXME: The resulting Document must be considered an iframe srcdoc document.
-            });
+            }));
 
             // 2. Set element's current navigation was lazy loaded boolean to true.
             set_current_navigation_was_lazy_loaded(true);
@@ -209,10 +212,10 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
     // 6. If the will lazy load element steps given element return true, then:
     if (will_lazy_load_element()) {
         // 1. Set element's lazy load resumption steps to the rest of this algorithm starting with the step labeled navigate.
-        set_lazy_load_resumption_steps([this, url, referrer_policy, initial_insertion]() {
+        set_lazy_load_resumption_steps(GC::create_function(GC::Heap::the(), GC::captures(*this, url, referrer_policy, initial_insertion), [](auto& self, auto& url, auto& referrer_policy, auto& initial_insertion) {
             // 7. Navigate: Navigate an iframe or frame given element, url, referrerPolicy, null, and initialInsertion.
-            navigate_an_iframe_or_frame(*url, referrer_policy, {}, initial_insertion);
-        });
+            self.navigate_an_iframe_or_frame(*url, referrer_policy, {}, initial_insertion);
+        }));
 
         // 2. Set element's current navigation was lazy loaded boolean to true.
         set_current_navigation_was_lazy_loaded(true);
@@ -269,9 +272,9 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
     if (auto* local_navigable = as_if<LocalNavigable>(*element.content_navigable())) {
         if (auto active_document = local_navigable->active_document(); active_document && active_document->anything_is_delaying_the_load_event()) {
             auto element_ref = GC::Ref(element);
-            element.queue_an_element_task(HTML::Task::Source::DOMManipulation, [element_ref] {
+            element.queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(element_ref), [](auto& element_ref) {
                 run_iframe_load_event_steps(element_ref);
-            });
+            }));
             return;
         }
     }
@@ -304,7 +307,7 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         // 4. Mark resource timing given fallbackTimingInfo, the result of parsing element's pending resource-timing
         //    URL, "iframe", global, the empty string, a new response body info, and 0.
         // FIXME: Our URL is already parsed, how are we supposed to parse it?
-        ResourceTiming::PerformanceResourceTiming::mark_resource_timing(
+        ResourceTiming::mark_resource_timing(
             fallback_timing_info,
             utf16_string_from_url_ascii(element.pending_resource_timing_url()->to_string()),
             "iframe"_utf16_fly_string,

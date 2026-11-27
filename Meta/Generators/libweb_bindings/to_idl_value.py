@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from dataclasses import field
+from typing import Callable
 from typing import List
 from typing import NoReturn
 from typing import Optional
@@ -168,6 +169,18 @@ def write_dictionary_declaration(
             out.write(f"    {member_cpp_type} {cpp_name(member)};\n")
         else:
             out.write(f"    {member_cpp_type} {cpp_name(member)} {{{default_value}}};\n")
+
+    # NB: A dictionary is traced through its members, so that a GC::Function can capture it.
+    includes.add("LibGC/CaptureTraits.h")
+    if dictionary.members or dictionary.parent_name:
+        out.write("\n    void visit_edges(auto& visitor) const\n    {\n")
+        if dictionary.parent_name:
+            out.write(f"        {dictionary.parent_name}::visit_edges(visitor);\n")
+        for member in dictionary.members:
+            out.write(f"        GC::visit_capture_member(visitor, {cpp_name(member)});\n")
+        out.write("    }\n")
+    else:
+        out.write("\n    void visit_edges(auto&) const { }\n")
     out.write("};\n\n")
     out.write(
         f"JS::ThrowCompletionOr<{dictionary.name}> {converter_function_name(dictionary)}(JS::VM&, JS::Value);\n\n"
@@ -960,7 +973,9 @@ def promise_to_idl_value(
         auto promise_capability0 = TRY(JS::new_promise_capability(vm, realm.intrinsics().promise_constructor()));
 
         // 2. Perform ? Call(promiseCapability.[[Resolve]], undefined, « V »).
-        TRY(JS::call(vm, *promise_capability0->resolve(), JS::js_undefined(), {value_name}));
+        // AD-HOC: We perform SafePromiseResolve instead, which never runs script.
+        //         See https://github.com/whatwg/webidl/pull/1645
+        TRY(JS::safe_promise_resolve(vm, *promise_capability0, {value_name}));
 
         // 3. Return promiseCapability.
         return promise_capability0;
@@ -1566,6 +1581,84 @@ def to_idl_value(
         return_cpp_type=cpp_type(member, context),
         value_cpp_type_name=cpp_value_type(member, context),
     )
+
+
+def string_argument_to_idl_value(
+    member: DictionaryMemberOrAttribute,
+    value_name: str,
+    includes: GeneratedIncludes,
+) -> Optional[str]:
+    """The conversion of a value to a WebIDL::StringArgument, which lends the string of a String value rather than
+    taking a reference to it, or None where the member is not a plain string."""
+    extended_attributes = getattr(member, "extended_attributes", {})
+    if member.type.nullable or isinstance(member.type, (IDLParameterizedType, IDLUnionType)):
+        return None
+    if cpp_type_name_for_string(member.type.name, extended_attributes) != "Utf16String":
+        return None
+
+    if member.type.name in ("CSSOMString", "DOMString"):
+        conversion = f"WebIDL::to_string_argument(vm, {value_name})"
+    elif member.type.name == "USVString":
+        conversion = f"WebIDL::to_usv_string_argument(vm, {value_name})"
+    else:
+        return None
+
+    includes.add("LibJS/Runtime/Value.h")
+    includes.add("LibWeb/WebIDL/AbstractOperations.h")
+    if "LegacyNullToEmptyString" in extended_attributes:
+        return f"{value_name}.is_null() ? WebIDL::StringArgument::owned({{}}) : TRY({conversion})"
+    return f"TRY({conversion})"
+
+
+def argument_with_string_to_idl_value(
+    member: DictionaryMemberOrAttribute,
+    cpp_type_name: str,
+    value_name: str,
+    owned_value: Callable[[], str],
+    includes: GeneratedIncludes,
+    context: GenerationContext,
+) -> Optional[str]:
+    """The conversion of a value to a WebIDL::ArgumentWithString of cpp_type_name, which lends the string of a String
+    value rather than taking a reference to it, and holds what owned_value returns for any other value. None, without
+    calling owned_value, where a String value does not convert to the string it holds: where the member is not a
+    nullable string or a union with a string member."""
+    idl_type = member.type
+    if isinstance(idl_type, IDLParameterizedType):
+        return None
+
+    if isinstance(idl_type, IDLUnionType):
+        # https://webidl.spec.whatwg.org/#es-union
+        # NB: None of the steps before the one that converts to the string type of the union takes a String value,
+        #     except for the one that matches it against the values of an enumeration.
+        types = collect_union_types(idl_type.flattened_member_types(), context)
+        if types.string_type is None or types.enumeration_types:
+            return None
+        string_type = types.string_type
+        if cpp_type_name != union_type_to_variant(idl_type, context):
+            return None
+        if cpp_type_for_idl_type(string_type, context) != "Utf16String":
+            return None
+    else:
+        string_type = idl_type
+        extended_attributes = {**idl_type.extended_attributes, **getattr(member, "extended_attributes", {})}
+        if not is_string_type(idl_type.name) or cpp_type_name != "Optional<Utf16String>":
+            return None
+        if cpp_type_name_for_string(idl_type.name, extended_attributes) != "Utf16String":
+            return None
+
+    if string_type.name in ("CSSOMString", "DOMString"):
+        lending = "lending"
+    elif string_type.name == "USVString":
+        lending = "lending_well_formed"
+    else:
+        return None
+
+    includes.add("LibJS/Runtime/Value.h")
+    includes.add("LibWeb/WebIDL/AbstractOperations.h")
+    holder = f"WebIDL::ArgumentWithString<{cpp_type_name}>"
+    return f"""{value_name}.is_string()
+        ? {holder}::{lending}({value_name}.as_string().utf16_string())
+        : {holder}::owning({owned_value()})"""
 
 
 def type_check_idl_value(

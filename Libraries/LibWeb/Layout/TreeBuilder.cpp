@@ -235,9 +235,9 @@ bool attach_owed_generated_image(Layout::BegunRead const& read, DOM::Document& d
             auto& marker = as<NodeWithStyle>(*static_cast<Node*>(RustFFI::render_state_node_shell_if_live(arena.host(), &read, generated_image.marker)));
             return *marker.list_style_image();
         }
-        auto const* payloads = DOM::AbstractElement { *element, css_pseudo_element(ffi_pseudo) }.style_record_payloads();
-        VERIFY(payloads);
-        auto content = CSS::style_group_from_payloads<CSS::ComputedValues::ContentValues>(payloads)->computed_content_value();
+        auto const* groups = DOM::AbstractElement { *element, css_pseudo_element(ffi_pseudo) }.style_record_groups();
+        VERIFY(groups);
+        auto content = CSS::style_record_group<CSS::ComputedValues::ContentValues>(groups).computed_content_value();
         return content->as_content().content().values()[generated_image.content_index]->as_abstract_image();
     }();
     attach_owned_image_provider(image_box, const_cast<CSS::AbstractImageStyleValue&>(*image));
@@ -246,11 +246,6 @@ bool attach_owed_generated_image(Layout::BegunRead const& read, DOM::Document& d
         image_box.set_needs_layout_update(DOM::SetNeedsLayoutReason::GeneratedContentImageFinishedLoading);
     attach_owed_style_images(image_box, images);
     return image_was_available;
-}
-
-void detach_top_layer_element_layout_subtree(Layout::BegunRead const& read, DOM::Element& element)
-{
-    RustFFI::render_state_detach_top_layer_element(element.document().layout_node_arena().host(), &read, element.style_node_id().value());
 }
 
 // https://drafts.csswg.org/css-tables-3/#fixup-algorithm

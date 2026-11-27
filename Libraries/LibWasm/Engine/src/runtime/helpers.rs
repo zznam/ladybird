@@ -7,13 +7,14 @@
 //! The runtime services the interpreter calls for what needs the runtime: growing memories and tables, and calling
 //! host functions. Each takes the execution context, whose `arguments` hold the operands.
 
+use super::memory::SharedMemory;
 use super::{FunctionAddress, FunctionInstance, FunctionKind, MemoryAddress, Store, TableAddress, Trap};
 use crate::abi::{
     ExecutionContext, FRAME_FUNCTION, FRAME_HEADER_SIZE, FRAME_INSTANCE, FRAME_RETURN_IP, FRAME_SAVED_FP, MemoryData,
     TableData,
 };
-use crate::futex::{self, AtomicWaitResult, WaitWord};
 use crate::validator::{CatchKind, NO_EXCEPTION_LOCAL, NOT_DELEGATED};
+use ak::waiter_list::{self, AgentWaiter, AtomicWaitResult, WaitWord};
 
 export_runtime_functions! {
     wasm_runtime_memory_grow => memory_grow,
@@ -39,8 +40,13 @@ unsafe fn memory_grow(context: *mut ExecutionContext) -> u64 {
     unsafe {
         let data = (*context).arguments[0] as *const MemoryData;
         let delta = (*context).arguments[1];
+        if (*data).shared != 0 {
+            // NB: Nothing is told that the memory grew: an agent finds the size where it finds the bytes, and the
+            //     embedder gives each of them a buffer of the new size once it is asked for one.
+            return SharedMemory::from_data(data).grow(delta).unwrap_or(u64::MAX);
+        }
         let store = store_of(context);
-        // The data is at the memory's handle.
+        // The data of a memory that is not shared is at the memory's handle, see MemoryInstance::data().
         let memory = MemoryAddress::from_ptr(data.cast());
         let Some(previous) = store.memory_mut(memory).grow(delta) else {
             return u64::MAX;
@@ -269,9 +275,9 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
         ));
         return crate::abi::WAIT_CANNOT_BLOCK;
     }
-    // NB: The waits and wakes are those of Atomics.wait and Atomics.notify (LibJS's futex), whose waiter lists are
-    //     the operating system's, per address: JavaScript and WebAssembly wake each other, as the memory model's
-    //     single WaiterList per location requires.
+    // NB: The waits and wakes are those of Atomics.wait and Atomics.notify, in the waiter lists of the process, per
+    //     address: JavaScript and WebAssembly wake each other, as the memory model's single WaiterList per location
+    //     requires.
     let word = unsafe {
         if size == 4 {
             WaitWord::Word32(&*(address as *const std::sync::atomic::AtomicU32))
@@ -280,10 +286,16 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
         }
     };
     let timeout = (timeout >= 0).then(|| std::time::Duration::from_nanos(timeout as u64));
-    match futex::atomic_wait(word, expected, timeout) {
+    // NB: A store without an agent has nothing to interrupt it, as a test's has not.
+    let waiter = store.agent_waiter.clone().unwrap_or_else(AgentWaiter::new);
+    match waiter_list::atomic_wait(word, expected, timeout, &waiter) {
         AtomicWaitResult::Woken => 0,
         AtomicWaitResult::NotEqual => 1,
         AtomicWaitResult::TimedOut => 2,
+        AtomicWaitResult::Interrupted => {
+            store.pending_trap = Some(Trap::StackExhausted);
+            crate::abi::WAIT_CANNOT_BLOCK
+        }
     }
 }
 
@@ -296,5 +308,5 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
 unsafe fn notify(context: *mut ExecutionContext) -> u64 {
     let (address, count) = unsafe { ((*context).arguments[0], (*context).arguments[1]) };
     let word = unsafe { &*(address as *const std::sync::atomic::AtomicU32) };
-    futex::atomic_notify(word, usize::try_from(count).unwrap_or(usize::MAX)) as u64
+    waiter_list::atomic_notify(word, usize::try_from(count).unwrap_or(usize::MAX)) as u64
 }

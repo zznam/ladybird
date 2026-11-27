@@ -12,9 +12,10 @@
 // A borrowed UTF-16 string in either of AK::Utf16View's storages: `ascii` is set when the string has ASCII storage,
 // and `utf16` otherwise. Lengths are in UTF-16 code units.
 struct UnicodeIntlText {
-    u8 const* ascii;
+    u8 const* latin1;
     u16 const* utf16;
     size_t length;
+    bool is_ascii;
 };
 
 // The parts of a Unicode::LocaleID, in the order parse_unicode_locale_id() parsed them. A transformed extension's
@@ -51,7 +52,7 @@ void unicode_canonicalize_unicode_extension_values(UnicodeIntlText key, UnicodeI
 bool unicode_is_locale_available(UnicodeIntlText locale);
 bool unicode_add_likely_subtags(UnicodeIntlText locale, UnicodeTextMappingOutput);
 bool unicode_remove_likely_subtags(UnicodeIntlText locale, UnicodeTextMappingOutput);
-bool unicode_is_locale_character_ordering_right_to_left(UnicodeIntlText locale);
+bool unicode_is_script_right_to_left(UnicodeIntlText script, bool* right_to_left);
 
 void unicode_available_keyword_values(UnicodeIntlText locale, UnicodeIntlText key, void* context, UnicodeAppendString);
 void unicode_available_calendars(void* context, UnicodeAppendString);

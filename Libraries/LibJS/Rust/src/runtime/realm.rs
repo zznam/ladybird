@@ -9,6 +9,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use crate::gc::class::{Extends, GcCell, define_cell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::embedder_cell::{EmbedderCell, EmbedderValue};
 use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::visitor::{Trace, Visitor};
@@ -47,6 +48,8 @@ pub struct RealmStorage {
     /// Whether ToPrimitive of a String object that inherits from %String.prototype% gives its [[StringData]] (see
     /// `runtime::realm_watchpoints`).
     pub(crate) string_objects_convert_to_their_string_data: WatchedCondition,
+    /// Whether this is the VM's empty realm, which nothing may fill (see `Vm::empty_realm()`).
+    empty: bool,
 }
 
 define_cell!(Realm, Other);
@@ -97,6 +100,7 @@ realm_intrinsic_accessors! {
         iterator_result_object_shape: Shape,
         normal_function_prototype_shape: Shape,
         normal_function_shape: Shape,
+        normal_constructor_function_shape: Shape,
         async_function_shape: Shape,
         generator_function_shape: Shape,
         async_generator_function_shape: Shape,
@@ -105,7 +109,6 @@ realm_intrinsic_accessors! {
         mapped_arguments_object_shape: Shape,
         regexp_builtin_exec_array_shape: Shape,
         throw_type_error_accessor: Accessor,
-        throw_type_error_function: FunctionObject,
         array_prototype_values_function: FunctionObject,
         generator_prototype_next_function: FunctionObject,
         eval_function: FunctionObject,
@@ -115,8 +118,8 @@ realm_intrinsic_accessors! {
         iterator_result_object_value_offset,
         iterator_result_object_done_offset,
         normal_function_prototype_constructor_offset,
-        normal_function_length_offset,
-        normal_function_name_offset,
+        generator_function_length_offset,
+        generator_function_name_offset,
         generator_function_prototype_property_offset,
         native_function_length_offset,
         native_function_name_offset,
@@ -136,7 +139,21 @@ impl Realm {
     /// A realm without intrinsics, a global object or a global environment, which
     /// InitializeHostDefinedRealm goes on to create.
     pub fn create(vm: &Vm) -> Gc<Realm> {
-        vm.heap().allocate(Realm {
+        Self::allocate(vm, RealmStorage::default())
+    }
+
+    pub(crate) fn create_empty(vm: &Vm) -> Gc<Realm> {
+        Self::allocate(
+            vm,
+            RealmStorage {
+                empty: true,
+                ..RealmStorage::default()
+            },
+        )
+    }
+
+    fn allocate(vm: &Vm, storage: RealmStorage) -> Gc<Realm> {
+        vm.heap().allocate(|_| Realm {
             header: CellHeader::for_class(Self::CLASS),
             global_object: Cell::new(None),
             global_declarative_environment: Cell::new(None),
@@ -145,7 +162,7 @@ impl Realm {
             host_defined: ForeignCellSlot::empty(),
             array_iterator_next_watchpoint_set: Cell::new(None),
             array_iterator_return_watchpoint_set: Cell::new(None),
-            storage: RealmStorage::default(),
+            storage,
         })
     }
 
@@ -191,10 +208,10 @@ impl Realm {
         new_context.function.set(None);
 
         // 9. Set the Realm of newContext to realm.
-        new_context.realm.set(Some(realm));
+        new_context.set_realm(Some(realm));
 
         // 10. Set the ScriptOrModule of newContext to null.
-        new_context.script_or_module.set(ScriptOrModule::Empty);
+        new_context.set_script_or_module(ScriptOrModule::Empty);
 
         // 11. Push newContext onto the execution context stack; newContext is now the running execution context.
         vm.push_execution_context(NonNull::from(new_context));
@@ -209,7 +226,7 @@ impl Realm {
             // a. Let global be OrdinaryObjectCreate(realm.[[Intrinsics]].[[%Object.prototype%]]).
             // NOTE: We allocate a proper GlobalObject directly as this plain object is
             //       turned into one via SetDefaultGlobalBindings in the spec.
-            allocate_object(vm, GlobalObject::new(vm, GlobalObject::CLASS, realm)).upcast()
+            allocate_object(vm, |_| GlobalObject::new(vm, GlobalObject::CLASS, realm)).upcast()
         };
 
         // 14. If the host requires that the this binding in realm's global scope return an object other than the global object, then
@@ -241,8 +258,8 @@ impl Realm {
 
     /// Realm::create<T>(): allocates an object and runs its initialize(), which defines the properties of built-in
     /// objects.
-    pub fn create_object<T: GcCell + Extends<Object>>(&self, vm: &Vm, object: T) -> Gc<T> {
-        let object = allocate_object(vm, object);
+    pub fn create_object<T: GcCell + Extends<Object>>(&self, vm: &Vm, build: impl FnOnce(&DeferGc<'_>) -> T) -> Gc<T> {
+        let object = allocate_object(vm, build);
         object.upcast::<Object>().initialize(vm, self.as_gc());
         object
     }
@@ -256,6 +273,7 @@ impl Realm {
     }
 
     pub fn set_intrinsics(&self, intrinsics: Gc<Intrinsics>) {
+        self.assert_not_empty();
         assert!(self.intrinsics.get().is_none());
         self.intrinsics.set(Some(intrinsics));
     }
@@ -265,6 +283,7 @@ impl Realm {
     }
 
     pub fn set_global_object(&self, global: Gc<Object>) {
+        self.assert_not_empty();
         self.global_object.set(Some(global));
     }
 
@@ -275,6 +294,7 @@ impl Realm {
     }
 
     pub fn set_global_environment(&self, environment: Gc<GlobalEnvironment>) {
+        self.assert_not_empty();
         self.global_environment.set(Some(environment));
         self.global_declarative_environment
             .set(Some(environment.declarative_record()));
@@ -296,8 +316,13 @@ impl Realm {
     /// Sets the data of the realm, a cell that the realm keeps alive from then on. A realm holds the data of one
     /// embedder.
     pub fn set_embedder_data<T: EmbedderValue>(&self, data: Gc<EmbedderCell<T>>) {
+        self.assert_not_empty();
         // SAFETY: The cell is a live cell of the heap that the realm is in.
         unsafe { self.storage.embedder_data.set(Some(data.as_non_null().cast())) };
+    }
+
+    pub(crate) fn assert_not_empty(&self) {
+        assert!(!self.storage.empty, "nothing may fill the empty realm");
     }
 
     pub fn global_declarative_environment(&self) -> Gc<DeclarativeEnvironment> {

@@ -102,6 +102,9 @@ pub enum Effect {
     Terminator,
 }
 
+/// In `Node::flags` of `SelectCompare`: the condition compares lhs & rhs with zero, `Eq` or `Ne`.
+pub const SELECT_TEST: u8 = 0x80;
+
 /// An integer comparison, in `Node::flags` of `Compare` and `BranchCompare`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -654,6 +657,9 @@ ops! {
 
     /// args: condition, value if nonzero, value if zero.
     Select: Fixed(3), Pure, "select";
+    /// operands: value if the condition fails, lhs, rhs, value if it holds; flags: `IntCondition` of lhs and rhs, or
+    /// with SELECT_TEST, `Eq` or `Ne` of lhs & rhs and zero. A select on a comparison that only it uses.
+    SelectCompare: Variadic, Pure, "select_compare";
 
     // Vectors. The SIMD sub-opcode says which operation; the node's type is its result's.
     /// args: operand, sub-opcode. Splats, unary lane operations and the reductions to an i32.
@@ -745,6 +751,10 @@ ops! {
     CheckFunction: Fixed(2), Write, "check_function";
     /// args: reference; flags: the TRAP_* code. Traps if the reference is null.
     CheckNull: Fixed(1), Write, "check_null";
+    /// Traps if another thread interrupted the store, which raised the stack limit. In the header of every loop: a
+    /// function entry checks the limit anyway, but loops may not call. It finds the limit through the frame, so that it
+    /// keeps no register busy across the loop.
+    CheckInterrupt: Fixed(0), Write, "check_interrupt";
     /// operands: callee FunctionHeader, its instance, its memory base, arguments; args[2]: the function index, or
     /// NONE for an indirect call. The value is the first result.
     Call: Variadic, Write, "call";

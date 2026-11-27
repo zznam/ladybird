@@ -60,7 +60,7 @@ SharedImageBuffer::SharedImageBuffer(NonnullRefPtr<Bitmap> bitmap)
 }
 
 #    ifdef USE_VULKAN_DMABUF_IMAGES
-SharedImageBuffer::SharedImageBuffer(NonnullRefPtr<Bitmap> bitmap, LinuxDmaBufHandle&& dmabuf)
+SharedImageBuffer::SharedImageBuffer(RefPtr<Bitmap> bitmap, LinuxDmaBufHandle&& dmabuf)
     : m_linux_dmabuf_handle(move(dmabuf))
     , m_bitmap(move(bitmap))
 {
@@ -77,19 +77,34 @@ SharedImageBuffer::SharedImageBuffer(WindowsD3DHandle&& d3d_handle)
 
 SharedImageBuffer SharedImageBuffer::create(IntSize size)
 {
+    return MUST(try_create(size));
+}
+
+ErrorOr<SharedImageBuffer> SharedImageBuffer::try_create(IntSize size)
+{
 #ifdef AK_OS_MACOS
-    auto iosurface_handle = Core::IOSurfaceHandle::create(size.width(), size.height());
+    auto iosurface_handle = TRY(Core::IOSurfaceHandle::try_create(size.width(), size.height()));
     auto bitmap = create_bitmap_from_iosurface(iosurface_handle);
     return SharedImageBuffer(move(iosurface_handle), move(bitmap));
 #else
-    return SharedImageBuffer(MUST(Bitmap::create_shareable(shared_image_buffer_format, shared_image_buffer_alpha_type, size)));
+    return SharedImageBuffer(TRY(Bitmap::create_shareable(shared_image_buffer_format, shared_image_buffer_alpha_type, size)));
 #endif
 }
 
-SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared_image)
+ErrorOr<void> SharedImageBuffer::check_can_import(SharedImage const& shared_image)
 {
 #ifdef AK_OS_MACOS
-    auto iosurface_handle = Core::IOSurfaceHandle::from_mach_port(shared_image.m_port).release_value_but_fixme_should_propagate_errors();
+    TRY(Core::IOSurfaceHandle::from_mach_port(shared_image.m_port));
+#else
+    (void)shared_image;
+#endif
+    return {};
+}
+
+ErrorOr<SharedImageBuffer> SharedImageBuffer::import_from_shared_image(SharedImage shared_image)
+{
+#ifdef AK_OS_MACOS
+    auto iosurface_handle = TRY(Core::IOSurfaceHandle::from_mach_port(shared_image.m_port));
     auto bitmap = create_bitmap_from_iosurface(iosurface_handle);
     return SharedImageBuffer(move(iosurface_handle), move(bitmap));
 #else
@@ -99,6 +114,9 @@ SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared
         },
         [](LinuxDmaBufHandle& dmabuf) -> SharedImageBuffer {
 #    ifdef USE_VULKAN_DMABUF_IMAGES
+            // NB: Only a linear layout can be read through a mapping. The pixels of a tiled one are only for the GPU.
+            if (dmabuf.modifier != DRM_FORMAT_MOD_LINEAR)
+                return SharedImageBuffer(nullptr, move(dmabuf));
             auto bitmap = create_bitmap_from_linux_dmabuf(dmabuf);
             return SharedImageBuffer(move(bitmap), move(dmabuf));
 #    else

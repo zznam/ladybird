@@ -9,8 +9,10 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/GenericShorthands.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/NumericLimits.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
@@ -128,8 +130,6 @@ struct ColorResolutionStyle {
 
     [[nodiscard]] static ColorResolutionStyle for_element(DOM::AbstractElement const&);
     [[nodiscard]] static ColorResolutionStyle for_layout_node(Layout::NodeWithStyle const&);
-    [[nodiscard]] static ColorResolutionStyle for_computed_values(ComputedValues const&);
-
     StyleValueFFI::FfiColorResolutionStyle to_ffi() const { return { inherited_ui_values, inherited_text_values }; }
 };
 
@@ -138,6 +138,25 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     virtual ~StyleValue() = default;
+
+    // An interned value belongs to every thread of the process and is never freed. These leave its count alone, which
+    // spares all other values an atomic one.
+    ALWAYS_INLINE void ref() const
+    {
+        VERIFY(m_ref_count > 0);
+        if (m_ref_count != IMMORTAL_REF_COUNT)
+            ++m_ref_count;
+    }
+    ALWAYS_INLINE bool unref() const
+    {
+        if (m_ref_count == IMMORTAL_REF_COUNT)
+            return false;
+        return RefCounted::unref();
+    }
+
+    // Puts value into slot, unless another value got there first, and returns the one that is there. This is how a table
+    // of values that fills on demand can be shared between threads.
+    static NonnullRefPtr<StyleValue const> intern(Atomic<StyleValue const*>& slot, NonnullRefPtr<StyleValue const> value);
 
     enum class Type {
 #define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) title_case,
@@ -160,10 +179,6 @@ public:
     }
     DimensionStyleValue const& as_dimension() const;
     DimensionStyleValue& as_dimension() { return const_cast<DimensionStyleValue&>(const_cast<StyleValue const&>(*this).as_dimension()); }
-
-    bool is_color_function() const;
-
-    bool depends_on_current_color() const;
 
 #define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) \
     bool is_##snake_case() const { return type() == Type::title_case; }                  \
@@ -212,9 +227,6 @@ public:
     Utf16String to_utf16_string(SerializationMode) const;
     void serialize(StringBuilder&, SerializationMode) const;
     void serialize(Utf16StringBuilder&, SerializationMode) const;
-    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
-    // The default reification, used by types without a bespoke one and by impls that fall back.
-    GC::Ref<CSSStyleValue> default_reify(Utf16FlyString const& associated_property) const;
     StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
 
     void set_style_sheet(StyleSheetState*);
@@ -236,10 +248,20 @@ public:
 protected:
     StyleValue(Type, StyleValueFFI::StyleValueData const*);
 
+    // For an interned value that nothing else has seen yet.
+    template<typename T>
+    static T const* make_immortal(T const* value)
+    {
+        value->m_ref_count = IMMORTAL_REF_COUNT;
+        return value;
+    }
+
     // The shared Rust-owned allocation holding this value's data.
     RustStyleValueHandle m_value;
 
 private:
+    static constexpr RefCountType IMMORTAL_REF_COUNT = NumericLimits<RefCountType>::max();
+
     Type m_type;
 };
 

@@ -8,21 +8,20 @@
 //! what.
 
 use core::cell::{Cell, RefCell};
-use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ops::Deref;
+use std::collections::HashMap;
 
 use ak::Utf16String;
-use libjs_rust::api::{ForeignCellSlot, Gc, Realm, Trace, Visitor, Vm};
+use libjs_rust::api::{DeferGc, ForeignCellSlot, Gc, GcRefCell, Realm, Trace, Visitor};
 
-use super::canvas::{
-    Canvas, TexImageSourceFrame, TexImageSourceKind, read_tex_image_frame, read_tex_image_pixels, read_tex_image_source,
-};
+use super::canvas::{Canvas, TexImageSourceKind, texture_image_frame};
 use super::constants::{
-    GL_BROWSER_DEFAULT_WEBGL, GL_CONTEXT_LOST_WEBGL, GL_INVALID_OPERATION, GL_INVALID_VALUE, GL_NO_ERROR,
+    GL_BROWSER_DEFAULT_WEBGL, GL_CONTEXT_LOST_WEBGL, GL_FLOAT, GL_INVALID_ENUM, GL_INVALID_OPERATION, GL_INVALID_VALUE,
+    GL_MAX_VERTEX_ATTRIBS, GL_NO_ERROR,
 };
 use super::extensions::{EnabledEmptyExtension, EnabledExtension};
-use super::host::{CppTransport, Frame};
+use super::host::{Frame, RemoteContext};
 use super::pixel_unpacking::PixelUnpackState;
 use super::proxy::custom::FrameUpload;
 use super::proxy::recorder::Proxy;
@@ -39,11 +38,20 @@ use super::web_gl_transform_feedback::WebGLTransformFeedback;
 use super::web_gl_uniform_location::WebGLUniformLocation;
 use super::web_gl_vertex_array_object::WebGLVertexArrayObject;
 use super::web_gl_vertex_array_object_oes::WebGLVertexArrayObjectOES;
-use crate::bindings::interface::{Inherits, Interface, Ref, Wrappable, cell_into_abi};
+use crate::bindings::interface::{Inherits, Interface, Ref, Wrappable};
 use crate::bindings::{Exception, WebIdlResult};
-use crate::canvas_2d::canvas::CanvasImageSourceKind;
+use crate::canvas_2d::canvas::{CanvasImageSourceKind, capture_video_frame, image_frame_from_pixels};
+use libcompositing_rust::display_list::canvas_2d_recorder::ColorSpace;
+use libcompositing_rust::webgl::texture_upload::texture_export_format;
 
 pub(crate) const MAX_WEBGL_DRAWING_BUFFER_DIMENSION: i32 = 16384;
+
+/// The width or height of the drawing buffer for a canvas of this width or height.
+// https://registry.khronos.org/webgl/specs/latest/1.0/#THE_DRAWING_BUFFER
+// A 0x0 canvas yields a 1x1 drawing buffer, and a canvas larger than the implementation supports yields a smaller one.
+pub(crate) fn drawing_buffer_dimension(canvas_dimension: i32) -> i32 {
+    canvas_dimension.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WebGLVersion {
@@ -66,7 +74,7 @@ pub(crate) struct RenderingContext<V: Version> {
 }
 
 impl<V: Version> RenderingContext<V> {
-    pub(crate) fn new(state: ContextState) -> Self {
+    pub(crate) fn new(_: &DeferGc<'_>, state: ContextState) -> Self {
         Self {
             state,
             version: PhantomData,
@@ -90,7 +98,7 @@ unsafe impl<V: Version> Trace for RenderingContext<V> {
 }
 
 impl<V: Version> Wrappable for RenderingContext<V> {
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         self.state.canvas().relevant_realm()
     }
 }
@@ -109,13 +117,6 @@ impl ContextRef {
             Self::WebGL2(context) => &context.state,
         }
     }
-
-    pub(crate) fn cell(&self) -> *mut c_void {
-        match *self {
-            Self::WebGL1(context) => cell_into_abi(context),
-            Self::WebGL2(context) => cell_into_abi(context),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Trace)]
@@ -127,11 +128,18 @@ pub(crate) enum VertexArrayBinding {
 
 pub(crate) type Binding<T> = Cell<Option<Ref<T>>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VertexAttribValueType {
+    Float,
+    Int,
+    UnsignedInt,
+}
+
 #[derive(Trace)]
 #[gc(crate = libjs_rust)]
 pub(crate) struct ContextState {
     #[gc(untraced)]
-    pub(crate) proxy: Proxy<CppTransport>,
+    pub(crate) proxy: Proxy<RemoteContext>,
     #[gc(untraced)]
     version: WebGLVersion,
     context_ref: Cell<Option<ContextRef>>,
@@ -156,9 +164,6 @@ pub(crate) struct ContextState {
     context_lost: Cell<bool>,
     #[gc(untraced)]
     context_restore_requested: Cell<bool>,
-    /// https://immersive-web.github.io/webxr/#xr-compatible
-    #[gc(untraced)]
-    xr_compatible: Cell<bool>,
     #[gc(untraced)]
     context_generation: Cell<u64>,
 
@@ -173,7 +178,7 @@ pub(crate) struct ContextState {
 
     #[gc(untraced)]
     pub(crate) enabled_compressed_texture_formats: RefCell<Vec<u32>>,
-    pub(crate) enabled_extensions: RefCell<Vec<EnabledExtension>>,
+    pub(crate) enabled_extensions: GcRefCell<Vec<EnabledExtension>>,
     #[gc(untraced)]
     pub(crate) enabled_empty_extensions: RefCell<Vec<EnabledEmptyExtension>>,
 
@@ -198,10 +203,17 @@ pub(crate) struct ContextState {
     pub(crate) any_samples_passed_conservative: Binding<WebGLQuery>,
     pub(crate) transform_feedback_primitives_written: Binding<WebGLQuery>,
     pub(crate) current_vertex_array: Cell<Option<VertexArrayBinding>>,
+    /// The type of the current value of each vertex attribute that the last vertexAttrib*() call set to integers:
+    /// Every other attribute's current value is floats.
+    #[gc(untraced)]
+    pub(crate) current_vertex_attrib_value_types: RefCell<HashMap<u32, VertexAttribValueType>>,
+    /// MAX_VERTEX_ATTRIBS, once asked for: The value types are noted only for the attributes that exist.
+    #[gc(untraced)]
+    max_vertex_attribs: Cell<Option<u32>>,
 }
 
 pub(crate) struct ContextParameters {
-    pub(crate) proxy: Proxy<CppTransport>,
+    pub(crate) proxy: Proxy<RemoteContext>,
     pub(crate) version: WebGLVersion,
     pub(crate) realm: Gc<Realm>,
     pub(crate) canvas: Canvas,
@@ -210,7 +222,7 @@ pub(crate) struct ContextParameters {
 }
 
 impl ContextState {
-    pub(crate) fn new(parameters: ContextParameters) -> Self {
+    pub(crate) fn new(_: &DeferGc<'_>, parameters: ContextParameters) -> Self {
         let canvas_cell = ForeignCellSlot::empty();
         // SAFETY: The canvas is a live cell of the heap that the runtime allocates from.
         unsafe { canvas_cell.set(Some(parameters.canvas.cell)) };
@@ -227,14 +239,13 @@ impl ContextState {
             error: Cell::new(GL_NO_ERROR),
             context_lost: Cell::new(false),
             context_restore_requested: Cell::new(false),
-            xr_compatible: Cell::new(false),
             context_generation: Cell::new(0),
             unpack_state: Cell::new(PixelUnpackState::default()),
             unpack_flip_y: Cell::new(false),
             unpack_premultiply_alpha: Cell::new(false),
             unpack_colorspace_conversion: Cell::new(GL_BROWSER_DEFAULT_WEBGL),
             enabled_compressed_texture_formats: RefCell::new(Vec::new()),
-            enabled_extensions: RefCell::new(Vec::new()),
+            enabled_extensions: GcRefCell::new(Vec::new()),
             enabled_empty_extensions: RefCell::new(Vec::new()),
             array_buffer_binding: Cell::new(None),
             element_array_buffer_binding: Cell::new(None),
@@ -256,6 +267,8 @@ impl ContextState {
             any_samples_passed_conservative: Cell::new(None),
             transform_feedback_primitives_written: Cell::new(None),
             current_vertex_array: Cell::new(None),
+            current_vertex_attrib_value_types: RefCell::new(HashMap::new()),
+            max_vertex_attribs: Cell::new(None),
         }
     }
 
@@ -293,14 +306,6 @@ impl ContextState {
         self.context_lost.get()
     }
 
-    pub(crate) fn xr_compatible(&self) -> bool {
-        self.xr_compatible.get()
-    }
-
-    pub(crate) fn set_xr_compatible(&self, xr_compatible: bool) {
-        self.xr_compatible.set(xr_compatible);
-    }
-
     /// Makes `error` the error of the context, unless it has one already.
     // TODO: The specification of glGetError allows for a queue of errors, which this could keep.
     pub(crate) fn set_error(&self, error: u32) {
@@ -330,6 +335,75 @@ impl ContextState {
             self.set_error(GL_INVALID_OPERATION);
         }
         handle
+    }
+
+    /// https://registry.khronos.org/OpenGL/specs/es/3.0/es_spec_3.0.pdf#page=58
+    /// "Commands that accept shader or program object names will generate the error INVALID_VALUE if the provided name
+    ///  is not the name of either a shader or program object"
+    /// NB: So a deleted program or shader is an INVALID_VALUE where every other deleted object is an INVALID_OPERATION.
+    pub(crate) fn handle_of_program_or_shader<O: Interface + Inherits<WebGLObject>>(
+        &self,
+        object: Ref<O>,
+    ) -> Option<u32> {
+        if object.parent().was_deleted_in(self) {
+            self.set_error(GL_INVALID_VALUE);
+            return None;
+        }
+        self.handle_of(object)
+    }
+
+    /// https://registry.khronos.org/webgl/specs/latest/2.0/#3.7.8
+    /// The checks that vertexAttribPointer() and vertexAttribIPointer() each make of their offset.
+    pub(crate) fn validate_vertex_attrib_offset(&self, offset: i64) -> bool {
+        // "If offset is negative, an INVALID_VALUE error will be generated."
+        if offset < 0 {
+            self.set_error(GL_INVALID_VALUE);
+            return false;
+        }
+
+        // "If no WebGLBuffer is bound to the ARRAY_BUFFER target and offset is non-zero, an INVALID_OPERATION error will
+        //  be generated."
+        if self.array_buffer_binding.get().is_none() && offset != 0 {
+            self.set_error(GL_INVALID_OPERATION);
+            return false;
+        }
+        true
+    }
+
+    /// https://registry.khronos.org/webgl/specs/latest/2.0/#3.7.8
+    /// getVertexAttrib() returns the current value of a vertex attribute as the type of the vertexAttrib*() call that
+    /// set it last.
+    pub(crate) fn note_current_vertex_attrib_value_type(&self, index: u32, value_type: VertexAttribValueType) {
+        // NB: GL rejects a call for an attribute that doesn't exist, so it sets no value, and leaves no type to note.
+        if index >= self.max_vertex_attribs() {
+            return;
+        }
+        let mut types = self.current_vertex_attrib_value_types.borrow_mut();
+        if value_type == VertexAttribValueType::Float {
+            types.remove(&index);
+        } else {
+            types.insert(index, value_type);
+        }
+    }
+
+    fn max_vertex_attribs(&self) -> u32 {
+        if let Some(max_vertex_attribs) = self.max_vertex_attribs.get() {
+            return max_vertex_attribs;
+        }
+        let mut result = [0];
+        self.proxy
+            .get_integerv_robust_angle(GL_MAX_VERTEX_ATTRIBS, 1, &mut result);
+        let max_vertex_attribs = u32::try_from(result[0]).unwrap_or(0);
+        self.max_vertex_attribs.set(Some(max_vertex_attribs));
+        max_vertex_attribs
+    }
+
+    pub(crate) fn current_vertex_attrib_value_type(&self, index: u32) -> VertexAttribValueType {
+        self.current_vertex_attrib_value_types
+            .borrow()
+            .get(&index)
+            .copied()
+            .unwrap_or(VertexAttribValueType::Float)
     }
 
     pub(crate) fn handle_for_deletion_of<O: Interface + Inherits<WebGLObject>>(&self, object: Ref<O>) -> Option<u32> {
@@ -369,43 +443,70 @@ impl ContextState {
             ));
         }
 
-        let source_frame = match *source {
+        let format_and_type_upload_images = texture_export_format(format, r#type).is_some();
+        // https://registry.khronos.org/webgl/extensions/OES_texture_float/
+        // When this extension is enabled:
+        // The texImage2D and texSubImage2D entry points taking ImageData, HTMLImageElement, HTMLCanvasElement and
+        // HTMLVideoElement are extended to accept the pixel type FLOAT.
+        if self.version() == WebGLVersion::WebGL1
+            && r#type == GL_FLOAT
+            && (!self.extension_enabled("OES_texture_float") || !format_and_type_upload_images)
+        {
+            self.set_error(GL_INVALID_ENUM);
+            return Ok(None);
+        }
+        let frame = match *source {
             TexImageSource::ImageBitmap(image_bitmap) => match image_bitmap.frame() {
-                Some(image_frame) => read_tex_image_frame(&image_frame, format, r#type),
+                Some(image_frame) => format_and_type_upload_images.then_some(Frame::Image(image_frame)),
                 // If this function is called with an ImageBitmap that has been neutered, an INVALID_VALUE error is
                 // generated.
-                None => TexImageSourceFrame::InvalidValue,
+                None => {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(None);
+                }
             },
             TexImageSource::ImageData(image_data) => match image_data.pixels() {
+                Some(_) if !format_and_type_upload_images => None,
                 Some(pixels) => {
                     let (width, height) = image_data.size();
+                    let pitch = width as usize * 4;
                     // SAFETY: Nothing runs script while the pixels are copied.
-                    unsafe { read_tex_image_pixels(pixels, width, height, format, r#type) }
+                    let Some(image_frame) = (unsafe {
+                        image_frame_from_pixels(pixels, pitch, width as i32, height as i32, ColorSpace::Srgb)
+                    }) else {
+                        self.set_error(GL_INVALID_VALUE);
+                        return Ok(None);
+                    };
+                    Some(Frame::Image(image_frame))
                 }
                 // If this function is called with an ImageData whose data attribute has been neutered, an
                 // INVALID_VALUE error is generated.
-                None => TexImageSourceFrame::InvalidValue,
+                None => {
+                    self.set_error(GL_INVALID_VALUE);
+                    return Ok(None);
+                }
             },
-            TexImageSource::HTMLImageElement(object) => {
-                read_tex_image_source(object, TexImageSourceKind::HTMLImageElement, format, r#type)
-            }
-            TexImageSource::HTMLCanvasElement(object) => {
-                read_tex_image_source(object, TexImageSourceKind::HTMLCanvasElement, format, r#type)
-            }
-            TexImageSource::HTMLVideoElement(object) => {
-                read_tex_image_source(object, TexImageSourceKind::HTMLVideoElement, format, r#type)
-            }
-            TexImageSource::OffscreenCanvas(object) => {
-                read_tex_image_source(object, TexImageSourceKind::OffscreenCanvas, format, r#type)
-            }
+            TexImageSource::HTMLImageElement(object) => format_and_type_upload_images
+                .then(|| texture_image_frame(object, TexImageSourceKind::HTMLImageElement).map(Frame::Image))
+                .flatten(),
+            TexImageSource::HTMLCanvasElement(object) => format_and_type_upload_images
+                .then(|| texture_image_frame(object, TexImageSourceKind::HTMLCanvasElement).map(Frame::Image))
+                .flatten(),
+            TexImageSource::OffscreenCanvas(object) => format_and_type_upload_images
+                .then(|| texture_image_frame(object, TexImageSourceKind::OffscreenCanvas).map(Frame::Image))
+                .flatten(),
+            TexImageSource::HTMLVideoElement(object) => format_and_type_upload_images
+                .then(|| capture_video_frame(object).map(Frame::Video))
+                .flatten(),
         };
-        let frame = match source_frame {
-            TexImageSourceFrame::Frame(frame) => frame,
-            TexImageSourceFrame::NoFrame => return Ok(None),
-            TexImageSourceFrame::InvalidValue => {
-                self.set_error(GL_INVALID_VALUE);
-                return Ok(None);
-            }
+        if tex_image_source_is_not_origin_clean(source) {
+            return Err(Exception::Dom(
+                "SecurityError",
+                Utf16String::from_ascii(b"Cannot upload a texture source that is not origin-clean"),
+            ));
+        }
+        let Some(frame) = frame else {
+            return Ok(None);
         };
         // The first pixel transferred from the source to the WebGL implementation corresponds to the upper left
         // corner of the source. This behavior is modified by the UNPACK_FLIP_Y_WEBGL pixel storage parameter,
@@ -463,7 +564,7 @@ impl ContextState {
     }
 
     /// The new replayer context has no GL objects: the page creates its objects anew once told of the restore.
-    pub(crate) fn restore(&self, transport: CppTransport, supported_opengl_extensions: Vec<Vec<u8>>) {
+    pub(crate) fn restore(&self, transport: RemoteContext, supported_opengl_extensions: Vec<Vec<u8>>) {
         self.proxy.restore(transport);
         self.supported_opengl_extensions.replace(supported_opengl_extensions);
 
@@ -497,6 +598,8 @@ impl ContextState {
         self.texture_binding_3d.set(None);
         self.transform_feedback_binding.set(None);
         self.current_vertex_array.set(None);
+        self.current_vertex_attrib_value_types.borrow_mut().clear();
+        self.max_vertex_attribs.set(None);
         self.any_samples_passed.set(None);
         self.any_samples_passed_conservative.set(None);
         self.transform_feedback_primitives_written.set(None);

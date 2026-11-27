@@ -22,8 +22,8 @@ pub(crate) struct WebGLBuffer {
 }
 
 impl Wrappable for WebGLBuffer {
-    fn relevant_realm(&self, vm: &Vm) -> Option<Gc<Realm>> {
-        self.object.relevant_realm(vm)
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
+        self.object.relevant_realm()
     }
 }
 
@@ -35,13 +35,10 @@ impl Inherits<WebGLObject> for WebGLBuffer {
 
 impl WebGLBuffer {
     pub(crate) fn create(vm: &Vm, context: &ContextState, handle: u32) -> Ref<Self> {
-        allocate(
-            vm,
-            Self {
-                object: WebGLObject::new(context, handle),
-                kind: KindOfFirstBinding::default(),
-            },
-        )
+        allocate(vm, |_| Self {
+            object: WebGLObject::new(context, handle),
+            kind: KindOfFirstBinding::default(),
+        })
     }
 
     pub(crate) fn kind_allows_binding_to(&self, target: u32) -> bool {

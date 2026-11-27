@@ -14,9 +14,11 @@ pub mod border_image;
 pub mod column_rule;
 pub mod fieldset;
 pub mod form_controls;
+pub mod frameset;
 pub mod gradient_resolution;
 pub mod inline_box;
 pub mod inspector_overlay;
+pub mod math;
 pub mod outline;
 pub mod overlay;
 pub mod replaced;
@@ -31,6 +33,7 @@ use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::node_painting;
+use crate::painting::paintable_geometry;
 use crate::painting::record::{BasePaintFacts, PaintPhase, PaintRecorder};
 use crate::painting::style_queries;
 
@@ -91,6 +94,14 @@ pub(crate) fn paint_phase_mask<O: Observer>(
 }
 
 pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
+    recorder
+        .recorder
+        .begin_record_origin(paintable, crate::painting::record::trace::paint_phase_name(phase));
+    paint_box_phase(recorder, paintable, phase);
+    recorder.recorder.end_record_origin();
+}
+
+fn paint_box_phase<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
     let Some(kind) = recorder.source.node_kind_if_live(paintable) else {
         return;
     };
@@ -104,15 +115,14 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
         }
         paint_base(recorder, paintable, phase);
         if phase == PaintPhase::Foreground {
-            if recorder.is_recording_svg_resource_content()
-                || recorder
-                    .source
-                    .committed_side_data(paintable)
-                    .inline_content
-                    .as_ref()
-                    .is_none_or(|content| content.items.is_empty())
-            {
-                text::paint_fragments_foreground(recorder, paintable, None);
+            let math_paint_data = paintable_geometry::committed_math_paint_data(recorder.source, paintable);
+            if let Some(data) = &math_paint_data {
+                math::paint_foreground(recorder, paintable, data);
+            }
+            if math_paint_data.is_some_and(|data| data.replaces_text) {
+                // NB: The glyph of a stretched or large operator is painted instead of its text.
+            } else if !crate::painting::paint_order_plan::text_fragments_are_producers(recorder.source, paintable) {
+                text::paint_fragments_foreground(recorder, paintable);
             }
             // visibility: hidden on this block does not hide descendants that set visibility:
             // visible again, so fragments (and the caret between their glyphs) are filtered by
@@ -158,6 +168,12 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
                 }
             }
         }
+        NodeKind::FrameSetBox => {
+            paint_base(recorder, paintable, phase);
+            if phase == PaintPhase::Foreground && recorder.is_visible(paintable) {
+                frameset::paint_frameset_borders(recorder, paintable);
+            }
+        }
         NodeKind::FieldSetBox => {
             if !recorder.is_visible(paintable) {
                 return;
@@ -179,7 +195,12 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
             svg::paint_path(recorder, paintable, phase);
         }
         NodeKind::SVGImageBox => svg::paint_image_element(recorder, paintable, phase),
-        NodeKind::Unset | NodeKind::BreakNode | NodeKind::GeneratedTextNode | NodeKind::Node | NodeKind::TextNode => {}
+        NodeKind::Unset
+        | NodeKind::BreakNode
+        | NodeKind::WordBreakOpportunityNode
+        | NodeKind::GeneratedTextNode
+        | NodeKind::Node
+        | NodeKind::TextNode => {}
         NodeKind::Viewport
         | NodeKind::BlockContainer
         | NodeKind::LegendBox
@@ -347,7 +368,7 @@ fn set_own_background_as_contrast_backdrop<O: Observer>(
     let backdrop = recorder
         .source
         .node_style_if_live(paintable)
-        .map(|style| libgfx_rust::Color(style.background().background_color));
+        .map(|style| libgfx_rust::Color(style.background_color()));
     recorder.recorder.set_contrast_backdrop(backdrop)
 }
 

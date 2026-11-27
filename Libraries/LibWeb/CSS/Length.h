@@ -25,9 +25,10 @@ namespace Web::CSS {
 class WEB_API Length {
 public:
     struct WEB_API FontMetrics {
-        FontMetrics(CSSPixels font_size, Gfx::FontPixelMetrics const&, CSSPixels line_height);
+        FontMetrics(double font_size, Gfx::FontPixelMetrics const&, CSSPixels line_height);
 
-        CSSPixels font_size;
+        // The computed font size, unrounded, so that em and rem lengths scale it exactly.
+        double font_size;
         CSSPixels x_height;
         CSSPixels cap_height;
         CSSPixels zero_advance;
@@ -70,6 +71,7 @@ public:
         bool font_metrics_depend_on_viewport_metrics { false };
         bool root_font_metrics_depend_on_viewport_metrics { false };
         bool subject_inline_axis_is_horizontal { true };
+        bool subject_is_pseudo_element { false };
         GC::Ptr<DOM::Element const> subject_element { nullptr };
         mutable Optional<GC::Ptr<DOM::Element const>> cached_width_query_container {};
         mutable Optional<GC::Ptr<DOM::Element const>> cached_height_query_container {};
@@ -147,7 +149,7 @@ public:
         }
         if (is_viewport_relative()) {
             context.record_viewport_relative_length_resolution();
-            return viewport_relative_length_to_px_without_rounding(context.viewport_rect);
+            return viewport_relative_length_to_px_without_rounding(context.viewport_rect, context.subject_inline_axis_is_horizontal);
         }
         if (is_container_relative())
             return container_relative_length_to_px_without_rounding(context);
@@ -174,7 +176,7 @@ public:
     }
 
     double font_relative_length_to_px_without_rounding(FontMetrics const& font_metrics, FontMetrics const& root_font_metrics) const;
-    double viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect) const;
+    double viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect, bool inline_axis_is_horizontal) const;
     double container_relative_length_to_px_without_rounding(ResolutionContext const&) const;
 
     static Length from_style_value(NonnullRefPtr<StyleValue const> const&, Optional<Length> percentage_basis);
@@ -185,6 +187,6 @@ private:
 };
 
 double ratio_between_font_relative_unit_and_px(LengthUnit font_relative_unit, Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics);
-double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_unit, CSSPixelRect const& viewport_rect);
+double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_unit, CSSPixelRect const& viewport_rect, bool inline_axis_is_horizontal);
 
 }

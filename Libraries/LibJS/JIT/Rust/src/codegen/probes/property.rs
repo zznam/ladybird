@@ -10,9 +10,10 @@
 //! entries out of line by the runtime's cache probe.
 
 use super::super::Codegen;
+use super::super::RegisterList;
 use super::super::checked_i32;
 use super::super::slow_path_calls::slow_path_saved_registers;
-use super::megamorphic::EntryShape;
+use super::keyed::KeyName;
 use super::megamorphic::MegamorphicKey;
 use crate::CompileFailure;
 use crate::asm::Address;
@@ -52,6 +53,38 @@ pub(in crate::codegen) struct DeferredCacheProbe {
     pub(in crate::codegen) miss: Label,
 }
 
+/// A probe of the VM's keyed caches for a megamorphic named access, out of
+/// line: the hit path of the access's own cache stays as short as without
+/// it. It starts at `entry`, where the access's own cache had no entry.
+pub(in crate::codegen) struct DeferredVmCacheProbe {
+    pub(in crate::codegen) node: NodeId,
+    pub(in crate::codegen) entry: Label,
+    pub(in crate::codegen) probe: VmCacheProbe,
+}
+
+/// What a `DeferredVmCacheProbe` does with its arguments, which are those of
+/// `emit_vm_named_cache_get()` (and for its lessons, the cache of the get) for
+/// gets and of `emit_keyed_store_cache_put()` for puts.
+pub(in crate::codegen) enum VmCacheProbe {
+    Get {
+        executable: u32,
+        cache: u32,
+        name: u64,
+        output: Gpr,
+        done: Label,
+        miss: Label,
+        fail: Label,
+    },
+    Put {
+        base: Gpr,
+        name: u64,
+        source: Gpr,
+        storage: Gpr,
+        miss: Label,
+        stored: Label,
+    },
+}
+
 /// The bytes of the record the `PutById` cache probe takes: the base and
 /// the value.
 pub(in crate::codegen) const PUT_BY_ID_RECORD_BYTES: u32 = 16;
@@ -64,20 +97,16 @@ pub(in crate::codegen) struct CacheRegisters {
 }
 
 /// The offsets in a cache entry of the parts of an addition (see
-/// `Codegen::emit_add_own_property()`). Entries that the shape they add to
-/// and its dictionary generation were already matched for have no
-/// `from_shape` or `dictionary_generation` to check.
+/// `Codegen::emit_add_own_property()`).
 #[derive(Clone, Copy)]
 pub(super) struct AdditionEntryFields {
     pub entry_type: i32,
-    pub from_shape: Option<i32>,
-    pub dictionary_generation: Option<i32>,
     pub prototype_chain_validity: i32,
     pub new_shape: i32,
     pub property_offset: i32,
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     fn cache_registers(&self, node: NodeId) -> CacheRegisters {
         CacheRegisters {
             object: self.temp(node, 0),
@@ -100,7 +129,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             let running = self.frame_field(self.runtime.offsets.execution_context_executable);
             self.masm.load64(dst, &running);
         } else {
-            self.masm.move_imm64(dst, self.executables[executable as usize].cell.0);
+            self.masm
+                .move_imm64(dst, self.snapshot.executables[executable as usize].cell.0);
         }
         self.masm.load64(
             dst,
@@ -116,9 +146,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// Loads the shape of the object in `registers.object` and the entry of
     /// property lookup cache `cache_index` for that shape into the entry
     /// register: the most recently used entry, or another entry of a
-    /// polymorphic or megamorphic cache, matching `entry_shape` of the
-    /// entries. Branches to `miss` unless there is one for the shape and its
-    /// dictionary generation. Leaves the shape register free. Caches that
+    /// polymorphic or megamorphic cache. Branches to `miss` unless there is
+    /// one for the shape and its dictionary generation. Leaves the shape
+    /// register free. Caches that
     /// were megamorphic when the snapshot was taken look in their hash
     /// tables first.
     fn probe_cache_entry(
@@ -126,19 +156,16 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         registers: &CacheRegisters,
         executable: u32,
         cache_index: u32,
-        entry_shape: EntryShape,
         miss: Label,
     ) -> Result<(), CompileFailure> {
         let layout = self.runtime.layout;
         let scratch = self.pinned.scratch;
         let CacheRegisters { object, shape, entry } = *registers;
         let found = self.masm.new_label();
-        self.masm
-            .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
-        let was_megamorphic = self.executables[executable as usize]
-            .property_caches
+        let was_megamorphic = self.snapshot[self.snapshot.executables[executable as usize].property_caches]
             .get(cache_index as usize)
             .is_some_and(|cache| cache.kind == PropertyCacheKind::Megamorphic);
         if was_megamorphic {
@@ -155,14 +182,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             );
             self.masm
                 .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-            self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, entry_shape, found, miss);
+            self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, miss);
             self.masm.bind(not_megamorphic);
         }
         self.masm.branch_test64(Condition::Zero, entry, u64::MAX, miss);
         self.masm.move64(scratch, entry);
         self.masm
             .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-        self.branch_if_entry_shape(entry, shape, entry_shape, found);
+        self.branch_if_entry_shape(entry, shape, found);
         // The other entries of a polymorphic cache follow the most recently used one.
         self.masm
             .and64_imm(scratch, scratch, !layout.property_lookup_cache_data_pointer_mask);
@@ -176,7 +203,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         for _ in 1..layout.property_lookup_cache_polymorphic_entry_count {
             self.masm
                 .add64_imm(entry, entry, i64::from(layout.property_lookup_cache_entry_size));
-            self.branch_if_entry_shape(entry, shape, entry_shape, found);
+            self.branch_if_entry_shape(entry, shape, found);
         }
         self.masm.jump(miss);
         // Megamorphic caches keep the other shapes' entries in hash tables.
@@ -187,7 +214,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             layout.property_lookup_cache_megamorphic_tag as i64,
             miss,
         );
-        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, entry_shape, found, miss);
+        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, miss);
         self.masm.bind(found);
         self.branch_unless_dictionary_generation_matches(shape, entry, miss);
         Ok(())
@@ -224,14 +251,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// Branches to `miss` unless a `GetMissingProperty` entry for the shape
     /// of `object`, whose prototype chain validity is at `validity`, applies
-    /// to it, like `get_with_property_lookup_cache()`: only objects whose
-    /// class keeps the default
-    /// `ObjectMethods::is_cacheable_for_property_absence` have no other
-    /// properties than those of their shape (for the names their entries can
-    /// be for), and the property must also be missing from an unchanged
-    /// prototype chain. Plain objects, ECMAScript functions, arrays and
-    /// String objects are told apart without loading the hook. Clobbers
-    /// `shape`.
+    /// to it, like `get_with_property_lookup_cache()`: the object must have
+    /// no other properties than those of its shape (see
+    /// `branch_unless_cacheable_for_property_absence()`), and the property
+    /// must also be missing from an unchanged prototype chain. Clobbers
+    /// `shape` and the scratch register.
     pub(super) fn branch_unless_property_absence_applies(
         &mut self,
         object: Gpr,
@@ -239,57 +263,16 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         validity: &Address,
         miss: Label,
     ) {
-        let scratch = self.pinned.scratch;
-        let layout = self.runtime.layout;
+        self.branch_unless_cacheable_for_property_absence(object, shape, miss);
         let offsets = self.runtime.offsets;
-        // NB: Plain objects start with the virtual table pointer of their
-        //     class, like the template of new plain objects.
-        let Some(&plain_object_vtable) = self.runtime.object_allocation.template.first() else {
-            self.masm.jump(miss);
-            return;
-        };
-        let cacheable = self.masm.new_label();
-        self.masm.move_imm64(scratch, plain_object_vtable);
-        self.masm
-            .branch64_memory(Condition::Equal, &Address::new(object, 0), scratch, cacheable);
-        for class in [layout.string_object_class, layout.string_prototype_class] {
-            self.masm.move_imm64(scratch, class);
-            self.masm
-                .branch64_memory(Condition::Equal, &Address::new(object, 0), scratch, cacheable);
-        }
-        let flags =
-            self.runtime.dynamic_calls.object_flag_is_ecmascript_function | layout.object_flag_has_magical_length;
-        if flags != 0 {
-            self.masm
-                .load16(scratch, &Address::new(object, offsets.object_flags as i32));
-            self.masm
-                .branch_test32(Condition::NonZero, scratch, u32::from(flags), cacheable);
-        }
-        if layout.default_is_cacheable_for_property_absence == 0 || layout.class_object_methods == 0 {
-            self.masm.jump(miss);
-        } else {
-            // NB: Objects start with their class.
-            self.masm.load64(shape, &Address::new(object, 0));
-            self.masm
-                .load64(shape, &Address::new(shape, layout.class_object_methods as i32));
-            self.masm
-                .move_imm64(scratch, layout.default_is_cacheable_for_property_absence);
-            self.masm.branch64_memory(
-                Condition::NotEqual,
-                &Address::new(shape, layout.object_methods_is_cacheable_for_property_absence as i32),
-                scratch,
-                miss,
-            );
-        }
-        self.masm.bind(cacheable);
+        let layout = self.runtime.layout;
         let (has_chain, done) = (self.masm.new_label(), self.masm.new_label());
         self.masm.load64(shape, validity);
         self.masm.branch_test64(Condition::NonZero, shape, u64::MAX, has_chain);
         // Entries without a prototype chain validity are for shapes without
         // a prototype.
-        self.masm
-            .load64(shape, &Address::new(object, offsets.object_shape as i32));
-        self.masm.branch64_memory_imm(
+        self.emit_load_compressed_cell(shape, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch32_memory_imm(
             Condition::NotEqual,
             &Address::new(shape, layout.shape_prototype as i32),
             0,
@@ -299,6 +282,58 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.bind(has_chain);
         self.branch_unless_prototype_chain_valid(shape, miss);
         self.masm.bind(done);
+    }
+
+    /// Branches to `miss` unless the object `object` has no other properties
+    /// than those of its shape, for the names `GetMissingProperty` entries
+    /// can be for: only objects whose class has
+    /// `ObjectMethods::is_cacheable_for_property_absence` set do. Plain
+    /// objects, ECMAScript functions, arrays and String objects are told
+    /// apart without loading it. Clobbers `class` and the scratch register.
+    pub(in crate::codegen) fn branch_unless_cacheable_for_property_absence(
+        &mut self,
+        object: Gpr,
+        class: Gpr,
+        miss: Label,
+    ) {
+        let shape = class;
+        let scratch = self.pinned.scratch;
+        let layout = self.runtime.layout;
+        let offsets = self.runtime.offsets;
+        if layout.object_class == 0 {
+            self.masm.jump(miss);
+            return;
+        }
+        let cacheable = self.masm.new_label();
+        self.emit_load_class(shape, object);
+        for class in [
+            layout.object_class,
+            layout.string_object_class,
+            layout.string_prototype_class,
+        ] {
+            self.masm.move_imm64(scratch, class);
+            self.masm.branch64(Condition::Equal, shape, scratch, cacheable);
+        }
+        let flags =
+            self.runtime.dynamic_calls.object_flag_is_ecmascript_function | layout.object_flag_has_magical_length;
+        if flags != 0 {
+            self.masm
+                .load16(scratch, &Address::new(object, offsets.object_flags as i32));
+            self.masm
+                .branch_test32(Condition::NonZero, scratch, u32::from(flags), cacheable);
+        }
+        if layout.object_methods_is_cacheable_for_property_absence == 0 || layout.class_object_methods == 0 {
+            self.masm.jump(miss);
+        } else {
+            self.masm
+                .load64(shape, &Address::new(shape, layout.class_object_methods as i32));
+            self.masm.load8(
+                scratch,
+                &Address::new(shape, layout.object_methods_is_cacheable_for_property_absence as i32),
+            );
+            self.masm.branch_test32(Condition::Zero, scratch, 0xff, miss);
+        }
+        self.masm.bind(cacheable);
     }
 
     /// A `ProbePropertyCache` node: the data property, or `undefined` for a
@@ -311,6 +346,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         node: NodeId,
         executable: u32,
         cache_index: u32,
+        property: u32,
     ) -> Result<(), CompileFailure> {
         let output = self.output(node);
         let scratch = self.pinned.scratch;
@@ -331,30 +367,28 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
         let base = self.input(node, 0);
         self.masm.shr64_imm(scratch, base, value::TAG_SHIFT);
-        let snapshot = &self.executables[executable as usize];
+        let snapshot = &self.snapshot.executables[executable as usize];
         let prototypes = [
             (value::STRING_TAG, snapshot.string_prototype),
             (value::INT32_TAG, snapshot.number_prototype),
             (value::BOOLEAN_TAG, snapshot.boolean_prototype),
         ]
-        .into_iter()
-        .filter_map(|(tag, prototype)| Some((tag, prototype?, self.masm.new_label())))
-        .collect::<Vec<_>>();
+        .map(|(tag, prototype)| Some((tag, prototype?, self.masm.new_label())));
         let (is_object, have_object) = (self.masm.new_label(), self.masm.new_label());
         self.masm
             .branch32_imm(Condition::Equal, scratch, i32::from(value::OBJECT_TAG), is_object);
-        for (tag, _, label) in &prototypes {
+        for (tag, _, label) in prototypes.iter().flatten() {
             self.masm
                 .branch32_imm(Condition::Equal, scratch, i32::from(*tag), *label);
         }
         // Doubles are numbers too.
-        if let Some((_, _, number)) = prototypes.iter().find(|(tag, ..)| *tag == value::INT32_TAG) {
+        if let Some((_, _, number)) = prototypes.iter().flatten().find(|(tag, ..)| *tag == value::INT32_TAG) {
             self.masm.and32_imm(scratch, scratch, u32::from(value::BASE_TAG));
             self.masm
                 .branch32_imm(Condition::NotEqual, scratch, i32::from(value::BASE_TAG), *number);
         }
         self.masm.jump(fail);
-        for (_, prototype, label) in prototypes {
+        for (_, prototype, label) in prototypes.into_iter().flatten() {
             self.masm.bind(label);
             self.masm.move_imm64(object, prototype.0);
             self.masm.jump(have_object);
@@ -362,7 +396,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.bind(is_object);
         self.emit_unbox_cell(object, base);
         self.masm.bind(have_object);
-        self.probe_cache_entry(&registers, executable, cache_index, EntryShape::Shape, probe)?;
+        // NB: The runtime also fills the VM's keyed lookup cache for the names of megamorphic caches (see
+        //     `get_with_property_lookup_cache()`).
+        let vm_cache_name = self.megamorphic_cache_name(executable, cache_index, property);
+        let vm_cache = vm_cache_name.map(|_| self.masm.new_label());
+        self.probe_cache_entry(&registers, executable, cache_index, vm_cache.unwrap_or(probe))?;
         let present = self.masm.new_label();
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
@@ -403,8 +441,154 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.load64(entry, &property);
         self.branch_on_tag(Condition::Equal, entry, value::ACCESSOR_TAG, self.pinned.scratch, fail);
         self.masm.move64(output, entry);
+        if let (Some(name), Some(vm_cache)) = (vm_cache_name, vm_cache) {
+            self.deferred_vm_cache_probes.push(DeferredVmCacheProbe {
+                node,
+                entry: vm_cache,
+                probe: VmCacheProbe::Get {
+                    executable,
+                    cache: cache_index,
+                    name,
+                    output,
+                    done,
+                    miss: probe,
+                    fail,
+                },
+            });
+        }
         self.bind_probe_failure(output, value::EMPTY, failure, done);
         Ok(())
+    }
+
+    /// The identity of the name at index `property` of the property key
+    /// table of `executable` (see `Op::ProbePropertyCache`), if property
+    /// lookup cache `cache_index` was megamorphic: such caches see more
+    /// shapes than their hash tables hold, so their accesses also look in
+    /// the VM's keyed caches.
+    fn megamorphic_cache_name(&self, executable: u32, cache_index: u32, property: u32) -> Option<u64> {
+        let snapshot = &self.snapshot.executables[executable as usize];
+        self.snapshot[snapshot.property_caches]
+            .get(cache_index as usize)
+            .filter(|cache| cache.kind == PropertyCacheKind::Megamorphic)
+            .and_then(|_| {
+                self.snapshot[snapshot.property_key_names]
+                    .get(property as usize)
+                    .copied()
+            })
+            .filter(|name| *name != 0)
+    }
+
+    /// Looks up the property whose name has the identity `name` on the
+    /// object in the object register in the VM's keyed property lookup
+    /// cache, like the runtime's keyed get does: puts the data property it
+    /// has (own, or of an unchanged prototype chain), or `undefined` where
+    /// the entry says the object and its prototype chain have no such
+    /// property, in `output` and jumps to `done`. Jumps to `fail` for
+    /// accessors, and to `miss` where the cache has no such entry. Clobbers
+    /// the cache registers and the scratch register.
+    fn emit_vm_named_cache_get(
+        &mut self,
+        registers: &CacheRegisters,
+        name: u64,
+        output: Gpr,
+        done: Label,
+        miss: Label,
+        fail: Label,
+    ) {
+        let CacheRegisters { object, shape, entry } = *registers;
+        let scratch = self.pinned.scratch;
+        let layout = self.runtime.layout;
+        if layout.keyed_lookup_cache_entries == 0
+            || layout.keyed_lookup_cache_prototype == 0
+            || layout.keyed_lookup_cache_prototype_chain_validity == 0
+        {
+            self.masm.jump(miss);
+            return;
+        }
+        self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        // The entry: the top bits of the Fibonacci hash of the shape and the name.
+        let entry_size_log2 = layout.keyed_lookup_cache_entry_size.trailing_zeros();
+        let bits = layout.keyed_lookup_cache_index_bits;
+        self.masm.move_imm64(scratch, u64::from(name as u32));
+        self.masm.xor32(scratch, scratch, shape);
+        self.masm.mul32_imm(
+            scratch,
+            scratch,
+            layout.property_lookup_cache_megamorphic_hash_multiplier,
+        );
+        self.masm
+            .shr32_imm(scratch, scratch, (32 - bits - entry_size_log2) as u8);
+        self.masm
+            .and32_imm(scratch, scratch, ((1u32 << bits) - 1) << entry_size_log2);
+        self.masm.move_imm64(entry, layout.keyed_lookup_cache_entries);
+        self.masm.add64(entry, entry, scratch);
+        self.masm.move_imm64(scratch, name);
+        self.masm.branch64_memory(
+            Condition::NotEqual,
+            &Address::new(entry, layout.keyed_lookup_cache_name as i32),
+            scratch,
+            miss,
+        );
+        self.masm.branch64_memory(
+            Condition::NotEqual,
+            &Address::new(entry, layout.keyed_lookup_cache_shape as i32),
+            shape,
+            miss,
+        );
+        let expected = Address::new(entry, layout.keyed_lookup_cache_dictionary_generation as i32);
+        self.branch_unless_dictionary_generation_is(shape, expected, [scratch, shape], miss);
+
+        let (own, inherited) = (self.masm.new_label(), self.masm.new_label());
+        self.masm.load32(
+            scratch,
+            &Address::new(entry, layout.keyed_lookup_cache_entry_type as i32),
+        );
+        self.masm.branch32_imm(
+            Condition::Equal,
+            scratch,
+            layout.property_lookup_cache_entry_type_get_own_property as i32,
+            own,
+        );
+        self.masm.branch32_imm(
+            Condition::Equal,
+            scratch,
+            layout.property_lookup_cache_entry_type_get_property_in_prototype_chain as i32,
+            inherited,
+        );
+        self.masm.branch32_imm(
+            Condition::NotEqual,
+            scratch,
+            layout.property_lookup_cache_entry_type_get_missing_property as i32,
+            miss,
+        );
+        let validity = Address::new(entry, layout.keyed_lookup_cache_prototype_chain_validity as i32);
+        self.branch_unless_property_absence_applies(object, shape, &validity, miss);
+        self.masm.move_imm64(output, value::UNDEFINED);
+        self.masm.jump(done);
+
+        // Properties found in a prototype need its chain to be unchanged.
+        self.masm.bind(inherited);
+        self.masm.load64(shape, &validity);
+        self.masm.branch_test64(Condition::Zero, shape, u64::MAX, miss);
+        self.branch_unless_prototype_chain_valid(shape, miss);
+        self.masm
+            .load64(object, &Address::new(entry, layout.keyed_lookup_cache_prototype as i32));
+
+        // NB: Accessors take the slow path, which calls them.
+        self.masm.bind(own);
+        self.masm.load32(
+            scratch,
+            &Address::new(entry, layout.keyed_lookup_cache_property_offset as i32),
+        );
+        self.masm.load64(
+            shape,
+            &Address::new(object, self.runtime.offsets.object_named_properties as i32),
+        );
+        self.masm
+            .load64(entry, &Address::indexed(shape, scratch, Scale::Eight, 0));
+        self.branch_on_tag(Condition::Equal, entry, value::ACCESSOR_TAG, scratch, fail);
+        self.masm.move64(output, entry);
+        self.masm.jump(done);
     }
 
     /// A `ProbePropertyStore` node: stores like the interpreter's `PutById`
@@ -419,6 +603,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         node: NodeId,
         executable: u32,
         cache_index: u32,
+        name_index: u32,
     ) -> Result<(), CompileFailure> {
         let scratch = self.pinned.scratch;
         let layout = self.runtime.layout;
@@ -427,6 +612,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let CacheRegisters { object, shape, entry } = registers;
         let (failure, stored, done) = (self.probe_failure_label(), self.masm.new_label(), self.masm.new_label());
         let (others, change, transition) = (self.masm.new_label(), self.masm.new_label(), self.masm.new_label());
+        let no_data_write = self.masm.new_label();
         let probe = if executable == 0 {
             let probe = self.masm.new_label();
             self.deferred_cache_probes.push(DeferredCacheProbe {
@@ -443,28 +629,18 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         };
 
         self.unbox_object_or_branch(object, base, failure.0);
-        self.masm
-            .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
         self.masm.branch_test64(Condition::Zero, entry, u64::MAX, probe);
         self.masm
             .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-        let most_recent_matches = self.masm.new_label();
         self.masm.branch64_memory(
-            Condition::Equal,
+            Condition::NotEqual,
             &Address::new(entry, layout.property_lookup_cache_entry_shape as i32),
             shape,
-            most_recent_matches,
+            others,
         );
-        self.masm.branch64_memory(
-            Condition::Equal,
-            &Address::new(entry, layout.property_lookup_cache_entry_from_shape as i32),
-            shape,
-            transition,
-        );
-        self.masm.jump(others);
-        self.masm.bind(most_recent_matches);
         self.branch_unless_dictionary_generation_matches(shape, entry, probe);
         // Own data properties.
         self.masm.bind(change);
@@ -478,19 +654,27 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             scratch,
             &Address::new(entry, layout.property_lookup_cache_entry_writes_data_property as i32),
         );
-        self.masm.branch_test32(Condition::Zero, scratch, 0xFF, probe);
+        self.masm.branch_test32(Condition::Zero, scratch, 0xFF, no_data_write);
         // NB: The address uses the scratch register, so the tag check must not.
         let property = self.cached_property_address(&registers, object);
         self.masm.load64(entry, &property);
         self.branch_on_tag(Condition::Equal, entry, value::ACCESSOR_TAG, entry, probe);
         self.masm.store64(&property, source);
         self.masm.jump(stored);
+        self.masm.bind(no_data_write);
+        self.masm.branch32_memory_imm(
+            Condition::Equal,
+            &Address::new(entry, layout.property_lookup_cache_entry_type as i32),
+            layout.property_lookup_cache_entry_type_add_own_property as i32,
+            transition,
+        );
+        self.masm.jump(probe);
 
-        // The entry for the object's shape, or the addition to it.
+        // The entry for the object's shape among the others.
         self.masm.bind(others);
-        self.probe_cache_entry(&registers, executable, cache_index, EntryShape::ShapeOrFromShape, probe)?;
-        self.masm
-            .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        let vm_cache_name = self.megamorphic_cache_name(executable, cache_index, name_index);
+        let vm_cache = vm_cache_name.map(|_| self.masm.new_label());
+        self.probe_cache_entry(&registers, executable, cache_index, vm_cache.unwrap_or(probe))?;
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
             &Address::new(entry, layout.property_lookup_cache_entry_type as i32),
@@ -501,6 +685,20 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let storage = self.temp(node, 3);
         let fields = self.site_addition_entry_fields();
         self.emit_add_own_property(node, &registers, fields, source, storage, probe);
+        if let (Some(name), Some(vm_cache)) = (vm_cache_name, vm_cache) {
+            self.deferred_vm_cache_probes.push(DeferredVmCacheProbe {
+                node,
+                entry: vm_cache,
+                probe: VmCacheProbe::Put {
+                    base,
+                    name,
+                    source,
+                    storage,
+                    miss: probe,
+                    stored,
+                },
+            });
+        }
         self.masm.bind(stored);
         self.masm.move_imm32(output, 1);
         self.bind_probe_failure(output, 0, failure, done);
@@ -508,10 +706,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     }
 
     /// Adds the property of the `AddOwnProperty` entry in `registers.entry`,
-    /// laid out like `fields` says, to the object in `registers.object`,
-    /// whose shape is in `registers.shape`, like `asm_try_put_by_id_cache()`
-    /// does: the object takes the entry's new shape, and `source` goes in the
-    /// new property's slot. Storage that must grow grows out of line (see
+    /// laid out like `fields` says and found for the shape of the object in
+    /// `registers.object`, like `asm_try_put_by_id_cache()` does: the object
+    /// takes the entry's new shape, and `source` goes in the new property's
+    /// slot. Storage that must grow grows out of line (see
     /// `named_storage`), or the addition is left to `miss`. Uses `storage`
     /// and clobbers the shape register.
     pub(super) fn emit_add_own_property(
@@ -534,31 +732,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             layout.property_lookup_cache_entry_type_add_own_property as i32,
             miss,
         );
-        if let Some(from_shape) = fields.from_shape {
-            self.masm
-                .branch64_memory(Condition::NotEqual, &Address::new(entry, from_shape), shape, miss);
-        }
-        // Extensible objects that may cache property additions, without a
-        // magical length (whose additions depend on the key).
-        let flags = layout.object_flag_is_extensible
-            | layout.object_flag_may_interfere
+        // Objects that may cache property additions, without a magical length
+        // (whose additions depend on the key).
+        let flags = layout.object_flag_may_interfere
             | layout.object_flag_requires_slow_add_own_property
             | layout.object_flag_has_magical_length;
         self.masm
             .load16(scratch, &Address::new(object, offsets.object_flags as i32));
-        self.masm.and32_imm(scratch, scratch, u32::from(flags));
-        self.masm.branch32_imm(
-            Condition::NotEqual,
-            scratch,
-            i32::from(layout.object_flag_is_extensible),
-            miss,
-        );
-        // NB: Only additions that make dictionary shapes need the dictionary
-        //     generations to match, but requiring it of all of them is safe.
-        if let Some(dictionary_generation) = fields.dictionary_generation {
-            let expected = Address::new(entry, dictionary_generation);
-            self.branch_unless_dictionary_generation_is(shape, expected, [shape, scratch], miss);
-        }
+        self.masm
+            .branch_test32(Condition::NonZero, scratch, u32::from(flags), miss);
         let valid_chain = self.masm.new_label();
         self.masm
             .load64(shape, &Address::new(entry, fields.prototype_chain_validity));
@@ -574,11 +756,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let check_capacity = self.masm.new_label();
         self.masm
             .load64(storage, &Address::new(object, offsets.object_named_properties as i32));
-        self.masm.load_effective_address(
+        // NB: Inline storage starts at one of two offsets, within the object. Heap storage is outside of it.
+        self.masm.sub64(scratch, storage, object);
+        self.masm.branch64_imm(
+            Condition::Above,
             scratch,
-            &Address::new(object, self.runtime.object_allocation.inline_storage_offset as i32),
+            i64::from(self.runtime.object_allocation.inline_storage_offset),
+            heap_storage,
         );
-        self.masm.branch64(Condition::NotEqual, storage, scratch, heap_storage);
         self.masm.load8(
             scratch,
             &Address::new(object, self.runtime.object_allocation.inline_capacity_offset as i32),
@@ -595,8 +780,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.branch32(Condition::Above, storage, scratch, grow);
 
         self.masm.bind(has_room);
-        self.masm
-            .store64(&Address::new(object, offsets.object_shape as i32), shape);
+        self.emit_store_compressed_cell(&Address::new(object, offsets.object_shape as i32), shape, shape);
         self.masm.load32(scratch, &Address::new(entry, fields.property_offset));
         self.masm
             .load64(storage, &Address::new(object, offsets.object_named_properties as i32));
@@ -610,17 +794,116 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let layout = self.runtime.layout;
         AdditionEntryFields {
             entry_type: layout.property_lookup_cache_entry_type as i32,
-            from_shape: Some(layout.property_lookup_cache_entry_from_shape as i32),
-            dictionary_generation: Some(layout.property_lookup_cache_entry_dictionary_generation as i32),
             prototype_chain_validity: layout.property_lookup_cache_entry_prototype_chain_validity as i32,
-            new_shape: layout.property_lookup_cache_entry_shape as i32,
+            new_shape: layout.property_lookup_cache_entry_new_shape as i32,
             property_offset: layout.property_lookup_cache_entry_property_offset as i32,
         }
     }
 
+    /// The probes of the VM's keyed caches of megamorphic named accesses, out
+    /// of line.
+    pub(in crate::codegen) fn emit_deferred_vm_cache_probes(&mut self) -> Result<(), CompileFailure> {
+        for deferred in self.deferred_vm_cache_probes.take() {
+            self.emitting = Some(deferred.node);
+            self.masm.bind(deferred.entry);
+            let registers = self.cache_registers(deferred.node);
+            match deferred.probe {
+                VmCacheProbe::Get {
+                    executable,
+                    cache,
+                    name,
+                    output,
+                    done,
+                    miss,
+                    fail,
+                } => {
+                    let lesson = (self.runtime.remember_vm_cache_get != 0).then(|| self.masm.new_label());
+                    self.emit_vm_named_cache_get(&registers, name, output, lesson.unwrap_or(done), miss, fail);
+                    if let Some(lesson) = lesson {
+                        self.masm.bind(lesson);
+                        self.emit_vm_cache_lesson(deferred.node, &registers, executable, cache, name, done)?;
+                    }
+                }
+                VmCacheProbe::Put {
+                    base,
+                    name,
+                    source,
+                    storage,
+                    miss,
+                    stored,
+                } => {
+                    let key = KeyName::Identity(name);
+                    self.emit_keyed_store_cache_put(deferred.node, base, key, source, registers, storage, miss, stored);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After a megamorphic named get found its property in the VM's keyed
+    /// property lookup cache, having missed the tables of its cache, which
+    /// is property lookup cache `cache_index` of `executable`: copies that
+    /// entry into the tables (see `remember_vm_cache_get()` of the runtime)
+    /// while they take such lessons, so that the get finds the property
+    /// inline the next time, and continues at `done` with the value of the
+    /// property still in the node's output register, which the call saves.
+    /// Clobbers the cache registers and the scratch register.
+    fn emit_vm_cache_lesson(
+        &mut self,
+        node: NodeId,
+        registers: &CacheRegisters,
+        executable: u32,
+        cache_index: u32,
+        name: u64,
+        done: Label,
+    ) -> Result<(), CompileFailure> {
+        let layout = self.runtime.layout;
+        let CacheRegisters { shape, entry, .. } = *registers;
+        // NB: The cache is megamorphic unless something cleared it since.
+        self.property_cache_address(entry, executable, cache_index)?;
+        self.masm.load64(entry, &Address::new(entry, 0));
+        self.masm.move64(shape, entry);
+        self.masm
+            .and64_imm(shape, shape, !layout.property_lookup_cache_data_pointer_mask);
+        self.masm.branch64_imm(
+            Condition::NotEqual,
+            shape,
+            layout.property_lookup_cache_megamorphic_tag as i64,
+            done,
+        );
+        self.masm
+            .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
+        self.masm.load32(
+            shape,
+            &Address::new(entry, layout.property_lookup_cache_megamorphic_vm_cache_lessons as i32),
+        );
+        self.masm.branch32_imm(
+            Condition::AboveOrEqual,
+            shape,
+            layout.property_lookup_cache_megamorphic_max_vm_cache_lessons as i32,
+            done,
+        );
+
+        let arguments = M::ARGUMENT_GPRS;
+        let saved = slow_path_saved_registers::<M>().iter().collect::<RegisterList<_>>();
+        self.emit_save_registers(&saved);
+        let base = self.input(node, 0);
+        if base != arguments[1] {
+            self.masm.move64(arguments[1], base);
+        }
+        self.property_cache_address(arguments[2], executable, cache_index)?;
+        self.masm.move_imm64(arguments[3], name);
+        self.masm.move64(arguments[0], self.pinned.vm);
+        self.masm.call_absolute(self.runtime.remember_vm_cache_get);
+        self.emit_restore_registers(&saved, None);
+        self.masm.jump(done);
+        Ok(())
+    }
+
     /// The runtime probes of the cache probe nodes, out of line.
     pub(in crate::codegen) fn emit_deferred_cache_probes(&mut self) -> Result<(), CompileFailure> {
-        for deferred in std::mem::take(&mut self.deferred_cache_probes) {
+        for deferred in self.deferred_cache_probes.take() {
+            self.emitting = Some(deferred.node);
             self.masm.bind(deferred.entry);
             let pc = self.graph.node(deferred.node).pc;
             self.emit_cache_probe(
@@ -657,7 +940,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         if let Some(output) = output {
             saved = saved.without(output);
         }
-        let saved = saved.iter().collect::<Vec<_>>();
+        let saved = saved.iter().collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
 
         let hit = self.masm.new_label();
@@ -683,7 +966,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.store64(&self.local_address(record + 8), source);
                 self.masm
                     .load_effective_address(arguments[3], &self.local_address(record));
-                let instruction = self.executables[executable as usize]
+                let instruction = self.snapshot.executables[executable as usize]
                     .bytecode_address
                     .checked_add(u64::from(pc))
                     .ok_or(CompileFailure::InvalidBytecode {

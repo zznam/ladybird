@@ -66,6 +66,10 @@ public:
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-textarea-element-2
+    // The textarea element is a devolvable widget [...]
+    virtual bool is_devolvable_widget() const override { return true; }
+
     virtual void reset_algorithm() override;
     virtual void clear_algorithm() override;
 
@@ -130,7 +134,8 @@ public:
 
     // ^FormAssociatedTextControlElement
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) override;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) override;
+    void record_user_edit(Utf16View previous_value);
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return this; }
 
@@ -155,6 +160,7 @@ private:
     virtual CSS::ElementBoxKind box_kind() const override;
 
     void set_raw_value(Utf16String);
+    bool replace_value(Utf16View);
 
     // ^DOM::Element
     virtual i32 default_tab_index_value() const override;
@@ -182,6 +188,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-api-value
     mutable Optional<Utf16String> m_api_value;
+
+    // NB: A missing value means that no uncommitted user edit remains.
+    Optional<Utf16String> m_value_before_first_user_edit;
 };
 
 }

@@ -11,6 +11,7 @@ use core::ptr::NonNull;
 
 use libjs_abi::register;
 use libjs_jit::code::SiteKind;
+use libjs_runtime_macros::jit_abi;
 
 use super::code::{
     CompileState, EXIT_COUNT_BEFORE_DISCARD, EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP, EntryStatus, JitEntry, JitResult,
@@ -39,10 +40,11 @@ pub fn can_enter_jit_code(vm: &Vm, executable: &Executable) -> bool {
 /// # Safety
 ///
 /// JIT code calls this with its VM and the frame it built for the callee.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_not_compiled_call_entry(vm: *const Vm, frame: *mut ExecutionContext) -> JitResult {
     // SAFETY: JIT code passes its live VM.
     let vm = unsafe { &*vm };
-    vm.head.running_execution_context.set(frame);
+    vm.set_running_frame_in_current_realm(frame);
     JitResult {
         value: 0,
         status: EntryStatus::Resume,
@@ -94,8 +96,10 @@ pub fn enter_jit_code_at_loop(vm: &Vm, frame: NonNull<ExecutionContext>, pc: u32
         let runs_once = frame_ref.function.get().is_none();
         if code.reaches_osr_entry_from(pc) {
             executable.head.tier_up_budget.set(tier_up_costs::LOOP_ITERATION);
-        } else if (runs_once || code.exit_count() >= EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP)
-            && !code.may_reach_osr_entry_from(pc)
+        } else if !code.may_reach_osr_entry_from(pc)
+            && (runs_once
+                || code.exit_count() >= EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP
+                || code.count_fruitless_loop_check(frame_ref))
         {
             // NB: The frame may have exited into this loop, and no later iteration of a loop it is in reaches an entry.
             //     Once the code is detached, a later check here compiles the executable again, with what the exits
@@ -103,6 +107,8 @@ pub fn enter_jit_code_at_loop(vm: &Vm, frame: NonNull<ExecutionContext>, pc: u32
             vm.jit.count_coverage("discard-from-loop");
             // NB: Top-level code that moved on to a later loop recompiles with an entry there, which is progress, so
             //     scripts with many long loops are not refused after MAX_FRUITLESS_DISCARD_COUNT of them.
+            //     A function's frame that ran out of fruitless loop checks does not count as progress: every call may
+            //     exit into the same loop again.
             if runs_once {
                 executable.note_learned_jit_exit_site();
             }
@@ -178,7 +184,7 @@ pub fn control_after_entry(vm: &Vm, result: JitResult) -> i64 {
             //     returns from the interpreter.
             let frame = vm.running_execution_context_ref();
             let exits_interpreter = frame.caller_frame.get().is_null() || frame.returns_to_native_caller.get();
-            vm.return_from_running_frame(Value(result.value));
+            vm.return_from_running_frame(Value::from_bits(result.value));
             if exits_interpreter { -1 } else { 1 }
         }
         EntryStatus::Resume => 1,
@@ -196,12 +202,14 @@ pub fn helper_enter_jit_code(vm: &Vm) -> i64 {
         return 0;
     }
     let frame = vm.running_execution_context().expect("a frame is running");
+    // NB: The interpreter's Call enters the code before the callee's Enter could bind its this value.
+    crate::interpreter::execution_context::coerce_this(vm, frame_of(frame));
     let result = enter_jit_code(vm, frame);
     match result.status {
         EntryStatus::Returned => {
             frame_of(frame)
                 .register(register::RETURN_VALUE)
-                .set(Value(result.value));
+                .set(Value::from_bits(result.value));
             1
         }
         EntryStatus::Resume => 0,
@@ -217,6 +225,7 @@ pub fn helper_enter_jit_code(vm: &Vm) -> i64 {
 /// # Safety
 ///
 /// JIT code calls this with its VM, its frame, one of its code's exit or leave sites and the registers it saved.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_exit(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -229,7 +238,7 @@ pub unsafe extern "C" fn libjs_jit_exit(
     // NB: The frame's executable keeps the code attached while JIT code runs the frame, also after it was discarded.
     let executable = executable_of(frame_of(root));
     let code = executable.jit_code(vm).expect("the code is attached");
-    match code.site(site).kind {
+    match code.site(site).kind() {
         SiteKind::Exit(_) => translate::exit(vm, root, code, site, dump),
         SiteKind::Leave => translate::leave(vm, root, code, site, dump),
         SiteKind::Publish => translate::publish(vm, root, code, site, dump),
@@ -252,6 +261,7 @@ fn call_site_callee_frame(vm: &Vm, root: NonNull<ExecutionContext>) -> NonNull<E
 /// # Safety
 ///
 /// Compiled code calls this with its VM, its frame, one of its code's inlined call sites and its frame pointer.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_push_inlined_call_frames(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -272,6 +282,7 @@ pub unsafe extern "C" fn libjs_jit_push_inlined_call_frames(
 ///
 /// Compiled code calls this with its VM, its frame, one of its code's inlined call sites, its frame pointer and the
 /// callee's status.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_finish_inlined_direct_call(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -288,8 +299,8 @@ pub unsafe extern "C" fn libjs_jit_finish_inlined_direct_call(
         .jit_code(vm_ref)
         .expect("the code is attached")
         .site(site)
-        .frames[0]
-        .pc;
+        .frame(0)
+        .pc();
     // SAFETY: The innermost frame of the inlined calls is the call's frame now.
     unsafe { super::calls::libjs_jit_finish_direct_call(vm, innermost.as_ptr(), pc, status) }
 }
@@ -302,6 +313,7 @@ pub unsafe extern "C" fn libjs_jit_finish_inlined_direct_call(
 ///
 /// Compiled code calls this with its VM, its frame, one of its code's inlined call sites, its frame pointer and the
 /// exception.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_inlined_raw_native_exception(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -316,8 +328,11 @@ pub unsafe extern "C" fn libjs_jit_inlined_raw_native_exception(
         .running_execution_context()
         .expect("the native function's frame runs");
     assert_eq!(frame_of(native_frame).caller_frame.get(), root.as_ptr());
+    // NB: The native function ran in its own realm, which may be another one than that of the frames of the call
+    //     site, whose realm the runtime unwinds to.
+    vm.head.current_realm.set(frame_of(root).realm());
     translate::materialize_call_site_frames(vm, root, site, frame_pointer, Some(native_frame));
-    crate::interpreter::slow_paths::calls::handle_raw_native_exception(vm, Value(exception)).0
+    crate::interpreter::slow_paths::calls::handle_raw_native_exception(vm, Value::from_bits(exception)).0
 }
 
 /// Called by JIT code that never created the arguments object of the frame (whose arguments are unchanged) when it
@@ -326,6 +341,7 @@ pub unsafe extern "C" fn libjs_jit_inlined_raw_native_exception(
 /// # Safety
 ///
 /// JIT code calls this with its VM and its frame.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_create_arguments(vm: *const Vm, frame: *mut ExecutionContext, mapped: u32) -> u64 {
     // SAFETY: JIT code passes live pointers.
     let (vm, frame) = unsafe { (&*vm, &*frame) };

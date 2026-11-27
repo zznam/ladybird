@@ -33,10 +33,10 @@ public:
     URL::BlobURLEntry::Token add_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry, BlobURLEntryOwner added_by, AddedByLocalFileContent = AddedByLocalFileContent::No);
     void remove_entries(Vector<Utf16String> const& urls, URL::Origin const& environment_origin, BlobURLEntryOwner const& removed_by);
     void remove_entries_added_by(BlobURLEntryOwner const&);
+    void remove_entries_added_by(Vector<Utf16String> const& urls, BlobURLEntryOwner const&);
 
     Optional<Web::FileAPI::SerializedBlobURLEntry> resolve(Utf16String const& url, Optional<URL::BlobURLEntry::Token>) const;
 
-    // Whether url names an entry that local file content added, for documents of the entry's origin.
     bool is_entry_of_local_file_content(Utf16String const& url, URL::Origin const&) const;
 
     // A revoked entry outlives its revocation for as long as handles are held on its token, and is dropped with the

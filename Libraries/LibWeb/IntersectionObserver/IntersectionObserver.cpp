@@ -34,7 +34,7 @@ GC_DEFINE_ALLOCATOR(IntersectionObserver);
 GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DOM::Document& document)
 {
     auto& realm = document.relevant_settings_object().realm();
-    auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, [&document](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+    auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, GC::create_function(GC::Heap::the(), GC::captures(document), [](DOM::Document& document, JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
         auto& entries = as<JS::Array>(vm.argument(0).as_object());
         auto entries_length = MUST(MUST(entries.get(vm.names.length)).to_length(vm));
 
@@ -49,7 +49,7 @@ GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DO
 
         document.process_lazy_load_intersection_observer_entries(intersection_observer_entries);
         return JS::js_undefined();
-    });
+    }));
 
     return GC::Heap::the().allocate<WebIDL::CallbackType>(callback, realm);
 }
@@ -176,8 +176,13 @@ void IntersectionObserver::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_root);
     visitor.visit(m_callback);
     visitor.visit(m_queued_entries);
-    for (auto& observed_target : m_observation_targets)
-        visitor.visit(observed_target.target);
+}
+
+void IntersectionObserver::remove_dead_observation_targets()
+{
+    m_observation_targets.remove_all_matching([](auto const& observed_target) {
+        return !observed_target.target;
+    });
 }
 
 // https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-observe
@@ -187,7 +192,7 @@ void IntersectionObserver::observe(DOM::Element& target)
     // https://www.w3.org/TR/intersection-observer/#observe-a-target-element
     // 1. If target is in observer’s internal [[ObservationTargets]] slot, return.
     auto observed_target = m_observation_targets.find_if([&target](auto const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
     if (!observed_target.is_end())
         return;
@@ -228,7 +233,7 @@ void IntersectionObserver::unobserve(DOM::Element& target)
 
     // 2. Remove target from this’s internal [[ObservationTargets]] slot, if present
     m_observation_targets.remove_first_matching([&target](ObservationTarget const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
 }
 
@@ -240,7 +245,8 @@ void IntersectionObserver::disconnect()
     //    [[RegisteredIntersectionObservers]] slot.
     // 2. Remove target from this’s internal [[ObservationTargets]] slot.
     for (auto& observed_target : m_observation_targets) {
-        observed_target.target->unregister_intersection_observer({}, *this);
+        if (auto target = observed_target.target.ptr())
+            target->unregister_intersection_observer({}, *this);
     }
     m_observation_targets.clear();
 }
@@ -340,7 +346,7 @@ GC::Ref<DOM::Node> IntersectionObserver::intersection_root_node() const
 }
 
 // https://www.w3.org/TR/intersection-observer/#intersectionobserver-root-intersection-rectangle
-CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const* visual_context_tree) const
+CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead const& read, Optional<MonotonicTime> visual_animation_sample_time) const
 {
     // If the IntersectionObserver is an implicit root observer,
     //    it’s treated as if the root were the top-level browsing context’s document, according to the following rule for document.
@@ -381,8 +387,8 @@ CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead
 
         // Otherwise,
         //    it’s the result of getting the bounding box for the intersection root.
-        rect = visual_context_tree
-            ? element->bounding_client_rect_assuming_layout_clean(read, *visual_context_tree)
+        rect = visual_animation_sample_time.has_value()
+            ? element->bounding_client_rect_assuming_layout_clean(read, *visual_animation_sample_time)
             : element->bounding_client_rect_assuming_layout_clean();
         if (auto const* layout_node = element->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
             intersection_root_is_scrollable = layout_node->is_scroll_container();
@@ -448,8 +454,8 @@ Optional<Vector<CSS::LengthPercentage>> IntersectionObserver::parse_a_margin(Str
     auto source = Utf16String::from_utf8(margin_string);
     auto source_view = source.utf16_view();
     CSS::Parser::ValueParserFFI::FfiUtf16View ffi_source {
-        .ascii = source_view.has_ascii_storage() ? reinterpret_cast<u8 const*>(source_view.ascii_span().data()) : nullptr,
-        .utf16 = source_view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(source_view.utf16_span().data()),
+        .latin1 = source_view.has_latin1_storage() ? source_view.latin1_span().data() : nullptr,
+        .utf16 = source_view.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(source_view.utf16_span().data()),
         .length = source_view.length_in_code_units(),
     };
     auto visit = [](void* context, u8 type, double value, u16 const* unit, size_t unit_length) {

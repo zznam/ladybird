@@ -5,6 +5,7 @@
  */
 
 use crate::css::css_pixels::CssPixels;
+use crate::css::style::index::StyleAtomID;
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{
@@ -16,12 +17,14 @@ use crate::painting::fragment_ownership;
 use crate::painting::host::FfiSelectionStyleFacts;
 use crate::painting::paint_read::GeometryRead;
 use crate::painting::paintable_data::{
-    FfiSearchTextRange, FfiSelectionEntry, FfiSpellingError, SELECTION_STATE_END, SELECTION_STATE_NONE,
-    SELECTION_STATE_START, SELECTION_STATE_START_AND_END,
+    FfiCustomHighlightReplacedEntry, FfiCustomHighlightTextEntry, FfiSearchTextRange, FfiSelectionEntry,
+    FfiSpellingError, SELECTION_STATE_END, SELECTION_STATE_NONE, SELECTION_STATE_START, SELECTION_STATE_START_AND_END,
 };
 use crate::painting::paintable_rows::PaintableRowsMut;
-use crate::painting::record::damage::PaintDamage;
-use crate::painting::record::paint::text::{HighlightShadowLayer, SelectionStyleAnswer, ShadowLayer};
+use crate::painting::record::change_ticks::RowPaintChange;
+use crate::painting::record::paint::text::{
+    HighlightDecorationMetrics, HighlightShadowLayer, SelectionStyleAnswer, ShadowLayer,
+};
 use crate::painting::text_fragment;
 use libgfx_rust::Color;
 use std::sync::Arc;
@@ -68,17 +71,17 @@ pub(crate) struct SelectionRange {
     pub boxes_with_selection_state: Vec<NodeSlotId>,
 }
 
-fn invalidate_text_node(layout_arena: &PaintableRowsMut<'_>, node: NodeSlotId) {
+fn invalidate_text_node(layout_arena: &mut PaintableRowsMut<'_>, node: NodeSlotId) {
     if let Some(containing_block) = text_fragment::containing_block_paintable_of_node(layout_arena, node) {
-        layout_arena.push_paint_damage(containing_block, PaintDamage::ALL_DRAW);
+        layout_arena.note_paint_change(containing_block, RowPaintChange::DRAWING);
     }
     if let Some(inline_box) = fragment_ownership::nearest_self_painting_inline_box(layout_arena, node) {
-        layout_arena.push_paint_damage(inline_box, PaintDamage::ALL_DRAW);
+        layout_arena.note_paint_change(inline_box, RowPaintChange::DRAWING);
     }
 }
 
 pub(crate) fn clear(layout_arena: &mut PaintableRowsMut<'_>) {
-    let Some(previous) = layout_arena.paint_state().borrow_mut().selection.take() else {
+    let Some(previous) = layout_arena.paint_state_mut().selection.take() else {
         return;
     };
     for node in previous.text_states.keys() {
@@ -89,7 +92,7 @@ pub(crate) fn clear(layout_arena: &mut PaintableRowsMut<'_>) {
             && layout_arena.paintable_data(row).selection_state != SELECTION_STATE_NONE
         {
             layout_arena.paintable_data_mut(row).selection_state = SELECTION_STATE_NONE;
-            layout_arena.push_paint_damage(row, PaintDamage::ALL_DRAW);
+            layout_arena.note_paint_change(row, RowPaintChange::DRAWING);
         }
     }
 }
@@ -115,7 +118,7 @@ pub(crate) fn apply(
             }
             if layout_arena.paintable_data(entry.layout_node).selection_state != entry.state {
                 layout_arena.paintable_data_mut(entry.layout_node).selection_state = entry.state;
-                layout_arena.push_paint_damage(entry.layout_node, PaintDamage::ALL_DRAW);
+                layout_arena.note_paint_change(entry.layout_node, RowPaintChange::DRAWING);
                 boxes_with_selection_state.push(entry.layout_node);
             }
         }
@@ -176,7 +179,7 @@ impl SearchTextHighlights {
 }
 
 pub(crate) fn clear_search_text(layout_arena: &mut PaintableRowsMut<'_>) {
-    let previous = std::mem::take(&mut layout_arena.paint_state().borrow_mut().search_text);
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().search_text);
     for node in previous.by_node.keys() {
         invalidate_text_node(layout_arena, *node);
     }
@@ -212,13 +215,13 @@ pub(crate) fn apply_search_text(
     for touching in highlights.by_node.values_mut() {
         touching.sort_by_key(|&(match_index, state)| matches[match_index as usize].offsets_in_node(state));
     }
-    let previous = std::mem::take(&mut layout_arena.paint_state().borrow_mut().search_text);
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().search_text);
     for node in previous.by_node.keys().chain(highlights.by_node.keys()) {
         if previous.node_signature(*node) != highlights.node_signature(*node) {
             invalidate_text_node(layout_arena, *node);
         }
     }
-    layout_arena.paint_state().borrow_mut().search_text = Arc::new(highlights);
+    layout_arena.paint_state_mut().search_text = Arc::new(highlights);
 }
 
 #[derive(Debug, Default)]
@@ -228,7 +231,7 @@ pub(crate) struct SpellingErrorHighlights {
 }
 
 pub(crate) fn clear_spelling_errors(layout_arena: &mut PaintableRowsMut<'_>) {
-    let previous = std::mem::take(&mut layout_arena.paint_state().borrow_mut().spelling_errors);
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().spelling_errors);
     for node in previous.by_node.keys() {
         invalidate_text_node(layout_arena, *node);
     }
@@ -248,13 +251,133 @@ pub(crate) fn apply_spelling_errors(layout_arena: &mut PaintableRowsMut<'_>, err
     for runs in highlights.by_node.values_mut() {
         runs.sort_unstable();
     }
-    let previous = std::mem::take(&mut layout_arena.paint_state().borrow_mut().spelling_errors);
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().spelling_errors);
     for node in previous.by_node.keys().chain(highlights.by_node.keys()) {
         if previous.by_node.get(node) != highlights.by_node.get(node) {
             invalidate_text_node(layout_arena, *node);
         }
     }
-    layout_arena.paint_state().borrow_mut().spelling_errors = Arc::new(highlights);
+    layout_arena.paint_state_mut().spelling_errors = Arc::new(highlights);
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CustomHighlights {
+    /// The custom highlight name of each layer, from bottom to top.
+    pub layers: Vec<StyleAtomID>,
+    /// For each text fragment row, the runs of its DOM text each layer covers, as layer and start and end offsets.
+    pub text_runs: std::collections::HashMap<NodeSlotId, Vec<(u32, usize, usize)>>,
+    /// For each replaced row, the layers whose ranges contain its element, from bottom to top.
+    pub replaced: std::collections::HashMap<NodeSlotId, Vec<u32>>,
+}
+
+impl CustomHighlights {
+    fn text_signature(&self, node: NodeSlotId) -> Vec<(StyleAtomID, usize, usize)> {
+        self.text_runs
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .map(|&(layer, start, end)| (self.layers[layer as usize], start, end))
+            .collect()
+    }
+
+    fn replaced_signature(&self, node: NodeSlotId) -> Vec<StyleAtomID> {
+        self.replaced
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .map(|&layer| self.layers[layer as usize])
+            .collect()
+    }
+
+    pub(crate) fn forget_row(&mut self, node: NodeSlotId) {
+        self.text_runs.remove(&node);
+        self.replaced.remove(&node);
+    }
+
+    pub(crate) fn covers_row(&self, node: NodeSlotId) -> bool {
+        self.text_runs.contains_key(&node) || self.replaced.contains_key(&node)
+    }
+}
+
+fn damage_custom_highlight_changes(
+    layout_arena: &mut PaintableRowsMut<'_>,
+    previous: &CustomHighlights,
+    highlights: &CustomHighlights,
+) {
+    for node in previous.text_runs.keys().chain(highlights.text_runs.keys()) {
+        if previous.text_signature(*node) != highlights.text_signature(*node) {
+            invalidate_text_node(layout_arena, *node);
+        }
+    }
+    for &node in previous.replaced.keys().chain(highlights.replaced.keys()) {
+        if previous.replaced_signature(node) != highlights.replaced_signature(node)
+            && layout_arena.paintable_row_is_populated(node)
+        {
+            layout_arena.note_paint_change(node, RowPaintChange::DRAWING);
+        }
+    }
+}
+
+pub(crate) fn clear_custom_highlights(layout_arena: &mut PaintableRowsMut<'_>) {
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().custom_highlights);
+    damage_custom_highlight_changes(layout_arena, &previous, &CustomHighlights::default());
+}
+
+pub(crate) fn apply_custom_highlights(
+    layout_arena: &mut PaintableRowsMut<'_>,
+    layers: &[StyleAtomID],
+    text_entries: &[FfiCustomHighlightTextEntry],
+    replaced_entries: &[FfiCustomHighlightReplacedEntry],
+) {
+    let mut highlights = CustomHighlights {
+        layers: layers.to_vec(),
+        ..CustomHighlights::default()
+    };
+    for entry in text_entries
+        .iter()
+        .filter(|entry| (entry.layer as usize) < layers.len())
+    {
+        for &node in layout_arena.text_fragments(entry.layout_node).as_slice() {
+            highlights
+                .text_runs
+                .entry(node)
+                .or_default()
+                .push((entry.layer, entry.start_offset, entry.end_offset));
+        }
+    }
+    // https://drafts.csswg.org/css-highlight-api-1/#painting
+    // Overlapping ranges within a single custom highlight are rendered as if a single range representing the union
+    // of the overlapping ones had been specified.
+    for runs in highlights.text_runs.values_mut() {
+        runs.sort_unstable();
+        let mut merged: Vec<(u32, usize, usize)> = Vec::with_capacity(runs.len());
+        for &(layer, start, end) in runs.iter() {
+            match merged.last_mut() {
+                Some(last) if last.0 == layer && start <= last.2 => last.2 = last.2.max(end),
+                _ => merged.push((layer, start, end)),
+            }
+        }
+        *runs = merged;
+    }
+    for entry in replaced_entries
+        .iter()
+        .filter(|entry| (entry.layer as usize) < layers.len())
+    {
+        if layout_arena.paintable_row_is_populated(entry.layout_node) {
+            highlights
+                .replaced
+                .entry(entry.layout_node)
+                .or_default()
+                .push(entry.layer);
+        }
+    }
+    for layers in highlights.replaced.values_mut() {
+        layers.sort_unstable();
+        layers.dedup();
+    }
+    let previous = std::mem::take(&mut layout_arena.paint_state_mut().custom_highlights);
+    damage_custom_highlight_changes(layout_arena, &previous, &highlights);
+    layout_arena.paint_state_mut().custom_highlights = Arc::new(highlights);
 }
 
 /// https://drafts.csswg.org/css-pseudo-4/#highlight-styling
@@ -262,17 +385,18 @@ pub(crate) fn apply_spelling_errors(layout_arena: &mut PaintableRowsMut<'_>, err
 /// `style_record`, the element's record for that pseudo-element (zero for none), or `None` when
 /// that record styles nothing a highlight paints.
 fn highlight_pseudo_style_of_record(
-    engine: &crate::css::style::StyleEngine,
+    engine: &crate::css::style::RetainedState,
     element: StyleNodeID,
     style_record: u64,
+    takes_own_decoration_metrics: bool,
 ) -> Option<SelectionStyleAnswer> {
     use crate::css::computed_longhand_table::{HIGHLIGHT_COLOR_IS_CURRENT_COLOR, HIGHLIGHT_COLORS_AUTHORED};
     use crate::css::property_metadata::property_id;
     let style = engine.published_record_view(style_record)?;
     let dependency_flags = engine.published_record_dependency_flags(style_record).unwrap_or(0);
-    let longhand_table = engine.published_record_longhand_table(style_record);
+    let longhands = engine.published_record_longhands(style_record);
     let specified_as_current_color =
-        |property_id: u16| longhand_table.is_some_and(|table| table.specified_value_is_current_color(property_id));
+        |property_id: u16| longhands.is_some_and(|longhands| longhands.specified_value_is_current_color(property_id));
     // https://drafts.csswg.org/css-pseudo-4/#paired-defaults
     // Paired default highlight colors must only be used when neither 'color' nor 'background-color' yield a
     // cascaded value from the author origin (or inherit their value from the author origin).
@@ -281,7 +405,7 @@ fn highlight_pseudo_style_of_record(
         ..Default::default()
     };
     if facts.colors_authored {
-        facts.background_color = Color(style.background().background_color);
+        facts.background_color = Color(style.background_color());
         facts.background_color_is_current_color = specified_as_current_color(property_id::BACKGROUND_COLOR);
         // https://drafts.csswg.org/css-pseudo-4/#highlight-text
         // currentColor on a highlight pseudo-element's 'color' property represents the color of the next active
@@ -307,8 +431,8 @@ fn highlight_pseudo_style_of_record(
         facts.wash_color = transform_selection_background_color(wash_color);
     }
 
-    let shadow_colors_are_current_color = longhand_table
-        .map(|table| table.text_shadow_layer_colors_are_current_color())
+    let shadow_colors_are_current_color = longhands
+        .map(|longhands| longhands.text_shadow_layer_colors_are_current_color())
         .unwrap_or_default();
     let shadows: Vec<HighlightShadowLayer> = style
         .inherited_text()
@@ -318,7 +442,7 @@ fn highlight_pseudo_style_of_record(
         .enumerate()
         .map(|(index, shadow)| HighlightShadowLayer {
             layer: ShadowLayer {
-                color: shadow.color,
+                color: shadow.color.resolve(style.current_color()),
                 offset_x: CssPixels::from_raw(shadow.offset_x),
                 offset_y: CssPixels::from_raw(shadow.offset_y),
                 blur_radius: CssPixels::from_raw(shadow.blur_radius),
@@ -330,18 +454,41 @@ fn highlight_pseudo_style_of_record(
 
     let text_reset = style.text_reset();
     let lines = text_reset.text_decoration_lines.as_slice();
+    let mut decoration_metrics = None;
+    if !lines.is_empty() && takes_own_decoration_metrics {
+        let inherited_text = style.inherited_text();
+        let element_font_size = engine
+            .published_style_view(element, None)
+            .map_or(CssPixels::from_raw(0), |element_style| element_style.font_size());
+        decoration_metrics = Some(HighlightDecorationMetrics {
+            thickness: (text_reset.text_decoration_thickness_kind == 2).then(|| {
+                text_reset
+                    .text_decoration_thickness
+                    .length_percentage()
+                    .map_or(CssPixels::from_integer(1), |value| value.to_px(element_font_size))
+                    .max(CssPixels::from_integer(1))
+            }),
+            underline_offset: inherited_text.text_underline_offset.used_value,
+            underline_position_horizontal: inherited_text.text_underline_position.horizontal,
+            underline_position_vertical: inherited_text.text_underline_position.vertical,
+            skip_ink: inherited_text.text_decoration_skip_ink,
+        });
+    }
     if !lines.is_empty() {
         facts.has_text_decoration = true;
         let count = lines.len().min(facts.text_decoration_lines.len());
         facts.text_decoration_lines[..count].copy_from_slice(&lines[..count]);
         facts.text_decoration_line_count = count as u32;
         facts.text_decoration_style = text_reset.text_decoration_style;
-        facts.text_decoration_color = Color(text_reset.text_decoration_color);
+        facts.text_decoration_color = Color(style.text_decoration_color());
         facts.text_decoration_color_is_current_color = specified_as_current_color(property_id::TEXT_DECORATION_COLOR);
     }
 
-    (facts.colors_authored || facts.has_text_shadow || facts.has_text_decoration)
-        .then_some(SelectionStyleAnswer { facts, shadows })
+    (facts.colors_authored || facts.has_text_shadow || facts.has_text_decoration).then_some(SelectionStyleAnswer {
+        facts,
+        shadows,
+        decoration_metrics,
+    })
 }
 
 /// The UA's adjustment of a selection wash's alpha channel: an opaque color becomes the most
@@ -383,7 +530,8 @@ fn highlight_pseudo_styles_of_records(
     style_records: HighlightStyleRecords,
 ) -> HighlightStyleAnswers {
     arena.with_style_store(|engine| {
-        style_records.map(|style_record| highlight_pseudo_style_of_record(engine, element, style_record).map(Arc::new))
+        style_records
+            .map(|style_record| highlight_pseudo_style_of_record(engine, element, style_record, false).map(Arc::new))
     })
 }
 
@@ -392,7 +540,7 @@ fn highlight_pseudo_styles_of_records(
 /// own rows, or, while it has no box, the rows of its text children, which then have no element
 /// row above them to find it on.
 pub(crate) fn sync_highlight_pseudo_styles(
-    arena: &LayoutNodeArena,
+    arena: &mut LayoutNodeArena,
     element: StyleNodeID,
     style_records: HighlightStyleRecords,
 ) {
@@ -403,57 +551,183 @@ pub(crate) fn sync_highlight_pseudo_styles(
     } else {
         HighlightStyleAnswers::default()
     };
+    for row in text_child_rows(arena, element) {
+        let rows: Vec<NodeSlotId> = arena.rows_sharing_dom_node_with(row).collect();
+        set_highlight_pseudo_styles_of_rows(arena, &rows, &text_rows_answers);
+    }
+    if !element_row.is_invalid() {
+        let rows: Vec<NodeSlotId> = arena.rows_sharing_dom_node_with(element_row).collect();
+        set_highlight_pseudo_styles_of_rows(arena, &rows, &answers);
+    }
+}
+
+/// Gives the rows that paint text under `element` `selection_record`, the record of its `::selection` a clock lane
+/// styled, zero for none. The other highlight pseudo-elements stay as the host published them.
+pub(crate) fn sync_selection_style(arena: &mut LayoutNodeArena, element: StyleNodeID, selection_record: u64) {
+    let style_records = arena.with_style_store(|engine| {
+        HighlightPseudoElement::ALL.map(|highlight| match highlight {
+            HighlightPseudoElement::Selection => selection_record,
+            _ => engine
+                .pseudo_published_style_record(element, highlight.pseudo_kind())
+                .unwrap_or(0),
+        })
+    });
+    sync_highlight_pseudo_styles(arena, element, style_records);
+}
+
+fn text_child_rows(arena: &LayoutNodeArena, element: StyleNodeID) -> Vec<NodeSlotId> {
     arena.with_style_store(|engine| {
-        for text in engine
-            .tree()
+        engine
             .dom_children(element)
             .filter(|child| child.text_index().is_some())
-        {
-            let row = arena.bound_row(text);
-            if !row.is_invalid() {
-                set_highlight_pseudo_styles_of_rows(arena, arena.rows_sharing_dom_node_with(row), &text_rows_answers);
+            .map(|text| arena.bound_row(text))
+            .filter(|row| !row.is_invalid())
+            .collect()
+    })
+}
+
+type CustomHighlightStyleAnswers = Vec<(StyleAtomID, Arc<SelectionStyleAnswer>)>;
+
+fn custom_highlight_pseudo_styles_of_records(
+    arena: &LayoutNodeArena,
+    element: StyleNodeID,
+    style_records: &[(StyleAtomID, u64)],
+) -> CustomHighlightStyleAnswers {
+    arena.with_style_store(|engine| {
+        style_records
+            .iter()
+            .filter_map(|&(name, style_record)| {
+                // Custom highlights take their decoration metrics from their own style, matching other engines.
+                Some((
+                    name,
+                    Arc::new(highlight_pseudo_style_of_record(engine, element, style_record, true)?),
+                ))
+            })
+            .collect()
+    })
+}
+
+pub(crate) fn sync_custom_highlight_pseudo_styles(
+    arena: &mut LayoutNodeArena,
+    element: StyleNodeID,
+    style_records: &[(StyleAtomID, u64)],
+) {
+    let answers = custom_highlight_pseudo_styles_of_records(arena, element, style_records);
+    let element_row = arena.bound_row(element);
+    for row in text_child_rows(arena, element) {
+        let rows: Vec<NodeSlotId> = arena.rows_sharing_dom_node_with(row).collect();
+        let text_rows_answers = if element_row.is_invalid() { &answers[..] } else { &[] };
+        set_custom_highlight_pseudo_styles_of_rows(arena, &rows, text_rows_answers);
+    }
+    if !element_row.is_invalid() {
+        let rows: Vec<NodeSlotId> = arena.rows_sharing_dom_node_with(element_row).collect();
+        set_custom_highlight_pseudo_styles_of_rows(arena, &rows, &answers);
+    }
+}
+
+fn set_custom_highlight_pseudo_styles_of_rows(
+    arena: &mut LayoutNodeArena,
+    rows: &[NodeSlotId],
+    answers: &[(StyleAtomID, Arc<SelectionStyleAnswer>)],
+) {
+    let paint_state = arena.paint_state_mut();
+    let unstyled: Vec<StyleAtomID> = paint_state
+        .custom_highlight_pseudo_styles
+        .iter()
+        .filter(|(name, styles)| {
+            !answers.iter().any(|(answered, _)| answered == *name) && rows.iter().any(|row| styles.contains_key(row))
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    if unstyled.is_empty() && answers.is_empty() {
+        return;
+    }
+    let table = Arc::make_mut(&mut paint_state.custom_highlight_pseudo_styles);
+    for name in unstyled {
+        if let Some(styles) = table.get_mut(&name) {
+            let styles = Arc::make_mut(styles);
+            for row in rows {
+                styles.remove(row);
+            }
+            if styles.is_empty() {
+                table.remove(&name);
             }
         }
-    });
-    if !element_row.is_invalid() {
-        set_highlight_pseudo_styles_of_rows(arena, arena.rows_sharing_dom_node_with(element_row), &answers);
     }
+    for (name, answer) in answers {
+        let styles = Arc::make_mut(table.entry(*name).or_default());
+        for &row in rows {
+            styles.insert(row, answer.clone());
+        }
+    }
+    request_ink_for_highlight_style_rows(arena, rows);
 }
 
 /// Gives a row the tree build made what the published highlight pseudo-element records of
 /// `element` say highlighted text paints with: `element`'s own row, or a text row whose parent
 /// element has no box.
-pub(crate) fn note_built_row_highlight_pseudo_styles(arena: &LayoutNodeArena, row: NodeSlotId, element: StyleNodeID) {
-    let style_records = arena.with_style_store(|engine| {
-        HighlightPseudoElement::ALL.map(|highlight| {
-            engine
-                .pseudo_published_style_record(element, highlight.pseudo_kind())
-                .unwrap_or(0)
-        })
+pub(crate) fn note_built_row_highlight_pseudo_styles(
+    arena: &mut LayoutNodeArena,
+    row: NodeSlotId,
+    element: StyleNodeID,
+) {
+    let (style_records, custom_style_records) = arena.with_style_store(|engine| {
+        (
+            HighlightPseudoElement::ALL.map(|highlight| {
+                engine
+                    .pseudo_published_style_record(element, highlight.pseudo_kind())
+                    .unwrap_or(0)
+            }),
+            engine.pseudo_published_custom_highlight_records(element),
+        )
     });
     let answers = highlight_pseudo_styles_of_records(arena, element, style_records);
-    set_highlight_pseudo_styles_of_rows(arena, arena.rows_sharing_dom_node_with(row), &answers);
+    let custom_answers = custom_highlight_pseudo_styles_of_records(arena, element, &custom_style_records);
+    let rows: Vec<NodeSlotId> = arena.rows_sharing_dom_node_with(row).collect();
+    set_highlight_pseudo_styles_of_rows(arena, &rows, &answers);
+    set_custom_highlight_pseudo_styles_of_rows(arena, &rows, &custom_answers);
 }
 
 fn set_highlight_pseudo_styles_of_rows(
-    arena: &LayoutNodeArena,
-    rows: impl Iterator<Item = NodeSlotId>,
+    arena: &mut LayoutNodeArena,
+    rows: &[NodeSlotId],
     answers: &HighlightStyleAnswers,
 ) {
-    let rows: Vec<NodeSlotId> = rows.collect();
-    let mut paint_state = arena.paint_state().borrow_mut();
+    let mut changed = false;
+    let paint_state = arena.paint_state_mut();
     for (highlight, answer) in HighlightPseudoElement::ALL.into_iter().zip(answers) {
         let styles = paint_state.highlight_pseudo_styles_mut(highlight);
-        for &row in &rows {
+        for &row in rows {
             match answer {
                 Some(answer) => {
+                    changed = true;
                     Arc::make_mut(styles).insert(row, answer.clone());
                 }
                 None if styles.contains_key(&row) => {
+                    changed = true;
                     Arc::make_mut(styles).remove(&row);
                 }
                 None => {}
             }
+        }
+    }
+    if changed {
+        request_ink_for_highlight_style_rows(arena, rows);
+    }
+}
+
+fn request_ink_for_highlight_style_rows(arena: &mut LayoutNodeArena, rows: &[NodeSlotId]) {
+    for &row in rows {
+        arena.request_ink_overflow_recalculation(row);
+        arena.request_inline_ink_overflow_recalculation(row);
+        let source = arena.paintable_rows();
+        let line_root = text_fragment::containing_block_paintable_of_node(&source, row);
+        let inline = fragment_ownership::nearest_self_painting_inline_box(&source, row);
+        if let Some(root) = line_root {
+            arena.request_ink_overflow_recalculation(root);
+        }
+        if let Some(inline) = inline {
+            arena.request_ink_overflow_recalculation(inline);
         }
     }
 }

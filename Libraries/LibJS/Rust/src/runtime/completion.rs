@@ -51,7 +51,7 @@ impl<T> Must<T> for ThrowCompletionOr<T> {
 pub use libjs_abi::CompletionType;
 
 /// The [[Type]] of a completion as the bytecode encodes it, in the operands of IteratorClose and SetCompletionType.
-pub fn completion_type_from_bytecode(encoded: u32) -> CompletionType {
+pub fn completion_type_from_bytecode(encoded: u8) -> CompletionType {
     match encoded {
         0 => CompletionType::Empty,
         1 => CompletionType::Normal,
@@ -137,7 +137,7 @@ pub fn r#await(vm: &Vm, value: Value) -> ThrowCompletionOr<Value> {
     // 2. Let promise be ? PromiseResolve(%Promise%, value).
     let promise_object = promise_resolve(vm, realm.intrinsics().promise_constructor(vm).upcast(), value)?;
 
-    let awaited_completion = vm.heap().allocate(AwaitedCompletion {
+    let awaited_completion = vm.heap().allocate(|_| AwaitedCompletion {
         header: CellHeader::for_class(AwaitedCompletion::CLASS),
         success: Cell::new(None),
         result: Cell::new(Value::UNDEFINED),
@@ -209,15 +209,22 @@ pub fn r#await(vm: &Vm, value: Value) -> ThrowCompletionOr<Value> {
         );
 
     // FIXME: Since we don't support context suspension, we attempt to "wait" for the promise to resolve
-    //        by synchronously running all queued promise jobs.
+    //        by synchronously running queued promise jobs until it settles.
     if let Some(agent) = vm.agent().embedder_agent {
         // Embedder case (i.e. LibWeb). Runs all promise jobs by performing a microtask checkpoint.
         // NB: The goal condition reads the outcome itself, as a copy taken before the promise settles would never
         //     make it true.
-        agent.spin_event_loop_until(vm, &|| awaited_completion.success.get().is_some());
+        agent.spin_event_loop_until(vm, &|| {
+            awaited_completion.success.get().is_some() || vm.interrupt_requested()
+        });
     } else {
         // No embedder, standalone LibJS implementation
-        vm.run_queued_promise_jobs();
+        vm.run_queued_promise_jobs_for_await(|| awaited_completion.success.get().is_some());
+    }
+
+    // NB: The jobs that would settle the promise do not run anymore.
+    if vm.interrupt_requested() {
+        return vm.throw_interrupt();
     }
 
     // 8. Remove asyncContext from the execution context stack and restore the execution context that is at the top of the execution context stack as the running execution context.

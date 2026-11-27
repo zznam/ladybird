@@ -5,17 +5,21 @@
  */
 
 #include <AK/Assertions.h>
+#include <AK/GenericShorthands.h>
 #include <AK/Math.h>
 #include <AK/MemoryStream.h>
+#include <Compositor/SkiaBackendContext.h>
 #include <Compositor/SkiaUtils.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorFilterType.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/InterpolationColorSpace.h>
+#include <LibGfx/PathData.h>
 #include <LibGfx/RustFFI.h>
 #include <core/SkBitmap.h>
 #include <core/SkBlender.h>
+#include <core/SkCanvas.h>
 #include <core/SkColorFilter.h>
 #include <core/SkColorSpace.h>
 #include <core/SkData.h>
@@ -26,6 +30,16 @@
 #include <effects/SkImageFilters.h>
 #include <effects/SkPerlinNoiseShader.h>
 #include <effects/SkRuntimeEffect.h>
+
+#ifdef AK_OS_MACOS
+#    include <LibGfx/MetalContext.h>
+#    include <gpu/ganesh/GrBackendSurface.h>
+#    include <gpu/ganesh/GrDirectContext.h>
+#    include <gpu/ganesh/SkImageGanesh.h>
+#    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
+#    include <gpu/ganesh/mtl/GrMtlTypes.h>
+#    include <ports/SkCFObject.h>
+#endif
 
 namespace Gfx {
 
@@ -38,9 +52,26 @@ static_assert(to_underlying(PathVerb::Close) == to_underlying(SkPathVerb::kClose
 static_assert(sizeof(PathVerb) == sizeof(SkPathVerb));
 static_assert(sizeof(FloatPoint) == sizeof(SkPoint));
 
-SkPath to_skia_path(Path const& path)
+void draw_tile_image_rect(SkCanvas& canvas, SkImage const& image, SkRect const& source_rect, SkRect const& target_rect, bool filtered, SkPaint const& paint)
 {
-    return to_skia_path(path.data());
+    auto sampling = filtered ? SkSamplingOptions { SkFilterMode::kLinear } : SkSamplingOptions {};
+    auto constraint = filtered ? SkCanvas::kFast_SrcRectConstraint : SkCanvas::kStrict_SrcRectConstraint;
+    canvas.drawImageRect(&image, source_rect, target_rect, sampling, &paint, constraint);
+}
+
+SkMatrix to_skia_matrix(AffineTransform const& affine_transform)
+{
+    SkScalar affine[6];
+    affine[0] = affine_transform.a();
+    affine[1] = affine_transform.b();
+    affine[2] = affine_transform.c();
+    affine[3] = affine_transform.d();
+    affine[4] = affine_transform.e();
+    affine[5] = affine_transform.f();
+
+    SkMatrix matrix;
+    matrix.setAffine(affine);
+    return matrix;
 }
 
 SkPath to_skia_path(PathData const& data)
@@ -52,16 +83,26 @@ SkPath to_skia_path(PathData const& data)
         to_skia_path_fill_type(data.winding_rule));
 }
 
+SkPath skia_path_from_serialized_bytes(ReadonlyBytes serialized_path)
+{
+    SkPath path;
+    with_contours_of_serialized_path(serialized_path, [&](PathData const& data) {
+        path = to_skia_path(data);
+    });
+    return path;
+}
+
 namespace {
 
 // Reads a serialized filter graph node by node and builds the SkImageFilter tree as it goes. The
 // layout is defined by the filter module of libgfx_rust, whose codec is the other reader of it.
 class SkiaFilterReader {
 public:
-    SkiaFilterReader(ReadonlyBytes bytes, Function<DecodedImageFrame const&(u64)> const& image_frame)
+    SkiaFilterReader(ReadonlyBytes bytes, Function<DecodedImageFrame const&(u64)> const& image_frame, Optional<FloatRect> blur_edge)
         : m_bytes(bytes)
         , m_stream(bytes)
         , m_image_frame(image_frame)
+        , m_blur_edge(blur_edge)
     {
     }
 
@@ -123,6 +164,7 @@ private:
     ReadonlyBytes m_bytes;
     FixedMemoryStream m_stream;
     Function<DecodedImageFrame const&(u64)> const& m_image_frame;
+    Optional<FloatRect> m_blur_edge;
 };
 
 sk_sp<SkImageFilter> SkiaFilterReader::filter()
@@ -200,7 +242,10 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
     case FilterOperationType::Blur: {
         auto radius_x = value<float>();
         auto radius_y = value<float>();
+        auto mirrors_at_backdrop_edge = value<bool>();
         auto input = optional_filter();
+        if (mirrors_at_backdrop_edge && m_blur_edge.has_value())
+            input = SkImageFilters::Crop(to_skia_rect(*m_blur_edge), SkTileMode::kMirror, move(input));
         return SkImageFilters::Blur(radius_x, radius_y, input);
     }
     case FilterOperationType::ColorFilter: {
@@ -210,6 +255,11 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
         sk_sp<SkColorFilter> color_filter;
 
         // Matrices are taken from https://drafts.fxtf.org/filter-effects-1/#FilterPrimitiveRepresentation
+        // https://drafts.csswg.org/filter-effects-1/#FilterPrimitivesOverviewIntro
+        // The RGBA result from each filter primitive will be clamped into the allowable ranges for colors and opacity
+        // values.
+        // NB: Each function is equivalent to a filter primitive of its own, so its result is clamped before the next
+        //     function applies to it.
         switch (type) {
         case ColorFilterType::Grayscale: {
             float matrix[20] = {
@@ -231,7 +281,7 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
                 0, 0, amount, 0, 0,
                 0, 0, 0, 1, 0
             };
-            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kNo);
+            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kYes);
             break;
         }
         case ColorFilterType::Contrast: {
@@ -242,7 +292,7 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
                 0, 0, amount, 0, intercept,
                 0, 0, 0, 1, 0
             };
-            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kNo);
+            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kYes);
             break;
         }
         case ColorFilterType::Invert: {
@@ -285,7 +335,7 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
                 0.213f - 0.213f * amount, 0.715f - 0.715f * amount, 0.072f + 0.928f * amount, 0, 0,
                 0, 0, 0, 1, 0
             };
-            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kNo);
+            color_filter = SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kYes);
             break;
         }
         default:
@@ -327,8 +377,8 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
         auto angle_degrees = value<float>();
         auto input = optional_filter();
         float radians = AK::to_radians(angle_degrees);
-        auto cosA = cos(radians);
-        auto sinA = sin(radians);
+        auto cosA = AK::cos(radians);
+        auto sinA = AK::sin(radians);
 
         auto a00 = 0.213f + cosA * 0.787f - sinA * 0.213f;
         auto a01 = 0.715f - cosA * 0.715f - sinA * 0.715f;
@@ -346,14 +396,18 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
             a20, a21, a22, 0, 0,
             0, 0, 0, 1, 0
         };
-        return SkImageFilters::ColorFilter(SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kNo), input);
+        return SkImageFilters::ColorFilter(SkColorFilters::Matrix(matrix, SkColorFilters::Clamp::kYes), input);
     }
     case FilterOperationType::Image: {
         auto const& frame = m_image_frame(value<u64>());
         auto src_rect = rect();
-        auto dest_rect = rect();
+        auto dest_x = value<float>();
+        auto dest_y = value<float>();
+        auto dest_width = value<float>();
+        auto dest_height = value<float>();
+        auto dest_rect = SkRect::MakeXYWH(dest_x, dest_y, dest_width, dest_height);
         auto sampling_options = to_skia_sampling_options(value<ScalingMode>());
-        auto image = sk_image_from_bitmap(frame.bitmap(), frame.color_space());
+        auto image = sk_image_from_decoded_image_frame(frame);
         return SkImageFilters::Image(move(image), src_rect, dest_rect, sampling_options);
     }
     case FilterOperationType::Merge: {
@@ -418,33 +472,84 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
         }
         return SkImageFilters::ColorFilter(move(color_space_filter), move(input));
     }
+    case FilterOperationType::Crop: {
+        auto x = value<float>();
+        auto y = value<float>();
+        auto width = value<float>();
+        auto height = value<float>();
+        auto input = optional_filter();
+        return SkImageFilters::Crop(SkRect::MakeXYWH(x, y, width, height), SkTileMode::kDecal, move(input));
+    }
     }
     VERIFY_NOT_REACHED();
 }
 
 }
 
-sk_sp<SkImageFilter> to_skia_image_filter(ReadonlyBytes serialized_filter, Function<DecodedImageFrame const&(u64)> const& image_frame)
+sk_sp<SkImageFilter> to_skia_image_filter(ReadonlyBytes serialized_filter, Function<DecodedImageFrame const&(u64)> const& image_frame, Optional<FloatRect> blur_edge)
 {
-    return SkiaFilterReader { serialized_filter, image_frame }.read_graph();
+    return SkiaFilterReader { serialized_filter, image_frame, blur_edge }.read_graph();
 }
 
-sk_sp<SkImage> sk_image_from_bitmap(Bitmap const& bitmap, ColorSpace const& color_space)
+static sk_sp<SkImage> sk_image_borrowing_pixels(IntSize size, BitmapFormat format, AlphaType alpha_type, ColorSpace const& color_space, void const* pixels, size_t pitch)
 {
-    auto info = SkImageInfo::Make(bitmap.width(), bitmap.height(), to_skia_color_type(bitmap.format()), to_skia_alpha_type(bitmap.format(), bitmap.alpha_type()), to_skia_color_space(color_space));
+    auto info = SkImageInfo::Make(size.width(), size.height(), to_skia_color_type(format), to_skia_alpha_type(format, alpha_type), to_skia_color_space(color_space));
     SkBitmap sk_bitmap;
-    sk_bitmap.installPixels(info, const_cast<void*>(static_cast<void const*>(bitmap.scanline(0))), bitmap.pitch());
+    sk_bitmap.installPixels(info, const_cast<void*>(pixels), pitch);
     sk_bitmap.setImmutable();
     return sk_bitmap.asImage();
 }
 
-sk_sp<SkImage> sk_image_adopting_bitmap(NonnullRefPtr<Bitmap> bitmap, ColorSpace const& color_space)
+sk_sp<SkImage> sk_image_from_bitmap(Bitmap const& bitmap, ColorSpace const& color_space)
+{
+    return sk_image_borrowing_pixels(bitmap.size(), bitmap.format(), bitmap.alpha_type(), color_space, bitmap.scanline(0), bitmap.pitch());
+}
+
+sk_sp<SkImage> sk_image_from_decoded_image_frame(DecodedImageFrame const& frame)
+{
+    return sk_image_borrowing_pixels(frame.size(), frame.format(), frame.alpha_type(), frame.color_space(), frame.pixels().data(), frame.pitch());
+}
+
+sk_sp<SkImage> sk_texture_image_sharing_pixels_of_decoded_image_frame([[maybe_unused]] DecodedImageFrame const& frame, [[maybe_unused]] SkiaBackendContext& skia_backend_context)
+{
+#ifdef AK_OS_MACOS
+    auto const* iosurface = frame.iosurface();
+    auto* gr_context = skia_backend_context.sk_context();
+    if (!iosurface || !gr_context)
+        return nullptr;
+    // NB: Metal aborts when asked for a texture larger than the GPU supports, so such a frame is drawn from its pixels
+    //     in memory instead.
+    if (frame.width() > gr_context->maxTextureSize() || frame.height() > gr_context->maxTextureSize())
+        return nullptr;
+
+    auto texture_format = first_is_one_of(frame.format(), BitmapFormat::RGBA8888, BitmapFormat::RGBx8888) ? MetalTextureFormat::RGBA8 : MetalTextureFormat::BGRA8;
+    // The frame's surface may come from another process, which need not have aligned its rows as the GPU needs them,
+    // so such a frame is uploaded instead.
+    auto& metal_context = skia_backend_context.metal_context();
+    if (!metal_context.rows_have_linear_texture_alignment(*iosurface, texture_format, 0))
+        return nullptr;
+    auto metal_texture = metal_context.create_texture_from_iosurface(*iosurface, texture_format, 0);
+    if (!metal_texture)
+        return nullptr;
+
+    // NB: The backend texture retains the Metal texture, which retains the surface.
+    GrMtlTextureInfo texture_info;
+    texture_info.fTexture = sk_ret_cfp(metal_texture->texture());
+    auto backend_texture = GrBackendTextures::MakeMtl(frame.width(), frame.height(), skgpu::Mipmapped::kNo, texture_info);
+    return SkImages::BorrowTextureFrom(gr_context, backend_texture, kTopLeft_GrSurfaceOrigin,
+        to_skia_color_type(frame.format()), to_skia_alpha_type(frame.format(), frame.alpha_type()), to_skia_color_space(frame.color_space()));
+#else
+    return nullptr;
+#endif
+}
+
+sk_sp<SkImage> sk_image_adopting_bitmap(NonnullRefPtr<Bitmap const> bitmap, ColorSpace const& color_space)
 {
     auto info = SkImageInfo::Make(bitmap->width(), bitmap->height(), to_skia_color_type(bitmap->format()), to_skia_alpha_type(bitmap->format(), bitmap->alpha_type()), to_skia_color_space(color_space));
     auto row_bytes = bitmap->pitch();
     auto byte_count = bitmap->size_in_bytes();
     auto* pixels = bitmap->scanline_u8(0);
-    auto data = SkData::MakeWithProc(pixels, byte_count, [](void const*, void* context) { static_cast<Bitmap*>(context)->unref(); }, &bitmap.leak_ref());
+    auto data = SkData::MakeWithProc(pixels, byte_count, [](void const*, void* context) { static_cast<Bitmap const*>(context)->unref(); }, const_cast<Bitmap*>(&bitmap.leak_ref()));
     return SkImages::RasterFromData(info, move(data), row_bytes);
 }
 

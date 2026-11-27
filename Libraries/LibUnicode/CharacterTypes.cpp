@@ -5,15 +5,18 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteString.h>
 #include <AK/CharacterTypes.h>
+#include <AK/Diagnostics.h>
 #include <AK/Find.h>
 #include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/String.h>
 #include <AK/Traits.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/ICU.h>
 
+#include <unicode/locid.h>
 #include <unicode/uchar.h>
 #include <unicode/uniset.h>
 #include <unicode/uscript.h>
@@ -56,14 +59,26 @@ static constexpr GeneralCategory GENERAL_CATEGORY_LIMIT = U_CHAR_CATEGORY_COUNT 
 
 static auto& category_sets_with_case_closure()
 {
-    static NeverDestroyed<HashMap<GeneralCategory, NonnullOwnPtr<icu::UnicodeSet>>> sets;
-    return *sets;
+    using Sets = HashMap<GeneralCategory, NonnullOwnPtr<icu::UnicodeSet>>;
+    // NB: Destroy each thread's ICU objects when that thread exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Sets sets)
+#else
+    static thread_local Sets sets;
+#endif
+    return sets;
 }
 
 static auto& property_sets_with_case_closure()
 {
-    static NeverDestroyed<HashMap<Property, NonnullOwnPtr<icu::UnicodeSet>>> sets;
-    return *sets;
+    using Sets = HashMap<Property, NonnullOwnPtr<icu::UnicodeSet>>;
+    // NB: Destroy each thread's ICU objects when that thread exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Sets sets)
+#else
+    static thread_local Sets sets;
+#endif
+    return sets;
 }
 
 Optional<GeneralCategory> general_category_from_string(StringView general_category)
@@ -263,6 +278,16 @@ bool code_point_has_emoji_presentation_property(u32 code_point)
     return code_point_has_property(code_point, UCHAR_EMOJI_PRESENTATION);
 }
 
+bool code_point_has_emoji_modifier_base_property(u32 code_point)
+{
+    return code_point_has_property(code_point, UCHAR_EMOJI_MODIFIER_BASE);
+}
+
+bool code_point_has_extended_pictographic_property(u32 code_point)
+{
+    return code_point_has_property(code_point, UCHAR_EXTENDED_PICTOGRAPHIC);
+}
+
 bool code_point_has_default_ignorable_code_point_property(u32 code_point)
 {
     return code_point_has_property(code_point, UCHAR_DEFAULT_IGNORABLE_CODE_POINT);
@@ -432,6 +457,33 @@ bool code_point_has_script(u32 code_point, Script script)
     return false;
 }
 
+Optional<String> likely_language_for_script_of(u32 code_point)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    auto script = uscript_getScript(static_cast<UChar32>(code_point), &status);
+    if (icu_failure(status))
+        return {};
+    switch (script) {
+    case USCRIPT_COMMON:
+    case USCRIPT_INHERITED:
+    case USCRIPT_UNKNOWN:
+    case USCRIPT_LATIN:
+    case USCRIPT_HAN:
+        return {};
+    default:
+        break;
+    }
+
+    auto locale = icu::Locale::createFromName(ByteString::formatted("und_{}", uscript_getShortName(script)).characters());
+    locale.addLikelySubtags(status);
+    if (icu_failure(status))
+        return {};
+    StringView language { locale.getLanguage(), strlen(locale.getLanguage()) };
+    if (language.is_empty() || language == "und"sv)
+        return {};
+    return MUST(String::from_utf8(language));
+}
+
 bool code_point_has_script_extension(u32 code_point, Script script)
 {
     auto icu_code_point = static_cast<UChar32>(code_point);
@@ -518,14 +570,115 @@ LineBreakClass line_break_class(u32 code_point)
     case U_LB_H2:
     case U_LB_H3:
         return LineBreakClass::Ideographic;
+    case U_LB_JL:
+    case U_LB_JV:
+    case U_LB_JT:
+        return LineBreakClass::HangulJamo;
     case U_LB_AMBIGUOUS:
         return LineBreakClass::Ambiguous;
     case U_LB_COMPLEX_CONTEXT:
+        // https://www.unicode.org/reports/tr14/#LB1
+        // In the absence of such criteria all characters with a specific combination of original class and
+        // General_Category property value are resolved as follows:
+        // Resolved | Original | General_Category
+        // [...]
+        // CM       | SA       | Only Mn or Mc
+        if ((U_GET_GC_MASK(icu_code_point) & (U_GC_MN_MASK | U_GC_MC_MASK)) != 0)
+            return LineBreakClass::CombiningMark;
         return LineBreakClass::ComplexContext;
     case U_LB_COMBINING_MARK:
         return LineBreakClass::CombiningMark;
+    case U_LB_CONDITIONAL_JAPANESE_STARTER:
+        return LineBreakClass::ConditionalJapaneseStarter;
+    case U_LB_OPEN_PUNCTUATION:
+        return LineBreakClass::OpenPunctuation;
+    case U_LB_CLOSE_PUNCTUATION:
+    case U_LB_CLOSE_PARENTHESIS:
+        return LineBreakClass::ClosePunctuation;
+    case U_LB_BREAK_SYMBOLS:
+        return LineBreakClass::BreakSymbols;
+    case U_LB_INFIX_NUMERIC:
+        return LineBreakClass::InfixNumericSeparator;
+    case U_LB_PREFIX_NUMERIC:
+        return LineBreakClass::PrefixNumeric;
+    case U_LB_POSTFIX_NUMERIC:
+        return LineBreakClass::PostfixNumeric;
+    case U_LB_HYPHEN:
+        return LineBreakClass::Hyphen;
+    case U_LB_GLUE:
+        return LineBreakClass::Glue;
+    case U_LB_WORD_JOINER:
+        return LineBreakClass::WordJoiner;
+    case U_LB_ZWJ:
+        return LineBreakClass::ZeroWidthJoiner;
     default:
         return LineBreakClass::Other;
+    }
+}
+
+JoiningType joining_type(u32 code_point)
+{
+    switch (static_cast<UJoiningType>(u_getIntPropertyValue(static_cast<UChar32>(code_point), UCHAR_JOINING_TYPE))) {
+    case U_JT_TRANSPARENT:
+        return JoiningType::Transparent;
+    case U_JT_DUAL_JOINING:
+        return JoiningType::DualJoining;
+    case U_JT_JOIN_CAUSING:
+        return JoiningType::JoinCausing;
+    case U_JT_LEFT_JOINING:
+        return JoiningType::LeftJoining;
+    case U_JT_RIGHT_JOINING:
+        return JoiningType::RightJoining;
+    default:
+        return JoiningType::NonJoining;
+    }
+}
+
+VerticalOrientation vertical_orientation(u32 code_point)
+{
+    switch (u_getIntPropertyValue(static_cast<UChar32>(code_point), UCHAR_VERTICAL_ORIENTATION)) {
+    case U_VO_TRANSFORMED_ROTATED:
+        return VerticalOrientation::TransformedRotated;
+    case U_VO_TRANSFORMED_UPRIGHT:
+        return VerticalOrientation::TransformedUpright;
+    case U_VO_UPRIGHT:
+        return VerticalOrientation::Upright;
+    default:
+        return VerticalOrientation::Rotated;
+    }
+}
+
+// https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-ink-property
+// [...] not applying ink-skipping for characters whose Unicode Script property is any of the CJK scripts Han,
+// Hiragana, Katakana, Bopomofo, or Hangul, or for characters whose Script property is Inherited or Common, and whose
+// ScriptExtensions property includes one or more of the CJK scripts.
+CJKScriptClass cjk_script_class(u32 code_point)
+{
+    static constexpr Array cjk_scripts { USCRIPT_HAN, USCRIPT_HIRAGANA, USCRIPT_KATAKANA, USCRIPT_BOPOMOFO, USCRIPT_HANGUL };
+
+    auto icu_code_point = static_cast<UChar32>(code_point);
+    UErrorCode status = U_ZERO_ERROR;
+    auto script = uscript_getScript(icu_code_point, &status);
+    if (icu_failure(status))
+        return CJKScriptClass::Other;
+    auto is_neutral = script == USCRIPT_COMMON || script == USCRIPT_INHERITED;
+    for (auto cjk_script : cjk_scripts) {
+        if (script == cjk_script || (is_neutral && uscript_hasScript(icu_code_point, cjk_script)))
+            return CJKScriptClass::CJK;
+    }
+    return is_neutral ? CJKScriptClass::Neutral : CJKScriptClass::Other;
+}
+
+i32 paired_bracket_key(u32 code_point)
+{
+    auto icu_code_point = static_cast<UChar32>(code_point);
+    switch (u_getIntPropertyValue(icu_code_point, UCHAR_BIDI_PAIRED_BRACKET_TYPE)) {
+    case U_BPT_OPEN:
+        return static_cast<i32>(code_point);
+    case U_BPT_CLOSE:
+        return -static_cast<i32>(u_getBidiPairedBracket(icu_code_point));
+    default:
+        return 0;
     }
 }
 
@@ -755,7 +908,11 @@ u32 unicode_get_case_closure(u32, u32*, u32);
 
 u8 unicode_layout_bidirectional_class(u32);
 u8 unicode_layout_line_break_class(u32);
+u8 unicode_layout_joining_type(u32);
 bool unicode_layout_code_point_has_emoji_property(u32);
+u8 unicode_layout_vertical_orientation(u32);
+u8 unicode_layout_cjk_script_class(u32);
+i32 unicode_layout_paired_bracket_key(u32);
 }
 
 extern "C" bool unicode_property_matches(
@@ -949,8 +1106,8 @@ extern "C" u32 unicode_get_case_closure(
     return count;
 }
 
-// LibWeb's text chunker classifies code points by these, mirroring the declaration order of BidiClass and
-// LineBreakClass.
+// LibWeb's text chunker classifies code points by these, mirroring the declaration order of BidiClass,
+// LineBreakClass and JoiningType.
 extern "C" u8 unicode_layout_bidirectional_class(u32 code_point)
 {
     return to_underlying(Unicode::bidirectional_class(code_point));
@@ -961,7 +1118,27 @@ extern "C" u8 unicode_layout_line_break_class(u32 code_point)
     return to_underlying(Unicode::line_break_class(code_point));
 }
 
+extern "C" u8 unicode_layout_joining_type(u32 code_point)
+{
+    return to_underlying(Unicode::joining_type(code_point));
+}
+
 extern "C" bool unicode_layout_code_point_has_emoji_property(u32 code_point)
 {
     return Unicode::code_point_has_emoji_property(code_point);
+}
+
+extern "C" u8 unicode_layout_vertical_orientation(u32 code_point)
+{
+    return to_underlying(Unicode::vertical_orientation(code_point));
+}
+
+extern "C" u8 unicode_layout_cjk_script_class(u32 code_point)
+{
+    return to_underlying(Unicode::cjk_script_class(code_point));
+}
+
+extern "C" i32 unicode_layout_paired_bracket_key(u32 code_point)
+{
+    return Unicode::paired_bracket_key(code_point);
 }

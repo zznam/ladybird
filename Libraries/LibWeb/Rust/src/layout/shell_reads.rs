@@ -106,8 +106,13 @@ pub extern "C" fn layout_row_style_is_derived(host: &DocumentHost, id: NodeSlotI
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_row_style_payloads(host: &DocumentHost, id: NodeSlotId) -> *const c_void {
-    styles(host, id, node_read()).style_payloads(id).as_ptr().cast()
+pub extern "C" fn layout_row_style(
+    host: &DocumentHost,
+    id: NodeSlotId,
+) -> *const crate::css::computed_value_views::StyleRecordGroups {
+    styles(host, id, node_read())
+        .style(id)
+        .map_or(std::ptr::null(), |style| style.as_ptr())
 }
 
 #[unsafe(no_mangle)]
@@ -159,6 +164,52 @@ pub extern "C" fn layout_row_bound_shell(host: &DocumentHost, read: &BegunRead, 
         return std::ptr::null_mut();
     };
     bound_shell(host, read, |identities| identities.bound_row(style_node))
+}
+
+/// Whether a row of `host`'s document may make an element contentful, as paint timing defines it: by holding text that
+/// is not all white space or replaced content, or by observing an image its style holds. It errs towards yes, as the
+/// rows do not say whether an image is available, and it makes no layout node. It follows `is_contentful()` of
+/// PaintTiming.cpp.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_rows_may_be_contentful(host: &DocumentHost, read: &BegunRead) -> bool {
+    // NB: The rows come first, as bringing them up to date may give a row its image observers.
+    let rows = rows(host, read);
+    !host.host_tables().image_observer_sets.borrow().is_empty() || rows.any_row_may_be_contentful()
+}
+
+/// Whether a text row of `host`'s document may have been given new rendered text since paint timing last took the text
+/// rows, which it answers without asking the render state: it errs towards yes while a frame flies.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_text_rows_may_await_first_paint(host: &DocumentHost) -> bool {
+    host.text_rows_may_await_first_paint()
+}
+
+/// Hands `push_row` each text row of `host`'s document that was given new rendered text since the last take, once and
+/// as the layout node of its text node (see [`crate::layout::LayoutNodeArena::take_text_rows_for_first_paint`]).
+///
+/// # Safety
+///
+/// `push_row` must be safe to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_take_text_rows_for_first_paint(
+    host: &DocumentHost,
+    read: &BegunRead,
+    context: *mut c_void,
+    push_row: unsafe extern "C" fn(*mut c_void, NodeSlotId),
+) {
+    let rows = read_arena(host, read, (), |arena, ()| arena.take_text_rows_for_first_paint());
+    for row in rows {
+        // SAFETY: The caller vouches for calling push_row with context.
+        unsafe { push_row(context, row) };
+    }
+}
+
+/// Stops noting the text rows of `host`'s document for paint timing, which will never take them again.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_stop_noting_text_rows_for_first_paint(host: &DocumentHost, read: &BegunRead) {
+    read_arena(host, read, (), |arena, ()| {
+        arena.stop_noting_text_rows_for_first_paint();
+    });
 }
 
 /// The content size of the committed box of the row the element with `style_node` is bound to, or none where the
@@ -279,13 +330,6 @@ pub extern "C" fn layout_row_paintable_layout_node_shell(
 pub extern "C" fn layout_row_paintable_is_positioned(host: &DocumentHost, slot: NodeSlotId) -> bool {
     read_rows(host, |rows| {
         rows.paintable_row_is_populated(slot) && crate::painting::style_queries::is_positioned(rows, slot)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_row_paintable_has_child_paintables(host: &DocumentHost, slot: NodeSlotId) -> bool {
-    read_rows(host, |rows| {
-        crate::painting::paint_order::first_paint_child(rows, slot).is_some()
     })
 }
 

@@ -14,16 +14,18 @@
 //! as it handles the move. The host hovers the move in its own state as it handles it, or as the lanes' report says.
 
 use super::{Lane, RenderState, TickRecording, WaitsForTickRecording};
+use crate::animations::snapshot::EffectTimingSnapshot;
 use crate::css::css_pixels::{CssPixelPoint, CssPixels};
 use crate::css::style::hover_lane::{HoverBoxRebuild, HoverInstall, hover_row_generated_for};
 use crate::css::style::style_job::SealedStyleInputs;
 use crate::css::style::tree::StyleNodeID;
-use crate::css::style_compute::FfiEffectTiming;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::tree_mutation::{HostCalls, OwedHostWork};
 use crate::painting::ffi::FfiChromeMetrics;
-use crate::painting::hit_test::{HitTestItemKind, HitTestList};
+use crate::painting::hit_test::HitTestItemKind;
+use crate::painting::hit_test::walk::{PointQuery, topmost_hit};
 use crate::painting::host::FfiHitTestQueryCallbacks;
+use crate::painting::visual_context::VisualContextTree;
 use crate::stage_thread::Riding;
 use libgfx_rust::FloatPoint;
 use std::sync::Arc;
@@ -32,18 +34,26 @@ use std::sync::Arc;
 #[repr(C)]
 pub struct FfiHoverPlanInputs {
     pub device_pixels_per_css_pixel: f64,
-    /// The scroll offsets of the frame the rendering update presented, in device pixels, by scroll frame.
-    pub scroll_offsets: *const libgfx_rust::FloatPoint,
-    pub scroll_offset_count: usize,
     pub chrome_metrics: FfiChromeMetrics,
     /// The cursor of the document's page, which the hover asks to show the cursor of what it hovers.
     pub page_cursor: FfiPageCursor,
+    /// What tells the document's page the link the hover is over.
+    pub link_reporter: FfiHoverLinkReporter,
     /// The timings the host runs the effects of elements on without sampling them, as the compositor runs them: the
-    /// element's style node, the effect's identity, and the timing, an `FfiEffectTiming`, by effect.
+    /// element's style node, the effect's identity, and the timing, an `EffectTimingSnapshot`, by effect.
     pub effect_timing_nodes: *const u32,
-    pub effect_timing_identities: *const u64,
+    pub effect_timing_identities: *const crate::animations::effect::AnimationEffectId,
     pub effect_timings: *const std::ffi::c_void,
     pub effect_timing_count: usize,
+    /// Where a drag selecting text the lane may follow is anchored, if one runs: the style node of a text node or an
+    /// element, or 0, and the offset in that text, or the style node of the child of that element right after the anchor,
+    /// or 0 after its last child.
+    pub selection_drag_anchor: u32,
+    pub selection_drag_anchor_offset: usize,
+    pub selection_drag_anchor_child: u32,
+    /// The scrollport the host's autoscroll keeps the pointer of that drag in, in CSS pixels of the viewport. Empty where
+    /// none does.
+    pub selection_drag_scrollport: crate::layout::svg_formatting_context::FfiFloatRect,
 }
 
 unsafe extern "C" {
@@ -116,14 +126,101 @@ impl Drop for PageCursor {
     }
 }
 
+/// What tells a document's page the link a hover is over, which the host hands a hover with its plan: the calls that
+/// reach it from any thread. It is retained for as long as a plan holds it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiHoverLinkReporter {
+    pub reporter: *const std::ffi::c_void,
+    pub retain: Option<unsafe extern "C" fn(*const std::ffi::c_void)>,
+    pub release: Option<unsafe extern "C" fn(*const std::ffi::c_void)>,
+    /// Whether the given style node is a link.
+    pub is_link: Option<unsafe extern "C" fn(*const std::ffi::c_void, u32) -> bool>,
+    /// Tells the page of the link the given style node is, or of no link where it is none.
+    pub report: Option<unsafe extern "C" fn(*const std::ffi::c_void, u32)>,
+    /// Tells the page that the pointer left the document, which ends the link it showed over the document.
+    pub withdraw: Option<unsafe extern "C" fn(*const std::ffi::c_void)>,
+}
+
+/// What tells a document's page the link a hover is over, which a plan holds a reference to.
+struct HoverLinkReporter(FfiHoverLinkReporter);
+
+// SAFETY: The reporter takes calls from any thread, and is retained and released atomically.
+unsafe impl Send for HoverLinkReporter {}
+// SAFETY: As above.
+unsafe impl Sync for HoverLinkReporter {}
+
+impl HoverLinkReporter {
+    /// A reference to the reporter `ffi` names, or none where it names none.
+    ///
+    /// # Safety
+    ///
+    /// `ffi.reporter` must point at a live reporter, which `ffi.retain` and `ffi.release` reference, or be null.
+    unsafe fn retained(ffi: FfiHoverLinkReporter) -> Option<Self> {
+        if ffi.reporter.is_null()
+            || ffi.release.is_none()
+            || ffi.is_link.is_none()
+            || ffi.report.is_none()
+            || ffi.withdraw.is_none()
+        {
+            return None;
+        }
+        let retain = ffi.retain?;
+        // SAFETY: Guaranteed by the caller.
+        unsafe { retain(ffi.reporter) };
+        Some(Self(ffi))
+    }
+
+    /// Whether `element` is a link.
+    fn is_link(&self, element: StyleNodeID) -> bool {
+        // SAFETY: The reference keeps the reporter live.
+        self.0
+            .is_link
+            .is_some_and(|is_link| unsafe { is_link(self.0.reporter, element.raw()) })
+    }
+
+    /// Tells the page of the link `link` describes, as an element's lookup answers: the link, none for no link, and
+    /// nothing at all where only the host knows, which tells as it handles the move.
+    fn report(&self, link: Option<Option<StyleNodeID>>) {
+        let (Some(link), Some(report)) = (link, self.0.report) else {
+            return;
+        };
+        // SAFETY: The reference keeps the reporter live.
+        unsafe { report(self.0.reporter, link.map_or(0, StyleNodeID::raw)) };
+    }
+
+    /// Tells the page that the pointer left the document.
+    fn withdraw(&self) {
+        if let Some(withdraw) = self.0.withdraw {
+            // SAFETY: The reference keeps the reporter live.
+            unsafe { withdraw(self.0.reporter) };
+        }
+    }
+}
+
+impl Drop for HoverLinkReporter {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.release {
+            // SAFETY: The reference was retained in `retained`, and is released once.
+            unsafe { release(self.0.reporter) };
+        }
+    }
+}
+
+/// A frame paints the overlays of its stacking contexts, the scrollbars among them, which a hit test of what the
+/// frame shows finds.
+pub(super) const FRAMES_PAINT_OVERLAYS: bool = true;
+
 /// The immutable inputs needed to hit test the presented frame and resolve its predefined cursors.
 struct ReadOnlyHoverFrame {
     rows: crate::painting::published_frame::PublishedRows,
+    /// The row the frame's paint order starts at.
+    viewport: NodeSlotId,
     bound_rows: crate::layout::PublishedBoundRows,
-    cursors: crate::css::style::hover_lane::HoverCursorFacts,
+    cursors: Arc<crate::css::style::hover_lane::HoverCursorFacts>,
     image_map_areas: crate::painting::image_map_areas::ImageMapAreaColumn,
     visual_context: crate::painting::visual_context::VisualContextState,
-    _style_records: Arc<[u64]>,
+    _style_records: Arc<crate::css::style::HoverFrameLease>,
 }
 
 /// What a lane's ticks hit test and restyle with, sealed with the clock plan at the end of a rendering update.
@@ -133,30 +230,33 @@ pub(crate) struct HoverPlan {
     /// The scroll offsets of the frame the rendering update presented, in device pixels, by scroll frame.
     scroll_offsets: Vec<FloatPoint>,
     chrome_metrics: FfiChromeMetrics,
-    /// What the hover's style transactions take: the root and the document computation inputs of the host's last.
+    /// What the hover's style updates take: the root and the document computation inputs of the host's last.
     style: Option<(StyleNodeID, Arc<SealedStyleInputs>)>,
     /// The cursor of the document's page.
     page_cursor: Option<PageCursor>,
+    /// What tells the document's page the link the hover is over.
+    link_reporter: Option<HoverLinkReporter>,
     /// The timings the host runs effects on without sampling them, which the descriptions of their elements' effects
     /// hold from before: the step a hover decides over the transitions they run reads them.
-    effect_timings: Vec<(StyleNodeID, u64, FfiEffectTiming)>,
+    effect_timings: Vec<(
+        StyleNodeID,
+        crate::animations::effect::AnimationEffectId,
+        EffectTimingSnapshot,
+    )>,
+    /// The drag selecting text the ticks show, until the button goes up.
+    selection_drag: Option<super::selection::SelectionDrag>,
 }
 
 impl HoverPlan {
-    /// The plan `inputs` describes.
+    /// The plan `inputs` describes, with `scroll_offsets`, the scroll offsets of the frame the rendering update
+    /// presented, in device pixels, by scroll frame.
     ///
     /// # Safety
     ///
-    /// `inputs.scroll_offsets` must point at `inputs.scroll_offset_count` offsets, or be null, the effect timing
-    /// arrays at `inputs.effect_timing_count` entries each, or be null, and `inputs.page_cursor` must name a live page
-    /// cursor, or none.
-    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs) -> Self {
-        let scroll_offsets = if inputs.scroll_offsets.is_null() {
-            Vec::new()
-        } else {
-            // SAFETY: Guaranteed by the caller.
-            unsafe { ak::slice_from_raw_parts(inputs.scroll_offsets, inputs.scroll_offset_count) }.to_vec()
-        };
+    /// The effect timing arrays of `inputs` must point at `inputs.effect_timing_count` entries each, or be null,
+    /// `inputs.page_cursor` must name a live page cursor, or none, and `inputs.link_reporter` a live link reporter, or
+    /// none.
+    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs, scroll_offsets: Vec<FloatPoint>) -> Self {
         let effect_timings = if inputs.effect_timing_count == 0 {
             Vec::new()
         } else {
@@ -166,7 +266,7 @@ impl HoverPlan {
                     ak::slice_from_raw_parts(inputs.effect_timing_nodes, inputs.effect_timing_count),
                     ak::slice_from_raw_parts(inputs.effect_timing_identities, inputs.effect_timing_count),
                     ak::slice_from_raw_parts(
-                        inputs.effect_timings.cast::<FfiEffectTiming>(),
+                        inputs.effect_timings.cast::<EffectTimingSnapshot>(),
                         inputs.effect_timing_count,
                     ),
                 )
@@ -186,7 +286,33 @@ impl HoverPlan {
             style: None,
             // SAFETY: Guaranteed by the caller.
             page_cursor: unsafe { PageCursor::retained(inputs.page_cursor) },
+            // SAFETY: Guaranteed by the caller.
+            link_reporter: unsafe { HoverLinkReporter::retained(inputs.link_reporter) },
             effect_timings,
+            selection_drag: super::selection::SelectionDrag::new(
+                inputs.selection_drag_anchor,
+                inputs.selection_drag_anchor_offset,
+                inputs.selection_drag_anchor_child,
+                inputs.selection_drag_scrollport,
+            ),
+        }
+    }
+
+    /// Tells the page of the link around what `hit` landed on.
+    fn report_link_of_hit(&self, state: &RenderState, hit: CursorHit) {
+        if let Some(reporter) = &self.link_reporter {
+            reporter.report(
+                state
+                    .engine_ref()
+                    .hover_enclosing_link(hit.element, |element| reporter.is_link(element)),
+            );
+        }
+    }
+
+    /// Tells the page that the pointer left the document.
+    fn pointer_left(&self) {
+        if let Some(reporter) = &self.link_reporter {
+            reporter.withdraw();
         }
     }
 
@@ -194,9 +320,13 @@ impl HoverPlan {
         let Some((root, _)) = self.style.as_ref() else {
             return;
         };
+        // A drag writes the highlight in the lane's fork.
+        if self.selection_drag.is_some() {
+            return;
+        }
         if !state.engine_ref().takes_hover_transactions()
             || state.engine_ref().has_animation_overlay_records()
-            || state.engine_ref().hover_needs_style_state(*root)
+            || state.engine_mut().hover_needs_style_state(*root)
         {
             return;
         }
@@ -205,18 +335,36 @@ impl HoverPlan {
         //     pins only these rows' records, leaving unrelated records reclaimable. Frames with animation overlays
         //     use the regular lane above, and so do frames with a row that still names an overlay record no element
         //     is assigned, which the lease declines.
-        let visual_context = state.arena.arena().paint_state().borrow().visual_context.clone();
+        let visual_context = state.arena.arena().paint_state().visual_context.clone();
         if visual_context.tree.is_none() {
             return;
         }
-        let records = state.arena.arena().hover_frame_style_records();
-        let Some(style_records) = state.engine_ref().lease_selected_style_records(records) else {
+        if state.arena.arena().names_uninstalled_style_records() {
             return;
-        };
+        }
+        // NB: A sweep frees what no holder holds, which no row of the arena can read after it, so what its rows name
+        //     is held. The lease has only to keep what is let go of from here on.
+        debug_assert!(
+            state
+                .arena
+                .arena()
+                .style_records()
+                .iter()
+                .all(|&record| record == 0 || state.engine_ref().style_record_is_held(record)),
+            "a row of a hover frame names a record nothing holds"
+        );
+        // A hit test of the frame skips the boxes whose ink overflow the pointer misses.
+        state.arena.arena_mut().settle_ink_overflow();
+        let viewport = state.arena.arena().layout_root();
+        let rows = state.arena.arena_mut().publish_rows();
+        let style_records = state
+            .engine_mut()
+            .lease_hover_frame_style_records(rows.paint_nodes().clone());
         self.read_only_frame = Some(ReadOnlyHoverFrame {
-            rows: state.arena.arena_mut().publish_rows(),
+            rows,
+            viewport,
             bound_rows: state.arena.arena_mut().bound_rows_mut().publish(),
-            cursors: state.engine_ref().hover_cursor_facts(),
+            cursors: state.engine_mut().hover_cursor_facts(),
             image_map_areas: state.arena.arena().image_map_areas().clone(),
             visual_context,
             _style_records: style_records,
@@ -227,7 +375,23 @@ impl HoverPlan {
         self.read_only_frame.is_none()
     }
 
-    /// Has the hover's style transactions take `inputs`, the document computation inputs the host sealed for its last
+    pub(super) fn selection_drag(&self) -> Option<super::selection::SelectionDrag> {
+        self.selection_drag
+    }
+
+    pub(super) fn end_selection_drag(&mut self) {
+        self.selection_drag = None;
+    }
+
+    pub(super) fn device_pixels_per_css_pixel(&self) -> f64 {
+        self.device_pixels_per_css_pixel
+    }
+
+    pub(super) fn chrome_metrics(&self) -> FfiChromeMetrics {
+        self.chrome_metrics
+    }
+
+    /// Has the hover's style updates take `inputs`, the document computation inputs the host sealed for its last
     /// transaction under `root`.
     pub(crate) fn with_style_inputs(self, style: Option<(StyleNodeID, Arc<SealedStyleInputs>)>) -> Self {
         Self { style, ..self }
@@ -249,6 +413,9 @@ fn hand_pointer_to_context(context: u64, position: Option<FloatPoint>, pointer: 
     );
 }
 
+/// The bit of `UIEvents::MouseButton::Primary` in the buttons of a move.
+const PRIMARY_MOUSE_BUTTON: u32 = 1;
+
 /// Where the render clock heard the pointer went.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingPointer {
@@ -260,6 +427,13 @@ pub(crate) struct PendingPointer {
     pub(crate) scrolled_since_frame: bool,
     /// The input event id of the mouse event the host takes beside the move, or 0 where there is none.
     pub(crate) input_event_id: u64,
+}
+
+impl PendingPointer {
+    /// Whether the move has the primary mouse button held, the one that drags a selection.
+    pub(super) fn holds_the_primary_button(&self) -> bool {
+        self.buttons & PRIMARY_MOUSE_BUTTON != 0
+    }
 }
 
 /// What the lanes want once they heard where the pointer went, as the render clock reads it.
@@ -304,6 +478,20 @@ impl PointerState {
         self.last
     }
 
+    /// Has the next tick hover where the pointer rests, as an animation moves what is under it, where a lane `follows`
+    /// the pointer, and answers what the lanes want next. A rest the host handled a newer move than is nobody's to
+    /// hover, as such a move is.
+    pub(super) fn rests_on_moving_content(&mut self, follows: bool) -> PointerAnswer {
+        let Some(last) = self.last.filter(|last| last.position.is_some()) else {
+            return PointerAnswer::Moves;
+        };
+        if !follows || self.is_older_than_handled(last) {
+            return PointerAnswer::Moves;
+        }
+        self.pending = Some(last);
+        PointerAnswer::Ticks
+    }
+
     /// Takes the move that waits for a tick to hover it.
     pub(super) fn take(&mut self) -> Option<PendingPointer> {
         self.pending.take()
@@ -314,6 +502,11 @@ impl PointerState {
         self.pending.is_some()
     }
 
+    /// Whether the move that waits for a tick has the primary mouse button held.
+    pub(super) fn holds_the_primary_button(&self) -> bool {
+        self.pending.is_some_and(|pending| pending.holds_the_primary_button())
+    }
+
     /// Forgets where the pointer went, short of the mouse events the host handled.
     pub(super) fn forget(&mut self) {
         self.pending = None;
@@ -321,10 +514,15 @@ impl PointerState {
     }
 
     /// Notes that the host handled the mouse event with the input event id `input_event_id`, and forgets the move that
-    /// waits for a tick, where it is older.
+    /// waits for a tick, where it is older, or the very move of a drag, which an idle host paints itself.
     pub(super) fn note_handled(&mut self, input_event_id: u64) {
         self.handled = self.handled.max(input_event_id);
-        if self.pending.is_some_and(|pending| self.is_older_than_handled(pending)) {
+        if self.pending.is_some_and(|pending| {
+            self.is_older_than_handled(pending)
+                || (pending.holds_the_primary_button()
+                    && pending.input_event_id != 0
+                    && pending.input_event_id == self.handled)
+        }) {
             self.pending = None;
         }
     }
@@ -537,8 +735,49 @@ impl Lane {
         }
     }
 
-    /// Hovers the element under `pointer`, and answers whether that moved anything to lay out and present.
-    pub(super) fn hover(&mut self, state: &mut RenderState, pointer: PendingPointer, timestamp: f64) -> Hovered {
+    /// Shows the cursor of what is under `pointer` in the frame the screen shows at `frame_time_nanoseconds`, where the
+    /// lane may present nothing, and leaves the move to the host, which hovers what is under the pointer itself.
+    pub(super) fn show_cursor_only(
+        &mut self,
+        state: &mut RenderState,
+        pointer: PendingPointer,
+        frame_time_nanoseconds: i64,
+    ) -> super::LaneMove {
+        let left_to_host = super::LaneMove {
+            input_event_id: pointer.input_event_id,
+            target: None,
+            handed: false,
+        };
+        let Some(plan) = self.plan.hover.take() else {
+            return left_to_host;
+        };
+        let placed = pointer.buttons == 0 && !(pointer.scrolled_since_frame && self.scroll_offsets.is_empty());
+        if pointer.position.is_none() {
+            plan.pointer_left();
+        } else if placed
+            && let Some(position) = pointer.position
+            && let Ok(HoverTarget::Element(hit)) = self.hit_test(state, &plan, position, frame_time_nanoseconds)
+        {
+            plan.report_link_of_hit(state, hit);
+            if let Some(page_cursor) = &plan.page_cursor
+                && let Some(cursor) = cursor_for_hit(state, hit)
+            {
+                page_cursor.request(cursor);
+            }
+        }
+        self.plan.hover = Some(plan);
+        left_to_host
+    }
+
+    /// Hovers the element under `pointer`, in the frame as the screen shows it at `frame_time_nanoseconds`, and answers
+    /// whether that moved anything to lay out and present.
+    pub(super) fn hover(
+        &mut self,
+        state: &mut RenderState,
+        pointer: PendingPointer,
+        timestamp: f64,
+        frame_time_nanoseconds: i64,
+    ) -> Hovered {
         // A scroll the host has not laid out moved what is under the pointer, and a held button drags or selects,
         // which only the host follows.
         let Some(plan) = self.plan.hover.take() else {
@@ -553,7 +792,14 @@ impl Lane {
         } else if pointer.buttons != 0 {
             Err(HoverDeclined::Unmoved("buttons held"))
         } else {
-            let hovered = self.hover_with(state, &plan, pointer, timestamp, &mut cursor_hit);
+            let hovered = self.hover_with(
+                state,
+                &plan,
+                pointer,
+                timestamp,
+                frame_time_nanoseconds,
+                &mut cursor_hit,
+            );
             // The iframe the hover handed the pointer to before hears that it left, wherever else in the document the
             // move went.
             if !matches!(hovered, Err(HoverDeclined::Handed(_) | HoverDeclined::Unplaced(_))) {
@@ -561,14 +807,20 @@ impl Lane {
             }
             hovered
         };
-        // The cursor shows what the pointer is over once the element the hover is on is the one under it, as the host
-        // shows it as it handles the move. A move the host hovers leaves the cursor to it too.
-        if matches!(hovered, Ok(()) | Err(HoverDeclined::Same))
-            && let Some(page_cursor) = &plan.page_cursor
+        // The cursor shows what the pointer is over in the frame on screen, whether the hover moves or the host hovers
+        // the move: the host shows the cursor of what it finds there as it handles the move. A move handed to an iframe
+        // shows the cursor its lane finds.
+        if pointer.position.is_none() {
+            plan.pointer_left();
+        } else if !matches!(hovered, Err(HoverDeclined::Handed(_)))
             && let Some(hit) = cursor_hit
-            && let Some(cursor) = cursor_for_hit(state, hit)
         {
-            page_cursor.request(cursor);
+            plan.report_link_of_hit(state, hit);
+            if let Some(page_cursor) = &plan.page_cursor
+                && let Some(cursor) = cursor_for_hit(state, hit)
+            {
+                page_cursor.request(cursor);
+            }
         }
         self.plan.hover = Some(plan);
         if logs_hover() {
@@ -622,10 +874,11 @@ impl Lane {
         plan: &HoverPlan,
         pointer: PendingPointer,
         timestamp: f64,
+        frame_time_nanoseconds: i64,
         cursor_hit: &mut Option<CursorHit>,
     ) -> Result<(), HoverDeclined> {
         let target = match pointer.position {
-            Some(position) => match self.hit_test(state, plan, position)? {
+            Some(position) => match self.hit_test(state, plan, position, frame_time_nanoseconds)? {
                 HoverTarget::Element(hit) => {
                     *cursor_hit = Some(hit);
                     Some(hit.element)
@@ -945,7 +1198,7 @@ impl Lane {
             }
             let installs = state.engine_mut().install_hover_wave(&wave);
             made.installed |= !settles_back;
-            let arena = state.arena.arena();
+            let arena = state.arena.arena_mut();
             let work = OwedHostWork::default();
             // The installs cannot call the host, which never hears of the boxes of the lane's fork they touched.
             arena.queue_box_presence();
@@ -965,7 +1218,7 @@ impl Lane {
             drop(work.resolve(arena));
             // The boxes show what the rows moved in place of the compositor animations the host published for them.
             if !settles_back {
-                let (engine, arena) = state.engine_and_arena();
+                let (engine, arena) = state.engine_ref_and_arena_mut();
                 for install in installs.iter().filter(|install| !rebuilt(install.element.style_node)) {
                     super::effects::stop_compositor_animations_a_row_moves(engine, arena, &install.element);
                 }
@@ -982,7 +1235,7 @@ impl Lane {
                 }
                 started_transitions = true;
                 made.started.push(transitions.node);
-                super::effects::stop_ended_compositor_animations(state.arena.arena(), &transitions);
+                super::effects::stop_ended_compositor_animations(state.arena.arena_mut(), &transitions);
                 made.replaced.extend(self.start_transitions(transitions, timestamp));
             }
             let engine = state.engine_mut();
@@ -1051,7 +1304,7 @@ impl Lane {
     }
 
     /// Hit tests the preserved frame without copying mutable style and layout state.
-    pub(super) fn hover_read_only(&mut self, pointer: PendingPointer) -> super::LaneMove {
+    pub(super) fn hover_read_only(&mut self, pointer: PendingPointer, frame_time_nanoseconds: i64) -> super::LaneMove {
         use crate::painting::paint_read::{GeometryRead, PaintSource};
         if pointer.buttons != 0 {
             return super::LaneMove {
@@ -1064,6 +1317,7 @@ impl Lane {
         let mut nested = None;
         let target = (|| {
             let Some(position) = pointer.position else {
+                plan.pointer_left();
                 return Some(None);
             };
             if pointer.scrolled_since_frame && self.scroll_offsets.is_empty() {
@@ -1071,30 +1325,41 @@ impl Lane {
             }
             let frame = plan.read_only_frame.as_ref()?;
             let tree = frame.visual_context.tree.as_ref()?;
-            let recorder = self.recording.0.take(WaitsForTickRecording(()));
-            let published = recorder.recorder.published_hit_test_items.clone();
-            self.recording = TickRecording(Riding::landed(recorder));
-            let published = published?;
-            if published.structural_epoch != tree.structural_epoch {
+            if self.structural_epoch_on_screen() != Some(tree.structural_epoch) {
                 return None;
             }
+            // The screen shows the compositor's animations sampled at the frame's time, where the hit test finds them.
+            let sampled;
+            let tree = match tree.has_visual_animations() {
+                true => {
+                    sampled = tree.with_visual_animation_samples(frame_time_nanoseconds);
+                    &sampled
+                }
+                false => tree,
+            };
             let absolute_rects = std::cell::RefCell::default();
             let source = PaintSource::over_rows(&frame.rows, &absolute_rects);
-            let mut list = HitTestList {
-                items: Arc::clone(&published.items),
-                ..HitTestList::default()
-            };
-            list.build_spatial_indexes_if_needed();
             let offsets = self.scroll_offsets_on_screen(&source, &frame.visual_context, &plan);
             let callbacks =
                 FfiHitTestQueryCallbacks::sealed(plan.device_pixels_per_css_pixel, &offsets, plan.chrome_metrics);
+            let world = callbacks.build_world_transforms(tree);
+            let callbacks = callbacks.with_world_transforms(&world);
             let ratio = plan.device_pixels_per_css_pixel as f32;
             let point = CssPixelPoint::new(
                 CssPixels::nearest_value_for_f32(position.x / ratio),
                 CssPixels::nearest_value_for_f32(position.y / ratio),
             );
-            let hit = list.find_topmost_item(&source, tree, &callbacks, point)?;
-            let item = &list.items[hit.index];
+            let hit = topmost_hit(
+                &source,
+                PointQuery {
+                    tree,
+                    callbacks: &callbacks,
+                    viewport: frame.viewport,
+                    paint_overlay: FRAMES_PAINT_OVERLAYS,
+                    point,
+                },
+            )?;
+            let item = &hit.item;
             if item.kind == HitTestItemKind::ChromeWidget {
                 return None;
             }
@@ -1120,7 +1385,7 @@ impl Lane {
             if kind == NodeKind::ImageBox && frame.image_map_areas.has_areas(item.paintable) {
                 return None;
             }
-            let resolved = list.resolve_hit(&source, hit.index, hit.local_point);
+            let resolved = crate::painting::hit_test::resolve::resolve_hit(&source, &hit.item, hit.local_point);
             let target = if kind == NodeKind::Viewport {
                 plan.style.as_ref().map(|&(root, _)| root)
             } else {
@@ -1134,6 +1399,13 @@ impl Lane {
                 }
                 Self::element_for_dispatch_in(&source, item.hit_node, StyleNodeID::from_raw(identity.style_node)?)
             }?;
+            if let Some(reporter) = &plan.link_reporter {
+                reporter.report(
+                    frame
+                        .cursors
+                        .enclosing_link(target, |element| reporter.is_link(element)),
+                );
+            }
             use crate::css::css_enums::cursor_predefined;
             let style = source.node(item.hit_node)?.style()?;
             let cursor = style.inherited_ui().cursor.as_slice().first()?;
@@ -1180,50 +1452,77 @@ impl Lane {
         }
     }
 
+    /// The structural epoch of the visual context tree of the frame on screen, which comes back with the lane's
+    /// recording: the frame a tick presented last, or else the lane's own. None once the lane left a frame to the host.
+    fn structural_epoch_on_screen(&mut self) -> Option<u64> {
+        let recorder = self.recording.0.take(WaitsForTickRecording(()));
+        let structural_epoch = recorder.structural_epoch_on_screen;
+        self.recording = TickRecording(Riding::landed(recorder));
+        structural_epoch
+    }
+
+    /// The tree of visual contexts of `state` as the screen shows it at `frame_time_nanoseconds`, where the frame on
+    /// screen was recorded against it, or why a hit test cannot place what the screen shows.
+    pub(super) fn tree_on_screen(
+        &mut self,
+        state: &RenderState,
+        frame_time_nanoseconds: i64,
+    ) -> Result<Arc<VisualContextTree>, &'static str> {
+        let structural_epoch_on_screen = self.structural_epoch_on_screen().ok_or("no frame on screen")?;
+        if state.arena.arena().has_boxes_removed_ahead_of_layout() {
+            return Err("boxes the host removed ahead of its layout");
+        }
+        let visual_context = &state.arena.arena().paint_state().visual_context;
+        let tree = visual_context.tree.clone().ok_or("no visual context tree")?;
+        // A hit test of the host's may have built the tree anew since without presenting it.
+        if structural_epoch_on_screen != tree.structural_epoch {
+            return Err("visual contexts the frame does not show");
+        }
+        // The screen shows the compositor's animations sampled at the frame's time, where the hit test finds them.
+        let tree = match tree.has_visual_animations() {
+            true => Arc::new(tree.with_visual_animation_samples(frame_time_nanoseconds)),
+            false => tree,
+        };
+        Ok(tree)
+    }
+
     /// Hit tests `position`, in device pixels, in the frame the lane presented last.
     fn hit_test(
         &mut self,
         state: &mut RenderState,
         plan: &HoverPlan,
         position: FloatPoint,
+        frame_time_nanoseconds: i64,
     ) -> Result<HoverTarget, HoverDeclined> {
-        // The hit-test list is the one of the frame the lane presented last, which comes back with its recording.
-        let recorder = self.recording.0.take(WaitsForTickRecording(()));
-        let published = recorder.recorder.published_hit_test_items.clone();
-        self.recording = TickRecording(Riding::landed(recorder));
-        let published = published.ok_or(HoverDeclined::Unplaced("no hit-test list"))?;
+        let tree = self
+            .tree_on_screen(state, frame_time_nanoseconds)
+            .map_err(HoverDeclined::Unplaced)?;
+        // The walk skips the boxes whose ink overflow the pointer misses.
+        state.arena.arena_mut().settle_ink_overflow();
         let arena = state.arena.arena();
-        let tree = arena
-            .paint_state()
-            .borrow()
-            .visual_context
-            .tree
-            .clone()
-            .ok_or(HoverDeclined::Unplaced("no visual context tree"))?;
-        // The items name the visual contexts of the tree they were recorded against, which a hit test of the host's may
-        // have built anew since without presenting it.
-        if published.structural_epoch != tree.structural_epoch {
-            return Err(HoverDeclined::Unplaced("visual contexts the frame does not show"));
-        }
-        let mut list = HitTestList {
-            items: std::sync::Arc::clone(&published.items),
-            ..HitTestList::default()
-        };
-        list.build_spatial_indexes_if_needed();
-        let paint_state = arena.paint_state().borrow();
-        let scroll_offsets = self.scroll_offsets_on_screen(arena, &paint_state.visual_context, plan);
-        drop(paint_state);
+        let scroll_offsets = self.scroll_offsets_on_screen(arena, &arena.paint_state().visual_context, plan);
         let callbacks =
             FfiHitTestQueryCallbacks::sealed(plan.device_pixels_per_css_pixel, &scroll_offsets, plan.chrome_metrics);
+        let world = callbacks.build_world_transforms(&tree);
+        let callbacks = callbacks.with_world_transforms(&world);
         let pixel_ratio = plan.device_pixels_per_css_pixel as f32;
         let point = CssPixelPoint::new(
             CssPixels::nearest_value_for_f32(position.x / pixel_ratio),
             CssPixels::nearest_value_for_f32(position.y / pixel_ratio),
         );
-        let Some(topmost) = list.find_topmost_item(arena, &tree, &callbacks, point) else {
+        let Some(topmost) = topmost_hit(
+            arena,
+            PointQuery {
+                tree: &tree,
+                callbacks: &callbacks,
+                viewport: arena.layout_root(),
+                paint_overlay: FRAMES_PAINT_OVERLAYS,
+                point,
+            },
+        ) else {
             return Ok(HoverTarget::Unchanged);
         };
-        let item = &list.items[topmost.index];
+        let item = &topmost.item;
         // A scrollbar or a resizer hovers nothing the host would hover without asking it.
         if item.kind == HitTestItemKind::ChromeWidget {
             return Err(HoverDeclined::Unmoved("a scrollbar or resizer"));
@@ -1257,10 +1556,10 @@ impl Lane {
         if paintable_kind == NodeKind::ImageBox && arena.image_map_areas().has_areas(paintable) {
             return Err(HoverDeclined::Unmoved("an image map"));
         }
-        let resolved = list.resolve_hit(arena, topmost.index, topmost.local_point);
+        let resolved = crate::painting::hit_test::resolve::resolve_hit(arena, item, topmost.local_point);
         let identity = if paintable_kind == NodeKind::Viewport {
             // The viewport stands for the document, and a hit that falls through to it hits the root element, the root
-            // of the style transactions the hover takes its own with. The cursor is the viewport's, as the host's is.
+            // of the style updates the hover takes its own with. The cursor is the viewport's, as the host's is.
             let &(root, _) = plan.style.as_ref().ok_or(HoverDeclined::Unmoved("no root element"))?;
             return Ok(HoverTarget::Element(CursorHit {
                 hit_node: paintable,
@@ -1293,7 +1592,7 @@ impl Lane {
     /// The device scroll offsets of the visual context tree's nodes as the screen shows them: those of the frame the
     /// host laid out, where the compositor scrolled the scroll containers to at the latest tick, as the hit test reads
     /// them.
-    fn scroll_offsets_on_screen(
+    pub(super) fn scroll_offsets_on_screen(
         &self,
         arena: &impl crate::painting::paint_read::PaintRead,
         visual_context: &crate::painting::visual_context::VisualContextState,
@@ -1413,26 +1712,16 @@ fn cursor_for_hit(state: &mut RenderState, hit: CursorHit) -> Option<u8> {
     })
 }
 
-/// Hands the clock lane `ticks` belong to where the pointer went: to `x`, `y` in device pixels where `has_position`,
-/// or out of the context, beside the mouse event with the input event id `input_event_id`, and answers what the lane
-/// wants next, as a `PointerAnswer`.
-///
+/// Hands the clock lanes of `host`'s document that the pointer rests where the compositor's animations move what is
+/// under it, ticks them at `frame_time_nanoseconds`, and waits as [`document_host_inject_pointer`] does. For a test.
 #[unsafe(no_mangle)]
-pub extern "C" fn clock_ticks_pointer_moved(
-    ticks: &super::ClockTicks,
-    has_position: bool,
-    x: f32,
-    y: f32,
-    buttons: u32,
-    scrolled_since_frame: bool,
-    input_event_id: u64,
-) -> u8 {
-    ticks.pointer_moved(PendingPointer {
-        position: has_position.then_some(FloatPoint { x, y }),
-        buttons,
-        scrolled_since_frame,
-        input_event_id,
-    }) as u8
+pub extern "C" fn document_host_inject_pointer_rest(
+    host: &crate::render_state::DocumentHost,
+    frame_time_nanoseconds: i64,
+) {
+    super::settle_lanes_for_testing();
+    host.clock_ticks().inject_pointer_rest(frame_time_nanoseconds);
+    super::settle_lanes_for_testing();
 }
 
 /// Hands the clock lanes of `host`'s document a pointer move to `x`, `y` in device pixels, as the compositor would,
@@ -1453,14 +1742,15 @@ pub extern "C" fn document_host_move_pointer(
     });
 }
 
-/// Hands the clock lanes of `host`'s document a pointer move to `x`, `y` in device pixels, beside the mouse event with
-/// the input event id `input_event_id`, or none for 0, ticks them at `frame_time_nanoseconds`, and waits until the
-/// StyleLayout thread has run the tick and the Paint thread the recording of the frame it presents. For a test.
+/// Hands the clock lanes of `host`'s document a pointer move to `x`, `y` in device pixels, with `buttons` held, beside the
+/// mouse event with the input event id `input_event_id`, or none for 0, ticks them at `frame_time_nanoseconds`, and waits
+/// until the Render thread has run the tick and the Paint thread the recording of the frame it presents. For a test.
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_inject_pointer(
     host: &crate::render_state::DocumentHost,
     x: f32,
     y: f32,
+    buttons: u32,
     frame_time_nanoseconds: i64,
     input_event_id: u64,
 ) {
@@ -1468,9 +1758,29 @@ pub extern "C" fn document_host_inject_pointer(
     host.clock_ticks().inject_pointer(
         PendingPointer {
             position: Some(FloatPoint { x, y }),
-            buttons: 0,
+            buttons,
             scrolled_since_frame: false,
             input_event_id,
+        },
+        frame_time_nanoseconds,
+    );
+    super::settle_lanes_for_testing();
+}
+
+/// Hands the clock lanes of `host`'s document the pointer leaving it, ticks them at `frame_time_nanoseconds`, and waits
+/// as [`document_host_inject_pointer`] does. For a test.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_inject_pointer_left(
+    host: &crate::render_state::DocumentHost,
+    frame_time_nanoseconds: i64,
+) {
+    super::settle_lanes_for_testing();
+    host.clock_ticks().inject_pointer(
+        PendingPointer {
+            position: None,
+            buttons: 0,
+            scrolled_since_frame: false,
+            input_event_id: 0,
         },
         frame_time_nanoseconds,
     );

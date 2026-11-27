@@ -12,7 +12,7 @@
 #include <LibWebCommon/Gamepad/GamepadStateBuffer.h>
 
 #ifdef AK_OS_MACOS
-#    include <LibIPC/TransportMachPort.h>
+#    include <LibIPC/Transport.h>
 #    include <mach/mach_vm.h>
 #endif
 
@@ -20,7 +20,7 @@ using namespace Web::Gamepad;
 
 static Core::AnonymousBuffer create_producer_buffer()
 {
-    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(sizeof(SharedGamepadStateBuffer), Core::AnonymousBuffer::Sealability::Sealable));
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(sizeof(SharedGamepadStateBuffer)));
     new (buffer.data<void>()) SharedGamepadStateBuffer {};
     return buffer;
 }
@@ -89,7 +89,7 @@ TEST_CASE(transferred_memory_entry_cannot_be_mapped_writable)
     IPC::Encoder encoder { message };
     MUST(encoder.encode(sent_buffer));
 
-    auto paired = MUST(IPC::TransportMachPort::create_paired());
+    auto paired = MUST(IPC::Transport::create_paired());
     auto peer = MUST(paired.remote_handle.create_transport());
     auto attachments = message.take_attachments();
     MUST(paired.local->post_message(message.take_data(), attachments));
@@ -97,7 +97,7 @@ TEST_CASE(transferred_memory_entry_cannot_be_mapped_writable)
     peer->wait_until_incoming_is_current();
 
     size_t received = 0;
-    (void)peer->read_as_many_messages_as_possible_without_blocking([&](IPC::TransportMachPort::Message&& incoming) {
+    (void)peer->read_as_many_messages_as_possible_without_blocking([&](IPC::Transport::Message&& incoming) {
         ++received;
         EXPECT_EQ(incoming.attachments.size(), 1uz);
         auto attachment = incoming.attachments.dequeue();

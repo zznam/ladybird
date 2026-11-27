@@ -6,6 +6,7 @@
 
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
+use num_bigint::Sign;
 use num_traits::FromPrimitive;
 
 use crate::gc::class::{GcCell, define_cell};
@@ -37,11 +38,42 @@ impl BigInt {
     }
 
     pub fn create(vm: &Vm, big_integer: SignedBigInteger) -> Gc<BigInt> {
-        vm.heap().allocate(Self::new(big_integer))
+        vm.heap().allocate(|_| Self::new(big_integer))
+    }
+
+    pub fn create_from_i64(vm: &Vm, value: i64) -> Gc<BigInt> {
+        Self::create(vm, SignedBigInteger::from(value))
+    }
+
+    pub fn create_from_u64(vm: &Vm, value: u64) -> Gc<BigInt> {
+        Self::create(vm, SignedBigInteger::from(value))
+    }
+
+    /// The BigInt with the sign and the magnitude, big-endian, which can have leading zeros.
+    pub fn create_from_magnitude_bytes_be(vm: &Vm, is_negative: bool, magnitude: &[u8]) -> Gc<BigInt> {
+        let sign = if is_negative { Sign::Minus } else { Sign::Plus };
+        Self::create(vm, SignedBigInteger::from_bytes_be(sign, magnitude))
     }
 
     pub fn big_integer(&self) -> &SignedBigInteger {
         &self.big_integer
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.big_integer.sign() == Sign::Minus
+    }
+
+    /// The magnitude of the value, big-endian and without leading zeros, which has no bytes for zero.
+    pub fn magnitude_to_bytes_be(&self) -> Vec<u8> {
+        if self.big_integer.sign() == Sign::NoSign {
+            return Vec::new();
+        }
+        self.big_integer.magnitude().to_bytes_be()
+    }
+
+    /// The value, if it is an integer in the range of u64.
+    pub fn to_u64_if_exact(&self) -> Option<u64> {
+        u64::try_from(&self.big_integer).ok()
     }
 
     pub fn to_utf16_string(&self) -> Utf16String {

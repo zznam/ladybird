@@ -5,15 +5,16 @@
  */
 
 #include <AK/StdLibExtras.h>
-#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/System.h>
 #include <LibGC/BlockAllocator.h>
+#include <LibGC/BlockDescriptor.h>
 #include <LibGC/CAPI.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapBlock.h>
 #include <LibGC/HeapRegion.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibGC/Root.h>
+#include <LibGC/Rootable.h>
 #include <LibGC/Weak.h>
 
 namespace GC {
@@ -66,52 +67,33 @@ static_assert(decode_primitive_storage_handle(GC_PRIMITIVE_STORAGE_NULL_HANDLE).
 
 class CAPICellAllocator final : public CellAllocatorDescriptorBase {
 public:
-    CAPICellAllocator(CellTypeInfo const& type_info, StringView class_name)
-        : CellAllocatorDescriptorBase(type_info, class_name)
+    CAPICellAllocator(CellTypeInfo const& type_info, StringView class_name, void const* foreign_type)
+        : CellAllocatorDescriptorBase(type_info, class_name, foreign_type)
     {
-    }
-};
-
-class RootGatheringVisitor final : public Cell::Visitor {
-public:
-    explicit RootGatheringVisitor(HashMap<Cell*, HeapRoot>& roots)
-        : m_roots(roots)
-    {
+        set_trace_thread(TraceThread::AnyThread);
     }
 
-    virtual void visit_possible_values(ReadonlyBytes) override
+    ~CAPICellAllocator()
     {
-        // NB: Roots are gathered precisely; a conservative range belongs in a ConservativeRangeProvider.
-        VERIFY_NOT_REACHED();
+        // NB: The address of a descriptor without a foreign type names the type of its blocks, so it may never be reused.
+        VERIFY(foreign_type());
+        release_index();
     }
-
-private:
-    virtual void visit_impl(Cell& cell) override
-    {
-        m_roots.set(&cell, HeapRoot { .type = HeapRoot::Type::VM });
-    }
-
-    virtual void visit_impl(ReadonlySpan<NanBoxedValue> values) override
-    {
-        for (auto const& value : values) {
-            if (value.is_cell())
-                visit_impl(value.as_cell());
-        }
-    }
-
-    HashMap<Cell*, HeapRoot>& m_roots;
 };
 
 struct CAPI {
     static_assert(offsetof(ForeignCell, m_word_owned_by_the_foreign_implementation) == 0);
-    static_assert(offsetof(ForeignCell, m_mark) == offsetof(Cell, m_mark));
+    static_assert(offsetof(ForeignCell, m_identity_hash_state) == offsetof(Cell, m_identity_hash_state));
     static_assert(offsetof(ForeignCell, m_state) == offsetof(Cell, m_state));
     static_assert(offsetof(ForeignCell, m_cell_kind) == offsetof(Cell, m_cell_kind));
+    static_assert(offsetof(Cell, m_identity_hash_state) == IdentityHashState::offset);
+    static_assert(IdentityHashState::offset == FFI::IDENTITY_HASH_STATE_OFFSET);
+    static_assert(IdentityHashState::hashed == FFI::IDENTITY_HASH_HASHED);
+    static_assert(IdentityHashState::moved == FFI::IDENTITY_HASH_MOVED);
 
     static void get_layout(GCLayout& layout)
     {
         layout = {
-            .cell_mark_offset = offsetof(Cell, m_mark),
             .cell_state_offset = offsetof(Cell, m_state),
             .cell_kind_offset = offsetof(Cell, m_cell_kind),
             .min_cell_size = HeapBlock::min_possible_cell_size,
@@ -127,22 +109,28 @@ struct CAPI {
             .heap_allocated_bytes_since_last_gc_offset = offsetof(Heap, m_allocated_bytes_since_last_gc),
             .heap_gc_bytes_threshold_offset = offsetof(Heap, m_gc_bytes_threshold),
             .heap_total_allocated_bytes_offset = offsetof(Heap, m_total_allocated_bytes),
+            .block_size = HeapBlockBase::BLOCK_SIZE,
+            .block_foreign_type_offset = offsetof(HeapBlockBase, m_foreign_type),
             .heap_region_offset_mask = HEAP_REGION_OFFSET_MASK,
             .primitive_storage_cage_offset_mask = PrimitiveStorage::cage_offset_mask,
+            .visitor_marker_offset = static_cast<uint32_t>(Cell::Visitor::marker_offset()),
+            .identity_hash_state_offset = FFI::IDENTITY_HASH_STATE_OFFSET,
+            .identity_hash_hashed = FFI::IDENTITY_HASH_HASHED,
+            .identity_hash_moved = FFI::IDENTITY_HASH_MOVED,
         };
     }
 
-    static Cell* allocate_cell(Heap& heap, CellAllocatorDescriptorBase& descriptor, bool& must_mark)
+    static Cell* allocate_cell(Heap& heap, CellAllocatorDescriptorBase& descriptor)
     {
         auto* cell = heap.allocate_cell(descriptor);
-        must_mark = heap.mark_if_allocated_during_incremental_sweep(*cell);
+        heap.mark_if_allocated_during_incremental_sweep(*cell);
         return cell;
     }
 
-    static Cell* allocate_storage_cell(Heap& heap, CellAllocatorDescriptorBase& descriptor, bool& must_mark)
+    static Cell* allocate_storage_cell(Heap& heap, CellAllocatorDescriptorBase& descriptor)
     {
         auto* cell = heap.allocate_cell(descriptor, Heap::TriggersCollection::No);
-        must_mark = heap.mark_if_allocated_during_incremental_sweep(*cell);
+        heap.mark_if_allocated_during_incremental_sweep(*cell);
         return cell;
     }
 
@@ -151,15 +139,31 @@ struct CAPI {
     static_assert(sizeof(Heap::m_total_allocated_bytes) == sizeof(size_t));
 
     // Foreign code reads and writes the head of the list, the cursor and the end as plain pointers.
-    static_assert(sizeof(RawPtr<Cell>) == sizeof(Cell*));
+    static_assert(sizeof(Ptr<Cell>) == sizeof(Cell*));
     static_assert(offsetof(CellAllocator::LocalFreeCells, free_list) == 0);
     static_assert(sizeof(FlatPtr) == sizeof(void*));
-    static CellAllocator::LocalFreeCells* local_free_cells(Heap& heap, CellAllocatorDescriptorBase& descriptor) { return descriptor.for_heap(heap).local_free_cells({}); }
+    static CellAllocator::LocalFreeCells* local_free_cells(Heap& heap, CellAllocatorDescriptorBase& descriptor) { return heap.cell_allocator_for(descriptor).local_free_cells({}); }
     static void set_foreign_context(Heap& heap, void* context) { heap.m_foreign_context = context; }
     static void* foreign_context(Heap& heap) { return heap.m_foreign_context; }
     static void defer_gc(Heap& heap) { heap.defer_gc(); }
     static void undefer_gc(Heap& heap) { heap.undefer_gc(); }
+    static void deferral_state(Heap& heap, size_t*& deferrals, bool*& collect_when_deferrals_end)
+    {
+        deferrals = &heap.m_gc_deferrals;
+        collect_when_deferrals_end = &heap.m_should_gc_when_deferral_ends;
+    }
     static StackInfo const& stack_info(Heap const& heap) { return heap.m_stack_info; }
+    static FFI::IdentityHashes** identity_hashes(Heap& heap) { return &heap.m_identity_hashes; }
+    static bool will_move(Cell const& cell)
+    {
+        auto* evacuation = cell.heap().m_evacuation;
+        return evacuation && FFI::rust_gc_evacuation_will_move(evacuation, &cell);
+    }
+    static void record_slot(Heap& heap, void const* slot, FFI::RecordedSlotKind kind)
+    {
+        if (heap.m_evacuation)
+            FFI::rust_gc_evacuation_record_slot(heap.m_evacuation, slot, kind);
+    }
 };
 
 }
@@ -204,8 +208,16 @@ static bool store_resized_primitive_storage(PrimitiveStorage const& storage, Err
 
 extern "C" {
 
-void gc_get_layout(GCLayout* layout)
+// Where a heap keeps the identity hashes of the cells that moved, for LibGC's Rust core.
+void** gc_heap_identity_hashes(void* heap);
+void** gc_heap_identity_hashes(void* heap)
 {
+    return reinterpret_cast<void**>(CAPI::identity_hashes(*static_cast<Heap*>(heap)));
+}
+
+void gc_get_layout(GCLayout* layout, size_t layout_size)
+{
+    VERIFY(layout_size == sizeof(GCLayout));
     CAPI::get_layout(*layout);
 }
 
@@ -220,14 +232,14 @@ uintptr_t gc_primitive_storage_cage_base(void)
     return js_primitive_storage_cage_base;
 }
 
-GCHeap* gc_heap_create(GCGatherRootsCallback gather_roots, void* context, bool become_process_default)
+GCHeap* gc_heap_create(GCGatherRootsCallback gather_roots, void* context, bool become_thread_default)
 {
     auto* heap = new Heap(
         [gather_roots, context](HashMap<Cell*, HeapRoot>& roots) {
-            RootGatheringVisitor visitor { roots };
+            Detail::RootGatheringVisitor visitor { roots, HeapRoot::Type::VM };
             gather_roots(context, reinterpret_cast<GCVisitor*>(static_cast<Cell::Visitor*>(&visitor)));
         },
-        become_process_default ? Heap::BecomeProcessDefault::Yes : Heap::BecomeProcessDefault::No);
+        become_thread_default ? Heap::BecomeThreadDefault::Yes : Heap::BecomeThreadDefault::No);
     CAPI::set_foreign_context(*heap, context);
     return reinterpret_cast<GCHeap*>(heap);
 }
@@ -244,9 +256,34 @@ void gc_heap_collect_garbage(GCHeap* heap, int collection_type, bool print_repor
     as_heap(heap).collect_garbage(type, print_report);
 }
 
+void gc_heap_collect_garbage_without_scanning_the_stack(GCHeap* heap)
+{
+    as_heap(heap).collect_garbage_without_scanning_the_stack();
+}
+
+bool gc_heap_moves_everything(void)
+{
+    return Heap::moves_everything();
+}
+
+void gc_heap_set_moves_everything_for_testing(GCHeap* heap, bool moves_everything)
+{
+    as_heap(heap).set_moves_everything_for_testing(moves_everything);
+}
+
 bool gc_heap_is_collecting_everything(GCHeap const* heap)
 {
     return as_heap(heap).is_collecting_everything();
+}
+
+bool gc_heap_is_marking_for_collection(GCHeap const* heap)
+{
+    return as_heap(heap).is_marking_for_collection();
+}
+
+bool gc_heap_is_returning_memory_to_system(GCHeap const* heap)
+{
+    return as_heap(heap).is_returning_memory_to_system();
 }
 
 void gc_heap_defer_gc(GCHeap* heap)
@@ -257,6 +294,11 @@ void gc_heap_defer_gc(GCHeap* heap)
 void gc_heap_undefer_gc(GCHeap* heap)
 {
     CAPI::undefer_gc(as_heap(heap));
+}
+
+void gc_heap_deferral_state(GCHeap* heap, size_t** deferrals, bool** collect_when_deferrals_end)
+{
+    CAPI::deferral_state(as_heap(heap), *deferrals, *collect_when_deferrals_end);
 }
 
 bool gc_heap_should_collect_on_every_allocation(GCHeap const* heap)
@@ -306,14 +348,14 @@ void gc_heap_did_free_external_memory(GCHeap* heap, size_t size)
     as_heap(heap).did_free_external_memory(size);
 }
 
-GCAllocator* gc_allocator_create(GCCellTypeInfo const* type_info, char const* name, size_t name_length)
+GCAllocator* gc_allocator_create(GCCellTypeInfo const* type_info, char const* name, size_t name_length, void const* foreign_type)
 {
     VERIFY(type_info->visit_edges);
     VERIFY(type_info->cell_size >= HeapBlock::min_possible_cell_size);
     VERIFY(type_info->cell_size <= HeapBlock::BLOCK_SIZE - sizeof(HeapBlock));
     VERIFY(type_info->alignment <= max_cell_alignment);
     VERIFY(type_info->cell_size % type_info->alignment == 0);
-    auto* allocator = new CAPICellAllocator(*reinterpret_cast<CellTypeInfo const*>(type_info), StringView { name, name_length });
+    auto* allocator = new CAPICellAllocator(*reinterpret_cast<CellTypeInfo const*>(type_info), StringView { name, name_length }, foreign_type);
     return reinterpret_cast<GCAllocator*>(allocator);
 }
 
@@ -322,16 +364,26 @@ void gc_allocator_destroy(GCAllocator* allocator)
     delete reinterpret_cast<CAPICellAllocator*>(allocator);
 }
 
-GCCell* gc_heap_allocate_cell(GCHeap* heap, GCAllocator* allocator, bool* must_mark)
+void gc_allocator_set_traced_on_owner_thread_only(GCAllocator* allocator)
 {
-    auto& descriptor = *reinterpret_cast<CAPICellAllocator*>(allocator);
-    return as_gc_cell(CAPI::allocate_cell(as_heap(heap), descriptor, *must_mark));
+    reinterpret_cast<CAPICellAllocator*>(allocator)->set_trace_thread(TraceThread::OwnerThreadOnly);
 }
 
-GCCell* gc_heap_allocate_storage_cell(GCHeap* heap, GCAllocator* allocator, bool* must_mark)
+void gc_allocator_set_movable(GCAllocator* allocator)
+{
+    reinterpret_cast<CAPICellAllocator*>(allocator)->set_movable();
+}
+
+GCCell* gc_heap_allocate_cell(GCHeap* heap, GCAllocator* allocator)
 {
     auto& descriptor = *reinterpret_cast<CAPICellAllocator*>(allocator);
-    return as_gc_cell(CAPI::allocate_storage_cell(as_heap(heap), descriptor, *must_mark));
+    return as_gc_cell(CAPI::allocate_cell(as_heap(heap), descriptor));
+}
+
+GCCell* gc_heap_allocate_storage_cell(GCHeap* heap, GCAllocator* allocator)
+{
+    auto& descriptor = *reinterpret_cast<CAPICellAllocator*>(allocator);
+    return as_gc_cell(CAPI::allocate_storage_cell(as_heap(heap), descriptor));
 }
 
 GCCell** gc_heap_allocator_local_free_list(GCHeap* heap, GCAllocator* allocator)
@@ -354,6 +406,32 @@ void* gc_cell_heap_context(GCCell const* cell)
 GCCellTypeInfo const* gc_cell_type_info(GCCell const* cell)
 {
     return reinterpret_cast<GCCellTypeInfo const*>(&reinterpret_cast<Cell const*>(cell)->type_info());
+}
+
+bool gc_cell_is_marked(GCCell const* cell)
+{
+    return GC::is_marked(cell);
+}
+
+bool gc_cell_will_move(GCCell const* cell)
+{
+    return CAPI::will_move(*reinterpret_cast<Cell const*>(cell));
+}
+
+bool gc_heap_is_moving_cells(GCHeap const* heap)
+{
+    return as_heap(heap).is_moving_cells();
+}
+
+void gc_heap_record_slot(GCHeap* heap, void const* slot, int kind)
+{
+    VERIFY(kind == GC_RECORDED_SLOT_VALUE || kind == GC_RECORDED_SLOT_CELL_POINTER);
+    CAPI::record_slot(as_heap(heap), slot, kind == GC_RECORDED_SLOT_VALUE ? FFI::RecordedSlotKind::Value : FFI::RecordedSlotKind::CellPointer);
+}
+
+uint32_t gc_cell_identity_hash(GCCell const* cell)
+{
+    return FFI::rust_gc_cell_identity_hash(heap_region_base(), cell);
 }
 
 GCRoot* gc_root_create(GCCell* cell)
@@ -412,9 +490,49 @@ void gc_visitor_visit_values(GCVisitor* visitor, uint64_t const* values, size_t 
     as_visitor(visitor).visit(ReadonlySpan<NanBoxedValue> { reinterpret_cast<NanBoxedValue const*>(values), count });
 }
 
-void gc_visitor_visit_possible_values(GCVisitor* visitor, uint8_t const* data, size_t size)
+void gc_visitor_visit_ephemeron(GCVisitor* visitor, GCCell* key, uint64_t const* value)
 {
-    as_visitor(visitor).visit_possible_values(ReadonlyBytes { data, size });
+    as_visitor(visitor).visit_ephemeron(*from_gc_cell(key), *reinterpret_cast<NanBoxedValue const*>(value));
+}
+
+void gc_marker_visit_cell(GCMarker* marker, GCCell* cell)
+{
+    FFI::rust_gc_marker_visit_cell(reinterpret_cast<FFI::Marker*>(marker), cell);
+}
+
+void gc_marker_visit_values(GCMarker* marker, uint64_t const* values, size_t count)
+{
+    FFI::rust_gc_marker_visit_values(reinterpret_cast<FFI::Marker*>(marker), values, count);
+}
+
+void gc_marker_visit_owned_values(GCMarker* marker, uint64_t const* values, size_t count)
+{
+    FFI::rust_gc_marker_visit_owned_values(reinterpret_cast<FFI::Marker*>(marker), values, count);
+}
+
+void gc_marker_visit_ephemeron_without_pinning(GCMarker* marker, GCCell* key, GCCell* value)
+{
+    FFI::rust_gc_marker_visit_ephemeron_without_pinning(reinterpret_cast<FFI::Marker*>(marker), key, value);
+}
+
+void gc_marker_visit_member(GCMarker* marker, uint32_t const* slot)
+{
+    FFI::rust_gc_marker_visit_member(reinterpret_cast<FFI::Marker*>(marker), slot);
+}
+
+void gc_marker_visit_interior_pointer(GCMarker* marker, uintptr_t const* slot, GCCell* cell)
+{
+    FFI::rust_gc_marker_visit_interior_pointer(reinterpret_cast<FFI::Marker*>(marker), slot, cell);
+}
+
+void gc_marker_visit_self_pointer(GCMarker* marker, uintptr_t const* slot)
+{
+    FFI::rust_gc_marker_visit_self_pointer(reinterpret_cast<FFI::Marker*>(marker), slot);
+}
+
+void gc_marker_pin_cell(GCMarker* marker, GCCell const* cell)
+{
+    FFI::rust_gc_marker_pin_cell(reinterpret_cast<FFI::Marker*>(marker), cell);
 }
 
 bool gc_primitive_storage_allocate(size_t size, bool zero_fill, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout)
@@ -427,12 +545,6 @@ bool gc_primitive_storage_reserve(size_t size, size_t capacity, bool zero_fill, 
 {
     auto& storage = PrimitiveStorage::the();
     return store_created_primitive_storage(storage, storage.try_reserve(size, capacity, as_zero_fill_new_bytes(zero_fill), guard_size), out_handle, out_layout);
-}
-
-bool gc_primitive_storage_adopt_shared_fd(int fd, size_t size, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout)
-{
-    auto& storage = PrimitiveStorage::the();
-    return store_created_primitive_storage(storage, storage.try_adopt_shared_fd(fd, size), out_handle, out_layout);
 }
 
 bool gc_primitive_storage_resize(GCPrimitiveStorageHandle handle, size_t new_size, bool zero_fill, GCPrimitiveStorageLayout* out_layout)
@@ -489,50 +601,5 @@ size_t gc_primitive_storage_committed_size(GCPrimitiveStorageHandle handle)
 uint8_t* gc_primitive_storage_data(GCPrimitiveStorageHandle handle)
 {
     return PrimitiveStorage::the().data(decode_primitive_storage_handle(handle));
-}
-
-bool gc_shared_memory_create(size_t size, int* out_fd)
-{
-    *out_fd = -1;
-    auto buffer = Core::AnonymousBuffer::create_with_size(size, Core::AnonymousBuffer::Sealability::Sealable);
-    if (buffer.is_error())
-        return false;
-    // NB: The buffer closes its descriptor and unmaps its own view of the memory when it goes away; the caller gets a
-    //     duplicate of the descriptor.
-    auto fd = Core::System::dup(buffer.value().fd());
-    if (fd.is_error())
-        return false;
-    *out_fd = fd.value();
-    return true;
-}
-
-struct GCSharedMemoryViewOutsideCage {
-    AK_ALLOC_WITH_KMALLOC;
-
-    Core::AnonymousBuffer buffer;
-};
-
-GCSharedMemoryViewOutsideCage* gc_shared_memory_view_outside_cage_create(int fd, size_t size)
-{
-    if (size == 0)
-        return nullptr;
-    auto duplicate_fd = Core::System::dup(fd);
-    if (duplicate_fd.is_error())
-        return nullptr;
-    // NB: The buffer owns the duplicate from here on, and closes it if mapping fails.
-    auto buffer = Core::AnonymousBuffer::create_from_anon_fd(duplicate_fd.value(), size);
-    if (buffer.is_error() || buffer.value().validate_backing_size().is_error())
-        return nullptr;
-    return new GCSharedMemoryViewOutsideCage { buffer.release_value() };
-}
-
-uint8_t* gc_shared_memory_view_outside_cage_data(GCSharedMemoryViewOutsideCage* view)
-{
-    return view->buffer.data<uint8_t>();
-}
-
-void gc_shared_memory_view_outside_cage_destroy(GCSharedMemoryViewOutsideCage* view)
-{
-    delete view;
 }
 }

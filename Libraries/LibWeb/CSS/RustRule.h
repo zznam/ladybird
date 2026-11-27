@@ -58,7 +58,6 @@ public:
             return RustDeclarationBlock { declarations };
         return {};
     }
-    size_t external_memory_size() const { return Parser::ValueParserFFI::rust_rule_external_memory_size(m_rule); }
     Parser::ValueParserFFI::NativeRule const* handle() const { return m_rule; }
 
 private:
@@ -103,6 +102,8 @@ public:
     RustMediaList import_media() const { return RustMediaList { Parser::ValueParserFFI::rust_rule_view_import_media(&m_view) }; }
     RustFontFeatureValuesSnapshot font_feature_values() const { return RustFontFeatureValuesSnapshot { Parser::ValueParserFFI::rust_rule_view_font_feature_values(&m_view) }; }
     RustCompiledFunction compile_function() const { return RustCompiledFunction { Parser::ValueParserFFI::rust_rule_view_compile_function(&m_view) }; }
+    // The declarations of a @position-try rule, retained for the caller.
+    Parser::ValueParserFFI::DeclarationBlockHeader const* position_try_declarations() const { return Parser::ValueParserFFI::rust_rule_view_position_try_declarations(&m_view); }
     Utf16String name() const
     {
         Utf16String name;
@@ -111,13 +112,7 @@ public:
         });
         return name;
     }
-    void for_each_keyframe(Function<void(ReadonlySpan<double>, RustDeclarationBlockSnapshot const&)> const& callback) const
-    {
-        Parser::ValueParserFFI::rust_rule_view_keyframes(&m_view, &callback, [](void const* context, double const* keys, size_t count, Parser::ValueParserFFI::DeclarationBlockData const* declarations) {
-            RustDeclarationBlockSnapshot snapshot { Parser::ValueParserFFI::rust_declaration_data_retain(declarations) };
-            (*static_cast<Function<void(ReadonlySpan<double>, RustDeclarationBlockSnapshot const&)> const*>(context))({ keys, count }, snapshot);
-        });
-    }
+    Parser::ValueParserFFI::NativeRuleView const& native_view() const { return m_view; }
 
 private:
     Parser::ValueParserFFI::NativeRuleView const& m_view;

@@ -1,7 +1,11 @@
+ladybird_test_suite(LibMedia)
+
 set(TEST_SOURCES
+    LoadBundledFFmpeg.cpp
     TestADTSDemuxer.cpp
     TestADTSFrameHeader.cpp
     TestADTSReader.cpp
+    TestAV1Decode.cpp
     TestAudioBlockTimingRing.cpp
     TestAudioDiscardIntervals.cpp
     TestAudioMixer.cpp
@@ -16,20 +20,21 @@ set(TEST_SOURCES
     TestDecoderRegistry.cpp
     TestDemuxerRegistry.cpp
     TestDisplayingVideoSink.cpp
+    TestFFmpegAudioConverter.cpp
     TestFFmpegAudioNormalization.cpp
     TestFLACDemuxer.cpp
+    TestFrameScanTimeline.cpp
     TestID3.cpp
     TestIncrementallyPopulatedStream.cpp
     TestISOBMFF.cpp
     TestMatroskaDemuxer.cpp
-    TestFrameScanTimeline.cpp
+    TestMediaSupport.cpp
+    TestMediaTime.cpp
     TestMP3Demuxer.cpp
     TestMP3FrameHeader.cpp
     TestMP3Reader.cpp
     TestMP3StreamInfo.cpp
     TestNonReferenceFrameDetector.cpp
-    TestMediaSupport.cpp
-    TestMediaTime.cpp
     TestOggDemuxer.cpp
     TestParseMatroska.cpp
     TestPipelineNodes.cpp
@@ -38,10 +43,10 @@ set(TEST_SOURCES
     TestRemoteVideoNode.cpp
     TestSourceBufferDemuxer.cpp
     TestTimeRanges.cpp
-    TestVideoEdgeQueue.cpp
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp
     TestVP9Decode.cpp
+    TestWebMByteStreamParser.cpp
     TestWav.cpp
     TestWAVDemuxer.cpp
 )
@@ -52,36 +57,41 @@ if (APPLE)
         TestVideoToolboxDecode.cpp
     )
 endif()
+if (WIN32)
+    list(APPEND TEST_SOURCES
+        TestWindowsMediaFoundationAudioDecode.cpp
+        TestWindowsMediaFoundationDecode.cpp
+    )
+endif()
 if (LINUX)
     list(APPEND TEST_SOURCES
         TestH264Decode.cpp
-        TestSystemFFmpeg.cpp
+        TestH265Decode.cpp
     )
+    if (USE_VULKAN_DMABUF_IMAGES)
+        list(APPEND TEST_SOURCES TestFFmpegVulkanDecode.cpp)
+    endif()
+
+    # Loads the bundled libavcodec in place of a system one, which needs it to be a shared library.
+    find_library(LADYBIRD_BUNDLED_LIBAVCODEC NAMES ${AVCODEC_LIBRARIES} PATHS ${AVCODEC_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+    if (LADYBIRD_BUNDLED_LIBAVCODEC MATCHES "\\${CMAKE_SHARED_LIBRARY_SUFFIX}$")
+        list(APPEND TEST_SOURCES TestSystemFFmpeg.cpp)
+    endif()
 endif()
 
-foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" LibMedia LIBS LibAudio LibMedia LibFileSystem)
-endforeach()
+target_sources(TestLibMedia PRIVATE ${TEST_SOURCES})
+target_link_libraries(TestLibMedia PRIVATE LibAudio LibFileSystem LibGfx LibIPC LibMedia LibMediaCodecs LibThreading)
+# The header of FFmpegChannelLayout includes FFmpeg's headers.
+if (LINUX AND NOT ANDROID)
+    ladybird_use_bundled_ffmpeg_headers(TestLibMedia)
+else()
+    target_link_libraries(TestLibMedia PRIVATE PkgConfig::AVCODEC PkgConfig::AVUTIL)
+endif()
 
-target_link_libraries(TestAudioBlockTimingRing PRIVATE LibThreading)
-target_link_libraries(TestDecodedAudioProducer PRIVATE LibGfx)
-target_link_libraries(TestDecodedVideoProducer PRIVATE LibThreading)
-target_link_libraries(TestDisplayingVideoSink PRIVATE LibGfx)
-target_link_libraries(TestVP9Decode PRIVATE LibGfx)
-target_link_libraries(TestADTSDemuxer PRIVATE LibThreading)
-target_link_libraries(TestFLACDemuxer PRIVATE LibThreading)
-target_link_libraries(TestMP3Demuxer PRIVATE LibThreading)
-target_link_libraries(TestOggDemuxer PRIVATE LibThreading LibGfx)
-target_link_libraries(TestWAVDemuxer PRIVATE LibThreading)
-target_link_libraries(TestISOBMFF PRIVATE LibThreading)
-target_link_libraries(TestMediaTime PRIVATE LibThreading)
-target_link_libraries(TestVideoFramePool PRIVATE LibThreading LibIPC)
-target_link_libraries(TestIncrementallyPopulatedStream PRIVATE LibThreading)
-target_link_libraries(TestRemoteVideoDecoder PRIVATE LibThreading LibIPC LibMediaCodecs)
-target_link_libraries(TestRemoteVideoNode PRIVATE LibThreading LibGfx LibIPC)
+if ("TestFFmpegVulkanDecode.cpp" IN_LIST TEST_SOURCES)
+    target_link_libraries(TestLibMedia PRIVATE LibPlatformFeatures Vulkan::Vulkan)
+endif()
 
-if (LINUX)
-    target_link_libraries(TestH264Decode PRIVATE LibGfx)
-    find_library(LADYBIRD_BUNDLED_LIBAVCODEC NAMES ${AVCODEC_LIBRARIES} PATHS ${AVCODEC_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
-    target_compile_definitions(TestSystemFFmpeg PRIVATE LADYBIRD_BUNDLED_LIBAVCODEC_PATH="${LADYBIRD_BUNDLED_LIBAVCODEC}")
+if ("TestSystemFFmpeg.cpp" IN_LIST TEST_SOURCES)
+    set_property(SOURCE TestSystemFFmpeg.cpp APPEND PROPERTY COMPILE_DEFINITIONS LADYBIRD_BUNDLED_LIBAVCODEC_PATH="${LADYBIRD_BUNDLED_LIBAVCODEC}")
 endif()

@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
+#include <AK/Array.h>
+#include <AK/CharacterTypes.h>
 #include <AK/GenericLexer.h>
+#include <AK/Hex.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringConversions.h>
 #include <AK/Utf16View.h>
-#include <LibCrypto/Hash/SHA1.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/HTTP.h>
@@ -19,6 +23,21 @@
 namespace HTTP {
 
 static Optional<StringView> extract_cache_control_directive(StringView, StringView, bool allow_argument);
+
+// https://httpwg.org/specs/rfc9111.html#delta-seconds
+static Optional<AK::Duration> parse_delta_seconds(StringView value)
+{
+    // delta-seconds = 1*DIGIT
+    if (value.is_empty() || !all_of(value, is_ascii_digit))
+        return {};
+
+    // If a cache receives a delta-seconds value greater than the greatest integer it can represent, or if any of its
+    // subsequent calculations overflows, the cache MUST consider the value to be 2147483648 (2^31) or the greatest
+    // positive integer it can conveniently represent.
+    static constexpr u64 maximum_delta_seconds = 2'147'483'648;
+    auto seconds = min(value.to_number<u64>().value_or(maximum_delta_seconds), maximum_delta_seconds);
+    return AK::Duration::from_seconds(static_cast<i64>(seconds));
+}
 
 // https://httpwg.org/specs/rfc9110.html#field.date
 static Optional<UnixDateTime> parse_http_date(Optional<ByteString const&> date)
@@ -63,55 +82,49 @@ String serialize_url_for_cache_storage(URL::URL const& url)
     return url.serialize(URL::ExcludeFragment::Yes);
 }
 
-static u64 serialize_hash(Crypto::Hash::SHA1& hasher)
+static CacheDigest serialize_hash(Crypto::Hash::Hasher& hasher)
 {
-    auto digest = hasher.digest();
-    auto bytes = digest.bytes();
-
-    u64 result = 0;
-    result |= static_cast<u64>(bytes[0]) << 56;
-    result |= static_cast<u64>(bytes[1]) << 48;
-    result |= static_cast<u64>(bytes[2]) << 40;
-    result |= static_cast<u64>(bytes[3]) << 32;
-    result |= static_cast<u64>(bytes[4]) << 24;
-    result |= static_cast<u64>(bytes[5]) << 16;
-    result |= static_cast<u64>(bytes[6]) << 8;
-    result |= static_cast<u64>(bytes[7]);
-
-    return result;
+    auto digest = hasher.finish();
+    return CacheDigest::from_bytes(digest.bytes()).release_value();
 }
 
-u64 create_cache_key(Utf16View const& partition, StringView url, StringView method)
+// Length prefixes prevent distinct fields from hashing the same byte sequence.
+static void update_with_length(Crypto::Hash::Hasher& hasher, StringView bytes)
 {
-    auto hasher = Crypto::Hash::SHA1::create();
+    u64 length = bytes.length();
+    hasher.update(ReadonlyBytes { &length, sizeof(length) });
+    hasher.update(bytes);
+}
+
+CacheDigest create_cache_key(Utf16View const& partition, StringView url, StringView method)
+{
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
+
+    u64 partition_length = partition.length_in_code_units();
+    hasher.update(ReadonlyBytes { &partition_length, sizeof(partition_length) });
 
     // NB: Hash the code units rather than the string's storage, so the same text always gives the same key.
     Array<u8, 256> buffer;
     size_t buffer_size = 0;
     for (size_t i = 0; i < partition.length_in_code_units(); ++i) {
         if (buffer_size == buffer.size()) {
-            hasher->update(buffer.span());
+            hasher.update(buffer.span());
             buffer_size = 0;
         }
         auto code_unit = partition.code_unit_at(i);
         buffer[buffer_size++] = static_cast<u8>(code_unit & 0xff);
         buffer[buffer_size++] = static_cast<u8>(code_unit >> 8);
     }
-    hasher->update(buffer.span().trim(buffer_size));
-    hasher->update("\n"sv);
-    hasher->update(url);
-    hasher->update(method);
+    hasher.update(buffer.span().trim(buffer_size));
+    update_with_length(hasher, url);
+    update_with_length(hasher, method);
 
-    return serialize_hash(*hasher);
+    return serialize_hash(hasher);
 }
 
-u64 create_cache_key(StringView url, StringView method)
+CacheKey create_cache_key(StringView url, StringView method)
 {
-    auto hasher = Crypto::Hash::SHA1::create();
-    hasher->update(url);
-    hasher->update(method);
-
-    return serialize_hash(*hasher);
+    return { MUST(String::from_utf8(url)), MUST(String::from_utf8(method)) };
 }
 
 // https://httpwg.org/specs/rfc9111.html#caching.negotiated.responses
@@ -159,25 +172,18 @@ Optional<Vector<ByteString>> vary_field_names(HeaderList const& response_headers
     return field_names;
 }
 
-Optional<u64> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers)
+Optional<CacheDigest> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers)
 {
     auto field_names = vary_field_names(response_headers);
     if (!field_names.has_value())
         return {};
     if (field_names->is_empty())
-        return 0;
+        return CacheDigest {};
 
-    auto hasher = Crypto::Hash::SHA1::create();
-
-    // Length prefixes prevent distinct field sets from hashing the same byte sequence.
-    auto update_with_length = [&](StringView bytes) {
-        u64 length = bytes.length();
-        hasher->update(ReadonlyBytes { &length, sizeof(length) });
-        hasher->update(bytes);
-    };
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
 
     for (auto const& field_name : *field_names) {
-        update_with_length(field_name);
+        update_with_length(hasher, field_name);
 
         // If (after any normalization that might take place) a header field is absent from a request, it can only
         // match another request if it is also absent there.
@@ -185,82 +191,25 @@ Optional<u64> create_vary_key(HeaderList const& request_headers, HeaderList cons
         // NB: Offset present-field counts to distinguish absent and empty fields.
         auto values = normalize_request_vary_header_values(field_name, request_headers);
         u64 value_count = values.has_value() ? values->size() + 1 : 0;
-        hasher->update(ReadonlyBytes { &value_count, sizeof(value_count) });
+        hasher.update(ReadonlyBytes { &value_count, sizeof(value_count) });
 
         if (values.has_value()) {
             for (auto const& value : *values)
-                update_with_length(value);
+                update_with_length(hasher, value);
         }
     }
 
-    return serialize_hash(*hasher);
+    return serialize_hash(hasher);
 }
 
-LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key)
+LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, CacheDigest const& cache_key, CacheDigest const& vary_key)
 {
-    auto file = vary_key == 0
-        ? ByteString::formatted("{:016x}", cache_key)
-        : ByteString::formatted("{:016x}_{:016x}", cache_key, vary_key);
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
+    hasher.update(cache_key.bytes.span());
+    hasher.update(vary_key.bytes.span());
+    auto digest = hasher.finish();
 
-    return cache_directory.append(file);
-}
-
-static constexpr StringView cache_entry_associated_data_suffix(CacheEntryAssociatedData associated_data)
-{
-    switch (associated_data) {
-    case CacheEntryAssociatedData::JavaScriptBytecode:
-        return "jsbc"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static constexpr Optional<CacheEntryAssociatedData> cache_entry_associated_data_from_suffix(StringView suffix)
-{
-    if (suffix == "jsbc"sv)
-        return CacheEntryAssociatedData::JavaScriptBytecode;
-    return {};
-}
-
-LexicalPath path_for_cache_entry_associated_data(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key, CacheEntryAssociatedData associated_data)
-{
-    auto file = vary_key == 0
-        ? ByteString::formatted("{:016x}.{}", cache_key, cache_entry_associated_data_suffix(associated_data))
-        : ByteString::formatted("{:016x}_{:016x}.{}", cache_key, vary_key, cache_entry_associated_data_suffix(associated_data));
-
-    return cache_directory.append(file);
-}
-
-Optional<CacheEntryData> cache_entry_data_for_file(LexicalPath const& cache_file)
-{
-    CacheEntryData result;
-
-    if (auto file_name = cache_file.basename(LexicalPath::StripExtension::Yes); file_name.contains('_')) {
-        auto parts = file_name.split_view('_', SplitBehavior::KeepEmpty);
-        if (parts.size() != 2)
-            return {};
-
-        auto cache_key = AK::parse_number<u64>(parts[0], TrimWhitespace::No, 16);
-        auto vary_key = AK::parse_number<u64>(parts[1], TrimWhitespace::No, 16);
-        if (!cache_key.has_value() || !vary_key.has_value())
-            return {};
-
-        result.cache_key = *cache_key;
-        result.vary_key = *vary_key;
-    } else {
-        auto cache_key = AK::parse_number<u64>(file_name, TrimWhitespace::No, 16);
-        if (!cache_key.has_value())
-            return {};
-
-        result.cache_key = *cache_key;
-    }
-
-    if (auto extension = cache_file.extension(); !extension.is_empty()) {
-        result.associated_data = cache_entry_associated_data_from_suffix(extension);
-        if (!result.associated_data.has_value())
-            return {};
-    }
-
-    return result;
+    return cache_directory.append(encode_hex(digest.bytes().trim(16)));
 }
 
 // https://httpwg.org/specs/rfc9111.html#response.cacheability
@@ -292,6 +241,26 @@ bool has_preconditions(HeaderList const& request_headers)
         || request_headers.contains("If-Modified-Since"sv)
         || request_headers.contains("If-Unmodified-Since"sv)
         || request_headers.contains("If-Range"sv);
+}
+
+// AD-HOC: The "force-cache" cache mode uses a stored response "not paying attention to staleness". But a request that
+//         carries a no-cache directive of its own asks for a response that the origin validated, so it does not get a
+//         stale one. This is checked when the cache is looked up, as only then does the request have its final headers.
+//         As RFC 7234 put it, "When the Cache-Control header field is also present and understood in a request, Pragma
+//         is ignored."
+bool request_permits_stale_responses(CacheMode cache_mode, HeaderList const& request_headers)
+{
+    if (!cache_mode_permits_stale_responses(cache_mode))
+        return false;
+    if (cache_mode != CacheMode::ForceCache)
+        return true;
+
+    if (auto cache_control = request_headers.get("Cache-Control"sv); cache_control.has_value())
+        return !contains_cache_control_directive(*cache_control, "no-cache"sv);
+    if (auto pragma = request_headers.get("Pragma"sv); pragma.has_value())
+        return !contains_cache_control_directive(*pragma, "no-cache"sv);
+
+    return true;
 }
 
 // https://datatracker.ietf.org/doc/html/rfc9110#name-overview-of-status-codes
@@ -412,7 +381,7 @@ bool is_cacheable(u32 status_code, HeaderList const& headers)
     if (cache_control.has_value()) {
         has_public = contains_cache_control_directive(*cache_control, "public"sv);
         has_private = contains_cache_control_directive(*cache_control, "private"sv);
-        has_max_age = contains_cache_control_directive(*cache_control, "max-age"sv);
+        has_max_age = extract_cache_control_duration_directive(*cache_control, "max-age"sv).has_value();
 
         // FIXME: cache extensions that explicitly allow caching are not interpreted.
     }
@@ -552,7 +521,14 @@ AK::Duration calculate_freshness_lifetime(u32 status_code, HeaderList const& hea
 
     // * If the Expires response header field (Section 5.3) is present, use its value minus the value of the Date response
     //   header field (using the time the message was received if it is not present, as per Section 6.6.1 of [HTTP]), or
-    if (auto expires = parse_http_date(headers.get("Expires"sv)); expires.has_value()) {
+    if (auto expires_header = headers.get("Expires"sv); expires_header.has_value()) {
+        // https://httpwg.org/specs/rfc9111.html#field.expires
+        // A cache recipient MUST interpret invalid date formats, especially the value "0", as representing a time in
+        // the past (i.e., "already expired").
+        auto expires = parse_http_date(*expires_header);
+        if (!expires.has_value())
+            return {};
+
         auto date = parse_http_date(headers.get("Date"sv)).value_or_lazy_evaluated([&]() {
             return UnixDateTime::now() + current_time_offset_for_testing;
         });
@@ -596,11 +572,8 @@ AK::Duration calculate_age(HeaderList const& headers, UnixDateTime request_time,
     AK::Duration age_value;
 
     if (auto age = headers.get("Age"sv); age.has_value()) {
-        if (!age->is_empty() && all_of(*age, is_ascii_digit)) {
-            static constexpr u64 maximum_age_value = 2'147'483'648;
-            auto seconds = min(age->to_number<u64>().value_or(maximum_age_value), maximum_age_value);
-            age_value = AK::Duration::from_seconds(static_cast<i64>(seconds));
-        }
+        if (auto seconds = parse_delta_seconds(*age); seconds.has_value())
+            age_value = *seconds;
     }
 
     // The term "now" means the current value of this implementation's clock (Section 5.6.7 of [HTTP]).
@@ -656,6 +629,15 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (response_cache_control.has_value() && contains_cache_control_directive(*response_cache_control, "no-cache"sv))
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
+    // AD-HOC: RFC 9111 deprecates Pragma, but clients still send it. Keep the rule of RFC 7234:
+    //         https://www.rfc-editor.org/rfc/rfc7234#section-5.4
+    //         "When the Cache-Control header field is not present in a request, caches MUST consider the no-cache
+    //         request pragma-directive as having the same effect as if "Cache-Control: no-cache" were present"
+    if (!request_cache_control.has_value()) {
+        if (auto request_pragma = request_headers.get("Pragma"sv); request_pragma.has_value() && contains_cache_control_directive(*request_pragma, "no-cache"sv))
+            return revalidation_status(CacheLifetimeStatus::MustRevalidate);
+    }
+
     if (request_cache_control.has_value()) {
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.no-cache
         // The no-cache request directive indicates that the client prefers a stored response not be used to satisfy the
@@ -691,7 +673,14 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (freshness_lifetime > current_age)
         return CacheLifetimeStatus::Fresh;
 
-    if (request_cache_control.has_value()) {
+    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
+    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
+    // that response to satisfy another request until it has been successfully validated by the origin
+    //
+    // NB: A max-stale request directive does not permit reuse of such a response either, so check this first.
+    bool has_must_revalidate = response_cache_control.has_value() && contains_cache_control_directive(*response_cache_control, "must-revalidate"sv);
+
+    if (request_cache_control.has_value() && !has_must_revalidate) {
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.max-stale
         // The max-stale request directive indicates that the client will accept a response that has exceeded its
         // freshness lifetime. If a value is present, then the client is willing to accept a response that has exceeded
@@ -709,16 +698,12 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (!response_cache_control.has_value())
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
-    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
-    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
-    // that response to satisfy another request until it has been successfully validated by the origin
-    //
-    // NB: This takes precedence over stale-while-revalidate, as per
+    // NB: must-revalidate takes precedence over stale-while-revalidate, as per
     //     https://httpwg.org/specs/rfc9111.html#serving.stale.responses:
     //     A cache MUST NOT generate a stale response if it is prohibited by an explicit in-protocol directive (e.g., by
     //     a no-cache response directive, a must-revalidate response directive, or an applicable s-maxage or
     //     proxy-revalidate response directive; see Section 5.2.2).
-    if (contains_cache_control_directive(*response_cache_control, "must-revalidate"sv))
+    if (has_must_revalidate)
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
     // https://httpwg.org/specs/rfc5861.html#n-the-stale-while-revalidate-cache-control-extension
@@ -926,8 +911,7 @@ Optional<AK::Duration> extract_cache_control_duration_directive(StringView cache
     if (auto value = extract_cache_control_directive(cache_control, directive); value.has_value()) {
         if (value->is_empty())
             return valueless_fallback;
-        if (auto seconds = value->to_number<i64>(); seconds.has_value())
-            return AK::Duration::from_seconds(*seconds);
+        return parse_delta_seconds(*value);
     }
 
     return {};

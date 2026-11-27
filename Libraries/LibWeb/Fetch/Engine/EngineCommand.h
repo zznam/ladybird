@@ -6,10 +6,13 @@
 
 #pragma once
 
+#include <AK/NonnullRefPtr.h>
 #include <AK/Variant.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibWeb/Fetch/Engine/BodyPresentation.h>
+#include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
+#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Engine/StartFetchInput.h>
 
 namespace Web::Fetch::Engine::Command {
@@ -30,14 +33,14 @@ struct Stop {
     FetchId fetch_id;
 };
 
-// The answer to a manual-redirect delivery's continuation, given exactly once.
+// The answer to the continuation of a manual redirect a fetch handed over, given at most once.
 struct ResolveRedirect {
     struct Follow { };
     struct AcceptAsFinal { };
     struct Abandon { };
     using Resolution = Variant<Follow, AcceptAsFinal, Abandon>;
 
-    DeliveryId delivery_id;
+    FetchId fetch_id;
     ContinuationId continuation_id;
     Resolution resolution;
 };
@@ -59,17 +62,29 @@ struct PreloadResponseResolved {
     CompletedPreloadResponse response;
 };
 
+// Main fetch's wait for a preload's response, which the agent can no longer resolve.
+struct PreloadWaitAbandoned {
+    FetchId fetch_id;
+};
+
 struct TransportControl {
-    struct ResumeBodyDeliveryUpTo {
+    struct StopTransport { };
+    struct ReleaseNavigationHold { };
+    struct ReleaseNavigationHoldUpTo {
         u64 byte_count { 0 };
     };
-    struct PauseBodyDelivery { };
-    struct StopTransport { };
-    using Operation = Variant<ResumeBodyDeliveryUpTo, PauseBodyDelivery, StopTransport>;
+    using Operation = Variant<StopTransport, ReleaseNavigationHold, ReleaseNavigationHoldUpTo>;
 
     RequestId request_id;
     TransportEpoch transport_epoch;
     Operation operation;
+};
+
+// The transport of a navigation body the agent adopted by its transfer lease, whose controls the engine applies from
+// then on.
+struct NavigationBodyAdopted {
+    NonnullRefPtr<NetworkTransportHandle> handle;
+    NonnullRefPtr<FetchBodyDeliveryGate> delivery_gate;
 };
 
 struct AdoptNetworkTransport {
@@ -87,7 +102,9 @@ using EngineCommand = Variant<
     Command::Stop,
     Command::ResolveRedirect,
     Command::PreloadResponseResolved,
+    Command::PreloadWaitAbandoned,
     Command::TransportControl,
+    Command::NavigationBodyAdopted,
     Command::AdoptNetworkTransport>;
 
 }

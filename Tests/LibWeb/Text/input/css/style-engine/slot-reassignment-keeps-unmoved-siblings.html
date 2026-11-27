@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <div id="host"></div>
 <script>
     test(() => {
@@ -22,12 +23,8 @@
         const moved = host.children[10];
         const unmoved = host.children[11];
         function moveTo(slot) {
-            internals.updateStyle();
-            const before = internals.styleEngineCounters();
-            moved.slot = slot;
-            internals.updateStyle();
-            const after = internals.styleEngineCounters();
-            println(`move to ${slot}: only moved subtree reached: ${after.reachedStyleNodes - before.reachedStyleNodes <= 2}`);
+            const work = styleWork(() => moved.slot = slot);
+            println(`move to ${slot} restyled: [${work.restyled().map(shortStyleName).join(", ")}]`);
             println(`moved color: ${getComputedStyle(moved).color}`);
             println(`child color: ${getComputedStyle(moved.firstElementChild).color}`);
             println(`unmoved color: ${getComputedStyle(unmoved).color}`);

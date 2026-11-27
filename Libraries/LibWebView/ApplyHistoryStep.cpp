@@ -51,7 +51,7 @@ void ApplyHistoryStep::apply_the_history_step()
     // FIXME: 1. Assert: This is running within traversable's session history traversal queue.
 
     // 2. Let targetStep be the result of getting the used step given traversable and step.
-    m_target_step = m_session_history.get_the_used_step(m_step).value();
+    m_target_step = m_session_history.get_the_used_step(m_step);
 
     // 3. If initiatorToCheck is not null, then:
     if (m_initiator_to_check.has_value()) {
@@ -204,8 +204,9 @@ void ApplyHistoryStep::end_changing_navigable_job(ChangingNavigable& changing_na
 {
     auto& navigable = changing_navigable.navigable();
     changing_navigable.job_ended = true;
-    if (auto population_loader = move(changing_navigable.population_loader))
+    if (auto population_loader = changing_navigable.population_loader())
         population_loader->reclaim_response_body_after_failed_handoff();
+    changing_navigable.population = Empty {};
     if (auto document = move(changing_navigable.populated_document))
         navigable.abandon_populated_document(changing_navigable.target_entry->document_state, *document);
     navigable.clear_ongoing_navigation_traversal(m_operation_id);
@@ -300,7 +301,7 @@ void ApplyHistoryStep::process_changing_navigable_continuations()
 
         // NB: targetStep was computed before the asynchronous parts of this algorithm. Re-normalize it in case a
         //     child navigable's removal made it unused meanwhile.
-        m_target_step = m_session_history.get_the_used_step(m_step).value();
+        m_target_step = m_session_history.get_the_used_step(m_step);
 
         auto& navigable = changing_navigable_continuation.navigable();
 
@@ -309,11 +310,13 @@ void ApplyHistoryStep::process_changing_navigable_continuations()
         //         job was paused, and can have taken that entry out of the session history: A replace (replaceState
         //         during a reload, e.g.) puts a new entry in its slot, and a push clears it away with the rest of the
         //         forward history (pushState during a forward traversal, or while a navigation's own new entry is still
-        //         ahead of the current step, e.g.). Activating such an entry gives its doc a navigation API entry list
+        //         ahead of the current step, e.g.), or with the oldest steps when it caps the session history
+        //         (pushState during a reload, e.g.). Activating such an entry gives its doc a navigation API entry list
         //         without the document's own entry in it, and leaves the navigable on an entry that the session history
         //         doesn't have. So this looks the target entry up again. A replacement in the claimed slot is the entry
-        //         to activate now. A traversal whose slot is gone is stale — the push that cleared the slot owns the
-        //         visible outcome. And a navigation whose new entry is gone appends it again, after the pushed entry.
+        //         to activate now. A traversal or reload whose slot is gone is stale — the push that cleared the slot
+        //         owns the visible outcome. And a navigation whose new entry is gone appends it again, after the pushed
+        //         entry.
         //         See https://github.com/whatwg/html/issues/12961.
         //
         //         Gecko/WebKit/Blink don't look a traversal's target up til the traversal runs, which is after any such
@@ -331,7 +334,7 @@ void ApplyHistoryStep::process_changing_navigable_continuations()
                 // NB: The job follows a replacement, so that the entry recorded as the navigable's active one is the
                 //     entry as the session history has it.
                 changing_navigable_continuation.target_entry = *target_entry;
-            } else if (m_navigation_type == Web::Bindings::NavigationType::Traverse) {
+            } else if (m_navigation_type == Web::Bindings::NavigationType::Traverse || m_navigation_type == Web::Bindings::NavigationType::Reload) {
                 return_result(Web::HTML::HistoryStepResult::Applied);
                 return;
             } else if (m_navigation_type == Web::Bindings::NavigationType::Push) {
@@ -390,7 +393,7 @@ void ApplyHistoryStep::append_the_claimed_target_entry_again(CanonicalNavigable&
 void ApplyHistoryStep::update_nonchanging_navigables()
 {
     // NB: targetStep is re-normalized once more; the continuation loop can have removed child navigables.
-    m_target_step = m_session_history.get_the_used_step(m_step).value();
+    m_target_step = m_session_history.get_the_used_step(m_step);
 
     // 17. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index
     //     given traversable and targetStep.
@@ -419,7 +422,7 @@ void ApplyHistoryStep::set_current_session_history_step()
     //         See https://github.com/whatwg/html/issues/12576.
     if (m_generation > m_traversable_state.committed_generation) {
         // 20. Set traversable's current session history step to targetStep.
-        auto used_target_step = m_session_history.get_the_used_step(m_target_step).value();
+        auto used_target_step = m_session_history.get_the_used_step(m_target_step);
         if (m_session_history.current_step() != used_target_step)
             m_traversable_state.committed_generation = m_generation;
         m_session_history.set_current_session_history_step(used_target_step);
@@ -441,6 +444,24 @@ void ApplyHistoryStep::abandon()
 void ApplyHistoryStep::return_result(Web::HTML::HistoryStepResult result)
 {
     m_traversable.finish_history_operation(m_operation_id, result);
+}
+
+// The document the job populated, or the one targetEntry's document state holds if the job's process hosts it.
+RefPtr<CanonicalDocument> ChangingNavigable::target_document(WebContentPage const& job_page) const
+{
+    if (populated_document)
+        return populated_document;
+    if (auto const& document = target_entry->document_state->document; document && document->host().ptr() == &job_page)
+        return document;
+    return {};
+}
+
+RefPtr<NavigationLoader> ChangingNavigable::population_loader() const
+{
+    return population.visit(
+        [](Empty) -> RefPtr<NavigationLoader> { return {}; },
+        [](AwaitingPopulation) -> RefPtr<NavigationLoader> { return {}; },
+        [](auto const& state) -> RefPtr<NavigationLoader> { return state.loader; });
 }
 
 Web::HTML::SessionHistoryEntryDescriptor ChangingNavigable::target_entry_descriptor() const

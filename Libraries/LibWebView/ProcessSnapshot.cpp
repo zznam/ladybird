@@ -5,11 +5,13 @@
  */
 
 #include <AK/HashMap.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/FaviconStore.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/TabDiscarder.h>
 #include <LibWebView/ViewImplementation.h>
 
 namespace WebView {
@@ -24,6 +26,9 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
         ProcessPageKind kind;
     };
     HashMap<u64, ProcessPage> process_pages;
+    HashMap<u64, Vector<ProcessTabSnapshot>> process_tabs;
+    HashMap<u64, Vector<ProcessFrameSnapshot>> process_frames;
+    auto now = MonotonicTime::now();
     // NB: The Application is only asked once there is a view, so that a ProcessManager without one can be described.
     bool did_look_up_active_view = false;
     Optional<ViewImplementation&> active_view;
@@ -47,10 +52,40 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
                 || (current->view == &view && kind == ProcessPageKind::TopLevel && current->kind == ProcessPageKind::Frame))
                 process_pages.set(child_id, ProcessPage { &view, url, kind });
         };
-        add_page(view.page().client().child_id(), view.url(), ProcessPageKind::TopLevel);
+        auto top_level_child_id = view.page().client().child_id();
+        add_page(top_level_child_id, view.url(), ProcessPageKind::TopLevel);
+        ProcessTabSnapshot tab {
+            .title = view.title(),
+            .page = {
+                .view_id = view.view_id(),
+                .url = view.url(),
+                .kind = ProcessPageKind::TopLevel,
+            },
+            .discard_blockers_under_memory_pressure = view.discard_blockers(ViewImplementation::DiscardReason::MemoryPressure, now),
+            .discard_blockers_after_inactivity = {},
+            .seconds_until_discarded_after_inactivity = {},
+        };
+        if (auto minimum_time_hidden = TabDiscarder::minimum_time_hidden_after_inactivity(); minimum_time_hidden.has_value()) {
+            auto blockers = view.discard_blockers(ViewImplementation::DiscardReason::Inactivity, now);
+            tab.discard_blockers_after_inactivity = blockers;
+            // NB: A tab that the UI was asked to discard already isn't counted down again until the user has seen it.
+            if (blockers == DiscardBlockers::None && view.hidden_since().has_value() && !view.discard_requested()) {
+                auto remaining = *minimum_time_hidden - (now - *view.hidden_since());
+                tab.seconds_until_discarded_after_inactivity = max<i64>(0, remaining.to_seconds());
+            }
+        }
+        process_tabs.ensure(top_level_child_id).append(move(tab));
         view.traversable().for_each_in_subtree([&](auto const& navigable) {
-            if (navigable.has_remote_host() && navigable.replicated_state().has_value())
-                add_page(navigable.remote_host().client().child_id(), navigable.replicated_state()->active_document_url, ProcessPageKind::Frame);
+            if (navigable.has_remote_host() && navigable.replicated_state().has_value()) {
+                auto child_id = navigable.remote_host().client().child_id();
+                add_page(child_id, navigable.replicated_state()->active_document_url, ProcessPageKind::Frame);
+                if (child_id != top_level_child_id) {
+                    process_frames.ensure(child_id).append({
+                        .url = navigable.replicated_state()->active_document_url,
+                        .is_sandboxed = has_flag(navigable.active_document().active_sandboxing_flag_set(), Web::HTML::SandboxingFlagSet::SandboxedOrigin),
+                    });
+                }
+            }
             return IterationDecision::Continue;
         });
         return IterationDecision::Continue;
@@ -63,18 +98,22 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
             .child_id = process.child_id(),
             .pid = statistics.pid,
             .type = process.type(),
+            .is_private = process.is_private(),
             .title = process.title(),
+            .site_url = process.site_url(),
             .owner_child_id = process.owner_child_id(),
             .cpu_percent = statistics.cpu_percent,
             .memory_usage_bytes = statistics.memory_usage_bytes,
             .page = {},
+            .tabs = process_tabs.get(process.child_id()).value_or({}),
+            .frames = process_frames.get(process.child_id()).value_or({}),
         };
         if (auto page = process_pages.get(process.child_id()); page.has_value()) {
+            snapshot.site_url = page->url;
             snapshot.page = ProcessPageSnapshot {
                 .view_id = page->view->view_id(),
                 .url = page->url,
                 .kind = page->kind,
-                .favicon_hash = page->view->favicon_hash(),
             };
         }
         snapshots.append(move(snapshot));
@@ -82,14 +121,10 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
     return snapshots;
 }
 
-Optional<ByteBuffer> favicon_png_for_page(ProcessPageSnapshot const& page)
+bool end_process(ProcessManager& process_manager, u64 child_id)
 {
-    if (!page.favicon_hash.has_value())
-        return {};
-    auto view = ViewImplementation::find_view_by_id(page.view_id);
-    if (!view.has_value())
-        return {};
-    return view->session().favicon_store->favicon_png(*page.favicon_hash);
+    auto result = process_manager.terminate_child(child_id, Core::Process::TerminationMode::Forceful);
+    return !result.is_error() || (result.error().is_errno() && result.error().code() == ESRCH);
 }
 
 }

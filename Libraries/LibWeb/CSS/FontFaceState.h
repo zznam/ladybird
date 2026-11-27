@@ -15,6 +15,7 @@
 #include <AK/Utf16View.h>
 #include <AK/Weakable.h>
 #include <LibGC/HeapVector.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Font/Typeface.h>
 #include <LibGfx/FontCascadeList.h>
@@ -25,6 +26,7 @@
 #include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/WebIDL/Buffers.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
@@ -51,7 +53,7 @@ public:
     // The serialization of the @font-face descriptor a FontFace attribute reflects.
     Utf16String const& descriptor_text(DescriptorID) const;
     WebIDL::ExceptionOr<void> set_descriptor(DescriptorID, Utf16View);
-    static constexpr size_t attribute_count = 11;
+    static constexpr size_t attribute_count = 12;
 
     bool is_css_connected() const { return m_css_font_face_rule_identity.has_value(); }
     Optional<u64> css_rule_identity() const
@@ -63,7 +65,7 @@ public:
 
     RefPtr<Gfx::Typeface const> typeface() const { return m_parsed_font; }
 
-    // The number this face is known by in the process. A style update that must not mutate the face names it by this
+    // The number this face is known by in the process, which only its agent can look up. A style update that must not mutate the face names it by this
     // number and leaves the mutation for the drain below.
     [[nodiscard]] u64 id() const { return m_id; }
     [[nodiscard]] static RefPtr<FontFaceState> with_id(u64);
@@ -78,6 +80,12 @@ public:
             .width = m_cached_width,
         };
     }
+
+    [[nodiscard]] double size_adjust() const { return m_size_adjust; }
+
+    // Whether the font-weight descriptor is auto, which takes the weight range of the font file in place of the
+    // range the matching key carries.
+    [[nodiscard]] bool weight_descriptor_is_auto() const { return m_weight_descriptor_is_auto; }
 
     bool should_be_registered_with_font_computer() const;
 
@@ -119,16 +127,18 @@ private:
     JS::Object& task_global_object() const;
     void reject_status_promise(WebIDL::Exception);
     void did_load(RefPtr<Gfx::Typeface const>);
+    void did_finish_loading_in_containing_sets(bool succeeded);
     void set_parsed_font(RefPtr<Gfx::Typeface const>);
 
     Optional<FontComputer&> font_computer() const;
+    GC::RootVector<GC::Ref<FontFaceSet>> containing_sets() const;
     void update_font_display_period();
     i64 font_download_elapsed_time() const;
     void invalidate_font_display();
     CSSFontFaceRule& cssom_rule() const;
     RustDescriptorBlock connected_descriptors() const;
 
-    [[nodiscard]] Optional<ComputationContext> computation_context() const;
+    [[nodiscard]] ComputationContext computation_context() const;
     void apply_descriptor(DescriptorID, StyleValue const&);
 
     u64 m_id { 0 };
@@ -138,6 +148,8 @@ private:
     Vector<Gfx::UnicodeRange> m_unicode_ranges;
 
     FontWeightRange m_cached_weight_range { 400, 400 };
+    bool m_weight_descriptor_is_auto { true };
+    double m_size_adjust { 1 };
     int m_cached_slope { 0 };
     int m_cached_width { 100 };
     GC::Ptr<FontLoader> m_font_loader;
@@ -177,17 +189,5 @@ private:
 };
 
 bool font_format_is_supported(Utf16View name);
-
-// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
-// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
-// which may happen while a style update runs, nor anywhere but the main thread.
-void note_wanted_web_face(u64 face_id);
-
-// Load every face wanted since the last call, unless a style update is running: that one drains them at its end.
-void request_wanted_web_faces();
-
-// A style update defers every load its cascades want to its own end.
-void begin_deferred_web_face_loads();
-void end_deferred_web_face_loads();
 
 }

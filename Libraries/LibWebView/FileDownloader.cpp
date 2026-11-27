@@ -9,11 +9,12 @@
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/Random.h>
+#include <AK/RefCounted.h>
+#include <AK/ScopeGuard.h>
 #include <LibCore/DirIterator.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/HeaderList.h>
@@ -30,6 +31,7 @@
 #include <LibWebView/RequestServerManager.h>
 
 #if defined(AK_OS_MACOS)
+#    include <LibWebView/QuarantineMacOS.h>
 #    include <sys/xattr.h>
 #endif
 
@@ -67,6 +69,33 @@ struct FileDownloader::Segment {
     }
 };
 
+// NB: An adopted response follows the download across intentional request stops and restarts.
+class AdoptedResponseObserver : public RefCounted<AdoptedResponseObserver> {
+    AK_ALLOC_WITH_KMALLOC;
+
+public:
+    explicit AdoptedResponseObserver(FileDownloader::ResponseFinished on_finish)
+        : m_on_finish(move(on_finish))
+    {
+    }
+
+    void set_timing_info(Requests::RequestTimingInfo const& timing) { m_timing_info = timing; }
+    Requests::RequestTimingInfo const* timing_info() const { return m_timing_info.has_value() ? &*m_timing_info : nullptr; }
+
+    void finish(u64 decoded_size, Requests::RequestTimingInfo const* timing,
+        Optional<StringView> error)
+    {
+        NonnullRefPtr protect { *this };
+        auto on_finish = move(m_on_finish);
+        if (on_finish)
+            on_finish(decoded_size, timing, error);
+    }
+
+private:
+    FileDownloader::ResponseFinished m_on_finish;
+    Optional<Requests::RequestTimingInfo> m_timing_info;
+};
+
 struct FileDownloader::ActiveDownload {
     AK_ALLOC_WITH_KMALLOC;
 
@@ -84,6 +113,7 @@ struct FileDownloader::ActiveDownload {
 
     Vector<Segment> segments;
     Function<void()> on_cancel;
+    RefPtr<AdoptedResponseObserver> response_observer;
     OwnPtr<Core::File> file;
     RefPtr<Core::Timer> stall_timer;
 
@@ -101,6 +131,8 @@ struct FileDownloader::ActiveDownload {
     u32 redirect_count { 0 };
     bool can_issue_own_requests { false };
     bool can_restart_from_zero { false };
+    // The context of the request that started the download, so later requests send the same cookies.
+    HTTP::Cookie::SameSiteContext same_site_context { HTTP::Cookie::SameSiteContext::same_site() };
     DownloadRangeSupport range_support;
     bool segmentation_abandoned { false };
     bool restored_from_disk { false };
@@ -137,10 +169,16 @@ FileDownloader::~FileDownloader() = default;
 
 // The operating system checks a downloaded file before it is first opened, as long as the file carries the mark that
 // browsers give their downloads.
-static void mark_as_downloaded([[maybe_unused]] Core::File& file)
+static void mark_as_downloaded([[maybe_unused]] Core::File& file, [[maybe_unused]] LexicalPath const& path, [[maybe_unused]] IsPrivate is_private)
 {
 #if defined(AK_OS_MACOS)
-    // NB: These are the quarantine flags other browsers set, and the time of the download in hexadecimal seconds.
+    // The quarantine event of a web download stays in a system log after the file is gone, which a private download must
+    // not leave behind.
+    if (is_private == IsPrivate::No && mark_as_web_download(path.string()))
+        return;
+
+    // Without a quarantine event the system tells the user that we created the file, but it does check the file. These
+    // are the quarantine flags of a download, and the time of the download in hexadecimal seconds.
     auto quarantine = ByteString::formatted("0083;{:08x};Ladybird;", UnixDateTime::now().seconds_since_epoch());
     if (::fsetxattr(file.fd(), "com.apple.quarantine", quarantine.characters(), quarantine.length(), 0, 0) < 0)
         dbgln("Unable to quarantine a download: {}", Error::from_errno(errno));
@@ -209,7 +247,7 @@ void FileDownloader::start_download_request(u64 download_id, URL::URL const& url
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, url, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
+    auto request = client.value()->start_request("GET"sv, url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -248,8 +286,14 @@ void FileDownloader::follow_download_redirect(u64 download_id, HTTP::HeaderList 
     start_download_request(download_id, redirect_url.release_value());
 }
 
-u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data)
+u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, int owner_client_id, ReadonlyBytes initial_data,
+    ResponseFinished on_response_finished)
 {
+    ScopeGuard report_failure = [&] {
+        if (on_response_finished)
+            on_response_finished(0, nullptr,
+                "Unable to adopt the download response"sv);
+    };
     auto download_id = start_download(is_private, url, move(destination), total_size);
     auto* active = active_download(download_id);
     if (!active)
@@ -257,6 +301,7 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, Le
 
     active->effective_url = url;
     active->can_issue_own_requests = true;
+    active->same_site_context = same_site_context;
 
     if (!initial_data.is_empty()) {
         append_download_data(download_id, initial_data);
@@ -265,24 +310,35 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, Le
             return download_id;
     }
 
-    // The response lives in the RequestServer of the client that fetched it.
+    // The response lives in the RequestServer of its owner.
     RefPtr<Requests::Request> request;
-    if (auto request_server = RequestServerManager::the().instance_for_client(request_server_client_id))
-        request = request_server->ui_client().adopt_request(request_server_client_id, request_server_request_id);
+    if (auto request_server = RequestServerManager::the().instance_for_client(owner_client_id))
+        request = request_server->ui_client().adopt_request(request_server_client_id, request_server_request_id, Requests::RequestClient::TransferLease::No, owner_client_id);
     if (!request) {
         fail_download(download_id, "Unable to adopt request to download file"_string);
         return download_id;
     }
 
-    attach_request_to_download(download_id, 0, request.release_nonnull());
+    attach_request_to_download(download_id, 0, request.release_nonnull(),
+        move(on_response_finished));
     return download_id;
 }
 
-void FileDownloader::attach_request_to_download(u64 download_id, size_t segment_index, NonnullRefPtr<Requests::Request> request)
+void FileDownloader::attach_request_to_download(u64 download_id, size_t segment_index, NonnullRefPtr<Requests::Request> request,
+    ResponseFinished on_response_finished)
 {
     auto* active = active_download(download_id);
-    if (!active || segment_index >= active->segments.size())
+    if (!active || segment_index >= active->segments.size()) {
+        if (on_response_finished)
+            on_response_finished(
+                0, nullptr, "Download was stopped before adopting its response"sv);
         return;
+    }
+    RefPtr<AdoptedResponseObserver> observer;
+    if (on_response_finished) {
+        observer = adopt_ref(*new AdoptedResponseObserver(move(on_response_finished)));
+        active->response_observer = observer;
+    }
 
     auto& segment = active->segments[segment_index];
     auto request_generation = ++active->last_request_generation;
@@ -297,7 +353,7 @@ void FileDownloader::attach_request_to_download(u64 download_id, size_t segment_
     request->set_body_delivery_paused(true);
 
     request->set_unbuffered_request_callbacks(
-        [this, download_id, segment_index, request_generation](NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState cache_state) {
+        [this, download_id, segment_index, request_generation](NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState cache_state) {
             handle_segment_headers(download_id, segment_index, request_generation, *response_headers, response_code, reason_phrase, cache_state);
         },
         [this, download_id, segment_index, request_generation](Requests::ResponseData data) {
@@ -305,7 +361,15 @@ void FileDownloader::attach_request_to_download(u64 download_id, size_t segment_
         },
         [](Core::ImmutableBytes) {
         },
-        [this, download_id, segment_index, request_generation](u64 delivered_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> network_error) {
+        [this, download_id, segment_index, request_generation, observer](u64 delivered_size, Requests::RequestTimingInfo const& timing_info, Optional<Requests::NetworkError> network_error) {
+            if (observer) {
+                auto* active = active_download(download_id);
+                // NB: Offsets from a replacement or split request do not share the original fetch's start time.
+                if (active && active->segments.size() == 1 && segment_index == 0
+                    && active->segments[0].request_generation == request_generation
+                    && !active->segments[0].request_is_ranged)
+                    observer->set_timing_info(timing_info);
+            }
             handle_segment_finished(download_id, segment_index, request_generation, delivered_size, network_error);
         });
 }
@@ -572,7 +636,7 @@ void FileDownloader::start_segment_request(u64 download_id, size_t segment_index
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, active->effective_url, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
+    auto request = client.value()->start_request("GET"sv, active->effective_url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -908,11 +972,17 @@ u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, Le
         return download_id;
     }
     auto file = file_or_error.release_value();
-    mark_as_downloaded(*file);
+    mark_as_downloaded(*file, temporary_destination, is_private);
 
     auto active = make<ActiveDownload>(move(file), temporary_destination);
     active->may_replace_destination = may_replace_destination == MayReplaceDestination::Yes;
     m_active_downloads.set(download_id, move(active));
+
+    // NB: Reading a folder such as the user's downloads folder can make the system ask the user for permission. The
+    //     user has just saved a file to this folder, so this is when to look for what earlier downloads left in it,
+    //     rather than when the browser starts.
+    if (m_download_store)
+        remove_orphaned_temporary_files_once(temporary_destination.dirname());
 
     return download_id;
 }
@@ -1184,7 +1254,7 @@ void FileDownloader::resume_download(u64 id)
 
         active->file = file_or_error.release_value();
         // NB: The file may come from a build that did not mark downloads, or have been created anew by opening it.
-        mark_as_downloaded(*active->file);
+        mark_as_downloaded(*active->file, active->temporary_destination, download->is_private);
         active->file_offset = {};
     }
 
@@ -1310,6 +1380,7 @@ void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
         .created_time = active->created_time,
         .can_restart_from_zero = active->can_restart_from_zero,
         .may_replace_destination = active->may_replace_destination,
+        .same_site_context = active->same_site_context,
     };
 
     record.segments.ensure_capacity(active->segments.size());
@@ -1335,8 +1406,6 @@ void FileDownloader::restore_persisted_downloads()
     HashTable<ByteString> directories;
     HashTable<ByteString> temporary_paths_in_use;
 
-    directories.set(Core::StandardPaths::downloads_directory());
-
     for (auto& record : m_download_store->resumable_downloads()) {
         LexicalPath temporary_destination { record.temporary_destination.to_byte_string() };
         directories.set(temporary_destination.dirname());
@@ -1350,6 +1419,23 @@ void FileDownloader::restore_persisted_downloads()
         (void)FileSystem::remove(temporary_destination.string(), FileSystem::RecursionMode::Disallowed);
     }
 
+    // NB: These folders hold downloads that we just looked at. Other folders wait for their next download.
+    remove_orphaned_temporary_files(directories, temporary_paths_in_use);
+    for (auto const& directory : directories)
+        m_directories_cleared_of_orphaned_temporary_files.set(directory);
+}
+
+void FileDownloader::remove_orphaned_temporary_files_once(ByteString const& directory)
+{
+    if (m_directories_cleared_of_orphaned_temporary_files.set(directory) != HashSetResult::InsertedNewEntry)
+        return;
+
+    HashTable<ByteString> temporary_paths_in_use;
+    for (auto const& [id, active] : m_active_downloads)
+        temporary_paths_in_use.set(active->temporary_destination.string());
+
+    HashTable<ByteString> directories;
+    directories.set(directory);
     remove_orphaned_temporary_files(directories, temporary_paths_in_use);
 }
 
@@ -1408,6 +1494,7 @@ bool FileDownloader::restore_persisted_download(DownloadRecord& record)
     active->can_issue_own_requests = true;
     active->can_restart_from_zero = record.can_restart_from_zero;
     active->may_replace_destination = record.may_replace_destination;
+    active->same_site_context = record.same_site_context;
     active->created_time = record.created_time;
     active->restored_from_disk = true;
     active->range_support.supports_ranges = true;
@@ -1656,8 +1743,23 @@ void FileDownloader::notify_download_added(Download const& download)
 
 void FileDownloader::notify_download_updated(Download const& download)
 {
+    RefPtr<AdoptedResponseObserver> response_observer;
+    Optional<Download> finished_download;
+    if (!status_is_active(download.status)) {
+        if (auto* active = active_download(download.id); active && active->response_observer) {
+            // NB: Take the terminal owner before notifying observers, which may reenter or remove the download.
+            response_observer = move(active->response_observer);
+            finished_download = download;
+        }
+    }
     for (auto& observer : m_observers)
         observer.download_updated(download);
+    if (response_observer) {
+        Optional<StringView> error;
+        if (finished_download->status != DownloadStatus::Completed)
+            error = finished_download->error.has_value() ? finished_download->error->bytes_as_string_view() : "Download was canceled"sv;
+        response_observer->finish(finished_download->downloaded_size, response_observer->timing_info(), error);
+    }
 }
 
 void FileDownloader::notify_download_removed(u64 id, IsPrivate is_private)

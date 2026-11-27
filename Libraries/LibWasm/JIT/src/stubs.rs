@@ -8,8 +8,8 @@
 //!
 //! - The trap exit, which compiled code jumps to with a TRAP_* code in edi. It leaves the code through the
 //!   interpreter's TrapFromNative handler, which returns from the interpreter's innermost entry with the trap.
-//! - The entry trampoline, through which the runtime calls compiled code: an `extern "C"` function of a
-//!   `NativeCall`, whose registers and home slot image it loads.
+//! - The entry trampoline, through which the runtime calls compiled code: a function of a `NativeCall`, with the System
+//!   V calling convention on every x86-64 target, whose registers and home slot image it loads.
 //! - The runtime adapter, the native entry of functions that run in the runtime (interpreted and host functions):
 //!   it saves the argument registers and calls a function of the runtime with them, the callee's header and the
 //!   frame, which puts the results where they go or returns a trap code.
@@ -74,7 +74,8 @@ fn copy(asm: &mut Assembler, ty: Type, from: Address, to: Address) {
 
 /// The host stub for functions with these parameter and result types.
 pub fn host_stub(params: &[Type], results: &[Type], runtime: &RuntimeInfo) -> Vec<u8> {
-    let mut asm = Assembler::new();
+    let mut memory = crate::CodeMemory::new();
+    let mut asm = Assembler::for_host(&mut memory.code, &memory.work);
     let parameter_slots = convention::slots(params) as i32;
     let result_slots = convention::slots(results) as i32;
     let buffer_slots = parameter_slots.max(result_slots);
@@ -182,7 +183,7 @@ pub fn host_stub(params: &[Type], results: &[Type], runtime: &RuntimeInfo) -> Ve
         asm.mov_ri(SCRATCH, runtime.trap_exit);
         asm.jmp_r(SCRATCH);
     }
-    asm.finish().expect("stubs have no unbound labels")
+    asm.finish().expect("stubs have no unbound labels").to_vec()
 }
 
 /// What the entry trampoline calls compiled code with, and what it returns.
@@ -230,7 +231,8 @@ fn field(offset: usize) -> i32 {
 /// The trap exit: stores the code in edi as the context's first argument, and the context in the frame that
 /// trapped, and continues at the interpreter's TrapFromNative handler at `handler`.
 pub fn trap_exit(handler: u64) -> Vec<u8> {
-    let mut asm = Assembler::new();
+    let mut memory = crate::CodeMemory::new();
+    let mut asm = Assembler::for_host(&mut memory.code, &memory.work);
     let context = gpr(convention::RAX);
     asm.mov_rm(Width::W64, context, &Address::new(FP, convention::FRAME_INSTANCE));
     asm.mov_rm(
@@ -246,7 +248,7 @@ pub fn trap_exit(handler: u64) -> Vec<u8> {
     );
     asm.mov_ri(SCRATCH, handler);
     asm.jmp_r(SCRATCH);
-    asm.finish().expect("stubs have no unbound labels")
+    asm.finish().expect("stubs have no unbound labels").to_vec()
 }
 
 /// Continues where the `resume` of the context in `context` says, as the runtime set it after unwinding an
@@ -274,10 +276,11 @@ fn copy_words(asm: &mut Assembler, from: Gpr, to: Gpr, count: Gpr, temp: Gpr) {
     asm.bind(done);
 }
 
-/// The entry trampoline, `extern "C" fn(*mut NativeCall)`, and the offset of the address its call of compiled code
+/// The entry trampoline, a System V `fn(*mut NativeCall)`, and the offset of the address its call of compiled code
 /// returns to, where an exception the compiled code does not handle continues (see `RuntimeInfo::throw`).
 pub fn entry_trampoline() -> (Vec<u8>, usize) {
-    let mut asm = Assembler::new();
+    let mut memory = crate::CodeMemory::new();
+    let mut asm = Assembler::for_host(&mut memory.code, &memory.work);
     let record = gpr(convention::R11);
     let (rax, rcx, rdx, rsi, rdi) = (
         gpr(convention::RAX),
@@ -287,17 +290,22 @@ pub fn entry_trampoline() -> (Vec<u8>, usize) {
         gpr(convention::RDI),
     );
     let call_field = |offset: usize| Address::new(record, field(offset));
-    asm.push(FP);
-    asm.mov_rr(Width::W64, FP, SP);
-    for register in [
+    let saved_registers = [
         convention::RBX,
         convention::R12,
         convention::R13,
         convention::R14,
         convention::R15,
-    ] {
+    ];
+    // NB: The frame is set up like that of compiled code, so that a stack walk that starts in compiled code before its
+    //     frame is set up, and takes this frame for its frame, stays on track.
+    asm.push(FP);
+    asm.lea(Width::W64, FP, &Address::new(SP, 16));
+    for register in saved_registers {
         asm.push(gpr(register));
     }
+    let lowest_saved_register = convention::FRAME_SAVED_FP - 8 * saved_registers.len() as i32;
+    let record_slot = lowest_saved_register - 8;
     // NB: Six pushes after the return address leave rsp 16-byte aligned. The record is the sixth.
     asm.push(rdi);
     asm.mov_rr(Width::W64, record, rdi);
@@ -306,7 +314,17 @@ pub fn entry_trampoline() -> (Vec<u8>, usize) {
     asm.shl_ri(Width::W64, rax, 3);
     asm.add_ri(Width::W64, rax, 15);
     asm.and_ri(Width::W64, rax, -16);
-    asm.sub_rr(Width::W64, SP, rax);
+    if crate::asm::x86_64::PROBES_STACK {
+        // NB: The image's pages are touched before anything goes in them (see `Assembler::probe_stack()`).
+        let (top, bottom) = (rdx, rsi);
+        asm.mov_rr(Width::W64, top, SP);
+        asm.mov_rr(Width::W64, bottom, SP);
+        asm.sub_rr(Width::W64, bottom, rax);
+        asm.probe_stack(top, bottom, None);
+        asm.mov_rr(Width::W64, SP, bottom);
+    } else {
+        asm.sub_rr(Width::W64, SP, rax);
+    }
     asm.mov_mr(Width::W64, &call_field(offset_of!(NativeCall, saved_sp)), SP);
     asm.mov_rm(Width::W64, rsi, &call_field(offset_of!(NativeCall, image)));
     asm.mov_rr(Width::W64, rdi, SP);
@@ -342,7 +360,7 @@ pub fn entry_trampoline() -> (Vec<u8>, usize) {
     asm.call_m(&call_field(offset_of!(NativeCall, entry)));
     let return_offset = asm.offset();
     // NB: Tail calls may have moved rsp; the record has it.
-    asm.mov_rm(Width::W64, record, &Address::new(FP, -48));
+    asm.mov_rm(Width::W64, record, &Address::new(FP, record_slot));
     asm.mov_rm(Width::W64, SP, &call_field(offset_of!(NativeCall, saved_sp)));
     asm.mov_mr(Width::W64, &call_field(offset_of!(NativeCall, result_gprs)), rax);
     asm.mov_mr(Width::W64, &call_field(offset_of!(NativeCall, result_gprs) + 8), rdx);
@@ -354,30 +372,28 @@ pub fn entry_trampoline() -> (Vec<u8>, usize) {
     asm.mov_rm(Width::W64, rdi, &call_field(offset_of!(NativeCall, image)));
     asm.mov_rr(Width::W64, rsi, SP);
     copy_words(&mut asm, rsi, rdi, rcx, rdx);
-    asm.lea(Width::W64, SP, &Address::new(FP, -40));
-    for register in [
-        convention::R15,
-        convention::R14,
-        convention::R13,
-        convention::R12,
-        convention::RBX,
-    ] {
+    asm.lea(Width::W64, SP, &Address::new(FP, lowest_saved_register));
+    for register in saved_registers.into_iter().rev() {
         asm.pop(gpr(register));
     }
     asm.pop(FP);
     asm.ret();
-    (asm.finish().expect("stubs have no unbound labels"), return_offset)
+    (
+        asm.finish().expect("stubs have no unbound labels").to_vec(),
+        return_offset,
+    )
 }
 
 /// What the runtime function of the adapter returns when the call threw an exception, which the runtime unwound: the
 /// adapter continues where the context's `resume` says.
 pub const ADAPTER_RESUME: u64 = u64::MAX;
 
-/// The runtime adapter. `function` is the runtime's `extern "C" fn(*mut ExecutionContext) -> u64`, which it calls
-/// with the callee's header, the save area and fp as the context's first three arguments. A nonzero result is a
-/// trap code, or `ADAPTER_RESUME`.
+/// The runtime adapter. `function` is the runtime's System V `fn(*mut ExecutionContext) -> u64`, which it calls with
+/// the callee's header, the save area and fp as the context's first three arguments. A nonzero result is a trap code,
+/// or `ADAPTER_RESUME`.
 pub fn runtime_adapter(function: u64, runtime: &RuntimeInfo) -> Vec<u8> {
-    let mut asm = Assembler::new();
+    let mut memory = crate::CodeMemory::new();
+    let mut asm = Assembler::for_host(&mut memory.code, &memory.work);
     let instance = gpr(convention::INSTANCE_REGISTER);
     // Below the frame header, the save area at rsp.
     let frame_size = (convention::FRAME_HEADER_SIZE as usize + ADAPTER_SAVE_AREA).next_multiple_of(16) as i32;
@@ -437,5 +453,5 @@ pub fn runtime_adapter(function: u64, runtime: &RuntimeInfo) -> Vec<u8> {
         &Address::new(context, field(offset_of!(InstanceData, context))),
     );
     resume(&mut asm, context);
-    asm.finish().expect("stubs have no unbound labels")
+    asm.finish().expect("stubs have no unbound labels").to_vec()
 }

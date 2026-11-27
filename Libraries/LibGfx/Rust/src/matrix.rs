@@ -5,6 +5,7 @@
  */
 
 use crate::geometry::{FloatPoint, FloatRect};
+use ak::math;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -58,6 +59,10 @@ impl AffineTransform {
         self.a() == 1.0 && self.b() == 0.0 && self.c() == 0.0 && self.d() == 1.0
     }
 
+    pub fn is_whole_pixel_translation(self) -> bool {
+        self.is_identity_or_translation() && self.e().fract() == 0.0 && self.f().fract() == 0.0
+    }
+
     pub fn determinant(self) -> f32 {
         self.a() * self.d() - self.b() * self.c()
     }
@@ -78,11 +83,11 @@ impl AffineTransform {
     }
 
     pub fn x_scale(self) -> f32 {
-        self.a().hypot(self.b())
+        math::hypot(self.a(), self.b())
     }
 
     pub fn y_scale(self) -> f32 {
-        self.c().hypot(self.d())
+        math::hypot(self.c(), self.d())
     }
 
     pub fn translated(mut self, x: f32, y: f32) -> Self {
@@ -164,11 +169,11 @@ macro_rules! matrix_element {
             }
 
             fn sin(self) -> Self {
-                <$type>::sin(self)
+                math::sin(self)
             }
 
             fn cos(self) -> Self {
-                <$type>::cos(self)
+                math::cos(self)
             }
         }
     };
@@ -303,15 +308,33 @@ impl<T: MatrixElement> Matrix4x4<T> {
         if s.abs() < T::EPSILON {
             s = T::ZERO;
         }
-        let t = T::ONE - c;
+        let (o, l) = (T::ZERO, T::ONE);
+        // NB: A rotation about x, y or z is built directly, since the general form below puts (1 - c) + c on the
+        //     diagonal for the axis, which rounds to a neighbor of one for many angles. A rotation in the plane would
+        //     then fail every check for an exact 2D affine matrix.
+        if axis == [o, o, l] {
+            return Self {
+                elements: [[c, o - s, o, o], [s, c, o, o], [o, o, l, o], [o, o, o, l]],
+            };
+        }
+        if axis == [l, o, o] {
+            return Self {
+                elements: [[l, o, o, o], [o, c, o - s, o], [o, s, c, o], [o, o, o, l]],
+            };
+        }
+        if axis == [o, l, o] {
+            return Self {
+                elements: [[c, o, s, o], [o, l, o, o], [o - s, o, c, o], [o, o, o, l]],
+            };
+        }
+        let t = l - c;
         let [x, y, z] = axis;
-        let o = T::ZERO;
         Self {
             elements: [
                 [t * x * x + c, t * x * y - z * s, t * x * z + y * s, o],
                 [t * x * y + z * s, t * y * y + c, t * y * z - x * s, o],
                 [t * x * z - y * s, t * y * z + x * s, t * z * z + c, o],
-                [o, o, o, T::ONE],
+                [o, o, o, l],
             ],
         }
     }

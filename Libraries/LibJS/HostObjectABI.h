@@ -26,18 +26,14 @@
 extern "C" {
 #endif
 
-enum {
-    JS_HOST_ABI_VERSION = 1,
-};
-
 // Layout of every host object of kind JS_HOST_CLASS_OBJECT. Direct getter functions read the wrappable slot without
 // checking what it holds, so it only ever holds the embedder's wrapped implementation object. Any other per-object state
-// belongs in the host data slot.
+// belongs in the host data slot. The host object's own fields follow the engine's object, which is 32 bytes.
 enum {
-    JS_HOST_OBJECT_HOST_CLASS_OFFSET = 72,
-    JS_HOST_OBJECT_WRAPPABLE_OFFSET = 80,
-    JS_HOST_OBJECT_HOST_DATA_OFFSET = 88,
-    JS_HOST_OBJECT_SIZE = 96,
+    JS_HOST_OBJECT_HOST_CLASS_OFFSET = 32,
+    JS_HOST_OBJECT_WRAPPABLE_OFFSET = JS_HOST_OBJECT_HOST_CLASS_OFFSET + 8,
+    JS_HOST_OBJECT_HOST_DATA_OFFSET = JS_HOST_OBJECT_WRAPPABLE_OFFSET + 8,
+    JS_HOST_OBJECT_SIZE = JS_HOST_OBJECT_HOST_DATA_OFFSET + 8,
 };
 
 typedef uint64_t JSValue;
@@ -140,6 +136,10 @@ enum {
     // answer for keys missing from its shape must set the first flag, or the second if they only answer for array
     // indices, and one whose hooks can start shadowing inherited properties must have that hook return false.
     //
+    // A class whose hooks answer differently depending on the realm that asks must set
+    // JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS, which keeps its objects out of the caches that every realm shares. Its
+    // hooks must also give no cacheable metadata to lookups that reach its objects through a prototype chain.
+    //
     // Enumeration (for-in, Object.keys, Object.assign, object spread, JSON.stringify) has fast paths that read keys,
     // attributes and values straight from the shape and storage. The engine never takes them for an object whose class
     // has a get_prototype_of, get_own_property, has_property, get or own_property_keys hook, nor for one whose class sets
@@ -148,6 +148,7 @@ enum {
     JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE = 1 << 6,
     JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH = 1 << 7,
     JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE = 1 << 10,
+    JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS = 1 << 11,
 
     // Only for JS_HOST_CLASS_FUNCTION, which must then have a construct hook.
     JS_HOST_CLASS_HAS_CONSTRUCTOR = 1 << 8,
@@ -189,6 +190,10 @@ typedef struct JSHostObjectHooks {
     // the own property there, if the hook can tell without running code; otherwise it returns the empty value, and
     // [[Get]] goes on as it would without it.
     JSCompletion (*get_indexed_value)(JSObject*, uint32_t index);
+    // Optional. Runs when script makes the identity of the object outlive the references to it: when the object is
+    // held weakly, by a WeakRef, a WeakMap, a WeakSet or a FinalizationRegistry, or gains a private element. An
+    // embedder that drops an object it can recreate must keep this one from then on. The hook must not run code.
+    void (*preserve_identity)(JSObject*);
 } JSHostObjectHooks;
 
 // The [[Call]] and [[Construct]] behavior of kind JS_HOST_CLASS_FUNCTION, which the engine runs in the function's own
@@ -201,6 +206,7 @@ typedef struct JSHostFunctionHooks {
 
 // The internal methods that kind JS_HOST_CLASS_ARRAY may replace. The rest are those of an Array exotic object.
 typedef struct JSHostArrayHooks {
+    JSCompletion (*define_own_property)(JSObject*, JSPropertyKey, JSPropertyDescriptor* descriptor, JSPropertyDescriptor const* precomputed_get_own_property);
     JSCompletion (*set)(JSObject*, JSPropertyKey, JSValue value, JSValue receiver, JSSetCacheMetadata*, uint8_t phase);
     JSCompletion (*delete_property)(JSObject*, JSPropertyKey);
 } JSHostArrayHooks;
@@ -230,9 +236,7 @@ typedef struct JSHostModuleHooks {
 } JSHostModuleHooks;
 
 typedef struct JSHostClass {
-    uint16_t abi_version;
     uint8_t kind;
-    uint8_t reserved;
     uint32_t flags;
     char const* name;
     size_t name_length;

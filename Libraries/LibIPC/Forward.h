@@ -13,7 +13,6 @@
 namespace IPC {
 
 class Attachment;
-class AutoCloseFileDescriptor;
 class Decoder;
 class Encoder;
 class Message;
@@ -25,18 +24,18 @@ struct HandleBrokerResponse;
 class HandleBrokerServer;
 class LocalHandleBroker;
 class Stub;
+class SyncRequestCanceller;
 class TransportHandle;
 
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 class MachBootstrapListener;
-class TransportMachPort;
-using Transport = TransportMachPort;
-#elif !defined(AK_OS_WINDOWS)
-class TransportSocket;
-using Transport = TransportSocket;
-#else
+#endif
+
+#if defined(AK_OS_WINDOWS)
 class TransportWindows;
 using Transport = TransportWindows;
+#else
+class Transport;
 #endif
 
 template<typename T>

@@ -8,9 +8,10 @@
 //!
 //! Code is carved out of large chunks that are mapped read+execute, and every write makes the affected pages writable
 //! (and not executable) for the duration of the copy: memory is never writable and executable at once. On Linux
-//! x86-64 with memory protection keys, the pages are writable and executable, but a protection key keeps every thread
-//! from writing them except the one writing code, while it writes. On macOS, chunks are MAP_JIT mappings whose write
-//! protection is toggled per thread instead.
+//! x86-64 with memory protection keys, the pages are writable and executable, but a protection key, allocated before
+//! the process has threads, keeps every thread from writing them except the one writing code, while it writes. On
+//! macOS, chunks are MAP_JIT mappings whose write protection is toggled per thread instead. On Windows, chunks are only
+//! reserved, and pages get committed when code is first written to them.
 //!
 //! Every VM has its own chunks, which only the VM's thread writes and runs code in, so flipping the protection of
 //! pages that hold other installed code is safe.
@@ -18,13 +19,32 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
+use libjs_jit::artifact::Patch;
+
+#[cfg(windows)]
+use ak::windows_code_memory;
+
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const ALLOCATION_ALIGNMENT: usize = 64;
 
+/// How much of the start of a chunk holds no code.
+#[cfg(windows)]
+const CHUNK_HEADER_SIZE: usize = windows_code_memory::UNWIND_INFO_SIZE;
+#[cfg(not(windows))]
+const CHUNK_HEADER_SIZE: usize = 0;
+
+const _: () = assert!(CHUNK_HEADER_SIZE.is_multiple_of(ALLOCATION_ALIGNMENT));
+
+#[cfg(not(windows))]
 fn page_size() -> usize {
     // SAFETY: sysconf() has no preconditions.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).expect("the page size is positive")
+}
+
+#[cfg(windows)]
+fn page_size() -> usize {
+    windows_code_memory::PAGE_SIZE
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -50,21 +70,45 @@ mod protection_key {
         ) -> libc::c_int;
     }
 
+    static KEY: OnceLock<libc::c_int> = OnceLock::new();
+
+    // NB: pkey_alloc() sets the rights to the key for the running thread only, and a new thread copies the rights of
+    //     the thread that creates it. Allocating the key while the library loads, before there is a second thread, is
+    //     what makes every thread start out unable to write with it.
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static ALLOCATE_KEY_ON_LOAD: extern "C" fn() = allocate_key;
+
+    extern "C" fn allocate_key() {
+        // NB: A thread that exists already would keep whatever rights it has to the key.
+        if !process_has_one_thread() {
+            return;
+        }
+        let key = pkey_alloc(0, PKEY_DISABLE_WRITE);
+        if key >= 0 {
+            let _ = KEY.set(key);
+        }
+    }
+
+    fn process_has_one_thread() -> bool {
+        // NB: A directory that cannot be read to its end may list any number of threads.
+        std::fs::read_dir("/proc/self/task")
+            .and_then(|threads| threads.collect::<Result<Vec<_>, _>>())
+            .is_ok_and(|threads| threads.len() == 1)
+    }
+
     /// The memory protection key of chunks whose write access is toggled per thread with the key instead of with
-    /// mprotect(), or None if the CPU or kernel lacks protection keys. Threads may write the chunks only while they
-    /// write code; the pages themselves are writable and executable. One key serves every VM in the process.
+    /// mprotect(), or None if the CPU or kernel lacks protection keys, or the process had threads when this library
+    /// loaded. Threads may write the chunks only while they write code; the pages themselves are writable and
+    /// executable. One key serves every VM in the process.
     pub fn key() -> Option<libc::c_int> {
-        static KEY: OnceLock<Option<libc::c_int>> = OnceLock::new();
-        *KEY.get_or_init(|| {
-            let key = pkey_alloc(0, PKEY_DISABLE_WRITE);
-            (key >= 0).then_some(key)
-        })
+        KEY.get().copied()
     }
 
     /// Allows (or forbids again) the running thread to write memory with the key.
     pub fn set_writable(key: libc::c_int, writable: bool) {
         let rights = if writable { 0 } else { PKEY_DISABLE_WRITE };
-        // SAFETY: The key was allocated by key().
+        // SAFETY: The key was allocated by allocate_key().
         let result = unsafe { pkey_set(key, rights) };
         assert_eq!(result, 0, "pkey_set() failed");
     }
@@ -76,7 +120,7 @@ unsafe extern "C" {
     fn sys_icache_invalidate(start: *mut libc::c_void, length: libc::size_t);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 unsafe extern "C" {
     /// The compiler runtime's instruction cache flush (a no-op on x86-64).
     fn __clear_cache(start: *mut libc::c_char, end: *mut libc::c_char);
@@ -111,7 +155,27 @@ impl Chunk {
                 has_protection_key: false,
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        {
+            let chunk = windows_code_memory::reserve(size);
+            assert!(!chunk.is_null(), "reserving JIT code memory failed");
+            // NB: The range starts at the chunk's first code, whose prologue the unwind info then describes (see
+            //     `JitState::entry_trampoline()`).
+            let unwind_range = windows_code_memory::CodeRange {
+                start: CHUNK_HEADER_SIZE as u32,
+                end: u32::try_from(size).expect("a chunk of JIT code is smaller than 4 GiB"),
+                frame_layout: windows_code_memory::FrameLayout::RbpAtSavedRbp,
+            };
+            // SAFETY: The chunk was just reserved, so it has no unwind info yet and no code runs in it.
+            let added = unsafe { windows_code_memory::add_unwind_info(chunk, &[unwind_range]) };
+            assert!(added, "registering the unwind info of JIT code failed");
+            Self {
+                start: chunk,
+                size,
+                has_protection_key: false,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             // SAFETY: An anonymous mapping has no preconditions.
             let chunk = unsafe {
@@ -159,7 +223,16 @@ impl Drop for Chunk {
     fn drop(&mut self) {
         // SAFETY: The chunk was mapped with this size. Every block of it holds the allocator that owns the chunk, so
         // no code lives in it anymore when it drops.
-        unsafe { libc::munmap(self.start.cast(), self.size) };
+        #[cfg(not(windows))]
+        unsafe {
+            libc::munmap(self.start.cast(), self.size);
+        }
+        // SAFETY: As above.
+        #[cfg(windows)]
+        unsafe {
+            windows_code_memory::delete_unwind_info(self.start);
+            windows_code_memory::release(self.start);
+        }
     }
 }
 
@@ -200,7 +273,23 @@ fn write_codes_in_chunk(chunk: &Chunk, writes: &[CodeWrite<'_>]) {
             unsafe { sys_icache_invalidate(write.destination.cast(), write.code.len()) };
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    // NB: Making a page writable commits it, so pages between the writes stay as they are.
+    #[cfg(windows)]
+    {
+        let runs = written_page_runs(writes);
+        for &(start, end) in &runs {
+            // SAFETY: The pages lie in a reserved chunk, and no code runs while this thread writes it.
+            let writable = unsafe { windows_code_memory::make_writable(start as *mut u8, end - start) };
+            assert!(writable, "making JIT code writable failed");
+        }
+        copy_all();
+        for &(start, end) in &runs {
+            // SAFETY: The pages were committed above.
+            let executable = unsafe { windows_code_memory::make_executable(start as *mut u8, end - start) };
+            assert!(executable, "making JIT code executable failed");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let page_mask = !(page_size() - 1);
         let page_start = writes
@@ -226,6 +315,29 @@ fn write_codes_in_chunk(chunk: &Chunk, writes: &[CodeWrite<'_>]) {
             unsafe { __clear_cache(write.destination.cast(), write.destination.add(write.code.len()).cast()) };
         }
     }
+}
+
+/// The pages the writes go to, as runs of consecutive pages in the order of their addresses, each from its first page
+/// to the end of its last.
+#[cfg(windows)]
+fn written_page_runs(writes: &[CodeWrite<'_>]) -> Vec<(usize, usize)> {
+    let page_mask = !(page_size() - 1);
+    let mut pages: Vec<(usize, usize)> = writes
+        .iter()
+        .map(|write| {
+            let start = write.destination as usize;
+            (start & page_mask, align_up(start + write.code.len(), page_size()))
+        })
+        .collect();
+    pages.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for (start, end) in pages {
+        match runs.last_mut() {
+            Some(run) if start <= run.1 => run.1 = run.1.max(end),
+            _ => runs.push((start, end)),
+        }
+    }
+    runs
 }
 
 #[derive(Clone, Copy)]
@@ -265,12 +377,12 @@ impl CodeAllocator {
             return address;
         }
 
-        let chunk = Chunk::map(CHUNK_SIZE.max(align_up(size, page_size())));
-        let start = chunk.start;
-        let chunk_size = chunk.size;
+        let chunk = Chunk::map(CHUNK_SIZE.max(align_up(CHUNK_HEADER_SIZE + size, page_size())));
+        let start = chunk.start.wrapping_add(CHUNK_HEADER_SIZE);
+        let code_size = chunk.size - CHUNK_HEADER_SIZE;
         self.chunks.push(chunk);
-        if chunk_size > size {
-            self.free(start.wrapping_add(size), chunk_size - size);
+        if code_size > size {
+            self.free(start.wrapping_add(size), code_size - size);
         }
         start
     }
@@ -374,19 +486,19 @@ impl ExecutableMemory {
         self.address
     }
 
-    /// Overwrites the code at each offset with the bytes that go there, which the code is not running at the time.
-    pub fn patch(&self, patches: &[(u32, Vec<u8>)]) {
+    /// Overwrites the code at the offset of each patch with its bytes, which the code is not running at the time.
+    pub fn patch(&self, patches: &[Patch]) {
         if patches.is_empty() {
             return;
         }
         let writes: Vec<CodeWrite<'_>> = patches
             .iter()
-            .map(|(offset, bytes)| {
-                assert!(*offset as usize + bytes.len() <= self.size);
+            .map(|patch| {
+                assert!(patch.offset as usize + patch.bytes().len() <= self.size);
                 CodeWrite {
                     // NB: The offset is within the memory, as asserted.
-                    destination: self.address.wrapping_add(*offset as usize),
-                    code: bytes,
+                    destination: self.address.wrapping_add(patch.offset as usize),
+                    code: patch.bytes(),
                 }
             })
             .collect();

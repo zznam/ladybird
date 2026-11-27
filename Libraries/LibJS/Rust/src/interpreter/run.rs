@@ -14,6 +14,7 @@ use ak::ScopeGuard;
 
 use super::vm::Vm;
 use crate::bytecode::executable::Executable;
+use crate::gc::root::Root;
 use crate::jit::code::EntryStatus;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
@@ -25,6 +26,7 @@ use crate::runtime::environment::Environment;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::promise::Promise;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::script::Script;
 use libjs_abi::register;
@@ -87,7 +89,13 @@ impl Vm {
 
         // NOTE: This is how we "push" a new execution context onto the VM's
         //       execution context stack.
-        let previous_running_execution_context = self.head.running_execution_context.replace(context.as_ptr());
+        // NB: The context is mostly the running one already, whose realm is current. The realm of a context does not
+        //     change while it runs, so the realm current now is that of the context running now, when this returns.
+        let previous_running_execution_context = self.head.running_execution_context.get();
+        let previous_realm = self.head.current_realm.get();
+        if context.as_ptr() != previous_running_execution_context {
+            self.set_running_execution_context(context.as_ptr());
+        }
         context_ref.executable.set(Some(Executable::head(executable)));
 
         assert!(
@@ -100,7 +108,11 @@ impl Vm {
             this_register.set(context_ref.this_value.get());
         }
 
-        if self.interpreter_stack().is_exhausted() || self.did_reach_stack_space_limit() {
+        if self.interrupt_requested() {
+            context_ref
+                .register(register::EXCEPTION)
+                .set(self.interrupt_exception());
+        } else if self.interpreter_stack().is_exhausted() || self.did_reach_stack_space_limit() {
             let Err(throw) =
                 self.throw_completion::<()>(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[])
             else {
@@ -109,7 +121,7 @@ impl Vm {
             context_ref.register(register::EXCEPTION).set(throw.value());
         } else if let Some(result) = self.enter_jit_code_at(context, executable_ref, entry_point) {
             match result.status {
-                EntryStatus::Returned => self.return_from_running_frame(Value(result.value)),
+                EntryStatus::Returned => self.return_from_running_frame(Value::from_bits(result.value)),
                 EntryStatus::Resume => self.run_running_frame_in_interpreter(),
                 EntryStatus::ExitInterpreter => {}
             }
@@ -142,6 +154,7 @@ impl Vm {
         self.head
             .running_execution_context
             .set(previous_running_execution_context);
+        self.head.current_realm.set(previous_realm);
         self.run_executable_depth().set(run_executable_depth);
         if exception != Value::EMPTY {
             return Err(exception);
@@ -201,14 +214,18 @@ impl Vm {
             return;
         }
 
-        if frame.caller_is_construct.get() && !return_value.is_object() {
+        // NB: The frame of a derived constructor returns its this value only for undefined.
+        if frame.caller_is_construct.get()
+            && !return_value.is_object()
+            && (!frame.caller_is_derived_construct.get() || return_value.is_undefined())
+        {
             return_value = frame.this_value.get();
         }
         // SAFETY: A frame's caller outlives it.
         let caller = unsafe { &*caller_frame };
         caller.program_counter.set(frame.caller_return_pc.get());
         caller.slots()[frame.caller_dst_raw.get() as usize].set(return_value);
-        self.head.running_execution_context.set(caller_frame);
+        self.set_running_frame_in_current_realm(caller_frame);
         self.interpreter_stack().deallocate(frame_pointer.as_ptr().cast());
         self.head.finish_execution_generation();
     }
@@ -242,6 +259,8 @@ impl Vm {
         unsafe { context.as_ref() }
             .register(register::ACCUMULATOR)
             .set(initial_accumulator_value);
+        // NB: A resumed frame continues after its Enter, so the resume counts as entering the executable.
+        executable.head.idle_collection_count.set(0);
         self.run_executable(context, executable, entry_point)
     }
 
@@ -259,7 +278,9 @@ impl Vm {
         // NOTE: Spec steps are rearranged in order to compute number of registers+constants+locals before construction of the execution context.
 
         // 11. Let script be scriptRecord.[[ECMAScriptCode]].
-        let executable = script_record.cached_executable();
+        let executable = script_record.cached_executable().expect("a script is evaluated once");
+        // NB: The top-level code runs once, so the script lets it go when this returns, on every path.
+        let _forget_executable_guard = ScopeGuard::new(|| script_record.forget_executable());
         if should_dump_bytecode() {
             executable.dump();
         }
@@ -281,17 +302,13 @@ impl Vm {
         // NOTE: This was done during execution context construction.
 
         // 4. Set the Realm of scriptContext to scriptRecord.[[Realm]].
-        script_context_ref.realm.set(Some(script_record.realm()));
+        script_context_ref.set_realm(Some(script_record.realm()));
 
         // 5. Set the ScriptOrModule of scriptContext to scriptRecord.
-        script_context_ref
-            .script_or_module
-            .set(ScriptOrModule::Script(script_record));
+        script_context_ref.set_script_or_module(ScriptOrModule::Script(script_record));
 
         // 6. Set the VariableEnvironment of scriptContext to globalEnv.
-        script_context_ref
-            .variable_environment
-            .set(Some(global_environment.upcast()));
+        script_context_ref.set_variable_environment(Some(global_environment.upcast()));
 
         // 7. Set the LexicalEnvironment of scriptContext to globalEnv.
         script_context_ref
@@ -343,17 +360,17 @@ impl Vm {
         result
     }
 
-    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Value> {
+    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Gc<Promise>> {
         // FIXME: This is not a entry point as defined in the spec, but is convenient.
         //        To avoid work we use link_and_eval_module however that can already be
         //        dangerous if the vm loaded other modules.
-        self.link_and_eval_module(module.upcast())?;
+        let evaluation = Root::new(self, self.link_and_eval_module(module.upcast())?);
 
         self.run_queued_promise_jobs();
 
         self.run_queued_finalization_registry_cleanup_jobs();
 
-        Ok(Value::UNDEFINED)
+        Ok(evaluation.value())
     }
 
     /// Enters a frame for a call of `callee_function` that the interpreter runs inline, as Return leaves it: the
@@ -419,6 +436,7 @@ impl Vm {
         new_target: Option<Gc<Object>>,
         is_construct: bool,
     ) -> Option<NonNull<ExecutionContext>> {
+        debug_assert!(self.is_in_current_realm(callee_function.as_function_object_gc()));
         let callee_context = self.allocate_inline_frame(
             callee_executable,
             arguments,
@@ -428,19 +446,21 @@ impl Vm {
             dst_raw,
         )?;
         callee_context.caller_is_construct.set(is_construct);
+        callee_context.caller_is_derived_construct.set(false);
 
         // Inlined PrepareForOrdinaryCall (avoids function call overhead on hot path).
         callee_context
             .function
             .set(Some(callee_function.as_function_object_gc()));
-        callee_context.realm.set(callee_function.realm());
-        callee_context.script_or_module.set(callee_function.script_or_module());
+        // NB: The context gets its realm and its ScriptOrModule from its function.
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
         let environment = callee_function.inline_call_environment(self, new_target);
         callee_context.lexical_environment.set(environment);
-        callee_context.variable_environment.set(environment);
-        callee_context
-            .private_environment
-            .set(callee_function.private_environment());
+        // NB: Only the frame of a function that needs a function environment keeps the field, but a store costs less
+        //     than asking.
+        callee_context.variable_environment_in_frame.set(environment);
 
         Some(self.enter_inline_frame(callee_context, callee_executable))
     }
@@ -460,6 +480,7 @@ impl Vm {
         this_value: Value,
     ) -> Option<NonNull<ExecutionContext>> {
         assert!(!callee_function.function_environment_needed());
+        debug_assert!(self.is_in_current_realm(callee_function.as_function_object_gc()));
         let caller_context = self.running_execution_context_ref();
         let callee_context = self.allocate_inline_frame(
             callee_executable,
@@ -478,10 +499,10 @@ impl Vm {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(callee_function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
-        callee_context.script_or_module.set(ScriptOrModule::Empty);
+        // NB: The ScriptOrModule of a context with a native function is null.
 
         // 8. Perform any necessary implementation-defined initialization of calleeContext.
         // NB: Like NativeFunction's [[Call]], which runs these builtins otherwise.
@@ -490,12 +511,6 @@ impl Vm {
         callee_context
             .lexical_environment
             .set(caller_context.lexical_environment.get());
-        callee_context
-            .variable_environment
-            .set(caller_context.variable_environment.get());
-        callee_context
-            .private_environment
-            .set(caller_context.private_environment.get());
 
         Some(self.enter_inline_frame(callee_context, callee_executable))
     }
@@ -553,12 +568,9 @@ impl Vm {
 
         // Inline JS-to-JS frames stay out of the VM execution context stack and
         // are tracked through caller_frame instead.
-        self.head.running_execution_context.set(callee_context_pointer.as_ptr());
+        self.set_running_frame_in_current_realm(callee_context_pointer.as_ptr());
 
         // Set up execution context fields that run_executable normally does.
-        // NB: We must use the callee's realm (not the caller's) for global_object
-        //     and global_declarative_environment, since the caller's realm may differ
-        //     in cross-realm calls (e.g. iframe <-> parent).
         callee_context.executable.set(Some(Executable::head(callee_executable)));
 
         callee_context_pointer
@@ -573,12 +585,25 @@ impl Vm {
         assert!(!caller_frame.is_null());
 
         self.interpreter_stack().deallocate(callee_frame.as_ptr().cast());
-        self.head.running_execution_context.set(caller_frame);
+        self.set_running_frame_in_current_realm(caller_frame);
     }
 
     /// Unwinds to the innermost handler of an exception thrown at `program_counter` in the running frame, leaving
     /// frames the interpreter entered without returning to the runtime.
+    ///
+    /// Once the VM is interrupted, whatever was thrown becomes the interrupt exception, which no handler catches, not
+    /// even a finally block: it unwinds to the native caller, and no script runs on the way.
     pub fn handle_exception(&self, mut program_counter: u32, exception: Value) -> HandleExceptionResponse {
+        if self.interrupt_requested() {
+            return self.unwind_for_interrupt();
+        }
+
+        // An exception that unwinds out to a native caller enters here again in the frame that called it, so remember
+        // only where it was first thrown.
+        if !self.is_last_throw(exception) {
+            self.did_throw(exception, program_counter);
+        }
+
         if let Some(debugger) = self.debugger() {
             let mut exception_will_be_caught = false;
             // The caller frame and return offset of the previous frame that runs an executable.
@@ -599,10 +624,16 @@ impl Vm {
                 previous_context = Some((context.caller_frame.get(), context.caller_return_pc.get()));
 
                 let executable = Executable::from_head(executable);
-                let handler = executable.exception_handlers_for_offset(context_program_counter);
-                if handler.is_some_and(|handler| handler.catches_exception) {
-                    exception_will_be_caught = true;
-                    return ControlFlow::Break(());
+                let mut offset = context_program_counter;
+                for _ in 0..executable.exception_handlers().len() {
+                    let Some(handler) = executable.exception_handlers_for_offset(offset) else {
+                        break;
+                    };
+                    if handler.catches_exception {
+                        exception_will_be_caught = true;
+                        return ControlFlow::Break(());
+                    }
+                    offset = handler.handler_offset;
                 }
                 ControlFlow::Continue(())
             });
@@ -627,10 +658,11 @@ impl Vm {
             if let Some(handler) = executable.exception_handlers_for_offset(program_counter) {
                 context.register(register::EXCEPTION).set(exception);
                 context.program_counter.set(handler.handler_offset);
-                if handler.catches_exception
-                    && let Some(debugger) = self.debugger()
-                {
-                    debugger.did_finish_exception_propagation(exception);
+                if handler.catches_exception {
+                    self.forget_throw_site_of(exception);
+                    if let Some(debugger) = self.debugger() {
+                        debugger.did_finish_exception_propagation(exception);
+                    }
                 }
                 return HandleExceptionResponse::ContinueInThisExecutable;
             }
@@ -647,7 +679,7 @@ impl Vm {
             if !caller_frame.is_null() {
                 let caller_pc = context.caller_return_pc.get();
                 self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
-                self.head.running_execution_context.set(caller_frame);
+                self.set_running_frame_in_current_realm(caller_frame);
 
                 // The caller's return address is one past the Call instruction, and handler ranges exclude their end
                 // offset, so look up the handler for an offset inside the Call.
@@ -662,6 +694,28 @@ impl Vm {
                 debugger.did_finish_exception_propagation(exception);
             }
             return HandleExceptionResponse::ExitFromExecutable;
+        }
+    }
+
+    /// Like handle_exception() for a thrown interrupt: leaves frames the interpreter entered, up to one that a native
+    /// caller waits for. A native caller that goes on to run code gets the same exception, as the VM stays interrupted.
+    #[cold]
+    #[inline(never)]
+    fn unwind_for_interrupt(&self) -> HandleExceptionResponse {
+        let exception = self.interrupt_exception();
+        loop {
+            let context_pointer = self
+                .running_execution_context()
+                .expect("an exception is thrown in a running frame");
+            // SAFETY: The running context is live until it is deallocated below.
+            let context = unsafe { context_pointer.as_ref() };
+            let caller_frame = context.caller_frame.get();
+            if context.returns_to_native_caller.get() || caller_frame.is_null() {
+                context.register(register::EXCEPTION).set(exception);
+                return HandleExceptionResponse::ExitFromExecutable;
+            }
+            self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
+            self.set_running_frame_in_current_realm(caller_frame);
         }
     }
 }

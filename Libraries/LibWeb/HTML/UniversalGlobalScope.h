@@ -9,18 +9,10 @@
 #pragma once
 
 #include <AK/Forward.h>
-#include <AK/Utf16String.h>
 #include <LibGC/HeapVector.h>
-#include <LibJS/Runtime/Value.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/ImportMap.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::Bindings {
-
-struct StructuredSerializeOptions;
-
-}
 
 namespace Web::HTML {
 
@@ -31,11 +23,6 @@ public:
 
     virtual DOM::EventTarget& this_impl() = 0;
     virtual DOM::EventTarget const& this_impl() const = 0;
-
-    WebIDL::ExceptionOr<Utf16String> btoa(Utf16View data) const;
-    WebIDL::ExceptionOr<Utf16String> atob(Utf16View data) const;
-    void queue_microtask(WebIDL::CallbackType&);
-    WebIDL::ExceptionOr<JS::Value> structured_clone(JS::Realm&, JS::Value, Bindings::StructuredSerializeOptions const&);
 
     void push_onto_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
     bool remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
@@ -57,7 +44,7 @@ protected:
 
 private:
     GC::Ptr<GC::HeapVector<GC::Ref<JS::Promise>>> m_about_to_be_notified_rejected_promises_list;
-    Vector<GC::Ptr<JS::Promise>> m_outstanding_rejected_promises_weak_set;
+    Vector<GC::Weak<JS::Promise>> m_outstanding_rejected_promises_weak_set;
     ImportMap m_import_map;
 };
 

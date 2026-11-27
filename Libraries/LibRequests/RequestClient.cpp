@@ -4,38 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ScopeGuard.h>
+#include <AK/Atomic.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Promise.h>
-#include <LibCore/System.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 
 namespace Requests {
 
-static Optional<Core::ImmutableBytes> map_cache_associated_data_file(int fd, u64 size)
+static u64 take_transport_epoch()
 {
-    ArmedScopeGuard close_fd = [fd] {
-        (void)Core::System::close(fd);
-    };
-
-    if (!AK::is_within_range<size_t>(size)) {
-        dbgln("RequestClient: Received cache associated data file outside mappable range");
-        return {};
-    }
-
-    close_fd.disarm();
-    auto payload = Core::ImmutableBytes::map_from_fd_range_and_close(fd, "cache associated data"sv, 0, static_cast<size_t>(size));
-    if (payload.is_error()) {
-        dbgln("RequestClient: Failed to map cache associated data file: {}", payload.error());
-        return {};
-    }
-
-    return payload.release_value();
+    static Atomic<u64> s_next_transport_epoch { 1 };
+    return s_next_transport_epoch.fetch_add(1);
 }
 
 RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport))
+    , m_transport_epoch(take_transport_epoch())
 {
     m_request_server_client_id = send_sync<Messages::RequestServer::GetClientId>()->client_id();
 }
@@ -43,6 +28,7 @@ RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport)
 RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport, int client_id)
     : IPC::ConnectionToServer<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport))
     , m_request_server_client_id(client_id)
+    , m_transport_epoch(take_transport_epoch())
 {
 }
 
@@ -59,6 +45,10 @@ void RequestClient::die()
 
     m_requests.clear();
     m_websockets.clear();
+
+    auto host_lookups = move(m_host_lookups);
+    for (auto& [id, on_resolved] : host_lookups)
+        on_resolved({});
 
     for (auto& [id, websocket] : websockets) {
         auto ready_state = websocket->ready_state();
@@ -79,7 +69,7 @@ void RequestClient::die()
     }
 }
 
-RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, TransferLease transfer_lease, Optional<u32> address_selection_hint, CacheMissNotification cache_miss_notification, u64 originating_page_id, Optional<HTTP::NetworkIsolationKey> network_isolation_key)
+RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, HTTP::Cookie::SameSiteContext same_site_context, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, TransferLease transfer_lease, Optional<u32> address_selection_hint, CacheMissNotification cache_miss_notification, u64 originating_page_id, Optional<HTTP::NetworkIsolationKey> network_isolation_key)
 {
     auto request_id = m_next_request_id++;
     auto headers = request_headers.map([](auto const& headers) { return headers.headers().span(); }).value_or({});
@@ -87,20 +77,20 @@ RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL 
     auto transfer_lease_key = transfer_lease == TransferLease::Yes
         ? Optional<RequestTransferLeaseKey> { { m_request_server_client_id, request_id } }
         : Optional<RequestTransferLeaseKey> {};
-    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, move(network_isolation_key), include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes, Core::System::getpid(), originating_page_id);
+    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, move(network_isolation_key), include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes, originating_page_id, same_site_context);
     auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
 
-RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease)
+RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease, Optional<int> owner_client_id)
 {
     auto request_id = m_next_request_id++;
 
     auto transfer_lease_key = transfer_lease == TransferLease::Yes
         ? Optional<RequestTransferLeaseKey> { { source_client_id, source_request_id } }
         : Optional<RequestTransferLeaseKey> {};
-    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value());
+    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value(), owner_client_id);
     auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
@@ -126,28 +116,6 @@ RefPtr<Request> RequestClient::import_request(ExportedRequest exported, Transfer
     auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
-}
-
-ErrorOr<Optional<Core::ImmutableBytes>> RequestClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, ReadonlyBytes data)
-{
-    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(data.size()));
-    memcpy(buffer.data<void>(), data.data(), data.size());
-    return store_cache_associated_data(network_isolation_key, url, method, request_headers, vary_key, associated_data, move(buffer));
-}
-
-ErrorOr<Optional<Core::ImmutableBytes>> RequestClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
-{
-    auto headers = request_headers.map([](auto const& headers) { return headers.headers(); }).value_or({});
-    auto response = IPCProxy::store_cache_associated_data(network_isolation_key, url, method, headers, vary_key, associated_data, move(data));
-    if (!response.file().has_value())
-        return Optional<Core::ImmutableBytes> {};
-    return map_cache_associated_data_file(response.take_file()->take_fd(), response.size());
-}
-
-ErrorOr<Optional<Core::AnonymousBuffer>> RequestClient::retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
-{
-    auto headers = request_headers.map([](auto const& headers) { return headers.headers(); }).value_or({});
-    return IPCProxy::retrieve_cache_associated_data(network_isolation_key, url, method, headers, vary_key, associated_data);
 }
 
 bool RequestClient::stop_request(Badge<Request>, Request& request)
@@ -182,11 +150,32 @@ void RequestClient::ensure_connection(URL::URL const& url, RequestServer::CacheL
     async_ensure_connection(request_id, url, cache_level);
 }
 
+void RequestClient::resolve_host(ByteString const& host, Function<void(Vector<ByteString>)> on_resolved)
+{
+    auto lookup_id = m_next_host_lookup_id++;
+    m_host_lookups.set(lookup_id, move(on_resolved));
+    async_resolve_host(lookup_id, host);
+}
+
+void RequestClient::host_resolved(u64 lookup_id, Vector<ByteString> addresses)
+{
+    if (auto on_resolved = m_host_lookups.take(lookup_id); on_resolved.has_value())
+        (*on_resolved)(move(addresses));
+}
+
 void RequestClient::request_requires_network(u64 request_id)
 {
     if (auto request = m_requests.get(request_id); request.has_value()) {
         if ((*request)->on_requires_network)
             (*request)->on_requires_network();
+    }
+}
+
+void RequestClient::request_upload_progress(u64 request_id, u64 bytes_sent)
+{
+    if (auto request = m_requests.get(request_id); request.has_value()) {
+        if ((*request)->on_upload_progress)
+            (*request)->on_upload_progress(bytes_sent);
     }
 }
 
@@ -243,15 +232,11 @@ void RequestClient::request_finished(u64 request_id, u64 total_size, RequestTimi
         m_requests.remove(request_id);
 }
 
-void RequestClient::headers_became_available(u64 request_id, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, Optional<IPC::File> javascript_bytecode_file, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state)
+void RequestClient::headers_became_available(u64 request_id, URL::URL url, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, CacheState cache_state, ByteString http_version)
 {
-    Optional<Core::ImmutableBytes> javascript_bytecode;
-    if (javascript_bytecode_file.has_value())
-        javascript_bytecode = map_cache_associated_data_file(javascript_bytecode_file->take_fd(), javascript_bytecode_size);
-
     RefPtr<Request> request = m_requests.get(request_id).value_or(nullptr);
     if (request)
-        request->did_receive_headers({}, HTTP::HeaderList::create(move(response_headers)), status_code, reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
+        request->did_receive_headers({}, move(url), HTTP::HeaderList::create(move(response_headers)), status_code, reason_phrase, cache_state, move(http_version));
     else
         warnln("Received headers for non-existent request {}", request_id);
 }
@@ -265,10 +250,10 @@ void RequestClient::request_transferred(u64 request_id)
     (*request)->did_transfer({});
 }
 
-RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers)
+RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, u64 originating_page_id, HTTP::Cookie::SameSiteContext same_site_context)
 {
     auto websocket_id = m_next_websocket_id++;
-    IPCProxy::async_websocket_connect(websocket_id, url, network_isolation_key, origin, protocols, extensions, request_headers.headers());
+    IPCProxy::async_websocket_connect(websocket_id, url, network_isolation_key, origin, protocols, extensions, request_headers.headers(), originating_page_id, same_site_context);
     auto connection = WebSocket::create_from_id({}, *this, websocket_id);
     m_websockets.set(websocket_id, connection);
     return connection;
@@ -284,6 +269,12 @@ void RequestClient::websocket_received(u64 websocket_id, bool is_text, ByteBuffe
 {
     if (auto connection = m_websockets.get(websocket_id); connection.has_value())
         (*connection)->did_receive({}, move(data), is_text);
+}
+
+void RequestClient::websocket_transmitted(u64 websocket_id, u64 message_byte_count)
+{
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_transmit({}, message_byte_count);
 }
 
 void RequestClient::websocket_received_shared(u64 websocket_id, bool is_text, Core::AnonymousBuffer data)

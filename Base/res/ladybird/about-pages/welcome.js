@@ -4,113 +4,203 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-import { populateSearchEngineSelect, updateSearchSuggestionsControl } from "./search-engine-controls.js";
-
 const form = document.querySelector("#welcome-form");
 const setupOptions = document.querySelector("#setup-options");
 const startBrowsing = document.querySelector("#start-browsing");
-const searchEngine = document.querySelector("#search-engine");
-const searchSuggestions = document.querySelector("#search-suggestions-enabled");
+const searchEngines = document.querySelector("#search-engines");
+const searchSuggestions = document.querySelector("#search-suggestions");
+const searchSuggestionsEnabled = document.querySelector("#search-suggestions-enabled");
 const searchSuggestionsDescription = document.querySelector("#search-suggestions-description");
+const tabLayoutInputs = document.querySelectorAll('input[name="tab-layout"]');
+const colorThemeInputs = document.querySelectorAll('input[name="color-theme"]');
 const enableContentBlocking = document.querySelector("#enable-content-blocking");
-const blockingOptions = document.querySelector("#blocking-options");
-const contentBlockerLists = document.querySelector("#content-blocker-lists");
+const enableUpdateChecks = document.querySelector("#enable-update-checks");
+const defaultBrowser = document.querySelector("#default-browser");
+const defaultBrowserLabel = document.querySelector("#default-browser-label");
+const defaultBrowserDescription = document.querySelector("#default-browser-description");
+const makeDefaultBrowser = document.querySelector("#make-default-browser");
 const saveStatus = document.querySelector("#save-status");
 
 let settings;
 let engines;
 let features;
 let initialized = false;
+// Why the last attempt to make Ladybird the default browser failed, which is shown in place of the row's description.
+let defaultBrowserFailure = null;
 
-const filterListDescriptions = {
-    easyList: "Blocks most ads.",
-    easyPrivacy: "Blocks trackers.",
-    fanboyAnnoyances: "Blocks pop-ups and other annoyances.",
-};
+function setSearchEngineSettings(name, suggestions) {
+    // NB: Keep our copy current, as the settings update for this change can arrive after the next one is made.
+    settings.searchEngine = { ...settings.searchEngine, engine: name, suggestions };
+    ladybird.sendMessage("setSearchEngineSettings", { engine: name, suggestions });
+    updateSearchSuggestions();
+}
 
-function updateBlockingOptions() {
-    blockingOptions.classList.toggle("hidden", !enableContentBlocking.checked);
+function setSearchEngine(name) {
+    setSearchEngineSettings(name, name !== null || settings.searchEngine.suggestions);
+}
+
+// The suggestions switch is only shown for a chosen engine that offers suggestions, and says where typed text goes.
+function updateSearchSuggestions() {
+    const name = settings.searchEngine.engine;
+    const engine = engines.search.find(engine => engine.name === name);
+    searchSuggestions.classList.toggle("hidden", !engine?.supportsSuggestions);
+    searchSuggestionsEnabled.checked = settings.searchEngine.suggestions;
+    if (engine)
+        searchSuggestionsDescription.textContent = `Your typing in the address bar is sent to ${name} before you press Enter.`;
+}
+
+function renderSearchEngines() {
+    const names = engines.search.map(engine => engine.name).sort((a, b) => a.localeCompare(b));
+
+    searchEngines.replaceChildren();
+    for (const name of names) {
+        const tile = document.createElement("label");
+        tile.className = "search-engine choice-card";
+
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "search-engine";
+        radio.value = name;
+        radio.checked = settings.searchEngine.engine === name;
+        radio.addEventListener("change", () => {
+            if (!initialized) return;
+            setSearchEngine(name);
+        });
+
+        // A search engine is optional, so choosing the chosen one again goes without one.
+        let wasChecked = false;
+        tile.addEventListener("pointerdown", () => {
+            wasChecked = radio.checked;
+        });
+        tile.addEventListener("click", event => {
+            if (!initialized || !wasChecked || event.target !== radio) return;
+            wasChecked = false;
+            radio.checked = false;
+            setSearchEngine(null);
+        });
+
+        // NB: Engines are shown by name only. Logos would mean shipping other companies' trademarks, or contacting
+        //     their servers before anyone has chosen.
+        const label = document.createElement("span");
+        label.textContent = name;
+
+        tile.append(radio, label);
+        searchEngines.append(tile);
+    }
+}
+
+function tabLayout() {
+    if (!settings.tabs.verticalTabsEnabled) return "horizontal";
+    return settings.tabs.everythingInSidebar ? "sidebar" : "vertical";
+}
+
+function updateTabLayout() {
+    const layout = tabLayout();
+    for (const input of tabLayoutInputs) input.checked = input.value === layout;
+}
+
+function updateColorTheme() {
+    const colorTheme = settings.appearance.colorTheme || "neutral";
+    for (const input of colorThemeInputs) input.checked = input.value === colorTheme;
+}
+
+// The row is only shown where the system can tell which browser is the default, and lets Ladybird become it.
+function updateDefaultBrowser() {
+    const isDefault = settings.defaultBrowser === "default";
+    const canMakeDefault = settings.defaultBrowser === "not-default";
+
+    defaultBrowser.classList.toggle("hidden", !isDefault && !canMakeDefault);
+    defaultBrowserDescription.textContent =
+        defaultBrowserFailure ??
+        (isDefault ? "Links from other apps open in Ladybird." : "Open links from other apps in Ladybird.");
+    makeDefaultBrowser.classList.toggle("hidden", !canMakeDefault);
+
+    // A control row is filled under the pointer, and a click anywhere on it reaches the control its label names. This
+    // row is one only while there is something for the button to do.
+    defaultBrowser.classList.toggle("control-row", canMakeDefault);
+    if (canMakeDefault) defaultBrowserLabel.htmlFor = makeDefaultBrowser.id;
+    else defaultBrowserLabel.removeAttribute("for");
+}
+
+function updateUpdateChecks() {
+    const networkFeatures = settings.backgroundNetworking.features;
+    if (Object.hasOwn(networkFeatures, "updateChecks")) enableUpdateChecks.checked = networkFeatures.updateChecks;
+    else enableUpdateChecks.closest(".switch-row").remove();
 }
 
 function initialize() {
     if (initialized || !settings || !engines || !features) return;
     initialized = true;
 
-    document.querySelector("#tab-mode-section").classList.toggle("hidden", !features.verticalTabs);
-    const tabMode = settings.tabs.verticalTabsEnabled ? "vertical" : "horizontal";
-    document.querySelector(`input[name="tab-mode"][value="${tabMode}"]`).checked = true;
+    document.querySelector("#tab-layout-section").classList.toggle("hidden", !features.verticalTabs);
+    updateTabLayout();
+    updateColorTheme();
+    updateDefaultBrowser();
 
-    populateSearchEngineSelect(searchEngine, engines.search, settings.searchEngine);
-    searchSuggestions.checked = settings.searchEngine.suggestions;
-    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
+    renderSearchEngines();
+    updateSearchSuggestions();
 
     enableContentBlocking.checked = settings.contentBlockers.enabled;
-    for (const list of settings.contentBlockerLists) {
-        if (!Object.hasOwn(filterListDescriptions, list.identifier)) continue;
-
-        const row = document.createElement("label");
-        row.className = "filter-list";
-        row.title = list.url;
-
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.dataset.identifier = list.identifier;
-        checkbox.checked = list.enabled;
-        checkbox.addEventListener("change", () => {
-            ladybird.sendMessage("setContentBlockerListEnabled", {
-                identifier: list.identifier,
-                enabled: checkbox.checked,
-            });
-        });
-
-        const name = document.createElement("span");
-        name.textContent = list.name;
-
-        const description = document.createElement("p");
-        description.id = `description-${list.identifier}`;
-        description.textContent = filterListDescriptions[list.identifier];
-        checkbox.setAttribute("aria-describedby", description.id);
-
-        row.append(checkbox, name, description);
-        contentBlockerLists.append(row);
-    }
-    updateBlockingOptions();
+    updateUpdateChecks();
     setupOptions.disabled = false;
     startBrowsing.disabled = false;
 }
 
-for (const input of document.querySelectorAll('input[name="tab-mode"]')) {
+for (const input of tabLayoutInputs) {
     input.addEventListener("change", () => {
         if (!initialized || !input.checked || !features.verticalTabs) return;
-        ladybird.sendMessage("setTabSettings", {
+        // NB: Keep our copy current, as the settings update for this change can arrive after the next one is made.
+        settings.tabs = {
             ...settings.tabs,
-            verticalTabsEnabled: input.value === "vertical",
-        });
+            verticalTabsEnabled: input.value !== "horizontal",
+            everythingInSidebar: input.value === "sidebar",
+        };
+        ladybird.sendMessage("setTabSettings", settings.tabs);
     });
 }
 
-function saveSearchEngineSettings() {
+// Picking a color recolors the window around the page at once.
+for (const input of colorThemeInputs) {
+    input.addEventListener("change", () => {
+        if (!initialized || !input.checked) return;
+        // NB: Keep our copy current, as the settings update for this change can arrive after the next one is made.
+        settings.appearance = { ...settings.appearance, colorTheme: input.value };
+        ladybird.sendMessage("setAppearance", settings.appearance);
+    });
+}
+
+searchSuggestionsEnabled.addEventListener("change", () => {
     if (!initialized) return;
-
-    ladybird.sendMessage("setSearchEngineSettings", {
-        engine: searchEngine.value || null,
-        suggestions: searchSuggestions.checked,
-    });
-}
-
-searchEngine.addEventListener("change", () => {
-    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
-    saveSearchEngineSettings();
+    setSearchEngineSettings(settings.searchEngine.engine, searchSuggestionsEnabled.checked);
 });
-
-searchSuggestions.addEventListener("change", saveSearchEngineSettings);
 
 enableContentBlocking.addEventListener("change", () => {
     if (!initialized) return;
 
-    updateBlockingOptions();
+    // Enable the lists before the content blocker, which then downloads every enabled list.
+    if (enableContentBlocking.checked) {
+        for (const identifier of ["easyList", "easyPrivacy"])
+            ladybird.sendMessage("setContentBlockerListEnabled", { identifier, enabled: true });
+    }
+
     ladybird.sendMessage("setContentBlockerEnabled", enableContentBlocking.checked);
     ladybird.sendMessage("setFilterListUpdatesEnabled", enableContentBlocking.checked);
+});
+
+enableUpdateChecks.addEventListener("change", () => {
+    if (!initialized) return;
+    ladybird.sendMessage("setUpdateChecksEnabled", enableUpdateChecks.checked);
+});
+
+// The system may ask before it changes the default browser, so the button waits for its answer.
+makeDefaultBrowser.addEventListener("click", () => {
+    if (!initialized) return;
+
+    makeDefaultBrowser.disabled = true;
+    defaultBrowserFailure = null;
+    updateDefaultBrowser();
+
+    ladybird.sendMessage("makeDefaultBrowser");
 });
 
 form.addEventListener("submit", event => {
@@ -136,34 +226,29 @@ document.addEventListener("WebUIMessage", event => {
         settings = { ...settings, ...data };
 
         if (initialized) {
-            if (Object.hasOwn(data, "tabs")) {
-                const mode = settings.tabs.verticalTabsEnabled ? "vertical" : "horizontal";
-                document.querySelector(`input[name="tab-mode"][value="${mode}"]`).checked = true;
-            }
+            if (Object.hasOwn(data, "tabs")) updateTabLayout();
+            if (Object.hasOwn(data, "appearance")) updateColorTheme();
             if (Object.hasOwn(data, "searchEngine")) {
-                populateSearchEngineSelect(searchEngine, engines.search, settings.searchEngine);
-                searchSuggestions.checked = settings.searchEngine.suggestions;
-                updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
+                for (const radio of searchEngines.querySelectorAll("input"))
+                    radio.checked = radio.value === settings.searchEngine.engine;
+                updateSearchSuggestions();
             }
-            if (Object.hasOwn(data, "contentBlockers")) {
+            if (Object.hasOwn(data, "contentBlockers"))
                 enableContentBlocking.checked = settings.contentBlockers.enabled;
-                updateBlockingOptions();
-            }
-            if (Object.hasOwn(data, "contentBlockerLists")) {
-                for (const checkbox of contentBlockerLists.querySelectorAll("input")) {
-                    const list = settings.contentBlockerLists.find(
-                        list => list.identifier === checkbox.dataset.identifier
-                    );
-                    if (list) {
-                        checkbox.checked = list.enabled;
-                    }
-                }
+            if (Object.hasOwn(data, "backgroundNetworking")) updateUpdateChecks();
+            if (Object.hasOwn(data, "defaultBrowser")) {
+                defaultBrowserFailure = null;
+                updateDefaultBrowser();
             }
         }
     } else if (name === "loadEngines") {
         engines = data;
     } else if (name === "loadFeatures") {
         features = data;
+    } else if (name === "defaultBrowserResult") {
+        makeDefaultBrowser.disabled = false;
+        defaultBrowserFailure = data;
+        updateDefaultBrowser();
     } else if (name === "firstRunCompleted") {
         location.replace(data);
     } else if (name === "firstRunError") {

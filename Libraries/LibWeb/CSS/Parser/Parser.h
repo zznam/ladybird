@@ -43,6 +43,11 @@ enum class ParsingMode {
     SVGPresentationAttribute, // See https://svgwg.org/svg2-draft/types.html#presentation-attribute-css-value
 };
 
+enum class PseudoElementParsingMode {
+    Selector,
+    ComputedStyle,
+};
+
 enum class IsUAStyleSheet {
     Yes,
     No,
@@ -89,7 +94,8 @@ public:
     NonnullRefPtr<CSS::StyleSheetState> parse_as_css_stylesheet(Utf16View, Optional<::URL::URL> location, RustMediaList = {});
     NonnullRefPtr<StyleSheetState> create_css_stylesheet(RustStyleSheetParse const&, Optional<::URL::URL> location, RustMediaList = {});
 
-    RustDeclarationBlock parse_as_property_declaration_block(Utf16View);
+    // NB: When given, `parsed_cleanly` is set to whether the parse reported no diagnostics or rejected declarations.
+    RustDeclarationBlock parse_as_property_declaration_block(Utf16View, bool* parsed_cleanly = nullptr);
     Vector<DevToolsStyleDeclaration> parse_as_devtools_property_declaration_block(Utf16View);
     RustDescriptorBlock parse_as_descriptor_declaration_block(Utf16View, AtRuleID);
     Optional<RustRule> parse_as_css_rule(Utf16View, bool nested = false);
@@ -106,7 +112,7 @@ public:
     // Contrary to the name, these parse a comma-separated list of selectors, according to the spec.
     Optional<SelectorList> parse_as_selector(Utf16View, SelectorParsingMode = SelectorParsingMode::Standard);
 
-    Optional<Selector::PseudoElementSelector> parse_as_pseudo_element_selector(Utf16View);
+    Optional<Selector::PseudoElementSelector> parse_as_pseudo_element_selector(Utf16View, PseudoElementParsingMode = PseudoElementParsingMode::Selector);
 
     Optional<RustQueryHandle> parse_as_supports(Utf16View);
 
@@ -123,8 +129,6 @@ public:
     };
     template<typename T>
     using ParseErrorOr = ErrorOr<T, ParseError>;
-
-    static ParseErrorOr<void> collect_arbitrary_substitution_function_presence(Utf16View, SubstitutionFunctionsPresence&);
 
 private:
     RustStyleSheetParse parse_stylesheet(Utf16View);
@@ -180,16 +184,15 @@ namespace Web {
 
 NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingParams const&, StringView, Optional<::URL::URL> location = {}, CSS::RustMediaList media_list = {});
 NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingParams const&, Utf16View, Optional<::URL::URL> location = {}, CSS::RustMediaList media_list = {});
-CSS::RustDeclarationBlock parse_css_property_declaration_block(CSS::Parser::ParsingParams const&, Utf16View);
+CSS::RustDeclarationBlock parse_css_property_declaration_block(CSS::Parser::ParsingParams const&, Utf16View, bool* parsed_cleanly = nullptr);
 CSS::RustDescriptorBlock parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const&, CSS::AtRuleID, Utf16View);
 RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const&, StringView, CSS::PropertyID);
 RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const&, Utf16View, CSS::PropertyID);
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const&, Utf16View, CSS::ValueType);
 RefPtr<CSS::StyleValue const> parse_css_descriptor(CSS::Parser::ParsingParams const&, CSS::AtRuleID, CSS::DescriptorNameAndID const&, Utf16View);
 Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const&, Utf16View);
-Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const&, Utf16View);
+Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const&, Utf16View, CSS::Parser::PseudoElementParsingMode = CSS::Parser::PseudoElementParsingMode::Selector);
 Optional<CSS::RustRule> parse_css_rule(CSS::Parser::ParsingParams const&, Utf16View, bool nested = false);
-Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const&, Utf16View);
 WEB_API ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<StringView> mime_type_charset, ReadonlyBytes encoded_string);
 bool is_valid_animation_name_custom_ident(Utf16View);
 

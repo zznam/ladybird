@@ -12,6 +12,7 @@
 #include <AK/Optional.h>
 #include <AK/Span.h>
 #include <AK/Vector.h>
+#include <LibMediaCodecs/Color/ColorMetadata.h>
 #include <LibMediaCodecs/Export.h>
 
 namespace Media::Codecs {
@@ -64,6 +65,10 @@ public:
     struct SequenceParameterSet {
         u8 seq_parameter_set_id;
         u8 max_num_reorder_frames;
+        u8 profile_idc { 0 };
+        u8 chroma_format_idc { 1 };
+        u8 bit_depth_luma { 8 };
+        CodingIndependentCodePoints cicp;
     };
 
     struct PictureParameterSet {
@@ -108,7 +113,13 @@ public:
     // Read the NAL unit header byte's fields (H.264, 7.4.1 and Table 7-1).
     static MEDIACODECS_API bool is_coded_slice(u8 nal_unit_header);
     static MEDIACODECS_API u8 nal_ref_idc(u8 nal_unit_header);
+    // Only an IDR picture starts a coded video sequence.
+    static MEDIACODECS_API bool begins_coded_video_sequence(u8 nal_unit_header);
     static MEDIACODECS_API bool is_parameter_set(u8 nal_unit_header);
+
+    // The HDR metadata a NAL unit carries, if any. The scene peak applies to the picture the NAL unit is part of, and
+    // the rest to its coded video sequence.
+    static MEDIACODECS_API ColorMetadata high_dynamic_range_metadata_of_nal_unit(ReadonlyBytes nal_unit);
 
     // Parse the fields needed for parameter-set tracking and output reordering from a complete NAL unit,
     // including its header. These do not validate the remaining syntax of the parameter set.

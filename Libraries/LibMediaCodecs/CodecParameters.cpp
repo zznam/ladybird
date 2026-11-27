@@ -90,7 +90,8 @@ Optional<ParsedCodec> parse_codec_parameters_string(StringView string)
 
     return {};
 }
-static Optional<ParsedCodec> parse_configuration_record(CodecID codec_id, ReadonlyBytes configuration_record)
+
+Optional<ParsedCodec> parse_configuration_record(CodecID codec_id, ReadonlyBytes configuration_record)
 {
     if (configuration_record.is_empty())
         return {};
@@ -176,8 +177,9 @@ ParsedCodec normalize_parsed_codec_for_support_keying(ParsedCodec const& codec)
         Optional<Codecs::H264::Profile> profile = Codecs::H264::Profile::Main;
         if (auto parameters = codec.h264_parameters(); parameters.has_value())
             profile = parameters->profile();
+        // Decoders can only support profiles that we recognize, so the rest share one key.
         if (!profile.has_value())
-            return codec;
+            return ParsedCodec { Codecs::H264::Parameters {} };
         return ParsedCodec { Codecs::H264::canonical_parameters_for_profile(*profile) };
     }
     case CodecID::H265: {
@@ -185,7 +187,7 @@ ParsedCodec normalize_parsed_codec_for_support_keying(ParsedCodec const& codec)
         if (auto parameters = codec.h265_parameters(); parameters.has_value())
             profile = parameters->profile();
         if (!profile.has_value())
-            return codec;
+            return ParsedCodec { Codecs::H265::Parameters {} };
         return ParsedCodec { Codecs::H265::canonical_parameters_for_profile(*profile) };
     }
     default:

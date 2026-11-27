@@ -11,15 +11,18 @@
 //! frame), the executable it belongs to, and the executable's JIT code. Executables keep only their slot number, which
 //! JIT code and the runtime mask into the table and check against the slot's owner. Nothing in the GC heap points at
 //! JIT code, so a corrupted executable can at worst name the slot of another executable, which the owner check
-//! catches.
+//! catches. On Windows, which commits slots as they get used, it can also name a slot past the ones in use, which
+//! faults.
 
 use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use super::code::JitCode;
+use super::code::{DetachedJitCode, JitCode};
+use crate::gc::defer_gc::DeferGc;
+use crate::gc::sweep::Sweep;
 
-#[cfg(feature = "address-sanitizer")]
+#[cfg(all(feature = "address-sanitizer", not(windows)))]
 unsafe extern "C" {
     fn __lsan_register_root_region(start: *const c_void, size: usize);
     fn __lsan_unregister_root_region(start: *const c_void, size: usize);
@@ -42,6 +45,11 @@ const JIT_ENTRY_TABLE_SIZE: usize = 3 * JIT_ENTRY_TABLE_CAPACITY * 8;
 /// The slot of executables without one. Its entry has the interpreter run the frame, and it has no owner.
 pub const NO_JIT_ENTRY_SLOT: u32 = 0;
 
+/// Windows has no mappings that take no commit charge until they are written to, and every worker would pay for the
+/// whole table. The arrays get committed together, this many slots at a time.
+#[cfg(windows)]
+const SLOTS_COMMITTED_AT_ONCE: u32 = (64 * 1024 / 8) as u32;
+
 /// One reserved mapping of three parallel arrays, indexed by slot: the entries (`*const c_void`), the owners (the
 /// address of the owning executable's head, as `u64`) and the code (`Option<Box<JitCode>>`). Its address stays the
 /// same for the VM's life, so JIT code embeds it.
@@ -56,29 +64,39 @@ pub struct JitEntryTable {
 
 impl JitEntryTable {
     pub fn new(not_compiled_entry: *const c_void) -> Self {
+        #[cfg(not(windows))]
         // SAFETY: A fresh anonymous mapping, which no one else uses. Its pages read as zeroes until written: no owner
         //         and no code in every slot.
         let base = unsafe {
-            libc::mmap(
+            let base = libc::mmap(
                 core::ptr::null_mut(),
                 JIT_ENTRY_TABLE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
-            )
+            );
+            assert!(base != libc::MAP_FAILED, "mapping the JIT entry table failed");
+            base.cast::<u8>()
         };
-        assert!(base != libc::MAP_FAILED, "mapping the JIT entry table failed");
+        // NB: Pages read as zeroes once committed: no owner and no code in every slot.
+        #[cfg(windows)]
+        let base = ak::windows_code_memory::reserve(JIT_ENTRY_TABLE_SIZE);
         let table = Self {
-            base: NonNull::new(base.cast()).expect("mmap does not return null"),
+            base: NonNull::new(base).expect("mapping the JIT entry table failed"),
             not_compiled_entry,
             next_slot: Cell::new(NO_JIT_ENTRY_SLOT + 1),
             free_slots: RefCell::default(),
         };
+        #[cfg(windows)]
+        assert!(
+            table.commit_slots_from(NO_JIT_ENTRY_SLOT),
+            "committing the JIT entry table failed"
+        );
         table.entry_cell(NO_JIT_ENTRY_SLOT).set(not_compiled_entry);
         // NB: The leak checker does not look into mappings for pointers, and would report the JIT code of a VM that
         //     lives until the process exits (js) as leaked.
-        #[cfg(feature = "address-sanitizer")]
+        #[cfg(all(feature = "address-sanitizer", not(windows)))]
         // SAFETY: The code of the table is inside its mapping, which lives as long as the table.
         unsafe {
             __lsan_register_root_region(table.code_start(), JIT_ENTRY_TABLE_SIZE - JIT_ENTRY_TABLE_CODE_OFFSET);
@@ -86,7 +104,26 @@ impl JitEntryTable {
         table
     }
 
-    #[cfg(feature = "address-sanitizer")]
+    /// Commits the next `SLOTS_COMMITTED_AT_ONCE` slots from `slot`, a multiple of that, in all three arrays. Returns
+    /// whether that worked, which only fails when the system is out of commit.
+    #[cfg(windows)]
+    fn commit_slots_from(&self, slot: u32) -> bool {
+        [0, JIT_ENTRY_TABLE_OWNERS_OFFSET, JIT_ENTRY_TABLE_CODE_OFFSET]
+            .into_iter()
+            .all(|array_offset| {
+                let offset = array_offset + 8 * slot as usize;
+                // SAFETY: Slots are inside the table, and the capacity is a multiple of how many get committed at
+                //         once. Committing pages again keeps what they hold.
+                unsafe {
+                    ak::windows_code_memory::make_writable(
+                        self.base.as_ptr().add(offset),
+                        8 * SLOTS_COMMITTED_AT_ONCE as usize,
+                    )
+                }
+            })
+    }
+
+    #[cfg(all(feature = "address-sanitizer", not(windows)))]
     fn code_start(&self) -> *const c_void {
         // NB: The offset is inside the mapping.
         self.base.as_ptr().wrapping_add(JIT_ENTRY_TABLE_CODE_OFFSET).cast()
@@ -130,13 +167,18 @@ impl JitEntryTable {
     }
 
     /// A slot for the executable whose head is at `owner`, with the not compiled entry, or `NO_JIT_ENTRY_SLOT` if the
-    /// table is full.
+    /// table is full (on Windows, also if the system is out of commit for more slots).
     pub fn allocate(&self, owner: u64) -> u32 {
         let slot = match self.free_slots.borrow_mut().pop() {
             Some(slot) => slot,
             None => {
                 let slot = self.next_slot.get();
                 if slot as usize == JIT_ENTRY_TABLE_CAPACITY {
+                    return NO_JIT_ENTRY_SLOT;
+                }
+                // NB: The next allocation tries again.
+                #[cfg(windows)]
+                if slot.is_multiple_of(SLOTS_COMMITTED_AT_ONCE) && !self.commit_slots_from(slot) {
                     return NO_JIT_ENTRY_SLOT;
                 }
                 self.next_slot.set(slot + 1);
@@ -149,7 +191,7 @@ impl JitEntryTable {
     }
 
     /// Frees the slot of the executable whose head is at `owner`, which died, and returns its code.
-    pub fn free(&self, slot: u32, owner: u64) -> Option<Box<JitCode>> {
+    pub fn free(&self, slot: u32, owner: u64, _: &Sweep<'_>) -> Option<JitCode> {
         let slot = slot & JIT_ENTRY_SLOT_MASK;
         if slot == NO_JIT_ENTRY_SLOT {
             return None;
@@ -158,11 +200,10 @@ impl JitEntryTable {
             self.is_owned_by(slot, owner),
             "only the owner of a JIT entry slot frees it"
         );
-        let code = self.code_cell(slot).take();
         self.entry_cell(slot).set(self.not_compiled_entry);
         self.owner_cell(slot).set(0);
         self.free_slots.borrow_mut().push(slot);
-        code
+        self.code_cell(slot).take().map(|code| *code)
     }
 
     /// Whether the slot belongs to the executable whose head is at `owner`.
@@ -177,15 +218,24 @@ impl JitEntryTable {
 
     /// The code attached to the slot.
     pub fn code(&self, slot: u32) -> Option<&JitCode> {
-        // SAFETY: The code stays in the slot until set_code() or free() replaces it, which callers do not do while
+        // SAFETY: The code stays in the slot until detach_code() or free() takes it, which callers do not do while
         //         they use the reference.
         unsafe { (*self.code_cell(slot).as_ptr()).as_deref() }
     }
 
-    /// Attaches `code` to the slot, and returns the code it had.
-    pub fn set_code(&self, slot: u32, code: Option<Box<JitCode>>) -> Option<Box<JitCode>> {
+    /// Attaches `code` to the slot, which has none.
+    pub fn attach_code(&self, slot: u32, code: JitCode, _: &DeferGc<'_>) {
         assert_ne!(slot & JIT_ENTRY_SLOT_MASK, NO_JIT_ENTRY_SLOT);
-        self.code_cell(slot).replace(code)
+        assert!(self.code_cell(slot).replace(Some(Box::new(code))).is_none());
+    }
+
+    /// Drops the code attached to the slot, or moves it to `parking`, whose owner drops it later.
+    pub fn detach_code(&self, slot: u32, parking: Option<&RefCell<DetachedJitCode>>) {
+        assert_ne!(slot & JIT_ENTRY_SLOT_MASK, NO_JIT_ENTRY_SLOT);
+        match parking {
+            Some(parking) => parking.borrow_mut().extend(self.code_cell(slot).take()),
+            None => drop(self.code_cell(slot).take()),
+        }
     }
 }
 
@@ -194,14 +244,20 @@ impl Drop for JitEntryTable {
         for slot in 0..self.next_slot.get() {
             drop(self.code_cell(slot).take());
         }
-        #[cfg(feature = "address-sanitizer")]
+        #[cfg(all(feature = "address-sanitizer", not(windows)))]
         // SAFETY: The region registered when the table was made.
         unsafe {
             __lsan_unregister_root_region(self.code_start(), JIT_ENTRY_TABLE_SIZE - JIT_ENTRY_TABLE_CODE_OFFSET);
         }
         // SAFETY: The table's mapping, which nothing uses anymore.
+        #[cfg(not(windows))]
         unsafe {
             libc::munmap(self.base.as_ptr().cast(), JIT_ENTRY_TABLE_SIZE);
+        }
+        // SAFETY: As above.
+        #[cfg(windows)]
+        unsafe {
+            ak::windows_code_memory::release(self.base.as_ptr());
         }
     }
 }

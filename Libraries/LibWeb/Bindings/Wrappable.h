@@ -63,7 +63,6 @@ WEB_API GC::Ref<JS::HostObject> create_wrapper_for_wrappable(JS::Realm& wrapper_
 WEB_API JS::Realm& wrapper_realm_for_wrappable(WrapperWorld const& wrapper_world, JS::Realm& preferred_realm, GC::Ref<Wrappable>);
 WEB_API JS::Realm& wrapper_realm_for_node(WrapperWorld const& wrapper_world, JS::Realm& preferred_realm, DOM::Node&);
 WEB_API GC::Ref<JS::HostObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, GC::Ref<Wrappable>);
-WEB_API JS::Realm& this_value_realm(JS::Realm& fallback_realm, JS::Value);
 WEB_API JS::ThrowCompletionOr<void> set_prototype_of_cached_main_world_wrapper(Wrappable&, JS::Object&);
 WEB_API void preserve_wrapper(Wrappable&, JS::HostObject&);
 WEB_API bool wrapper_is_preserved(JS::HostObject const&);
@@ -115,6 +114,10 @@ public:
     [[nodiscard]] virtual Bindings::InterfaceName interface_name() const { VERIFY_NOT_REACHED(); }
     [[nodiscard]] virtual bool implements_interface(Bindings::InterfaceName) const { return false; }
     [[nodiscard]] virtual bool implements_interface(String const&) const { return false; }
+
+    // Whether an object of an interface implemented in Rust owns this object, so that its wrappers are the Rust
+    // object's (Libraries/LibWeb/Bindings/Rust/src/bindings/event_target.rs).
+    [[nodiscard]] virtual bool is_owned_by_rust_interface_object() const { return false; }
 
     template<typename T>
     requires(IsBaseOf<Wrappable, T> && requires { T::s_interface_name; })

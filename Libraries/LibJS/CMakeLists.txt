@@ -19,6 +19,10 @@ set(LIBJS_RUST_FEATURES ${LIBJS_RUST_FEATURES} PARENT_SCOPE)
 
 add_subdirectory(Rust)
 
+# The core of the parser, a pure Rust crate that keeps all the work data of a parse in a zone. Its unit tests run
+# without the rest of LibJS.
+test_rust_crate(MANIFEST_PATH Parser/Rust/Cargo.toml CRATE_NAME libjs_parser)
+
 # The optimizing JIT's compiler, a pure Rust crate that only works on plain data. Its unit tests run without the rest of
 # LibJS.
 if (ENABLE_JS_JIT)
@@ -29,7 +33,6 @@ set(SOURCES
     Console.cpp
     CyclicModule.cpp
     Debugger.cpp
-    DecodedBytecodeCache.cpp
     Heap/Cell.cpp
     Module.cpp
     ParserError.cpp
@@ -65,7 +68,6 @@ set(SOURCES
     Runtime/JSONObject.cpp
     Runtime/Map.cpp
     Runtime/MapIterator.cpp
-    Runtime/ModuleEnvironment.cpp
     Runtime/NativeFunction.cpp
     Runtime/NumberObject.cpp
     Runtime/Object.cpp
@@ -76,7 +78,6 @@ set(SOURCES
     Runtime/PromiseJob.cpp
     Runtime/PropertyDescriptor.cpp
     Runtime/Realm.cpp
-    Runtime/Reference.cpp
     Runtime/RegExpObject.cpp
     Runtime/Set.cpp
     Runtime/SetIterator.cpp
@@ -111,7 +112,7 @@ add_lagom_library_install_rules(LibJSHeaders ALIAS_NAME JSHeaders)
 add_library(LibJSObjects OBJECT ${SOURCES})
 ladybird_library_setup(LibJSObjects)
 target_link_libraries(LibJSObjects PUBLIC LibJSHeaders)
-target_link_libraries(LibJSObjects PRIVATE LibCore LibCrypto LibGC LibSyntax LibTextCodec)
+target_link_libraries(LibJSObjects PRIVATE LibCore LibGC LibSyntax LibTextCodec)
 target_compile_definitions(LibJSObjects PRIVATE LibJS_EXPORTS)
 set_target_properties(LibJSObjects PROPERTIES DEFINE_SYMBOL LibJS_EXPORTS)
 ladybird_generate_export_header(LibJSObjects js BASE_NAME LibJS)
@@ -124,35 +125,26 @@ if (LIBJS_FOLDED_INTO_LIBWEB)
     ladybird_install_library_headers(LibJS JS)
     add_lagom_library_install_rules(LibJS ALIAS_NAME JS)
 
-    # LibJSStandalone is what a JavaScript tool that does not use LibWeb links: the objects, and the runtime out of the
-    # archive of LibWeb's crate, of which the tool takes only the members it references, so that building a tool never
-    # builds LibWeb's C++. The tool initializes the runtime's panic hook and demangler as the crate the runtime is.
-    add_rust_crate_initializer(libjs_rust)
+    # Standalone JavaScript tools link the objects and an independent runtime archive, so building them does not
+    # build LibWeb's Rust code or generate its bindings.
     add_library(LibJSStandalone INTERFACE)
     target_link_libraries(LibJSStandalone INTERFACE
         $<TARGET_OBJECTS:LibJSObjects>
-        $<TARGET_OBJECTS:libjs_rust_init>
-        LibJSHeaders libweb_bindings_rust_archive AK LibCore LibCrypto LibGC LibSyntax LibTextCodec
+        LibJSHeaders libjs_rust AK LibCore LibGC LibSyntax LibTextCodec
     )
     if ((LINUX OR BSD) AND BUILD_SHARED_LIBS)
         # The tool's copy of the runtime, with its Rust standard library, stays out of its dynamic symbol table, as the
-        # copy in LibJS's own library does. LibWeb's directory, which imports the archive, comes after this one, so
-        # the archive's name is resolved when the build is generated.
+        # copy in LibJS's own library does.
         target_link_options(LibJSStandalone INTERFACE
-            "LINKER:--exclude-libs,$<TARGET_FILE_NAME:libweb_bindings_rust_archive>"
+            "LINKER:--exclude-libs,$<TARGET_FILE_NAME:libjs_rust>"
         )
-    elseif ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
-        # The archive carries its own copy of the Rust standard library and of the crates it shares with the Rust
-        # archives of LibUnicode and the other libraries a tool links, whose exported symbols then appear twice in
-        # static ELF links.
-        target_link_options(LibJSStandalone INTERFACE LINKER:--allow-multiple-definition)
     endif()
 else()
     set(SOURCES $<TARGET_OBJECTS:LibJSObjects>)
     ladybird_lib(LibJS js)
     set_target_properties(LibJS PROPERTIES LINKER_LANGUAGE CXX WINDOWS_EXPORT_ALL_SYMBOLS OFF)
     target_link_libraries(LibJS PUBLIC LibJSHeaders)
-    target_link_libraries(LibJS PRIVATE LibCore LibCrypto LibGC LibSyntax LibTextCodec)
+    target_link_libraries(LibJS PRIVATE LibCore LibGC LibSyntax LibTextCodec)
 
     if (NOT BUILD_SHARED_LIBS OR WIN32)
         target_link_libraries(LibJS PRIVATE libjs_rust)

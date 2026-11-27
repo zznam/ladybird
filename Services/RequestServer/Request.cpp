@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Checked.h>
 #include <AK/GenericShorthands.h>
 #include <AK/HashMap.h>
@@ -20,12 +21,12 @@
 #include <LibTextCodec/Decoder.h>
 #include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
+#include <RequestServer/CertificateExceptions.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
 #include <RequestServer/ResourceSubstitutionMap.h>
-#include <openssl/ssl.h>
 #include <string.h>
 
 namespace RequestServer {
@@ -33,6 +34,7 @@ namespace RequestServer {
 extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 static long s_connect_timeout_seconds = 90L;
+static constexpr long s_alternative_service_connect_timeout_seconds = 2L;
 
 static constexpr size_t max_response_header_count = 1000;
 static AK::Duration s_wait_for_cache_timeout = AK::Duration::from_seconds(10);
@@ -45,33 +47,6 @@ static ByteString url_without_credentials(URL::URL url)
     url.set_username(""sv);
     url.set_password(""sv);
     return url.to_byte_string();
-}
-
-static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, [[maybe_unused]] void* aia_collector)
-{
-    // Everything below casts ssl_context to an SSL_CTX, which only holds when curl is built against OpenSSL.
-    [[maybe_unused]] static auto const curl_uses_openssl = [] {
-        auto const* version_info = curl_version_info(CURLVERSION_NOW);
-        VERIFY(version_info);
-        return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
-    }();
-
-#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
-    // Some HTTPS servers, including the Python server used by WPT, close the connection without sending the
-    // mandatory TLS close-notify alert. Other browsers treat such a post-handshake transport EOF as a clean TLS EOF
-    // for compatibility. Do the same while leaving curl responsible for detecting incomplete HTTP framing.
-    if (curl_uses_openssl)
-        SSL_CTX_set_options(static_cast<SSL_CTX*>(ssl_context), SSL_OP_IGNORE_UNEXPECTED_EOF);
-#endif
-
-#ifndef AK_OS_MACOS
-    // curl keeps one SSL context callback per handle, and AIA has to run against the same SSL_CTX configured above. So
-    // both are applied here. The collector arrives as CURLOPT_SSL_CTX_DATA and is null on handles lacking AIA state.
-    if (curl_uses_openssl && aia_collector)
-        apply_aia_verification(static_cast<SSL_CTX*>(ssl_context), *static_cast<AIACollector*>(aia_collector));
-#endif
-
-    return CURLE_OK;
 }
 
 // https://everything.curl.dev/internals/content-encoding.html#supported-content-encodings
@@ -305,8 +280,11 @@ static void record_chunk(Request const* request, size_t bytes)
         stats.max_chunk_bytes = bytes;
 }
 
-[[maybe_unused]] static int on_xferinfo(void* user_data, curl_off_t /*dltotal*/, curl_off_t dlnow, curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
+static int on_xferinfo(void* user_data, curl_off_t /*dltotal*/, curl_off_t dlnow, curl_off_t /*ultotal*/, curl_off_t ulnow)
 {
+    if (ulnow > 0)
+        static_cast<Request*>(user_data)->did_send_request_body_bytes(static_cast<u64>(ulnow));
+
     if constexpr (!REQUESTSERVER_WIRE_DEBUG)
         return 0;
     auto* request = static_cast<Request const*>(user_data);
@@ -461,11 +439,12 @@ NonnullOwnPtr<Request> Request::fetch(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease,
     Optional<u32> address_selection_hint,
     bool notify_on_cache_miss)
 {
-    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, move(network_isolation_key), cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(transfer_lease) });
+    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, move(network_isolation_key), cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, same_site_context, move(transfer_lease) });
     request->m_address_selection_hint = address_selection_hint;
     request->m_notify_on_cache_miss = notify_on_cache_miss;
     request->process();
@@ -498,12 +477,13 @@ NonnullOwnPtr<Request> Request::revalidate(
     ByteString method,
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
-    HTTP::Cookie::IncludeCredentials include_credentials)
+    HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context)
 {
     // Revalidation headers must not leak into the initiating request.
     request_headers = HTTP::HeaderList::create(request_headers->headers());
 
-    auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, move(network_isolation_key), HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials });
+    auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, move(network_isolation_key), HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, same_site_context });
     request->process();
 
     return request;
@@ -523,6 +503,7 @@ Request::Request(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease)
     : m_request_id(request_id)
     , m_type(type)
@@ -538,11 +519,12 @@ Request::Request(
     , m_request_headers(move(request_headers))
     , m_request_body(move(request_body))
     , m_include_credentials(include_credentials)
+    , m_same_site_context(same_site_context)
     , m_response_headers(HTTP::HeaderList::create())
     , m_transfer_lease(move(transfer_lease))
 {
     // A response for another site is only passing through this RequestServer on its way to that site's.
-    if (auto const& site = process_top_level_site(); site.has_value() && m_disk_cache.has_value() && m_network_isolation_key->top_level_site != *site)
+    if (m_disk_cache.has_value() && !process_keeps_responses_under(m_network_isolation_key->top_level_site))
         m_disk_cache.clear();
 
     if constexpr (REQUESTSERVER_WIRE_DEBUG)
@@ -591,7 +573,7 @@ NonnullOwnPtr<Request> Request::import(
     Requests::ExportedRequest exported,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease)
 {
-    auto request = adopt_own(*new Request { request_id, RequestType::Imported, disk_cache, move(exported.network_isolation_key), HTTP::CacheMode::Default, client, nullptr, resolver, move(exported.url), move(exported.method), HTTP::HeaderList::create(move(exported.request_headers)), ByteBuffer {}, HTTP::Cookie::IncludeCredentials::No, move(transfer_lease) });
+    auto request = adopt_own(*new Request { request_id, RequestType::Imported, disk_cache, move(exported.network_isolation_key), HTTP::CacheMode::Default, client, nullptr, resolver, move(exported.url), move(exported.method), HTTP::HeaderList::create(move(exported.request_headers)), ByteBuffer {}, HTTP::Cookie::IncludeCredentials::No, {}, move(transfer_lease) });
     request->m_request_start_time = exported.request_start_time;
     request->m_status_code = exported.status_code;
     request->m_reason_phrase = move(exported.reason_phrase);
@@ -599,6 +581,7 @@ NonnullOwnPtr<Request> Request::import(
     request->m_import = Import {};
     request->m_import->body_fd = exported.body.take_fd();
     request->m_import->status_fd = exported.status.take_fd();
+    request->m_import->may_rely_on_certificate_exception = exported.may_rely_on_certificate_exception;
     request->transition_to_state(State::ReadImported);
     return request;
 }
@@ -616,12 +599,8 @@ Request::~Request()
     if (m_disk_cache.has_value())
         m_disk_cache->close_entries_read_by(*this);
 
-    if (m_cache_entry_writer.has_value()) {
-        if (m_state == State::Complete && m_curl_result_code == CURLE_OK)
-            (void)m_cache_entry_writer->flush(m_request_headers);
-        else
-            m_cache_entry_writer->remove_incomplete_entry();
-    }
+    // A finished response has closed its entry by now.
+    close_disk_cache_entry(DiskCacheEntryOutcome::Incomplete);
 
     if constexpr (REQUESTSERVER_WIRE_DEBUG)
         wire_stats().remove(this);
@@ -732,7 +711,7 @@ void Request::request_response_storage(ControlConnectionFromClient& connection)
     static u64 s_next_response_storage_request_id = 0;
     m_response_storage_request_id = s_next_response_storage_request_id++;
 
-    connection.async_store_response_cookies_and_hsts_policy(m_client->client_id(), m_request_id, *m_response_storage_request_id, m_url, cookie_partition_context(), m_pending_response_storage->cookies, m_pending_response_storage->hsts_policy);
+    connection.async_store_response_cookies_and_hsts_policy(m_client->client_id(), m_request_id, *m_response_storage_request_id, m_url, cookie_partition_context(), m_same_site_context, m_pending_response_storage->cookies, m_pending_response_storage->hsts_policy);
 }
 
 bool Request::notify_stored_response_cookies_and_hsts_policy(Badge<ControlConnectionFromClient>, u64 store_request_id)
@@ -779,6 +758,11 @@ void Request::handle_fetch_complete(int result_code)
         m_alternative_services_disabled = true;
         m_alternative_service.clear();
         m_dns_result = nullptr;
+        // The origin may present another certificate than the alternative service did.
+        if (m_aia_collector) {
+            m_aia_collector->rejected_certificate.clear();
+            m_aia_collector->chain_for_system_verifier.clear();
+        }
 
         MUST(free_curl_structs());
         reset_for_retry();
@@ -821,11 +805,13 @@ void Request::handle_fetch_complete(int result_code)
 
     if (is_revalidation_request()) {
         auto is_not_modified = result_code == CURLE_OK && acquire_status_code() == 304;
-        if (is_not_modified && HTTP::can_freshen_stored_response(m_cache_entry_reader->response_headers(), *m_response_headers)) {
+        // As with storing a response, a 304 that may rely on a certificate exception must not extend a stored one.
+        if (is_not_modified && !may_rely_on_certificate_exception() && HTTP::can_freshen_stored_response(m_cache_entry_reader->response_headers(), *m_response_headers)) {
             if (m_type == RequestType::BackgroundRevalidation && m_disk_cache->mode() == HTTP::DiskCache::Mode::Testing)
                 m_response_headers->set({ HTTP::TEST_CACHE_REVALIDATION_STATUS_HEADER, "fresh"sv });
 
-            m_cache_entry_reader->revalidation_succeeded(m_response_headers);
+            auto current_time_offset_for_testing = HTTP::compute_current_time_offset_for_testing(m_disk_cache, *m_request_headers);
+            m_cache_entry_reader->revalidation_succeeded(m_response_headers, m_request_start_time + current_time_offset_for_testing, UnixDateTime::now() + current_time_offset_for_testing);
             m_cache_entry_was_revalidated = true;
             transition_to_state(m_type == RequestType::Fetch ? State::ReadCache : State::Complete);
             return;
@@ -851,10 +837,26 @@ void Request::handle_fetch_complete(int result_code)
             transfer_headers_to_client_if_needed();
     }
 
+    // https://fetch.spec.whatwg.org/#concept-http-network-fetch
+    // 11. If bytes is failure, then terminate fetchParams’s controller.
+    // NB: A decoding failure is a body error after the response headers arrived. Expose that response even if libcurl
+    //     could not produce a single decoded byte, after storing its cookies and HSTS policy.
+    if (result_code == CURLE_BAD_CONTENT_ENCODING) {
+        if (defer_until_response_cookies_and_hsts_policy_are_stored([this, result_code] { handle_fetch_complete(result_code); }))
+            return;
+        transfer_headers_to_client_if_needed();
+    }
+
     m_curl_result_code = result_code;
 
-    if (m_response_buffer.is_eof())
+    if (m_response_buffer.is_eof()) {
         transition_to_state(State::Complete);
+        return;
+    }
+
+    // The client hasn't taken the whole response yet, and it may never do so. Requests waiting on the cache entry
+    // shouldn't have to wait for it.
+    close_disk_cache_entry(result_code == CURLE_OK ? DiskCacheEntryOutcome::Complete : DiskCacheEntryOutcome::Incomplete);
 }
 
 void Request::reset_for_retry()
@@ -951,8 +953,11 @@ void Request::retry_after_aia(Badge<ConnectionFromClient>)
     MUST(free_curl_structs());
 
     m_curl_result_code = {};
-    if (m_aia_collector)
+    if (m_aia_collector) {
         m_aia_collector->pending_urls.clear();
+        m_aia_collector->rejected_certificate.clear();
+        m_aia_collector->chain_for_system_verifier.clear();
+    }
     transition_to_state(State::Fetch);
 }
 
@@ -1039,7 +1044,7 @@ void Request::handle_initial_state()
 
                     if (m_cache_entry_reader.has_value()) {
                         if (m_cache_entry_reader->revalidation_type() == HTTP::CacheEntryReader::RevalidationType::StaleWhileRevalidate)
-                            m_client->start_revalidation_request({}, *m_network_isolation_key, m_method, m_url, m_request_headers, m_request_body, m_include_credentials);
+                            m_client->start_revalidation_request({}, *m_network_isolation_key, m_method, m_url, m_request_headers, m_request_body, m_include_credentials, m_same_site_context);
 
                         if (is_revalidation_request())
                             transition_to_state(State::DNSLookup);
@@ -1290,8 +1295,24 @@ void Request::handle_dns_lookup_state()
         return;
     }
 
-    // Avoid leaking hostnames resolved by the proxy.
     m_proxy = proxy_configuration().proxy_for(m_url).copy();
+    // The proxy configuration can change while a lookup is pending, so resolve again for a different proxy.
+    if (!m_proxy_host_resolved || m_resolved_proxy != m_proxy) {
+        resolve_proxy_host(m_proxy, weak_callback(*this, [proxy = m_proxy](auto& self, ErrorOr<void> result) {
+            if (result.is_error()) {
+                dbgln("Request::handle_dns_lookup_state: Proxy lookup failed: {}", result.error());
+                self.m_network_error = Requests::NetworkError::UnableToResolveProxy;
+                self.transition_to_state(State::Error);
+                return;
+            }
+            self.m_proxy_host_resolved = true;
+            self.m_resolved_proxy = proxy;
+            self.handle_dns_lookup_state();
+        }));
+        return;
+    }
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (m_proxy.has_value() && m_proxy->resolves_hostnames()) {
         m_dns_result = nullptr;
         continue_after_dns_lookup();
@@ -1334,6 +1355,23 @@ void Request::handle_dns_lookup_state()
         }));
 }
 
+// Pins the request's host, if it was resolved, and its proxy's host, if that's given by name, so that curl resolves
+// neither itself.
+void Request::set_curl_resolve_list(Optional<ByteString> host_entry)
+{
+    curl_slist* resolve_list = nullptr;
+    if (host_entry.has_value())
+        resolve_list = curl_slist_append(resolve_list, host_entry->characters());
+    if (auto proxy_entry = curl_resolve_entry_for_proxy(m_proxy); proxy_entry.has_value())
+        resolve_list = curl_slist_append(resolve_list, proxy_entry->characters());
+    if (!resolve_list)
+        return;
+
+    auto result = curl_easy_setopt(m_curl_easy_handle, CURLOPT_RESOLVE, resolve_list);
+    VERIFY(result == CURLE_OK);
+    m_curl_string_lists.append(resolve_list);
+}
+
 StringView Request::connect_host() const
 {
     if (m_alternative_service.has_value() && !m_alternative_service->host.is_empty())
@@ -1369,11 +1407,34 @@ void Request::handle_retrieve_cookie_state()
         static u64 s_next_cookie_request_id = 0;
         m_cookie_request_id = s_next_cookie_request_id++;
         mark_lifecycle_event(this, &WireStats::cookie_started_at);
-        connection->async_retrieve_http_cookie(m_client->client_id(), m_request_id, m_type, *m_cookie_request_id, m_url, cookie_partition_context());
+        connection->async_retrieve_http_cookie(m_client->client_id(), m_request_id, m_type, *m_cookie_request_id, m_url, cookie_partition_context(), m_same_site_context);
     } else {
         m_network_error = Requests::NetworkError::RequestServerDied;
         transition_to_state(State::Error);
     }
+}
+
+// Imported responses rely on the exporter to report certificate exceptions this RequestServer cannot see.
+bool Request::may_rely_on_certificate_exception() const
+{
+    if (m_import.has_value())
+        return m_import->may_rely_on_certificate_exception;
+    return m_aia_collector && has_any_certificate_exception(m_aia_collector->host, m_aia_collector->port);
+}
+
+bool Request::configure_certificate_verification()
+{
+    if (!m_aia_collector) {
+        m_aia_collector = make_ref_counted<AIACollector>(m_client->is_private());
+        m_aia_collector->host = m_url.serialized_host().to_byte_string();
+        m_aia_collector->port = m_url.port_or_default();
+    }
+    if (auto result = RequestServer::configure_certificate_verification(m_curl_easy_handle, *m_aia_collector); result != CURLE_OK) {
+        m_curl_result_code = result;
+        transition_to_state(State::Error);
+        return false;
+    }
+    return true;
 }
 
 void Request::handle_connect_state()
@@ -1393,7 +1454,8 @@ void Request::handle_connect_state()
 
     set_option(CURLOPT_NOSIGNAL, 1L);
 
-    set_option(CURLOPT_SSL_CTX_FUNCTION, configure_ssl_context);
+    if (!configure_certificate_verification())
+        return;
 
     set_option(CURLOPT_URL, url_without_credentials(m_url).characters());
     set_option(CURLOPT_DISALLOW_USERNAME_IN_URL, 1L);
@@ -1405,15 +1467,7 @@ void Request::handle_connect_state()
     set_option(CURLOPT_PROXY, m_proxy.has_value() ? m_proxy->to_curl_url().characters() : "");
 
     // Pre-populate the multi's hostcache so libcurl skips its threaded resolver entirely.
-    if (m_dns_result) {
-        auto formatted_address = build_curl_resolve_list(*m_dns_result, m_url.serialized_host(), m_url.port_or_default());
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, formatted_address.characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            m_curl_string_lists.append(resolve_list);
-        } else {
-            VERIFY_NOT_REACHED();
-        }
-    }
+    set_curl_resolve_list(m_dns_result ? build_curl_resolve_list(*m_dns_result, m_url.serialized_host(), m_url.port_or_default()) : Optional<ByteString> {});
 
     mark_lifecycle_event(this, &WireStats::curl_added_at);
     auto result = curl_multi_add_handle(m_curl_multi_handle, m_curl_easy_handle);
@@ -1451,12 +1505,8 @@ void Request::handle_fetch_state()
     if (auto const& path = default_certificate_path(); !path.is_empty())
         set_option(CURLOPT_CAINFO, path.characters());
 
-    set_option(CURLOPT_SSL_CTX_FUNCTION, configure_ssl_context);
-#ifndef AK_OS_MACOS
-    if (!m_aia_collector)
-        m_aia_collector = make_ref_counted<AIACollector>(m_client->is_private());
-    set_option(CURLOPT_SSL_CTX_DATA, m_aia_collector.ptr());
-#endif
+    if (!configure_certificate_verification())
+        return;
 
     if (m_content_decoding_disabled) {
         set_option(CURLOPT_ACCEPT_ENCODING, "identity");
@@ -1472,12 +1522,26 @@ void Request::handle_fetch_state()
     set_option(CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     set_option(CURLOPT_CONNECTTIMEOUT, s_connect_timeout_seconds);
 
-    // https://www.rfc-editor.org/rfc/rfc7838#section-2.4
-    // If the connection to the alternative service does not negotiate the expected protocol (for example, ALPN fails to
-    // negotiate h2, or an Upgrade request to h2c is not accepted), the connection to the alternative service MUST be
-    // considered to have failed.
-    if (m_alternative_service.has_value())
+#ifdef LIBCURL_WAKES_ALL_PENDING_TRANSFERS
+    // A burst of requests to a new origin would otherwise each open a connection, even if they could all multiplex over
+    // one. The TLS handshake tells curl if a connection can multiplex. A plain HTTP connection only tells curl through
+    // the response, and that response may be waiting for this very request. An unpatched curl leaves the requests
+    // waiting in the same way over TLS, so builds with a system curl go without this.
+    if (m_url.scheme() == "https"sv)
+        set_option(CURLOPT_PIPEWAIT, 1L);
+#endif
+
+    if (m_alternative_service.has_value()) {
+        // https://www.rfc-editor.org/rfc/rfc7838#section-2.4
+        // If the connection to the alternative service does not negotiate the expected protocol (for example, ALPN
+        // fails to negotiate h2, or an Upgrade request to h2c is not accepted), the connection to the alternative
+        // service MUST be considered to have failed.
         set_option(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_3ONLY);
+
+        // NB: Advertised HTTP/3 is often unreachable (e.g. UDP blocked along the path). Give up on the alternative
+        //     quickly so the request falls back to the origin instead of waiting out the full connect timeout.
+        set_option(CURLOPT_CONNECTTIMEOUT, s_alternative_service_connect_timeout_seconds);
+    }
 
     // Nobody waits on a background revalidation, so nothing else would ever notice one whose connection silently died.
     // While it lives, it holds its cache entry open and every request for the same URL waits on it, so give up on it
@@ -1500,7 +1564,9 @@ void Request::handle_fetch_state()
 
     curl_slist* curl_headers = nullptr;
 
-    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv)) {
+    // Any method can carry a body (WebDAV's PROPFIND and REPORT, e.g.), and the request's headers already announce
+    // its length, so hand curl the body whatever the method.
+    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv) || (!m_request_body.is_empty() && m_method != "HEAD"sv)) {
         set_option(CURLOPT_POSTFIELDSIZE, m_request_body.size());
         set_option(CURLOPT_POSTFIELDS, m_request_body.data());
 
@@ -1523,8 +1589,20 @@ void Request::handle_fetch_state()
             m_request_headers->set({ "If-Modified-Since"sv, *revalidation_attributes.last_modified });
     }
 
+    // INTEROP: Like other engines, ask HTTP/1.x servers to keep the connection alive. curl leaves this header out of
+    //          HTTP/2 and HTTP/3 requests, which have no Connection header.
+    if (!m_request_headers->contains("Connection"sv))
+        curl_headers = curl_slist_append(curl_headers, "Connection: keep-alive");
+
+    // NB: Send each header name once, with the combined value of all headers of that name, as other engines do.
+    Vector<StringView> sent_header_names;
     for (auto const& header : *m_request_headers) {
-        if (header.value.is_empty()) {
+        if (any_of(sent_header_names, [&](auto name) { return name.equals_ignoring_ascii_case(header.name); }))
+            continue;
+        sent_header_names.append(header.name);
+
+        auto value = m_request_headers->get(header.name).release_value();
+        if (value.is_empty()) {
             // curl will discard the header unless we pass the header name followed by a semicolon (i.e. we need to pass
             // "Content-Type;" instead of "Content-Type: ").
             //
@@ -1532,7 +1610,7 @@ void Request::handle_fetch_state()
             auto header_string = ByteString::formatted("{};", header.name);
             curl_headers = curl_slist_append(curl_headers, header_string.characters());
         } else {
-            auto header_string = ByteString::formatted("{}: {}", header.name, header.value);
+            auto header_string = ByteString::formatted("{}: {}", header.name, value);
             curl_headers = curl_slist_append(curl_headers, header_string.characters());
         }
     }
@@ -1550,7 +1628,8 @@ void Request::handle_fetch_state()
     set_option(CURLOPT_WRITEFUNCTION, &on_data_received);
     set_option(CURLOPT_WRITEDATA, this);
 
-    if constexpr (REQUESTSERVER_WIRE_DEBUG) {
+    // Progress callbacks report how much of a request body curl has sent.
+    if (REQUESTSERVER_WIRE_DEBUG || (m_type == RequestType::Fetch && !m_request_body.is_empty())) {
         set_option(CURLOPT_NOPROGRESS, 0L);
         set_option(CURLOPT_XFERINFOFUNCTION, &on_xferinfo);
         set_option(CURLOPT_XFERINFODATA, this);
@@ -1558,16 +1637,7 @@ void Request::handle_fetch_state()
 
     set_option(CURLOPT_PROXY, m_proxy.has_value() ? m_proxy->to_curl_url().characters() : "");
 
-    if (m_dns_result) {
-        auto formatted_address = build_curl_resolve_list(*m_dns_result, connect_host(), connect_port());
-
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, formatted_address.characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            m_curl_string_lists.append(resolve_list);
-        } else {
-            VERIFY_NOT_REACHED();
-        }
-    }
+    set_curl_resolve_list(m_dns_result ? build_curl_resolve_list(*m_dns_result, connect_host(), connect_port()) : Optional<ByteString> {});
 
     // libcurl authenticates the alternative as the origin.
     if (m_alternative_service.has_value() && (connect_host() != m_url.serialized_host() || connect_port() != m_url.port_or_default())) {
@@ -1621,6 +1691,17 @@ void Request::handle_complete_state()
         if (m_curl_result_code != CURLE_OK) {
             m_network_error = curl_code_to_network_error(*m_curl_result_code);
 
+            if (m_network_error == Requests::NetworkError::SSLVerificationFailed && m_aia_collector)
+                explain_system_verifier_refusal(*m_aia_collector);
+
+            if (m_network_error == Requests::NetworkError::SSLVerificationFailed && m_aia_collector && m_aia_collector->rejected_certificate.has_value()) {
+                auto const& rejected = *m_aia_collector->rejected_certificate;
+                m_network_error = Requests::network_error_for_certificate_errors(rejected.errors);
+
+                if (auto control_connection = ControlConnectionFromClient::the(); control_connection.has_value())
+                    control_connection->async_rejected_certificate(m_aia_collector->host, m_aia_collector->port, rejected.fingerprint, rejected.errors, rejected.details);
+            }
+
             if (m_network_error == Requests::NetworkError::Unknown) {
                 char const* curl_error_message = curl_easy_strerror(static_cast<CURLcode>(*m_curl_result_code));
                 dbgln("Request::handle_complete_state: Unable to map error ({}): \"\033[31;1m{}\033[0m\"", *m_curl_result_code, curl_error_message);
@@ -1633,44 +1714,27 @@ void Request::handle_complete_state()
         auto timing_info = acquire_timing_info();
         transfer_headers_to_client_if_needed();
 
-        // Finalize the disk cache entry before notifying WebContent that the request is complete: WebContent may
-        // immediately fire off a JavaScript bytecode cache store against this entry, and that store needs the cache
-        // index row to already exist. If we notified first the store would race the index write and be rejected.
-        Optional<HTTP::CacheEntryBodyFile> cached_body_file;
-        if (m_cache_entry_writer.has_value()) {
-            if (m_cache_entry_writer->body_size() >= static_cast<u64>(PAGE_SIZE)) {
-                auto body_file = m_cache_entry_writer->flush_and_take_body_file(m_request_headers);
-                if (!body_file.is_error())
-                    cached_body_file = body_file.release_value();
-            } else {
-                (void)m_cache_entry_writer->flush(m_request_headers);
-            }
-            m_cache_entry_writer.clear();
-        }
+        // Finalize the disk cache entry before notifying WebContent that the request is complete, so that a large body
+        // can be handed over as a file from the cache.
+        close_disk_cache_entry(DiskCacheEntryOutcome::Complete);
 
         if (m_export.has_value()) {
             write_export_result();
         } else {
-            if (cached_body_file.has_value())
-                m_client->async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(cached_body_file->fd), cached_body_file->offset, cached_body_file->size);
-
             m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, timing_info, m_network_error);
         }
     }
 
-    if (m_cache_entry_writer.has_value()) {
-        if (m_curl_result_code == CURLE_OK)
-            (void)m_cache_entry_writer->flush(m_request_headers);
-        else
-            m_cache_entry_writer->remove_incomplete_entry();
-        m_cache_entry_writer.clear();
-    }
+    close_disk_cache_entry(m_curl_result_code == CURLE_OK ? DiskCacheEntryOutcome::Complete : DiskCacheEntryOutcome::Incomplete);
 
     m_client->request_complete({}, *this);
 }
 
 void Request::handle_error_state()
 {
+    // A transfer lease can keep this request alive long after it has failed.
+    close_disk_cache_entry(DiskCacheEntryOutcome::Incomplete);
+
     if (m_export.has_value()) {
         write_export_result();
     } else if (delivers_response_to_client()) {
@@ -1728,6 +1792,7 @@ Request::Import::Import(Import&& other)
     , body_notifier(move(other.body_notifier))
     , status_notifier(move(other.status_notifier))
     , body_ended(other.body_ended)
+    , may_rely_on_certificate_exception(other.may_rely_on_certificate_exception)
     , status_bytes(move(other.status_bytes))
     , timing_info(move(other.timing_info))
     , network_error(move(other.network_error))
@@ -1783,6 +1848,7 @@ ErrorOr<Requests::ExportedRequest> Request::export_response()
         .status_code = m_status_code,
         .reason_phrase = m_reason_phrase,
         .response_headers = m_response_headers->headers(),
+        .may_rely_on_certificate_exception = may_rely_on_certificate_exception(),
         .body = move(body),
         .status = move(status),
     };
@@ -1880,7 +1946,9 @@ void Request::read_imported_body()
         }
 
         mark_activity();
-        if (auto write_result = m_response_buffer.write_some({ buffer, static_cast<size_t>(result.value()) }); write_result.is_error()) {
+        ReadonlyBytes bytes { buffer, static_cast<size_t>(result.value()) };
+        write_to_disk_cache(bytes);
+        if (auto write_result = m_response_buffer.write_some(bytes); write_result.is_error()) {
             m_network_error = Requests::NetworkError::Unknown;
             transition_to_state(State::Error);
             return;
@@ -1933,6 +2001,7 @@ void Request::complete_import_if_finished()
         return;
 
     m_curl_result_code = CURLE_OK;
+    close_disk_cache_entry(m_import->network_error.has_value() ? DiskCacheEntryOutcome::Incomplete : DiskCacheEntryOutcome::Complete);
     if (auto result = write_queued_bytes_without_blocking(); result.is_error()) {
         m_network_error = Requests::NetworkError::Unknown;
         transition_to_state(State::Error);
@@ -1956,8 +2025,11 @@ size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void
         // We need to extract the HTTP reason phrase since it can be a custom value. Fetching infrastructure needs this
         // value for setting the status message.
         auto space_index = header_line.find(' ');
-        if (space_index.has_value())
+        if (space_index.has_value()) {
+            // NB: Observers need the HTTP version before the response body finishes.
+            request.m_http_version = ByteString(header_line.substring_view(0, *space_index)).to_lowercase();
             space_index = header_line.find(' ', *space_index + 1);
+        }
 
         if (space_index.has_value()) {
             if (auto reason_phrase = HTTP::normalize_header_value(header_line.substring_view(*space_index + 1)); !reason_phrase.is_empty()) {
@@ -2024,6 +2096,11 @@ size_t Request::on_data_received(void* buffer, size_t size, size_t nmemb, void* 
 
     auto total_size = size * nmemb;
     ReadonlyBytes bytes { static_cast<u8 const*>(buffer), total_size };
+
+    request.write_to_disk_cache(bytes);
+
+    if (request.m_type == RequestType::BackgroundRevalidation)
+        return total_size;
 
     auto result = [&] -> ErrorOr<void> {
         TRY(request.m_response_buffer.write_some(bytes));
@@ -2194,6 +2271,12 @@ void Request::transfer_headers_to_client_if_needed()
     if (m_disk_cache.has_value() && m_disk_cache_partition.has_value() && !m_method.is_one_of("GET"sv, "HEAD"sv, "OPTIONS"sv, "TRACE"sv) && *m_status_code >= 200 && *m_status_code < 400)
         m_disk_cache->invalidate(*m_disk_cache_partition, m_url);
 
+    // Cached responses could outlive a certificate exception and be served without the server presenting a certificate.
+    if (m_cache_entry_writer.has_value() && may_rely_on_certificate_exception()) {
+        close_disk_cache_entry(DiskCacheEntryOutcome::Incomplete);
+        m_cache_status = CacheStatus::NotCached;
+    }
+
     if (m_cache_entry_writer.has_value()) {
         if (m_cache_entry_writer->write_status_and_reason(*m_status_code, m_reason_phrase, m_request_headers, m_response_headers).is_error()) {
             m_cache_status = CacheStatus::NotCached;
@@ -2222,61 +2305,71 @@ void Request::transfer_headers_to_client_if_needed()
         }
     }
 
-    Optional<IPC::File> javascript_bytecode;
-    u64 javascript_bytecode_size { 0 };
-    Optional<u64> javascript_bytecode_cache_vary_key;
-    if (m_cache_status == CacheStatus::ReadFromCache && m_disk_cache.has_value()) {
-        VERIFY(m_cache_entry_reader.has_value());
-        javascript_bytecode_cache_vary_key = m_cache_entry_reader->vary_key();
-        auto data = m_disk_cache->retrieve_associated_data_file(*m_disk_cache_partition, m_url, m_method, *m_request_headers, javascript_bytecode_cache_vary_key, HTTP::CacheEntryAssociatedData::JavaScriptBytecode);
-        if (!data.is_error() && data.value().has_value()) {
-            javascript_bytecode_size = data.value()->size;
-            javascript_bytecode = IPC::File::adopt_fd(data.value()->fd);
-        }
-    } else if (m_cache_status == CacheStatus::WrittenToCache && m_cache_entry_writer.has_value()) {
-        javascript_bytecode_cache_vary_key = m_cache_entry_writer->vary_key();
-    }
-
-    send_headers_to_client(move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key);
+    send_headers_to_client();
 }
 
-void Request::send_headers_to_client(Optional<IPC::File> javascript_bytecode, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key)
+void Request::did_send_request_body_bytes(u64 bytes_sent)
 {
+    if (m_type != RequestType::Fetch)
+        return;
+
+    bytes_sent = min(bytes_sent, m_request_body.size());
+    if (bytes_sent <= m_reported_request_body_bytes)
+        return;
+
+    // Curl calls back far more often than a client could use, so report at most every 50ms, which is how often XHR
+    // fires its upload progress events, and always report the whole body once it's sent.
+    auto now = MonotonicTime::now();
+    if (bytes_sent < m_request_body.size() && m_last_request_body_report_time.has_value()
+        && now - *m_last_request_body_report_time < AK::Duration::from_milliseconds(50))
+        return;
+
+    m_last_request_body_report_time = now;
+    m_reported_request_body_bytes = bytes_sent;
+    m_client->async_request_upload_progress(m_request_id, bytes_sent);
+}
+
+void Request::send_headers_to_client()
+{
+    // A response means the request body has been sent, including one that a cache or a substitution answered, and
+    // which never went out at all.
+    did_send_request_body_bytes(m_request_body.size());
+
     auto cache_state = Requests::CacheState::NotCached;
     if (m_cache_status == CacheStatus::ReadFromCache)
         cache_state = m_cache_entry_was_revalidated ? Requests::CacheState::Validated : Requests::CacheState::Local;
-    m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key, cache_state);
+    m_client->async_headers_became_available(m_request_id, m_url, m_response_headers->headers(), m_status_code, m_reason_phrase, cache_state, m_http_version);
+}
+
+void Request::write_to_disk_cache(ReadonlyBytes bytes)
+{
+    if (!m_cache_entry_writer.has_value())
+        return;
+
+    if (m_cache_entry_writer->write_data(bytes).is_error())
+        m_cache_entry_writer.clear();
+}
+
+void Request::close_disk_cache_entry(DiskCacheEntryOutcome outcome)
+{
+    if (!m_cache_entry_writer.has_value())
+        return;
+
+    if (outcome == DiskCacheEntryOutcome::Incomplete) {
+        m_cache_entry_writer->remove_incomplete_entry();
+    } else if (delivers_response_to_client() && !m_export.has_value() && m_cache_entry_writer->body_size() >= static_cast<u64>(PAGE_SIZE)) {
+        // The client may still be reading the response through its pipe, which this file doesn't replace.
+        if (auto body_file = m_cache_entry_writer->flush_and_take_body_file(m_request_headers); !body_file.is_error())
+            m_client->async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(body_file.value().fd), body_file.value().offset, body_file.value().size);
+    } else {
+        (void)m_cache_entry_writer->flush(m_request_headers);
+    }
+
+    m_cache_entry_writer.clear();
 }
 
 ErrorOr<void> Request::write_queued_bytes_without_blocking()
 {
-    auto write_bytes_to_disk_cache = [&](ReadonlyBytes bytes) {
-        if (!m_cache_entry_writer.has_value())
-            return;
-
-        if (m_cache_entry_writer->write_data(bytes).is_error()) {
-            m_cache_entry_writer.clear();
-            return;
-        }
-
-        // The entry is still filling, even once curl has nothing left to deliver: A client that reads its response
-        // slowly keeps these writes coming long after the transfer is over — so they count as progress too.
-        mark_activity();
-    };
-
-    if (m_type == RequestType::BackgroundRevalidation) {
-        while (!m_response_buffer.is_eof()) {
-            auto bytes = m_response_buffer.peek_some_contiguous();
-            write_bytes_to_disk_cache(bytes);
-            MUST(m_response_buffer.discard(bytes.size()));
-        }
-
-        if (m_curl_result_code.has_value())
-            transition_to_state(State::Complete);
-
-        return {};
-    }
-
     if (!m_client_writer_notifier) {
         m_client_writer_notifier = Core::Notifier::construct(m_client_request_pipe->writer_fd(), Core::NotificationType::Write);
         m_client_writer_notifier->set_enabled(false);
@@ -2327,7 +2420,6 @@ ErrorOr<void> Request::write_queued_bytes_without_blocking()
         }
 
         auto written = result.value();
-        write_bytes_to_disk_cache(bytes.slice(0, written));
         MUST(m_response_buffer.discard(written));
 
         m_bytes_transferred_to_client += written;
@@ -2485,7 +2577,7 @@ static u64 saturating_add(u64 left, u64 right)
 
 static bool s_performance_monitor_enabled;
 static u64 s_performance_generation;
-static HashMap<i32, HashMap<u64, Requests::NetworkUsage>> s_network_usage;
+static HashMap<int, HashMap<u64, Requests::NetworkUsage>> s_network_usage;
 
 void Request::set_performance_monitor_enabled(bool enabled)
 {
@@ -2499,23 +2591,34 @@ void Request::set_performance_monitor_enabled(bool enabled)
 Vector<Requests::NetworkUsage> Request::take_network_usage()
 {
     Vector<Requests::NetworkUsage> result;
-    for (auto const& process : s_network_usage) {
-        for (auto const& page : process.value)
+    for (auto const& client : s_network_usage) {
+        for (auto const& page : client.value)
             result.append(page.value);
     }
     s_network_usage.clear();
     return result;
 }
 
-void Request::set_performance_origin(i32 process_id, u64 page_id)
+void Request::add_network_usage(Requests::NetworkUsage const& usage)
 {
-    m_performance_origin = { process_id, page_id, 0, 0 };
+    if (!s_performance_monitor_enabled || usage.client_id == 0 || (usage.download_bytes == 0 && usage.upload_bytes == 0))
+        return;
+    auto& total = s_network_usage.ensure(usage.client_id).ensure(usage.page_id, [&] {
+        return Requests::NetworkUsage { usage.client_id, usage.page_id, 0, 0 };
+    });
+    total.download_bytes = saturating_add(total.download_bytes, usage.download_bytes);
+    total.upload_bytes = saturating_add(total.upload_bytes, usage.upload_bytes);
+}
+
+void Request::set_performance_origin(int client_id, u64 page_id)
+{
+    m_performance_origin = { client_id, page_id, 0, 0 };
     m_performance_generation = s_performance_generation;
 }
 
 void Request::sample_network_usage()
 {
-    if (!s_performance_monitor_enabled || m_performance_origin.process_id == 0)
+    if (!s_performance_monitor_enabled || m_performance_origin.client_id == 0)
         return;
     if (!m_curl_easy_handle) {
         m_sampled_download_bytes = 0;
@@ -2535,11 +2638,7 @@ void Request::sample_network_usage()
         auto delta = m_performance_origin;
         delta.download_bytes = download_bytes >= m_sampled_download_bytes ? download_bytes - m_sampled_download_bytes : download_bytes;
         delta.upload_bytes = upload_bytes >= m_sampled_upload_bytes ? upload_bytes - m_sampled_upload_bytes : upload_bytes;
-        if (delta.download_bytes || delta.upload_bytes) {
-            auto& total = s_network_usage.ensure(delta.process_id).ensure(delta.page_id, [&] { return m_performance_origin; });
-            total.download_bytes = saturating_add(total.download_bytes, delta.download_bytes);
-            total.upload_bytes = saturating_add(total.upload_bytes, delta.upload_bytes);
-        }
+        add_network_usage(delta);
     }
     m_sampled_download_bytes = download_bytes;
     m_sampled_upload_bytes = upload_bytes;

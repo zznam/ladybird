@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/HashTable.h>
 #include <AK/IterationDecision.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
@@ -30,6 +31,7 @@
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/WindowType.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/PermissionsPolicy/PermissionsPolicy.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -119,7 +121,7 @@ public:
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
     void navigate(URL::URL, Web::HTML::DocumentResource = {}, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
     Web::HTML::PreparedNavigationDescriptor prepare_navigation(URL::URL, Web::HTML::DocumentResource = {}, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
-    void begin_navigation(Web::HTML::PreparedNavigationDescriptor);
+    void begin_navigation(Web::HTML::PreparedNavigationDescriptor, RefPtr<WebContentPage> source_page = {});
 
     CanonicalBrowsingContext::BrowsingContextAndDocument obtain_a_browsing_context_to_use_for_a_navigation_response(NavigationLoader::ResponseDocument const&);
     NonnullRefPtr<CanonicalDocument> create_and_initialize_a_document(NavigationLoader::ResponseDocument const&);
@@ -127,8 +129,16 @@ public:
     CanonicalNavigable& append_child(NonnullOwnPtr<CanonicalNavigable>);
     NonnullOwnPtr<CanonicalNavigable> remove_child(CanonicalNavigable&);
     bool is_ancestor_of(CanonicalNavigable const&) const;
+    bool active_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention() const;
+    void run_activation_notification_steps_for_active_document(HashTable<Web::HTML::CrossProcessId>& notified_document_ids) const;
     bool allowed_by_sandboxing_to_navigate(CanonicalNavigable const& target, Web::InitiatorSourceSnapshot const& source_snapshot_params) const;
     bool is_familiar_with(CanonicalNavigable const&) const;
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
+    struct ChosenTopLevelTraversable {
+        CanonicalTraversable& traversable;
+        Web::HTML::WindowType window_type;
+    };
+    ChosenTopLevelTraversable choose_a_new_top_level_traversable(WebContentPage& current_page, Utf16View name, bool no_opener, Optional<URL::URL> current_document_base_url, Web::HTML::CrossProcessId id, Web::HTML::CrossProcessId document_id);
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#snapshotting-target-snapshot-params
     Web::HTML::TargetSnapshotParams snapshot_target_snapshot_params() const;
 
@@ -191,6 +201,7 @@ public:
     // The navigable's replicated state: what its host reports, and what the UI process knows of it.
     Optional<Web::HTML::ReplicatedNavigableState> replicated_state() const;
     void send_replicated_state() const;
+    void give_sticky_activation_to_window_of(CanonicalDocument const&) const;
     Optional<Web::HTML::HostedNavigableState> const& hosted_state() const { return m_hosted_state; }
     void set_hosted_state(Web::HTML::HostedNavigableState);
     void did_lose_active_document();
@@ -217,6 +228,7 @@ public:
 
     // A history operation activated the entry. It commits the navigation it names, or with none named, the ongoing
     // navigation admitted before the operation's sequence number.
+    void apply_populated_history_entry(CanonicalSessionHistoryEntry&, Web::HTML::PendingSessionHistoryEntryDescriptor const&);
     void did_commit_navigation(CanonicalSessionHistoryEntry&, Web::HTML::HostedNavigableState, u64 operation_sequence_number, Optional<Utf16String const&> navigation_id, RefPtr<WebContentPage> host);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#ongoing-navigation

@@ -6,35 +6,6 @@
 
 use super::*;
 
-/// The four inset properties.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InsetField {
-    Top,
-    Right,
-    Bottom,
-    Left,
-}
-
-impl InsetField {
-    pub(crate) fn side(self) -> geometry::Side {
-        match self {
-            Self::Top => geometry::Side::Top,
-            Self::Right => geometry::Side::Right,
-            Self::Bottom => geometry::Side::Bottom,
-            Self::Left => geometry::Side::Left,
-        }
-    }
-
-    pub(crate) fn from_side(side: geometry::Side) -> Self {
-        match side {
-            geometry::Side::Top => Self::Top,
-            geometry::Side::Right => Self::Right,
-            geometry::Side::Bottom => Self::Bottom,
-            geometry::Side::Left => Self::Left,
-        }
-    }
-}
-
 /// A resolved px-or-auto inset produced by anchor resolution. It takes
 /// precedence over every style read and reports
 /// contains_anchor_function() == false.
@@ -164,18 +135,15 @@ impl AnchorResolvedValues {
     pub(crate) fn new(resolved: &ResolvedAnchorSizes, frame: geometry::Frame) -> Self {
         let size = |value: Option<ResolvedSizeOverride>| {
             value.map(|value| match value {
-                ResolvedSizeOverride::Length(px) => ComputedSize {
-                    kind: ComputedSizeKind::Length,
-                    value: ComputedStyleValueHandle::length(px.to_double()),
-                },
+                ResolvedSizeOverride::Length(px) => ComputedSize::new(
+                    ComputedSizeKind::Length,
+                    ComputedStyleValueHandle::length(px.to_double()),
+                ),
                 ResolvedSizeOverride::Keyword(kind) => ComputedSize::keyword(kind),
             })
         };
         let margin = |value: Option<CssPixels>| {
-            value.map(|px| ComputedLengthPercentageOrAuto {
-                is_auto: false,
-                value: ComputedStyleValueHandle::length(px.to_double()),
-            })
+            value.map(|px| ComputedLengthPercentageOrAuto::new(false, ComputedStyleValueHandle::length(px.to_double())))
         };
         Self {
             width: size(resolved.width),
@@ -241,9 +209,9 @@ impl<'a> std::ops::Deref for StyleValues<'a> {
 
 impl<'a> StyleValues<'a> {
     #[inline]
-    pub(crate) fn new(payloads: &'a FfiStylePayloads) -> Self {
+    pub(crate) fn new(payloads: ComputedValuesView<'a>) -> Self {
         Self {
-            style: ComputedValuesView::new(&payloads.groups),
+            style: payloads,
             resolved_anchor_insets: None,
             anchor_resolved_values: None,
             vertical_align_override: None,
@@ -253,10 +221,11 @@ impl<'a> StyleValues<'a> {
     }
 
     #[inline]
-    pub(crate) fn for_node(callbacks: &LayoutPass<'a>, node: Node) -> Self {
-        StyleValues::new(callbacks.style_payloads(node))
-            .for_kind(callbacks.node_data(node).kind.get())
-            .in_frame(callbacks.frame)
+    pub(crate) fn for_node(pass: &LayoutPass<'a>, node: Node) -> Self {
+        let (data, style) = pass.row_and_style(node);
+        StyleValues::new(style.expect("styled node must publish its style container before layout"))
+            .for_kind(data.kind.get())
+            .in_frame(pass.frame)
     }
 
     /// The view as seen from `frame`, whose sides and axes the box's sizes and box model properties are read in.
@@ -268,7 +237,20 @@ impl<'a> StyleValues<'a> {
 
     #[inline]
     fn physical(self, side: geometry::Side) -> geometry::Side {
+        if self.frame.is_physical() {
+            return side;
+        }
         self.frame.physical_side(side)
+    }
+
+    /// `physical`, unless the frame is transposed and so reads the value of the other physical axis, `transposed`.
+    #[inline]
+    fn physical_or_transposed<T>(self, physical: T, transposed: T) -> T {
+        if self.frame.is_transposed() {
+            transposed
+        } else {
+            physical
+        }
     }
 
     /// Whether the inline-start side is the frame's right side rather than its left side.
@@ -292,92 +274,64 @@ impl<'a> StyleValues<'a> {
 
     #[inline]
     pub(crate) fn unresolved_width(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.height()
-        } else {
-            self.style.width()
-        }
+        self.physical_or_transposed(self.style.width(), self.style.height())
     }
 
     #[inline]
     pub(crate) fn unresolved_height(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.width()
-        } else {
-            self.style.height()
-        }
+        self.physical_or_transposed(self.style.height(), self.style.width())
     }
 
     #[inline]
     pub(crate) fn unresolved_min_width(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.min_height()
-        } else {
-            self.style.min_width()
-        }
+        self.physical_or_transposed(self.style.min_width(), self.style.min_height())
     }
 
     #[inline]
     pub(crate) fn unresolved_min_height(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.min_width()
-        } else {
-            self.style.min_height()
-        }
+        self.physical_or_transposed(self.style.min_height(), self.style.min_width())
     }
 
     #[inline]
     pub(crate) fn unresolved_max_width(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.max_height()
-        } else {
-            self.style.max_width()
-        }
+        self.physical_or_transposed(self.style.max_width(), self.style.max_height())
     }
 
     #[inline]
     pub(crate) fn unresolved_max_height(self) -> &'a ComputedSize {
-        if self.frame.is_transposed() {
-            self.style.max_width()
-        } else {
-            self.style.max_height()
-        }
+        self.physical_or_transposed(self.style.max_height(), self.style.max_width())
     }
 
     #[inline]
     pub(crate) fn contain_intrinsic_width_has_length(self) -> bool {
-        if self.frame.is_transposed() {
-            self.style.contain_intrinsic_height_has_length()
-        } else {
-            self.style.contain_intrinsic_width_has_length()
-        }
+        self.physical_or_transposed(
+            self.style.contain_intrinsic_width_has_length(),
+            self.style.contain_intrinsic_height_has_length(),
+        )
     }
 
     #[inline]
     pub(crate) fn contain_intrinsic_width_px(self) -> f64 {
-        if self.frame.is_transposed() {
-            self.style.contain_intrinsic_height_px()
-        } else {
-            self.style.contain_intrinsic_width_px()
-        }
+        self.physical_or_transposed(
+            self.style.contain_intrinsic_width_px(),
+            self.style.contain_intrinsic_height_px(),
+        )
     }
 
     #[inline]
     pub(crate) fn contain_intrinsic_height_has_length(self) -> bool {
-        if self.frame.is_transposed() {
-            self.style.contain_intrinsic_width_has_length()
-        } else {
-            self.style.contain_intrinsic_height_has_length()
-        }
+        self.physical_or_transposed(
+            self.style.contain_intrinsic_height_has_length(),
+            self.style.contain_intrinsic_width_has_length(),
+        )
     }
 
     #[inline]
     pub(crate) fn contain_intrinsic_height_px(self) -> f64 {
-        if self.frame.is_transposed() {
-            self.style.contain_intrinsic_width_px()
-        } else {
-            self.style.contain_intrinsic_height_px()
-        }
+        self.physical_or_transposed(
+            self.style.contain_intrinsic_height_px(),
+            self.style.contain_intrinsic_width_px(),
+        )
     }
 
     /// The preferred aspect ratio as a width to height fraction in the frame.
@@ -393,22 +347,21 @@ impl<'a> StyleValues<'a> {
 
     #[inline]
     pub(crate) fn border_spacing_horizontal(self) -> CssPixels {
-        if self.frame.is_transposed() {
-            self.style.border_spacing_vertical()
-        } else {
-            self.style.border_spacing_horizontal()
-        }
+        self.physical_or_transposed(
+            self.style.border_spacing_horizontal(),
+            self.style.border_spacing_vertical(),
+        )
     }
 
     #[inline]
     pub(crate) fn border_spacing_vertical(self) -> CssPixels {
-        if self.frame.is_transposed() {
-            self.style.border_spacing_horizontal()
-        } else {
-            self.style.border_spacing_vertical()
-        }
+        self.physical_or_transposed(
+            self.style.border_spacing_vertical(),
+            self.style.border_spacing_horizontal(),
+        )
     }
 
+    #[inline]
     fn physical_margin(self, side: geometry::Side) -> &'a ComputedLengthPercentageOrAuto {
         match side {
             geometry::Side::Top => self.style.margin_top(),
@@ -420,36 +373,25 @@ impl<'a> StyleValues<'a> {
 
     #[inline]
     pub(crate) fn unresolved_margin_top(self) -> &'a ComputedLengthPercentageOrAuto {
-        if self.frame.is_physical() {
-            return self.style.margin_top();
-        }
         self.physical_margin(self.physical(geometry::Side::Top))
     }
 
     #[inline]
     pub(crate) fn unresolved_margin_right(self) -> &'a ComputedLengthPercentageOrAuto {
-        if self.frame.is_physical() {
-            return self.style.margin_right();
-        }
         self.physical_margin(self.physical(geometry::Side::Right))
     }
 
     #[inline]
     pub(crate) fn unresolved_margin_bottom(self) -> &'a ComputedLengthPercentageOrAuto {
-        if self.frame.is_physical() {
-            return self.style.margin_bottom();
-        }
         self.physical_margin(self.physical(geometry::Side::Bottom))
     }
 
     #[inline]
     pub(crate) fn unresolved_margin_left(self) -> &'a ComputedLengthPercentageOrAuto {
-        if self.frame.is_physical() {
-            return self.style.margin_left();
-        }
         self.physical_margin(self.physical(geometry::Side::Left))
     }
 
+    #[inline]
     fn physical_border(self, side: geometry::Side) -> (CssPixels, u8, u32) {
         match side {
             geometry::Side::Top => (
@@ -477,65 +419,41 @@ impl<'a> StyleValues<'a> {
 
     #[inline]
     pub(crate) fn border_top_style(self) -> u8 {
-        if self.frame.is_physical() {
-            return self.style.border_top_style();
-        }
         self.physical_border(self.physical(geometry::Side::Top)).1
     }
 
     #[inline]
     pub(crate) fn border_right_style(self) -> u8 {
-        if self.frame.is_physical() {
-            return self.style.border_right_style();
-        }
         self.physical_border(self.physical(geometry::Side::Right)).1
     }
 
     #[inline]
     pub(crate) fn border_bottom_style(self) -> u8 {
-        if self.frame.is_physical() {
-            return self.style.border_bottom_style();
-        }
         self.physical_border(self.physical(geometry::Side::Bottom)).1
     }
 
     #[inline]
     pub(crate) fn border_left_style(self) -> u8 {
-        if self.frame.is_physical() {
-            return self.style.border_left_style();
-        }
         self.physical_border(self.physical(geometry::Side::Left)).1
     }
 
     #[inline]
     pub(crate) fn border_top_color(self) -> u32 {
-        if self.frame.is_physical() {
-            return self.style.border_top_color();
-        }
         self.physical_border(self.physical(geometry::Side::Top)).2
     }
 
     #[inline]
     pub(crate) fn border_right_color(self) -> u32 {
-        if self.frame.is_physical() {
-            return self.style.border_right_color();
-        }
         self.physical_border(self.physical(geometry::Side::Right)).2
     }
 
     #[inline]
     pub(crate) fn border_bottom_color(self) -> u32 {
-        if self.frame.is_physical() {
-            return self.style.border_bottom_color();
-        }
         self.physical_border(self.physical(geometry::Side::Bottom)).2
     }
 
     #[inline]
     pub(crate) fn border_left_color(self) -> u32 {
-        if self.frame.is_physical() {
-            return self.style.border_left_color();
-        }
         self.physical_border(self.physical(geometry::Side::Left)).2
     }
 
@@ -586,13 +504,28 @@ impl<'a> StyleValues<'a> {
             .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_height(), auto_computed_size()))
     }
 
+    /// Whether the box is a table row, row group or cell, whose 'min-height' and 'max-height' are ignored.
+    // NB: "In CSS 2.1, the effect of 'min-height' and 'max-height' on tables, inline tables, table cells, table rows,
+    //     and row groups is undefined." https://www.w3.org/TR/CSS22/visudet.html#min-max-heights
+    // INTEROP: Other engines ignore them on table cells, rows and row groups.
+    fn ignores_min_and_max_height(self) -> bool {
+        let display = self.display();
+        display.is_table_cell() || display.is_table_row() || display.is_table_row_group_kind()
+    }
+
     pub(crate) fn min_height(self) -> &'a ComputedSize {
+        if self.ignores_min_and_max_height() {
+            return auto_computed_size();
+        }
         self.anchor_resolved_values
             .and_then(|resolved| resolved.min_height.as_ref())
             .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_min_height(), auto_computed_size()))
     }
 
     pub(crate) fn max_height(self) -> &'a ComputedSize {
+        if self.ignores_min_and_max_height() {
+            return none_computed_size();
+        }
         self.anchor_resolved_values
             .and_then(|resolved| resolved.max_height.as_ref())
             .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_max_height(), none_computed_size()))
@@ -622,13 +555,13 @@ impl<'a> StyleValues<'a> {
             .unwrap_or_else(|| self.unresolved_margin_left())
     }
 
-    fn bare_anchor_wrapper(self, field: InsetField) -> Option<&'a crate::css::style_value::StyleValueData> {
+    fn bare_anchor_wrapper(self, physical_side: geometry::Side) -> Option<&'a crate::css::style_value::StyleValueData> {
         let values = self.style.surround();
-        let handle = match field {
-            InsetField::Top => &values.top_anchor_inset_wrapper,
-            InsetField::Right => &values.right_anchor_inset_wrapper,
-            InsetField::Bottom => &values.bottom_anchor_inset_wrapper,
-            InsetField::Left => &values.left_anchor_inset_wrapper,
+        let handle = match physical_side {
+            geometry::Side::Top => &values.top_anchor_inset_wrapper,
+            geometry::Side::Right => &values.right_anchor_inset_wrapper,
+            geometry::Side::Bottom => &values.bottom_anchor_inset_wrapper,
+            geometry::Side::Left => &values.left_anchor_inset_wrapper,
         };
         // SAFETY: The node's style group payload retains the wrapper for the
         // view's lifetime.
@@ -640,45 +573,38 @@ impl<'a> StyleValues<'a> {
         }
     }
 
-    fn inset_value(self, field: InsetField) -> InsetValue<'a> {
+    fn inset_value(self, side: geometry::Side) -> InsetValue<'a> {
         // NB: The abspos engine resolves anchor functions per side of the frame it lays the box out in.
-        if let Some(resolved) = self
-            .resolved_anchor_insets
-            .and_then(|insets| insets.override_for(field))
-        {
+        if let Some(resolved) = self.resolved_anchor_insets.and_then(|insets| insets.override_for(side)) {
             return InsetValue::Resolved(resolved);
         }
-        let field = if self.frame.is_physical() {
-            field
-        } else {
-            InsetField::from_side(self.physical(field.side()))
-        };
-        if let Some(wrapper) = self.bare_anchor_wrapper(field) {
+        let physical_side = self.physical(side);
+        if let Some(wrapper) = self.bare_anchor_wrapper(physical_side) {
             return InsetValue::BareAnchor(wrapper);
         }
         let values = self.style.surround();
-        InsetValue::FromStyle(match field {
-            InsetField::Top => &values.inset.top,
-            InsetField::Right => &values.inset.right,
-            InsetField::Bottom => &values.inset.bottom,
-            InsetField::Left => &values.inset.left,
+        InsetValue::FromStyle(match physical_side {
+            geometry::Side::Top => &values.inset.top,
+            geometry::Side::Right => &values.inset.right,
+            geometry::Side::Bottom => &values.inset.bottom,
+            geometry::Side::Left => &values.inset.left,
         })
     }
 
     pub(crate) fn inset_top(self) -> InsetValue<'a> {
-        self.inset_value(InsetField::Top)
+        self.inset_value(geometry::Side::Top)
     }
 
     pub(crate) fn inset_right(self) -> InsetValue<'a> {
-        self.inset_value(InsetField::Right)
+        self.inset_value(geometry::Side::Right)
     }
 
     pub(crate) fn inset_bottom(self) -> InsetValue<'a> {
-        self.inset_value(InsetField::Bottom)
+        self.inset_value(geometry::Side::Bottom)
     }
 
     pub(crate) fn inset_left(self) -> InsetValue<'a> {
-        self.inset_value(InsetField::Left)
+        self.inset_value(geometry::Side::Left)
     }
 
     // AD-HOC: CSS UI only says a non-devolvable widget keeps its native appearance whatever its border; it doesn't say
@@ -700,6 +626,7 @@ impl<'a> StyleValues<'a> {
         }
     }
 
+    #[inline]
     fn physical_padding(self, side: geometry::Side) -> PaddingValue<'a> {
         self.padding_unless_non_devolvable(match side {
             geometry::Side::Top => self.style.padding_top(),
@@ -709,68 +636,44 @@ impl<'a> StyleValues<'a> {
         })
     }
 
+    #[inline]
     pub(crate) fn padding_top(self) -> PaddingValue<'a> {
-        if self.frame.is_physical() {
-            return self.padding_unless_non_devolvable(self.style.padding_top());
-        }
         self.physical_padding(self.physical(geometry::Side::Top))
     }
 
+    #[inline]
     pub(crate) fn padding_right(self) -> PaddingValue<'a> {
-        if self.frame.is_physical() {
-            return self.padding_unless_non_devolvable(self.style.padding_right());
-        }
         self.physical_padding(self.physical(geometry::Side::Right))
     }
 
+    #[inline]
     pub(crate) fn padding_bottom(self) -> PaddingValue<'a> {
-        if self.frame.is_physical() {
-            return self.padding_unless_non_devolvable(self.style.padding_bottom());
-        }
         self.physical_padding(self.physical(geometry::Side::Bottom))
     }
 
+    #[inline]
     pub(crate) fn padding_left(self) -> PaddingValue<'a> {
-        if self.frame.is_physical() {
-            return self.padding_unless_non_devolvable(self.style.padding_left());
-        }
         self.physical_padding(self.physical(geometry::Side::Left))
     }
 
+    #[inline]
     pub(crate) fn border_top_width(self) -> CssPixels {
-        let width = if self.frame.is_physical() {
-            self.style.border_top_width()
-        } else {
-            self.physical_border(self.physical(geometry::Side::Top)).0
-        };
-        self.border_width_unless_non_devolvable(width)
+        self.border_width_unless_non_devolvable(self.physical_border(self.physical(geometry::Side::Top)).0)
     }
 
+    #[inline]
     pub(crate) fn border_right_width(self) -> CssPixels {
-        let width = if self.frame.is_physical() {
-            self.style.border_right_width()
-        } else {
-            self.physical_border(self.physical(geometry::Side::Right)).0
-        };
-        self.border_width_unless_non_devolvable(width)
+        self.border_width_unless_non_devolvable(self.physical_border(self.physical(geometry::Side::Right)).0)
     }
 
+    #[inline]
     pub(crate) fn border_bottom_width(self) -> CssPixels {
-        let width = if self.frame.is_physical() {
-            self.style.border_bottom_width()
-        } else {
-            self.physical_border(self.physical(geometry::Side::Bottom)).0
-        };
-        self.border_width_unless_non_devolvable(width)
+        self.border_width_unless_non_devolvable(self.physical_border(self.physical(geometry::Side::Bottom)).0)
     }
 
+    #[inline]
     pub(crate) fn border_left_width(self) -> CssPixels {
-        let width = if self.frame.is_physical() {
-            self.style.border_left_width()
-        } else {
-            self.physical_border(self.physical(geometry::Side::Left)).0
-        };
-        self.border_width_unless_non_devolvable(width)
+        self.border_width_unless_non_devolvable(self.physical_border(self.physical(geometry::Side::Left)).0)
     }
 
     pub(crate) fn with_vertical_align_keyword(mut self, keyword: u8) -> Self {
@@ -793,7 +696,7 @@ impl<'a> StyleValues<'a> {
 /// If no fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
 /// NB: Outside of the resolutions the abspos engine installs, an anchor function is unresolvable.
 fn unresolvable_anchor_size_or<'a>(size: &'a ComputedSize, initial: &'static ComputedSize) -> &'a ComputedSize {
-    if !size.is_length_percentage() || !size.length_percentage().contains_anchor_function() {
+    if !size.contains_anchor_function() {
         return size;
     }
     let mut percentage_basis = CssPixels::default();
@@ -811,7 +714,7 @@ fn unresolvable_anchor_size_or<'a>(size: &'a ComputedSize, initial: &'static Com
 
 /// A px calc node, holding one reference for the external-resolution snapshot that releases it.
 pub(crate) fn calc_node_create_px_dimension(value: f64) -> *const c_void {
-    crate::css::calc::rust_calc_node_create_numeric_dimension(
+    crate::css::calc::calc_node_create_numeric_dimension(
         formatting_context::CALC_NUMERIC_KIND_LENGTH,
         value,
         crate::css::style_compute::px_length_unit(),
@@ -877,8 +780,8 @@ unsafe extern "C" fn resolve_unresolvable_anchor_function(context: *mut c_void, 
     // SAFETY: The context is the percentage basis resolve_calc_with_unresolvable_anchor_functions passes.
     let percentage_basis = unsafe { *context.cast::<CssPixels>() };
     // SAFETY: `shell` is the live style value the calc core's non-math-function node retains.
-    match unsafe { &*shell.cast::<StyleValueData>() } {
-        StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => unsafe {
+    match unsafe { &*shell.cast::<StyleValueData>() }.anchor_name_and_fallback() {
+        Some((_, _, fallback_value)) => unsafe {
             anchor_function_fallback_node(
                 fallback_value,
                 percentage_basis,
@@ -886,7 +789,7 @@ unsafe extern "C" fn resolve_unresolvable_anchor_function(context: *mut c_void, 
                 resolve_unresolvable_anchor_function,
             )
         },
-        _ => std::ptr::null(),
+        None => std::ptr::null(),
     }
 }
 

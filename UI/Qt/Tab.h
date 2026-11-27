@@ -13,19 +13,21 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
+#include <LibCompositing/Types.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
-#include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebView/FileDownloader.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
-#include <UI/Qt/BookmarksBar.h>
+#include <LibWebView/TabPerformanceStats.h>
 #include <UI/Qt/FindInPageWidget.h>
 #include <UI/Qt/LocationEdit.h>
+#include <UI/Qt/PermissionPromptPopover.h>
+#include <UI/Qt/SessionStore.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QBoxLayout>
+#include <QElapsedTimer>
 #include <QLabel>
 #include <QMenu>
 #include <QPointer>
@@ -33,7 +35,9 @@
 #include <QToolButton>
 #include <QWidget>
 
+class QAction;
 class QColorDialog;
+class QDialog;
 class QFileDialog;
 class QMessageBox;
 class QTimer;
@@ -41,56 +45,45 @@ class QVariantAnimation;
 
 namespace Ladybird {
 
+class BookmarkPopover;
 class BrowserWindow;
 enum class ChromeIcon;
-class DownloadsPopover;
-class ContentBlockingButton;
-class ContentBlockingPopover;
-class ReloadButton;
 class JavaScriptDialog;
 class MessagePopover;
-class WindowControlButton;
 
 class HyperlinkLabel final : public QLabel {
-    Q_OBJECT
-
 public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit HyperlinkLabel(QWidget* parent = nullptr)
-        : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
+        : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput)
     {
         setAttribute(Qt::WA_ShowWithoutActivating);
-        setMouseTracking(true);
     }
-
-    virtual void enterEvent(QEnterEvent* event) override
-    {
-        emit mouse_entered(event);
-    }
-
-signals:
-    void mouse_entered(QEnterEvent*);
 };
 
 // What a restored tab shows until it's selected: It has no view, and so no WebContent process, until then.
 struct DeferredTab {
-    WebView::SessionTabId session_tab_id { 0 };
+    SessionTabId session_tab_id { 0 };
     URL::URL url;
     QString title;
     QIcon favicon;
+    // The history of a discarded tab, which it restores once it is selected, and the state the Hub keeps for it.
+    Optional<WebView::SessionHistorySnapshot> history;
+    Optional<u64> discarded_tab_state_id;
 };
 
+class Popover;
+class SiteSettingsPopover;
 class Tab final
     : public QWidget
-    , public WebView::FileDownloaderObserver
     , public WebView::SettingsObserver {
     Q_OBJECT
 
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable = {});
+    Tab(BrowserWindow* window, Optional<u64> hub_view_id = {});
     Tab(BrowserWindow* window, DeferredTab);
     virtual ~Tab() override;
 
@@ -111,8 +104,8 @@ public:
 
     URL::URL url() const;
 
-    Optional<WebView::SessionTabId> session_tab_id() const;
-    void set_session_tab_id(WebView::SessionTabId);
+    Optional<SessionTabId> session_tab_id() const;
+    void set_session_tab_id(SessionTabId);
     void clear_session_tab_id();
 
     // A page that has never had a real size must be sized while hidden, so that it doesn't load into Qt's placeholder
@@ -129,10 +122,6 @@ public:
     void find_previous();
     void find_next();
 
-    BookmarksBar& bookmarks_bar() { return *m_bookmarks_bar; }
-    bool has_bookmarks_bar_in_page() const;
-    void update_bookmarks_bar_visibility();
-
     void request_close();
     void request_window_close_preflight(Function<void(bool)> on_complete);
     void cancel_window_close_preflight();
@@ -141,25 +130,32 @@ public:
     QIcon const& favicon() const { return m_favicon; }
     QIcon tab_icon() const;
     bool is_loading() const { return m_is_loading; }
+    // Whether the page being loaded has yet to respond.
+    bool is_waiting_for_response() const { return m_is_loading && m_is_waiting_for_response; }
+    // How strongly the tab's loading ring shows: fully while the tab loads, then fading out once it has loaded.
+    qreal loading_ring_opacity() const;
+    // How far the favicon has shrunk to sit inside the loading ring: it shrinks as the tab starts loading, and grows back
+    // as the ring fades out.
+    qreal loading_favicon_shrink() const;
+    // A tab in the background whose title changes after it has loaded has news, until it is selected.
+    bool needs_attention() const { return m_needs_attention; }
+    void clear_attention() { m_needs_attention = false; }
+    void set_needs_attention(bool needs_attention) { m_needs_attention = needs_attention; }
     QString title() const;
 
     QMenu* context_menu() const { return m_context_menu; }
 
-    QToolButton* hamburger_button() const { return m_hamburger_button; }
-    QWidget* toolbar_container() const { return m_toolbar_container; }
+    LocationEdit& location_edit() { return *m_location_edit; }
+    WebView::TabPerformanceStats const& performance_stats() const { return m_performance_stats; }
+    Optional<Compositing::CompositorLayersDescription> const& compositor_layers() const { return m_compositor_layers; }
 
-    void set_vertical_tabs_enabled(bool);
-    void set_vertical_tabs_position(WebView::VerticalTabsPosition);
-#ifdef AK_OS_MACOS
-    void update_web_view_frame(bool chrome_visible, Optional<WebView::VerticalTabsPosition> sidebar_position);
-#endif
     void set_window(BrowserWindow&);
-    void set_toolbar_container_in_tab_layout(bool);
-    void set_toolbar_window_controls_visible(bool);
-    void update_window_control_icons();
     void update_hover_label();
 
     void enter_report_review(Tab* tab_to_activate_on_close, Optional<QString> title = {});
+    bool is_in_report_review() const { return m_report_review_navigation_listener.has_value(); }
+    // Another tab stands in for one that was discarded, and takes its place wherever this tab refers to it.
+    void did_replace_tab(Tab const& old_tab, Tab& new_tab);
 
     bool is_pinned() const { return m_is_pinned; }
     // BrowserWindow pins and unpins tabs, since it keeps each window's pinned tabs at the start of its strip.
@@ -168,98 +164,77 @@ public:
     bool url_is_hidden() const { return m_location_edit->url_is_hidden(); }
     void set_url_is_hidden(bool url_is_hidden) { m_location_edit->set_url_is_hidden(url_is_hidden); }
 
+public:
+    void show_private_session_popover();
+    void show_bookmark_popover();
+    void close_popovers();
+
+    enum class FocusRingTransition : u8 {
+        FadeIn,
+        Immediate,
+    };
+
 public slots:
-    void focus_location_editor();
+    void focus_location_editor(FocusRingTransition = FocusRingTransition::FadeIn);
     void park_location_editing();
     LocationEdit* location_edit_with_parked_editing() const { return is_loaded() && m_location_edit->has_parked_editing_session() ? m_location_edit : nullptr; }
 
 signals:
     void title_changed(int id, QString const&);
     void favicon_changed(int id, QIcon const&);
-    void audio_play_state_changed(int id, Web::HTML::AudioPlayState);
+    void audio_state_changed(int id);
+    void microphone_in_use_changed();
     void loading_changed();
-    void loading_finished();
+    void performance_stats_changed();
     void loaded();
 
 private:
     void create_tab_shell();
     void create_tab_context_menu();
-    void initialize(Optional<WebView::CanonicalTraversable&>);
+    void initialize(Optional<u64> hub_view_id);
+    FindInPageWidget& ensure_find_in_page();
 
     void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
-#ifdef AK_OS_MACOS
-    virtual void paintEvent(QPaintEvent*) override;
-#endif
     virtual void resizeEvent(QResizeEvent*) override;
     virtual void hideEvent(QHideEvent*) override;
+    virtual void showEvent(QShowEvent*) override;
     virtual bool event(QEvent*) override;
     virtual bool eventFilter(QObject*, QEvent*) override;
 
     virtual void tab_settings_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
-    virtual void content_blocker_count_visibility_changed() override;
 
-    void recreate_toolbar_icons();
-    void update_vertical_tabs_toolbar_button_placement();
-    void connect_hamburger_menu();
-    QToolButton* create_navigation_history_toolbar_button(QWidget& parent, QAction&, int direction);
+    void show_site_settings_popover();
+    void refresh_site_settings_popover();
+    void show_zoom_popover(QAction& zoom_level);
+    void show_translation_menu();
+
+    void recreate_location_edit_icons();
     void update_chrome_style();
     void update_tab_title();
     void leave_report_review();
-    void update_downloads_button();
-    void update_downloads_popover();
-    void show_downloads_popover();
-    void position_downloads_popover();
-    void show_content_blocking_popover();
-    void update_content_blocking_controls(WebView::ContentBlockingSnapshot const&);
-    void show_private_session_popover();
     void position_private_session_popover();
+    QWidget& site_settings_anchor() const;
+    void update_permission_prompts();
     void hide_hover_label();
+    bool hover_text_belongs_on_right(QPoint pointer) const;
+    QImage render_hover_text(QString const&) const;
     void set_loading(bool);
     void update_tab_icon();
     int tab_index();
     void set_screen_wake_lock_state(Web::ScreenWakeLockState);
 
-    bool can_expand_bookmarks_bar_on_hover() const;
-    bool cursor_is_over_bookmarks_bar_hover_region() const;
-    void update_bookmarks_bar_hover();
-    void set_bookmarks_bar_hover_expanded(bool);
-    void update_bookmarks_bar_geometry();
-
-    virtual void download_added(WebView::FileDownloader::Download const&) override;
-    virtual void download_updated(WebView::FileDownloader::Download const&) override;
-    virtual void download_removed(u64, WebView::IsPrivate) override;
-
-    QWidget* m_toolbar_container { nullptr };
-    QWidget* m_toolbar { nullptr };
-    QWidget* m_performance_monitor { nullptr };
-    QWidget* m_toolbar_window_controls_separator { nullptr };
-    QWidget* m_toolbar_window_controls { nullptr };
-    QSpacerItem* m_sidebar_toggle_navigation_spacer { nullptr };
-    QToolButton* m_left_toggle_vertical_tabs_expanded_button { nullptr };
-    QToolButton* m_right_toggle_vertical_tabs_expanded_button { nullptr };
-    WindowControlButton* m_minimize_window_button { nullptr };
-    WindowControlButton* m_maximize_window_button { nullptr };
-    WindowControlButton* m_close_window_button { nullptr };
-
-    BookmarksBar* m_bookmarks_bar { nullptr };
-    QWidget* m_bookmarks_bar_container { nullptr };
-    QTimer* m_bookmarks_bar_hover_expand_timer { nullptr };
-    QTimer* m_bookmarks_bar_hover_collapse_timer { nullptr };
-    QVariantAnimation* m_bookmarks_bar_hover_expand_animation { nullptr };
-    bool m_bookmarks_bar_hover_expanded { false };
-    qreal m_bookmarks_bar_hover_expand_progress { 0.0 };
-
-    QPushButton* m_private_badge { nullptr };
-    QToolButton* m_hamburger_button { nullptr };
-    ContentBlockingButton* m_content_blocking_button { nullptr };
-    QPointer<ContentBlockingPopover> m_content_blocking_popover;
-    Optional<String> m_content_blocking_popover_reload_site;
-    QToolButton* m_downloads_button { nullptr };
-    QPointer<DownloadsPopover> m_downloads_popover;
     QPointer<MessagePopover> m_private_session_popover;
+    QPointer<SiteSettingsPopover> m_site_settings_popover;
+    // The site the open popover shows, which its changes apply to whatever the tab shows by then.
+    Optional<URL::Origin> m_site_settings_popover_origin;
+    QTimer* m_content_blocking_update_timer { nullptr };
+    QPointer<Popover> m_zoom_popover;
+    QPointer<QAction> m_translate_action;
+    QPointer<QMenu> m_translation_menu;
+    QPointer<BookmarkPopover> m_bookmark_popover;
     QPointer<Tab> m_tab_to_activate_on_close;
-    LocationEdit* m_location_edit { nullptr };
+    QPointer<LocationEdit> m_location_edit;
     WebContentView* m_view { nullptr };
     FindInPageWidget* m_find_in_page { nullptr };
     Optional<WakeLock::DisplaySleepInhibitor> m_screen_display_sleep_inhibitor;
@@ -269,61 +244,45 @@ private:
     Optional<u64> m_report_review_navigation_listener;
     bool m_has_loaded_report_review_page { false };
     HyperlinkLabel* m_hover_label { nullptr };
+    // The address of the hovered link, which shows over the bottom corner of the page that the pointer is not over.
+    QString m_hover_text;
+    bool m_hover_text_is_on_right { false };
+    // Whether the view stacks the hover text above the page itself, in place of the hover label.
+    bool m_hover_text_is_over_page { false };
     QIcon m_favicon;
-    QTimer* m_loading_animation_timer { nullptr };
     bool m_is_loading { false };
+    bool m_needs_attention { false };
+    bool m_is_waiting_for_response { false };
+    QElapsedTimer m_load_started_clock;
+    QElapsedTimer m_load_finished_clock;
     bool m_has_had_real_size { false };
     bool m_is_updating_chrome_style { false };
-    bool m_vertical_tabs_enabled { false };
-    WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
-#ifdef AK_OS_MACOS
-    QHBoxLayout* m_view_layout { nullptr };
-    // The web view's frame as TabWidget last asked for it, which a tab that hasn't loaded gets once it loads.
-    bool m_web_view_chrome_visible { true };
-    Optional<WebView::VerticalTabsPosition> m_web_view_sidebar_position;
-#endif
-    int m_loading_animation_frame { 0 };
 
     QMenu* m_context_menu { nullptr };
-    QMenu* m_page_context_menu { nullptr };
-    QMenu* m_link_context_menu { nullptr };
-    QMenu* m_selected_text_link_context_menu { nullptr };
-    QMenu* m_image_context_menu { nullptr };
-    QMenu* m_media_context_menu { nullptr };
     QMenu* m_select_dropdown { nullptr };
 
-    QAction* m_toggle_vertical_tabs_expanded_action { nullptr };
-    QAction* m_navigate_back_action { nullptr };
-    QAction* m_navigate_forward_action { nullptr };
-    QAction* m_reload_action { nullptr };
-    QAction* m_reload_bypassing_cache_action { nullptr };
-    QAction* m_stop_action { nullptr };
-    ReloadButton* m_reload_button { nullptr };
-    QAction* m_open_downloads_page_action { nullptr };
     QAction* m_pin_tab_action { nullptr };
-    Optional<ChromeIcon> m_downloads_button_icon;
-    QString m_downloads_button_tooltip;
+    WebView::TabPerformanceStats m_performance_stats;
+    Optional<Compositing::CompositorLayersDescription> m_compositor_layers;
 
     JavaScriptDialog* m_javascript_dialog { nullptr };
     Function<void(bool)> m_before_unload_completion;
     QPointer<QColorDialog> m_color_picker_dialog;
+    QPointer<QDialog> m_date_picker_dialog;
     QPointer<QFileDialog> m_file_picker_dialog;
     QPointer<QMessageBox> m_external_url_confirmation_dialog;
-    // Requests the same dialog would answer wait on the one open, so a page cannot stack dialogs by asking again.
-    struct PendingPermissionRequests {
-        QPointer<QMessageBox> dialog;
-        Vector<Function<void(bool granted)>> on_decided;
-    };
-    HashMap<String, PendingPermissionRequests> m_pending_permission_requests;
+    PermissionPromptQueue m_permission_prompts;
 
     bool m_suppress_javascript_dialogs_until_navigation { false };
+    // The dialogs the current document has shown, and whether the user stopped it from showing more.
+    u64 m_javascript_dialogs_shown_by_document { 0 };
+    bool m_javascript_dialogs_blocked_for_document { false };
     bool m_already_requested_close { false };
     bool m_preserve_close_retry_state_on_dialog_dismissal { false };
     bool m_window_is_closing { false };
     bool m_is_pinned { false };
 
-    bool m_toolbar_window_controls_visible { false };
-    Optional<WebView::SessionTabId> m_session_tab_id;
+    Optional<SessionTabId> m_session_tab_id;
     Optional<DeferredTab> m_deferred_tab;
 };
 

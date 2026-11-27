@@ -12,6 +12,7 @@
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/SeqLock.h>
+#include <AK/SharedMemoryValue.h>
 #include <AK/Time.h>
 #include <LibCompositing/Export.h>
 #include <LibCore/AnonymousBuffer.h>
@@ -52,10 +53,11 @@ public:
         u64 generation { 0 };
         u64 presented_frame_count { 0 };
         u64 dropped_frame_count { 0 };
-        AK::Duration media_time { AK::Duration::zero() };
-        MonotonicTime presentation_time;
+        SharedMemoryValue<AK::Duration> media_time;
+        SharedMemoryValue<MonotonicTime> presentation_time;
         u32 width { 0 };
         u32 height { 0 };
+        bool frame_is_up_to_date { false };
     };
     void publish_presented_frame(PresentedFrame const&);
     Optional<PresentedFrame> presented_frame() const;

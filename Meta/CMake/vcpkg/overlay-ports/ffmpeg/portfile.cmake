@@ -20,6 +20,8 @@ vcpkg_from_github(
         0051-fix-msvc-undef-flags.patch
         0052-fix-disable-unstable-swscale-link.patch
         0100-ladybird-symbol-version-nodes.patch
+        0101-vulkan-decode-dpb-distinct-no-drm-modifiers.patch
+        0102-vulkan-av1-clear-unused-ref-frame-mvs.patch
 )
 
 if(SOURCE_PATH MATCHES " ")
@@ -281,6 +283,9 @@ if("ladybird-components" IN_LIST FEATURES)
     set(OPTIONS "${OPTIONS} --disable-everything --disable-network")
     set(OPTIONS "${OPTIONS} --enable-decoder=vp8,vp9,libdav1d,theora,vorbis,opus,flac,mp3float,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw")
     set(OPTIONS "${OPTIONS} --enable-parser=vp8,vp9,av1,mpegaudio")
+    if("opus" IN_LIST FEATURES)
+        set(OPTIONS "${OPTIONS} --enable-encoder=libopus")
+    endif()
     if("vulkan" IN_LIST FEATURES)
         set(OPTIONS "${OPTIONS} --enable-decoder=av1 --enable-hwaccel=vp9_vulkan,av1_vulkan --enable-libdrm")
     endif()

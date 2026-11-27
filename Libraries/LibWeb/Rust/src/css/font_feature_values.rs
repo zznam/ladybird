@@ -8,6 +8,7 @@ use crate::css::css_string::CssString;
 use crate::css::ffi_support::{FfiUtf16View, OwnedArc};
 use crate::css::parser::value_parser::equals_ascii_case_insensitive;
 use crate::css::style_value::StyleValueData;
+use crate::css::style_value::{FunctionPayload, OpenTypeTaggedPayload};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -71,6 +72,58 @@ impl FontFeatureValuesRule {
     pub(crate) fn snapshot(&self) -> Arc<FontFeatureValuesData> {
         self.data.borrow().clone()
     }
+    pub(crate) fn families_text(&self) -> Vec<ak::Utf16String> {
+        let data = self.data.borrow();
+        data.families
+            .iter()
+            .map(|family| ak::Utf16String::from_utf16(family.units()))
+            .collect()
+    }
+
+    pub(crate) fn set_families_text(&self, families: Vec<ak::Utf16String>) {
+        let families = families
+            .iter()
+            .map(|family| CssString::from_utf16(&family.to_utf16()))
+            .collect();
+        Arc::make_mut(&mut self.data.borrow_mut()).families = families;
+    }
+
+    pub(crate) fn set_value(&self, kind: FontFeatureValuesRuleKind, name: &[u16], values: Vec<u32>) {
+        Arc::make_mut(&mut self.data.borrow_mut()).set(kind, name, values);
+    }
+
+    pub(crate) fn remove_value(&self, kind: FontFeatureValuesRuleKind, name: &[u16]) -> bool {
+        let mut data = self.data.borrow_mut();
+        let Some(&index) = data.maps[kind as usize].indices.get(name) else {
+            return false;
+        };
+        let map = &mut Arc::make_mut(&mut data).maps[kind as usize];
+        map.indices.remove(name);
+        map.entries.remove(index);
+        for (index, entry) in map.entries.iter().enumerate().skip(index) {
+            *map.indices.get_mut(&entry.name).unwrap() = index;
+        }
+        true
+    }
+
+    pub(crate) fn clear_values(&self, kind: FontFeatureValuesRuleKind) {
+        let mut data = self.data.borrow_mut();
+        if !data.maps[kind as usize].entries.is_empty() {
+            let map = &mut Arc::make_mut(&mut data).maps[kind as usize];
+            map.entries.clear();
+            map.indices.clear();
+        }
+    }
+
+    pub(crate) fn entries_of(&self, kind: FontFeatureValuesRuleKind) -> Vec<(ak::Utf16String, Vec<u32>)> {
+        let data = self.data.borrow();
+        data.maps[kind as usize]
+            .entries
+            .iter()
+            .map(|entry| (ak::Utf16String::from_utf16(&entry.name), entry.values.clone()))
+            .collect()
+    }
+
     pub(crate) fn new(data: Arc<FontFeatureValuesData>) -> Self {
         Self {
             data: RefCell::new(data),
@@ -142,8 +195,8 @@ pub unsafe extern "C" fn rust_font_feature_values_family_at(
     FfiUtf16View::from_utf16(data.families[index].units())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_font_feature_values_set_families(
+#[cfg(test)]
+pub(crate) unsafe fn rust_font_feature_values_set_families(
     owner: &FontFeatureValuesRule,
     families: *const FfiUtf16View,
     count: usize,
@@ -154,7 +207,7 @@ pub unsafe extern "C" fn rust_font_feature_values_set_families(
     Arc::make_mut(&mut owner.data.borrow_mut()).families = families;
 }
 
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub extern "C" fn rust_font_feature_values_count(
     owner: &FontFeatureValuesRule,
     kind: FontFeatureValuesRuleKind,
@@ -162,7 +215,7 @@ pub extern "C" fn rust_font_feature_values_count(
     owner.data.borrow().maps[kind as usize].entries.len()
 }
 
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub extern "C" fn rust_font_feature_values_find(
     owner: &FontFeatureValuesRule,
     kind: FontFeatureValuesRuleKind,
@@ -178,7 +231,7 @@ pub extern "C" fn rust_font_feature_values_find(
 
 /// # Safety
 /// The caller must not change the rule's values while it uses the returned entry.
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub unsafe extern "C" fn rust_font_feature_values_at(
     owner: &FontFeatureValuesRule,
     kind: FontFeatureValuesRuleKind,
@@ -194,7 +247,7 @@ pub unsafe extern "C" fn rust_font_feature_values_at(
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub unsafe extern "C" fn rust_font_feature_values_set(
     owner: &FontFeatureValuesRule,
     kind: FontFeatureValuesRuleKind,
@@ -207,69 +260,38 @@ pub unsafe extern "C" fn rust_font_feature_values_set(
     let values = (0..count)
         .map(|index| unsafe { *values.add(index) })
         .collect::<Vec<_>>();
-    Arc::make_mut(&mut owner.data.borrow_mut()).set(kind, &name, values);
+    owner.set_value(kind, &name, values);
 }
 
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub extern "C" fn rust_font_feature_values_remove(
     owner: &FontFeatureValuesRule,
     kind: FontFeatureValuesRuleKind,
     name: FfiUtf16View,
 ) -> bool {
-    let name = name.to_utf16().unwrap();
-    let mut data = owner.data.borrow_mut();
-    let Some(&index) = data.maps[kind as usize].indices.get(name.as_slice()) else {
-        return false;
-    };
-    let map = &mut Arc::make_mut(&mut data).maps[kind as usize];
-    map.indices.remove(name.as_slice());
-    map.entries.remove(index);
-    for (index, entry) in map.entries.iter().enumerate().skip(index) {
-        *map.indices.get_mut(&entry.name).unwrap() = index;
-    }
-    true
+    owner.remove_value(kind, &name.to_utf16().unwrap())
 }
 
-#[unsafe(no_mangle)]
+#[cfg(test)]
 pub extern "C" fn rust_font_feature_values_clear(owner: &FontFeatureValuesRule, kind: FontFeatureValuesRuleKind) {
-    let mut data = owner.data.borrow_mut();
-    if !data.maps[kind as usize].entries.is_empty() {
-        let map = &mut Arc::make_mut(&mut data).maps[kind as usize];
-        map.entries.clear();
-        map.indices.clear();
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_font_feature_values_external_memory_size(owner: &FontFeatureValuesRule) -> usize {
-    let data = owner.data.borrow();
-    let mut size = size_of::<FontFeatureValuesRule>().saturating_add(size_of::<FontFeatureValuesData>());
-    size = size.saturating_add(data.families.capacity().saturating_mul(size_of::<CssString>()));
-    for family in &data.families {
-        size = size.saturating_add(size_of_val(family.units()));
-    }
-    for map in &data.maps {
-        size = size.saturating_add(map.entries.capacity().saturating_mul(size_of::<FeatureValueEntry>()));
-        size = size.saturating_add(map.indices.capacity().saturating_mul(size_of::<(Arc<[u16]>, usize)>()));
-        for entry in &map.entries {
-            size = size
-                .saturating_add(size_of_val(&*entry.name))
-                .saturating_add(entry.values.capacity().saturating_mul(size_of::<u32>()));
-        }
-    }
-    size
+    owner.clear_values(kind);
 }
 
 /// The OpenType features a style asks of a font, by tag, the later setting of a tag winning.
 #[derive(Default)]
-struct ShapeFeatures(Vec<(u32, u32)>);
+/// Each feature's tag, its value, and whether font-feature-settings set it.
+struct ShapeFeatures(Vec<(u32, u32, bool)>);
 
 impl ShapeFeatures {
     fn set(&mut self, tag: &[u8; 4], value: u32) {
+        self.set_from(tag, value, false);
+    }
+
+    fn set_from(&mut self, tag: &[u8; 4], value: u32, set_by_feature_settings: bool) {
         let tag = u32::from_be_bytes(*tag);
-        match self.0.iter_mut().find(|(existing, _)| *existing == tag) {
-            Some(feature) => feature.1 = value,
-            None => self.0.push((tag, value)),
+        match self.0.iter_mut().find(|(existing, ..)| *existing == tag) {
+            Some(feature) => (feature.1, feature.2) = (value, set_by_feature_settings),
+            None => self.0.push((tag, value, set_by_feature_settings)),
         }
     }
 }
@@ -306,7 +328,8 @@ fn integer_of(value: &StyleValueData) -> Option<i32> {
 /// The OpenType features the computed values of a font resolution request ask for, by
 /// `FontResolutionFeatureInput` and null for a property with its initial value. The names in
 /// `font-variant-alternates` are looked up in a family's `@font-feature-values` through `lookup`,
-/// when `family_values` is not null. Each feature goes to `append` as a big-endian tag and a value.
+/// when `family_values` is not null. Each feature goes to `append` as a big-endian tag, a value,
+/// and whether font-feature-settings set it.
 /// https://drafts.csswg.org/css-fonts-4/#feature-variation-precedence
 ///
 /// # Safety
@@ -319,7 +342,7 @@ pub unsafe extern "C" fn rust_font_shape_features(
     family_values: *const c_void,
     lookup: unsafe extern "C" fn(*const c_void, FontFeatureValuesRuleKind, FfiUtf16View, &mut usize) -> *const u32,
     features: *mut c_void,
-    append: unsafe extern "C" fn(*mut c_void, u32, u32),
+    append: unsafe extern "C" fn(*mut c_void, u32, u32, bool),
 ) {
     use crate::css::css_enums::keyword::*;
     use crate::css::style::bridge::{FONT_RESOLUTION_FEATURE_INPUT_COUNT, FontResolutionFeatureInput as Input};
@@ -407,12 +430,13 @@ pub unsafe extern "C" fn rust_font_shape_features(
         _ => &[],
     };
     for alternate in alternates.iter().map(|alternate| alternate.data()) {
-        let StyleValueData::Function { name, value } = alternate else {
+        let StyleValueData::Function(function_payload) = alternate else {
             if keyword_of(Some(alternate)) == Some(HISTORICAL_FORMS) {
                 shape.set(b"hist", 1);
             }
             continue;
         };
+        let FunctionPayload { name, value } = &**function_payload;
         let Some(kind) = [
             ("stylistic", FontFeatureValuesRuleKind::Stylistic),
             ("styleset", FontFeatureValuesRuleKind::Styleset),
@@ -484,22 +508,19 @@ pub unsafe extern "C" fn rust_font_shape_features(
     // 13. Font features implied by the value of font-feature-settings property are applied.
     if let Some(StyleValueData::ValueList { values, .. }) = value(Input::FontFeatureSettings) {
         for setting in values.as_slice() {
-            if let StyleValueData::OpenTypeTagged {
-                packed_tag,
-                value: setting,
-                ..
-            } = setting.data()
-                && let Some(setting) = integer_of(setting.data())
+            if let StyleValueData::OpenTypeTagged(open_type_tagged) = setting.data()
+                && let Some(setting) = integer_of(open_type_tagged.value.data())
             {
+                let packed_tag = open_type_tagged.packed_tag;
                 // NB: A feature setting is kept as one byte.
-                shape.set(&packed_tag.to_be_bytes(), u32::from(setting as u8));
+                shape.set_from(&packed_tag.to_be_bytes(), u32::from(setting as u8), true);
             }
         }
     }
 
-    for (tag, value) in shape.0 {
+    for (tag, value, set_by_feature_settings) in shape.0 {
         // SAFETY: Guaranteed by the caller.
-        unsafe { append(features, tag, value) };
+        unsafe { append(features, tag, value, set_by_feature_settings) };
     }
 }
 
@@ -530,9 +551,10 @@ pub unsafe extern "C" fn rust_font_variation_axes(
         return;
     };
     for setting in values.as_slice() {
-        let StyleValueData::OpenTypeTagged { packed_tag, value, .. } = setting.data() else {
+        let StyleValueData::OpenTypeTagged(open_type_tagged_payload) = setting.data() else {
             continue;
         };
+        let OpenTypeTaggedPayload { packed_tag, value, .. } = &**open_type_tagged_payload;
         let value = match value.data() {
             StyleValueData::Number { value } => Some(*value),
             calculated => crate::css::calc::resolve_calculated_number_without_context(calculated),

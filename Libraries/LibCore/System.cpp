@@ -47,6 +47,12 @@ static int memfd_create(char const* name, unsigned int flags)
 extern char** environ;
 #endif
 
+#if defined(AK_OS_MACOS)
+#    include <LibCore/MachPort.h>
+#    include <mach/mach.h>
+#    include <mach/mach_vm.h>
+#endif
+
 #if defined(AK_OS_BSD_GENERIC) && !defined(AK_OS_SOLARIS)
 #    include <sys/sysctl.h>
 #endif
@@ -103,6 +109,28 @@ ErrorOr<struct stat> fstat(int fd)
     return st;
 }
 
+#if defined(AK_OS_LINUX) || defined(AK_OS_MACOS)
+ErrorOr<struct statfs> statfs(StringView path)
+{
+    if (!path.characters_without_null_termination())
+        return Error::from_syscall("statfs"sv, EFAULT);
+
+    struct statfs file_system = {};
+    ByteString path_string = path;
+    if (::statfs(path_string.characters(), &file_system) < 0)
+        return Error::from_syscall("statfs"sv, errno);
+    return file_system;
+}
+
+ErrorOr<struct statfs> fstatfs(int fd)
+{
+    struct statfs file_system = {};
+    if (::fstatfs(fd, &file_system) < 0)
+        return Error::from_syscall("fstatfs"sv, errno);
+    return file_system;
+}
+#endif
+
 ErrorOr<struct stat> fstatat(int fd, StringView path, int flags)
 {
     if (!path.characters_without_null_termination())
@@ -156,14 +184,27 @@ static int mmap_anonymous_fd([[maybe_unused]] MemoryTag tag)
 
 ErrorOr<void*> reserve_address_space(size_t size, MemoryTag tag)
 {
+#ifdef AK_OS_MACOS
+    // On macOS, reserving address space that may later become accessible costs time in proportion to its size, while
+    // a reservation that can never become accessible costs nothing. Committing memory maps over the reservation, which
+    // replaces its protections, so the reservation itself never needs to become accessible.
+    int flags = VM_FLAGS_ANYWHERE;
+    if (auto tag_flags = mmap_anonymous_fd(tag); tag_flags != -1)
+        flags |= tag_flags;
+    mach_vm_address_t address = 0;
+    if (auto result = mach_vm_map(mach_task_self(), &address, size, 0, flags, MEMORY_OBJECT_NULL, 0, false, VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_DEFAULT); result != KERN_SUCCESS)
+        return mach_error_to_error(result);
+    return reinterpret_cast<void*>(address);
+#else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#ifdef MAP_NORESERVE
+#    ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
-#endif
+#    endif
     auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return ptr;
+#endif
 }
 
 ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag tag)
@@ -201,15 +242,6 @@ ErrorOr<void> decommit_memory(void* address, size_t size, MemoryTag tag)
     flags |= MAP_NORESERVE;
 #endif
     auto* ptr = ::mmap(address, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
-    if (ptr == MAP_FAILED)
-        return Error::from_syscall("mmap"sv, errno);
-    VERIFY(ptr == address);
-    return {};
-}
-
-ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int fd)
-{
-    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     VERIFY(ptr == address);
@@ -355,7 +387,10 @@ ErrorOr<struct stat> lstat(StringView path)
 
 ErrorOr<size_t> read(int fd, Bytes buffer)
 {
-    auto rc = ::read(fd, buffer.data(), buffer.size());
+    ssize_t rc;
+    do {
+        rc = ::read(fd, buffer.data(), buffer.size());
+    } while (rc < 0 && errno == EINTR);
     if (rc < 0)
         return Error::from_syscall("read"sv, errno);
     return rc;
@@ -363,7 +398,10 @@ ErrorOr<size_t> read(int fd, Bytes buffer)
 
 ErrorOr<size_t> write(int fd, ReadonlyBytes buffer)
 {
-    auto rc = ::write(fd, buffer.data(), buffer.size());
+    ssize_t rc;
+    do {
+        rc = ::write(fd, buffer.data(), buffer.size());
+    } while (rc < 0 && errno == EINTR);
     if (rc < 0)
         return Error::from_syscall("write"sv, errno);
     return rc;

@@ -53,21 +53,20 @@ void CommitMessages::append(Layout::BegunRead const& read, Layout::RustFFI::FfiC
         }
         m_messages.append({ .identity = identity, .kind = Kind::NavigableContainerViewportCommitted });
         return;
-    case Layout::RustFFI::FfiCommitMessageKind::LayoutTreeRebuildRequested:
-        m_messages.append({
-            .identity = identity,
-            .kind = Kind::NeedsLayoutTreeUpdate,
-            .layout_tree_update_reason = SetNeedsLayoutTreeUpdateReason::PseudoElementBoxEscapedRebuildRoot,
-        });
-        return;
-    case Layout::RustFFI::FfiCommitMessageKind::TopLayerZoneRebuildNeeded:
-        m_messages.append({ .identity = identity, .kind = Kind::TopLayerZoneRebuildNeeded });
-        return;
     case Layout::RustFFI::FfiCommitMessageKind::ListItemCounterValueRendered:
         m_messages.append({ .identity = identity, .kind = Kind::ListItemCounterValueRendered });
         return;
     case Layout::RustFFI::FfiCommitMessageKind::UnstyledElementReached:
         m_messages.append({ .identity = identity, .kind = Kind::UnstyledElementReached });
+        return;
+    case Layout::RustFFI::FfiCommitMessageKind::StyleDependsOnSizeContainerQuery:
+        m_messages.append({ .identity = identity, .kind = Kind::StyleDependsOnSizeContainerQuery });
+        return;
+    case Layout::RustFFI::FfiCommitMessageKind::SizeQueryContainerResolvedAgainst:
+        m_messages.append({ .identity = identity, .kind = Kind::SizeQueryContainerResolvedAgainst });
+        return;
+    case Layout::RustFFI::FfiCommitMessageKind::ContainerQueryEvaluationNeededAfterLayout:
+        m_messages.append({ .identity = identity, .kind = Kind::ContainerQueryEvaluationNeededAfterLayout });
         return;
     case Layout::RustFFI::FfiCommitMessageKind::SvgResourceReferenced:
         m_messages.append({
@@ -103,7 +102,8 @@ void CommitMessages::apply(Layout::BegunRead const& read, Message const& message
         // Only an element can be a query container; the viewport names the document, which is not one. Layout says
         // this of every size container, but `container-type` is set far more widely than it is asked about, and one
         // no size query or container-relative unit resolved against has no dependent to record.
-        if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()); element && element->is_size_query_container())
+        if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()); element && element->is_size_query_container()
+            && m_document->note_size_container_moved_in_stabilization_epoch(element->style_node_id()))
             m_document->style_computer().style_engine().record_size_container_query_dependents(element->style_node_id());
         return;
     case Kind::NavigableContainerViewportCommitted:
@@ -113,13 +113,6 @@ void CommitMessages::apply(Layout::BegunRead const& read, Message const& message
             if (auto* content_navigable = local_content_navigable(*box))
                 content_navigable->set_viewport_size(Painting::content_size(*box));
         }
-        return;
-    case Kind::NeedsLayoutTreeUpdate:
-        if (auto node = message.identity.resolve(m_document))
-            node->set_needs_layout_tree_update(true, message.layout_tree_update_reason);
-        return;
-    case Kind::TopLayerZoneRebuildNeeded:
-        m_document->set_top_layer_needs_layout_zone_rebuild();
         return;
     case Kind::ListItemCounterValueRendered:
         if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()))
@@ -144,6 +137,18 @@ void CommitMessages::apply(Layout::BegunRead const& read, Message const& message
                 m_document->update_style_for_element({ *element });
             element->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::StyleChange);
         }
+        return;
+    case Kind::StyleDependsOnSizeContainerQuery:
+        if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()))
+            element->set_style_depends_on_size_container_query();
+        return;
+    case Kind::SizeQueryContainerResolvedAgainst:
+        if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()))
+            element->set_is_size_query_container();
+        return;
+    case Kind::ContainerQueryEvaluationNeededAfterLayout:
+        if (auto* element = as_if<Element>(message.identity.resolve(m_document).ptr()))
+            m_document->set_needs_container_query_evaluation_after_layout(*element);
         return;
     }
     VERIFY_NOT_REACHED();

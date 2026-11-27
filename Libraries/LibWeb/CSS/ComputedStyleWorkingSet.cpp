@@ -13,6 +13,7 @@
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterStyleStyleValue.h>
@@ -29,12 +30,12 @@
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/StyleEngineRustFFI.h>
 #include <LibWebCommon/CSS/SystemColor.h>
 
 namespace Web::CSS {
 
 static Atomic<u64> s_next_animated_properties_identity { 1 };
-static u64 s_longhand_wrappers_minted { 0 };
 
 AnimatedProperties::~AnimatedProperties()
 {
@@ -43,58 +44,26 @@ AnimatedProperties::~AnimatedProperties()
 
 static_assert(to_underlying(PseudoElement::KnownPseudoElementCount) <= sizeof(u64) * 8);
 
-ComputedStyleWorkingSet::ComputedStyleWorkingSet()
-    : m_computed_longhand_table(ComputedValuesFFI::rust_computed_longhand_table_create())
+ComputedStyleWorkingSet::ComputedStyleWorkingSet(StyleRecordRef record)
+    : m_record(move(record))
+    , m_metadata(ComputedValuesFFI::rust_style_record_metadata(m_record.get()))
 {
 }
 
-ComputedStyleWorkingSet::ComputedStyleWorkingSet(ComputedValuesFFI::ComputedLonghandTable* longhand_table)
-    : m_computed_longhand_table(longhand_table)
-{
-}
+ComputedStyleWorkingSet::~ComputedStyleWorkingSet() = default;
 
-ComputedStyleWorkingSet::~ComputedStyleWorkingSet()
+NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_over_record(StyleRecordRef record)
 {
-    ComputedValuesFFI::rust_computed_longhand_table_release(m_computed_longhand_table);
-}
-
-NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create()
-{
-    return adopt_ref(*new ComputedStyleWorkingSet);
-}
-
-NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_longhand_table(ComputedValuesFFI::ComputedLonghandTable* longhand_table)
-{
-    VERIFY(longhand_table);
-    return adopt_ref(*new ComputedStyleWorkingSet(longhand_table));
+    VERIFY(record.get());
+    return adopt_ref(*new ComputedStyleWorkingSet(move(record)));
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base_values_from(ComputedValues const& style)
 {
-    auto working_set = create();
     auto const& base = style.base_values();
-    // Seed the table with the previous drive's computed values so unevaluated longhands read
-    // and publish without reverse-materialization; the funnel overwrites what this drive
-    // evaluates. A borrowed record view seeds from its interned value span. The base always
-    // carries a table: property() has no other source for an unevaluated longhand's value.
-    if (auto const* table = base.computed_longhand_table()) {
-        ComputedValuesFFI::rust_computed_longhand_table_copy_from(working_set->m_computed_longhand_table, static_cast<ComputedValuesFFI::ComputedLonghandTable const*>(table));
-    } else {
-        auto longhand_values = base.computed_longhand_values();
-        VERIFY(!longhand_values.is_empty());
-        ComputedValuesFFI::rust_computed_longhand_table_copy_from_values(working_set->m_computed_longhand_table, longhand_values.data(), longhand_values.size());
-    }
-    // A fresh drive starts with nothing evaluated and re-records its own inheritance-dependent
-    // specified values; the flag bitmaps seed from the base style's published bitmaps, which a
-    // borrowed record view carries even though it owns no table.
-    ComputedValuesFFI::rust_computed_longhand_table_clear_seeded_state(working_set->m_computed_longhand_table);
-    auto importance = base.property_importance_bitmap();
-    auto inheritance = base.property_inheritance_bitmap();
-    ComputedValuesFFI::rust_computed_longhand_table_load_flag_bitmaps(working_set->m_computed_longhand_table, importance, inheritance);
-    for (auto const& entry : base.inheritance_dependent_specified_values())
-        ComputedValuesFFI::rust_computed_longhand_table_add_inheritance_dependent_value(working_set->m_computed_longhand_table, entry.property, entry.value);
+    // The base style's record holds every longhand's value, so an unevaluated longhand reads it in place.
+    auto working_set = create_over_record(base.record());
     working_set->set_display_before_box_type_transformation(base.display_before_box_type_transformation());
-    working_set->set_has_pseudo_element_styles(base.pseudo_element_style_mask());
     if (base.depends_on_viewport_metrics())
         working_set->set_depends_on_viewport_metrics();
     if (base.font_metrics_depend_on_viewport_metrics())
@@ -104,14 +73,12 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base
     return working_set;
 }
 
-NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_animation_update(ComputedValuesFFI::ComputedLonghandTable const* table, ComputedValuesFFI::AnimatedOverlay const* overlay)
+NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_animation_update(StyleEngineFFI::Record const* record, ComputedValuesFFI::AnimatedOverlay const* overlay)
 {
-    VERIFY(table);
-    auto* retained_table = const_cast<ComputedValuesFFI::ComputedLonghandTable*>(ComputedValuesFFI::rust_computed_longhand_table_retain(table));
-    auto working_set = create_with_longhand_table(retained_table);
-    working_set->m_computed_longhand_table_is_shared = true;
+    auto working_set = create_over_record(StyleRecordRef { record });
     if (overlay) {
         working_set->m_had_animated_post_compute_adjustment_property = ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Display))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Appearance))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Position))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Float))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::LineHeight))
@@ -122,22 +89,6 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_anima
         working_set->m_animated_properties = move(animated_properties);
     }
     return working_set;
-}
-
-void ComputedStyleWorkingSet::ensure_mutable_computed_longhand_table()
-{
-    if (!m_computed_longhand_table_is_shared)
-        return;
-    auto* table = ComputedValuesFFI::rust_computed_longhand_table_create();
-    ComputedValuesFFI::rust_computed_longhand_table_copy_from(table, m_computed_longhand_table);
-    ComputedValuesFFI::rust_computed_longhand_table_release(m_computed_longhand_table);
-    m_computed_longhand_table = table;
-    m_computed_longhand_table_is_shared = false;
-}
-
-void ComputedStyleWorkingSet::freeze_computed_longhand_table()
-{
-    ComputedValuesFFI::rust_computed_longhand_table_freeze(m_computed_longhand_table);
 }
 
 AnimatedProperties::AnimatedProperties()
@@ -163,21 +114,6 @@ AnimatedProperties::AnimatedProperties(ComputedValuesFFI::AnimatedOverlay const*
     : m_identity(s_next_animated_properties_identity.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
     , m_overlay(ComputedValuesFFI::rust_animated_overlay_clone_inherited(overlay))
 {
-}
-
-u64 longhand_wrappers_minted()
-{
-    return s_longhand_wrappers_minted;
-}
-
-void reset_longhand_wrappers_minted()
-{
-    s_longhand_wrappers_minted = 0;
-}
-
-void count_longhand_wrapper_mint()
-{
-    ++s_longhand_wrappers_minted;
 }
 
 AnimatedProperties const& ComputedStyleWorkingSet::animated_properties() const
@@ -226,26 +162,6 @@ StyleValue const& AnimatedProperties::property(PropertyID property_id) const
     return *wrapper;
 }
 
-void AnimatedProperties::set_property(PropertyID id, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition animated_property_result_of_transition, ComputedStyleWorkingSet::Inherited inherited)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-
-    ComputedValuesFFI::rust_animated_overlay_set(m_overlay, to_underlying(id), value->rust_style_value_data(),
-        inherited == ComputedStyleWorkingSet::Inherited::Yes,
-        animated_property_result_of_transition == AnimatedPropertyResultOfTransition::Yes);
-    m_wrapper_cache.set(id, move(value));
-}
-
-ReadonlyBytes ComputedStyleWorkingSet::property_importance_bitmap() const
-{
-    return { ComputedValuesFFI::rust_computed_longhand_table_importance_bits(m_computed_longhand_table), (number_of_longhand_properties + 7) / 8 };
-}
-
-ReadonlyBytes ComputedStyleWorkingSet::property_inheritance_bitmap() const
-{
-    return { ComputedValuesFFI::rust_computed_longhand_table_inheritance_bits(m_computed_longhand_table), (number_of_longhand_properties + 7) / 8 };
-}
-
 RefPtr<AnimatedProperties const> ComputedStyleWorkingSet::animated_properties_snapshot() const
 {
     return m_animated_properties;
@@ -259,20 +175,6 @@ ComputedValuesFFI::AnimatedOverlay const* ComputedStyleWorkingSet::animated_over
 bool ComputedStyleWorkingSet::has_animated_property(PropertyID property_id) const
 {
     return animated_properties().has_property(property_id);
-}
-
-bool ComputedStyleWorkingSet::has_pseudo_element_style(PseudoElement pseudo_element) const
-{
-    VERIFY(to_underlying(pseudo_element) < to_underlying(PseudoElement::KnownPseudoElementCount));
-    return metadata().pseudo_element_styles & (1ull << to_underlying(pseudo_element));
-}
-
-void ComputedStyleWorkingSet::set_has_pseudo_element_styles(u64 pseudo_element_styles)
-{
-    constexpr auto known_pseudo_element_count = to_underlying(PseudoElement::KnownPseudoElementCount);
-    if constexpr (known_pseudo_element_count < sizeof(u64) * 8)
-        VERIFY((pseudo_element_styles >> known_pseudo_element_count) == 0);
-    metadata().pseudo_element_styles |= pseudo_element_styles;
 }
 
 void ComputedStyleWorkingSet::set_depends_on_viewport_metrics()
@@ -324,6 +226,7 @@ void ComputedStyleWorkingSet::finish_animated_overlay_rust_mutation(Badge<StyleC
 bool ComputedStyleWorkingSet::requires_animated_post_compute_adjustments() const
 {
     return m_had_animated_post_compute_adjustment_property
+        || has_animated_property(PropertyID::Appearance)
         || has_animated_property(PropertyID::Display)
         || has_animated_property(PropertyID::Position)
         || has_animated_property(PropertyID::Float)
@@ -331,11 +234,6 @@ bool ComputedStyleWorkingSet::requires_animated_post_compute_adjustments() const
         || has_animated_property(PropertyID::OverflowX)
         || has_animated_property(PropertyID::OverflowY)
         || has_animated_property(PropertyID::TextAlign);
-}
-
-void ComputedStyleWorkingSet::prepare_for_animated_post_compute_adjustments(Badge<StyleComputer>)
-{
-    ensure_mutable_computed_longhand_table();
 }
 
 void ComputedStyleWorkingSet::set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
@@ -352,6 +250,7 @@ void ComputedStyleWorkingSet::install_animated_overlay(Badge<StyleComputer>, Com
 void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
 {
     m_animated_custom_properties.clear();
+    m_animated_custom_properties_trigger_restyle = true;
     if (!m_animated_properties)
         return;
 
@@ -364,7 +263,6 @@ void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
 
 NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_data)
 {
-    ++s_longhand_wrappers_minted;
     return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value_data)));
 }
 
@@ -373,15 +271,14 @@ StyleValue const& ComputedStyleWorkingSet::property(PropertyID property_id, With
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
 
     auto& cache = m_minted_wrappers;
-    // Without an animated overlay, a cached wrapper is always the effective value: the store
-    // funnels replace or invalidate the entry on every table write, and the recorded specified
-    // values invalidate it when they change.
+    // Without an animated overlay, a cached wrapper is always the effective value: the record
+    // the values are read from never changes.
     if (!m_animated_properties) {
         if (auto it = cache.find(property_id); it != cache.end())
             return *it->value;
     }
-    auto effective = ComputedValuesFFI::rust_computed_longhand_table_effective_value(
-        m_computed_longhand_table,
+    auto effective = ComputedValuesFFI::rust_style_record_effective_value(
+        m_record.get(),
         m_animated_properties ? m_animated_properties->overlay() : nullptr,
         to_underlying(property_id),
         return_animated_value == WithAnimationsApplied::Yes);
@@ -405,8 +302,8 @@ StyleValue const& ComputedStyleWorkingSet::property(PropertyID property_id, With
 StyleValueFFI::StyleValueData const* ComputedStyleWorkingSet::effective_property_data(PropertyID property_id, WithAnimationsApplied return_animated_value) const
 {
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
-    auto effective = ComputedValuesFFI::rust_computed_longhand_table_effective_value(
-        m_computed_longhand_table,
+    auto effective = ComputedValuesFFI::rust_style_record_effective_value(
+        m_record.get(),
         m_animated_properties ? m_animated_properties->overlay() : nullptr,
         to_underlying(property_id),
         return_animated_value == WithAnimationsApplied::Yes);
@@ -437,7 +334,7 @@ PreferredColorScheme ComputedStyleWorkingSet::color_scheme(PreferredColorScheme 
 
 CSSPixels normal_line_height(Gfx::FontPixelMetrics const& font_metrics)
 {
-    return CSSPixels { round_to<i32>(font_metrics.ascent) + round_to<i32>(font_metrics.descent) };
+    return CSSPixels { round_to<i32>(font_metrics.ascent) + round_to<i32>(font_metrics.descent) + round_to<i32>(font_metrics.line_gap) };
 }
 
 CSSPixels ComputedStyleWorkingSet::line_height(FontComputer const& font_computer) const
@@ -504,11 +401,13 @@ ComputedValuesFFI::FfiFontGroupBuildInputs ComputedStyleWorkingSet::font_group_b
     auto math_style = keyword_to_math_style(property(PropertyID::MathStyle).to_keyword()).release_value();
     return {
         .font_size_raw = font_size().raw_value(),
+        .font_size = font_size_for_lengths(),
         .line_height_used_raw = line_height(document.font_computer()).raw_value(),
         .font_variant_emoji = to_underlying(font_variant_emoji()),
         .font_ascent = metrics.ascent,
         .font_descent = metrics.descent,
         .font_x_height = metrics.x_height,
+        .font_cap_height = metrics.cap_height,
         .font_zero_advance = metrics.advance_of_ascii_zero,
         .first_available_font = &first_available_font,
         .font_cascade_list = font_list.ptr(),
@@ -534,6 +433,8 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
                 .font_width = font_width(),
                 .feature_values = font_resolution_feature_values(),
                 .font_feature_values_scope = tree_scope,
+                .font_oblique_angle = font_oblique_angle(),
+                .font_synthesis = font_synthesis(),
             });
         m_cached_computed_font_list_scope = tree_scope;
         VERIFY(!m_cached_computed_font_list->is_empty());
@@ -567,7 +468,12 @@ Optional<FontSizeAdjust> ComputedStyleWorkingSet::font_size_adjust() const
 
 CSSPixels ComputedStyleWorkingSet::font_size() const
 {
-    return CSSPixels { StyleValueFFI::rust_style_value_computed_length_value(effective_property_data(PropertyID::FontSize)) };
+    return CSSPixels { font_size_for_lengths() };
+}
+
+double ComputedStyleWorkingSet::font_size_for_lengths() const
+{
+    return StyleValueFFI::rust_style_value_computed_length_value(effective_property_data(PropertyID::FontSize));
 }
 
 Vector<ComputedFontFamily> ComputedStyleWorkingSet::computed_font_families() const
@@ -606,6 +512,33 @@ double ComputedStyleWorkingSet::font_weight() const
 Percentage ComputedStyleWorkingSet::font_width() const
 {
     return Percentage { StyleValueFFI::rust_style_value_computed_percentage(effective_property_data(PropertyID::FontWidth)) };
+}
+
+// https://drafts.csswg.org/css-fonts-4/#valdef-font-style-oblique-angle
+// "The lack of an <angle> represents 14deg."
+double ComputedStyleWorkingSet::font_oblique_angle() const
+{
+    auto const& font_style = property(PropertyID::FontStyle).as_font_style();
+    if (font_style.font_style() != FontStyleKeyword::Oblique)
+        return 14;
+    auto angle = font_style.angle();
+    if (!angle || !angle->is_angle())
+        return 14;
+    return angle->as_angle().angle().to_degrees();
+}
+
+// Which synthesis the font-synthesis longhands forbid, in the encoding of the style engine's font resolution requests.
+u8 ComputedStyleWorkingSet::font_synthesis() const
+{
+    u8 synthesis = 0;
+    if (property(PropertyID::FontSynthesisWeight).to_keyword() == Keyword::None)
+        synthesis |= StyleEngineFFI::FONT_SYNTHESIS_NO_WEIGHT;
+    auto style = property(PropertyID::FontSynthesisStyle).to_keyword();
+    if (style == Keyword::None)
+        synthesis |= StyleEngineFFI::FONT_SYNTHESIS_STYLE_NONE << StyleEngineFFI::FONT_SYNTHESIS_STYLE_SHIFT;
+    else if (style == Keyword::ObliqueOnly)
+        synthesis |= StyleEngineFFI::FONT_SYNTHESIS_STYLE_OBLIQUE_ONLY << StyleEngineFFI::FONT_SYNTHESIS_STYLE_SHIFT;
+    return synthesis;
 }
 
 int ComputedStyleWorkingSet::font_slope() const

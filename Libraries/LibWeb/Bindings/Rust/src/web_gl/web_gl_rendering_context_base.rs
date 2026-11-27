@@ -7,26 +7,27 @@
 //! https://registry.khronos.org/webgl/specs/latest/1.0/#5.14
 
 use ak::Utf16String;
-use libjs_rust::api::{Gc, Object, Trace};
+use libjs_rust::api::{Gc, MarkedVec, Object, Trace};
 
 use super::buffer_kind::BufferKind;
 use super::buffer_source::copy_of_first_numbers;
-use super::byte_ranges::gl_sizei_of_array_length;
 use super::constants::{
-    GL_ARRAY_BUFFER, GL_COLOR_ATTACHMENT0, GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, GL_DEPTH_ATTACHMENT,
-    GL_DEPTH_STENCIL, GL_DEPTH_STENCIL_ATTACHMENT, GL_DEPTH24_STENCIL8, GL_DRAW_FRAMEBUFFER, GL_ELEMENT_ARRAY_BUFFER,
-    GL_FRAGMENT_SHADER, GL_FRAMEBUFFER, GL_INFO_LOG_LENGTH, GL_INVALID_ENUM, GL_INVALID_OPERATION, GL_INVALID_VALUE,
-    GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER, GL_READ_FRAMEBUFFER, GL_RENDERBUFFER, GL_SHADER_SOURCE_LENGTH,
-    GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_3D, GL_TEXTURE_CUBE_MAP,
+    GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, GL_ACTIVE_UNIFORM_MAX_LENGTH, GL_ARRAY_BUFFER, GL_COLOR_ATTACHMENT0,
+    GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, GL_DEPTH_ATTACHMENT, GL_DEPTH_STENCIL, GL_DEPTH_STENCIL_ATTACHMENT,
+    GL_DEPTH24_STENCIL8, GL_DRAW_FRAMEBUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_FRAGMENT_SHADER, GL_FRAMEBUFFER,
+    GL_INFO_LOG_LENGTH, GL_INVALID_ENUM, GL_INVALID_OPERATION, GL_INVALID_VALUE, GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
+    GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS, GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER, GL_READ_FRAMEBUFFER,
+    GL_RENDERBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_3D, GL_TEXTURE_CUBE_MAP,
     GL_TEXTURE_CUBE_MAP_NEGATIVE_X, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
     GL_TEXTURE_CUBE_MAP_POSITIVE_X, GL_TEXTURE_CUBE_MAP_POSITIVE_Y, GL_TEXTURE_CUBE_MAP_POSITIVE_Z,
     GL_TRANSFORM_FEEDBACK_BUFFER, GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNPACK_COLORSPACE_CONVERSION_WEBGL,
-    GL_UNPACK_FLIP_Y_WEBGL, GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS,
-    GL_UNPACK_SKIP_ROWS, GL_VERTEX_ATTRIB_ARRAY_POINTER, GL_VERTEX_SHADER,
+    GL_UNPACK_FLIP_Y_WEBGL, GL_UNPACK_IMAGE_HEIGHT, GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL, GL_UNPACK_ROW_LENGTH,
+    GL_UNPACK_SKIP_IMAGES, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS, GL_VERTEX_ATTRIB_ARRAY_POINTER,
+    GL_VERTEX_SHADER,
 };
 use super::gl_string::{utf8_bytes, utf16_string_from_gl_string};
 use super::state::{
-    Binding, ContextState, MAX_WEBGL_DRAWING_BUFFER_DIMENSION, RenderingContext, Version, WebGLVersion,
+    Binding, ContextState, RenderingContext, Version, VertexAttribValueType, WebGLVersion, drawing_buffer_dimension,
 };
 use super::types::Float32List;
 use super::web_gl_active_info::WebGLActiveInfo;
@@ -41,7 +42,6 @@ use super::web_gl_texture::WebGLTexture;
 use super::web_gl_uniform_location::WebGLUniformLocation;
 use crate::bindings::conversions::CppInterface;
 use crate::bindings::interface::Ref;
-use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#WEBGLCONTEXTATTRIBUTES
@@ -56,12 +56,7 @@ pub(crate) struct WebGLContextAttributes {
     pub(crate) power_preference: WebGLPowerPreference,
     pub(crate) fail_if_major_performance_caveat: bool,
     pub(crate) desynchronized: bool,
-    /// https://immersive-web.github.io/webxr/#dom-webglcontextattributes-xrcompatible
-    pub(crate) xr_compatible: bool,
 }
-
-const ACTIVE_INFO_NAME_BUFFER_SIZE: usize = 256;
-const ACTIVE_INFO_NAME_BUFFER_GL_SIZE: i32 = gl_sizei_of_array_length(ACTIVE_INFO_NAME_BUFFER_SIZE);
 
 pub(crate) fn is_valid_framebuffer_binding_target(version: WebGLVersion, target: u32) -> bool {
     if target == GL_FRAMEBUFFER {
@@ -114,6 +109,18 @@ fn zeroed_gl_string_buffer(size_with_terminating_nul: i32) -> Vec<u8> {
     vec![0; size]
 }
 
+/// A buffer that holds the name of any active attribute or uniform of the program, with its terminating NUL: as long
+/// as GL reports for `pname`, ACTIVE_ATTRIBUTE_MAX_LENGTH or ACTIVE_UNIFORM_MAX_LENGTH.
+pub(super) fn active_name_buffer(context: &ContextState, program: u32, pname: u32) -> Vec<u8> {
+    let mut size = [0];
+    context.proxy.get_programiv(program, pname, &mut size);
+    zeroed_gl_string_buffer(size[0].max(1))
+}
+
+pub(super) fn gl_size_of_buffer(buffer: &[u8]) -> i32 {
+    i32::try_from(buffer.len()).expect("a name buffer is smaller than 2^31 bytes")
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the operations have the arguments of the GL functions"
@@ -127,12 +134,12 @@ impl<V: Version> RenderingContext<V> {
 
     pub(crate) fn drawing_buffer_width(&self, _: &mut CallContext) -> WebIdlResult<i32> {
         let (width, _) = ContextState::canvas(self).bitmap_size();
-        Ok(width.min(MAX_WEBGL_DRAWING_BUFFER_DIMENSION))
+        Ok(drawing_buffer_dimension(width))
     }
 
     pub(crate) fn drawing_buffer_height(&self, _: &mut CallContext) -> WebIdlResult<i32> {
         let (_, height) = ContextState::canvas(self).bitmap_size();
-        Ok(height.min(MAX_WEBGL_DRAWING_BUFFER_DIMENSION))
+        Ok(drawing_buffer_dimension(height))
     }
 
     pub(crate) fn get_context_attributes(&self, _: &mut CallContext) -> WebIdlResult<Option<WebGLContextAttributes>> {
@@ -165,10 +172,10 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         shader: Ref<WebGLShader>,
     ) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
-        let Some(shader_handle) = self.handle_of(shader) else {
+        let Some(shader_handle) = self.handle_of_program_or_shader(shader) else {
             return Ok(());
         };
 
@@ -206,7 +213,7 @@ impl<V: Version> RenderingContext<V> {
         index: u32,
         name: Utf16String,
     ) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
         self.proxy
@@ -416,7 +423,7 @@ impl<V: Version> RenderingContext<V> {
     }
 
     pub(crate) fn compile_shader(&self, _: &mut CallContext, shader: Ref<WebGLShader>) -> WebIdlResult<()> {
-        let Some(shader_handle) = self.handle_of(shader) else {
+        let Some(shader_handle) = self.handle_of_program_or_shader(shader) else {
             return Ok(());
         };
         self.proxy.compile_shader(shader_handle);
@@ -615,10 +622,10 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         shader: Ref<WebGLShader>,
     ) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
-        let Some(shader_handle) = self.handle_of(shader) else {
+        let Some(shader_handle) = self.handle_of_program_or_shader(shader) else {
             return Ok(());
         };
 
@@ -683,7 +690,7 @@ impl<V: Version> RenderingContext<V> {
 
     pub(crate) fn framebuffer_renderbuffer(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         target: u32,
         attachment: u32,
         renderbuffertarget: u32,
@@ -718,13 +725,13 @@ impl<V: Version> RenderingContext<V> {
         }
         self.proxy
             .framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer_handle);
-        bound_framebuffer.set_renderbuffer_attachment(attachment, renderbuffer);
+        bound_framebuffer.set_renderbuffer_attachment(cx.vm(), attachment, renderbuffer);
         Ok(())
     }
 
     pub(crate) fn framebuffer_texture2d(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         target: u32,
         attachment: u32,
         textarget: u32,
@@ -765,7 +772,7 @@ impl<V: Version> RenderingContext<V> {
         }
         self.proxy
             .framebuffer_texture2d(target, attachment, textarget, texture_handle, level);
-        bound_framebuffer.set_texture_attachment(attachment, texture, textarget, level);
+        bound_framebuffer.set_texture_attachment(cx.vm(), attachment, texture, textarget, level);
         Ok(())
     }
 
@@ -785,14 +792,14 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         index: u32,
     ) -> WebIdlResult<Option<Ref<WebGLActiveInfo>>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
 
-        let mut name = [0; ACTIVE_INFO_NAME_BUFFER_SIZE];
+        let mut name = active_name_buffer(self, program_handle, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH);
         let outputs = self
             .proxy
-            .get_active_attrib(program_handle, index, ACTIVE_INFO_NAME_BUFFER_GL_SIZE, &mut name);
+            .get_active_attrib(program_handle, index, gl_size_of_buffer(&name), &mut name);
         Ok(Some(WebGLActiveInfo::create(
             cx.vm(),
             active_info_name(&name, outputs.length),
@@ -807,14 +814,14 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         index: u32,
     ) -> WebIdlResult<Option<Ref<WebGLActiveInfo>>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
 
-        let mut name = [0; ACTIVE_INFO_NAME_BUFFER_SIZE];
+        let mut name = active_name_buffer(self, program_handle, GL_ACTIVE_UNIFORM_MAX_LENGTH);
         let outputs = self
             .proxy
-            .get_active_uniform(program_handle, index, ACTIVE_INFO_NAME_BUFFER_GL_SIZE, &mut name);
+            .get_active_uniform(program_handle, index, gl_size_of_buffer(&name), &mut name);
         Ok(Some(WebGLActiveInfo::create(
             cx.vm(),
             active_info_name(&name, outputs.length),
@@ -823,20 +830,26 @@ impl<V: Version> RenderingContext<V> {
         )))
     }
 
-    pub(crate) fn get_attached_shaders(
+    pub(crate) fn get_attached_shaders<'vm>(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext<'vm>,
         program: Ref<WebGLProgram>,
-    ) -> WebIdlResult<Option<Vec<Ref<WebGLShader>>>> {
-        if self.handle_of(program).is_none() {
+    ) -> WebIdlResult<Option<MarkedVec<'vm, Ref<WebGLShader>>>> {
+        if self.handle_of_program_or_shader(program).is_none() {
             return Ok(None);
         }
 
-        let attached_shaders = [
+        let attached_shaders = MarkedVec::with_capacity(cx.vm(), 2);
+        for shader in [
             program.attached_vertex_shader.get(),
             program.attached_fragment_shader.get(),
-        ];
-        Ok(Some(attached_shaders.into_iter().flatten().collect()))
+        ]
+        .into_iter()
+        .flatten()
+        {
+            attached_shaders.push(shader);
+        }
+        Ok(Some(attached_shaders))
     }
 
     pub(crate) fn get_attrib_location(
@@ -845,15 +858,10 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         name: Utf16String,
     ) -> WebIdlResult<i32> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(-1);
         };
         Ok(self.proxy.get_attrib_location(program_handle, &utf8_bytes(&name)))
-    }
-
-    pub(crate) fn make_xr_compatible(&self, _: &mut CallContext) -> WebIdlResult<WebIdlPromise> {
-        // SAFETY: The cell is that of this context.
-        Ok(unsafe { super::canvas::make_xr_compatible(self.context_ref().cell()) })
     }
 
     pub(crate) fn get_error(&self, _: &mut CallContext) -> WebIdlResult<u32> {
@@ -865,7 +873,7 @@ impl<V: Version> RenderingContext<V> {
         _: &mut CallContext,
         program: Ref<WebGLProgram>,
     ) -> WebIdlResult<Option<Utf16String>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
 
@@ -907,7 +915,7 @@ impl<V: Version> RenderingContext<V> {
         _: &mut CallContext,
         shader: Ref<WebGLShader>,
     ) -> WebIdlResult<Option<Utf16String>> {
-        let Some(shader_handle) = self.handle_of(shader) else {
+        let Some(shader_handle) = self.handle_of_program_or_shader(shader) else {
             return Ok(None);
         };
 
@@ -929,24 +937,10 @@ impl<V: Version> RenderingContext<V> {
         _: &mut CallContext,
         shader: Ref<WebGLShader>,
     ) -> WebIdlResult<Option<Utf16String>> {
-        let Some(shader_handle) = self.handle_of(shader) else {
+        if self.handle_of_program_or_shader(shader).is_none() {
             return Ok(None);
-        };
-
-        let mut shader_source_length = [0i32; 1];
-        self.proxy
-            .get_shaderiv(shader_handle, GL_SHADER_SOURCE_LENGTH, &mut shader_source_length);
-        let [shader_source_length] = shader_source_length;
-        if shader_source_length == 0 {
-            return Ok(Some(Utf16String::from_ascii(b"")));
         }
-
-        let mut shader_source = zeroed_gl_string_buffer(shader_source_length);
-        self.proxy
-            .get_shader_source(shader_handle, shader_source_length, &mut shader_source);
-        Ok(Some(utf16_string_from_gl_string(
-            &shader_source[..shader_source.len() - 1],
-        )))
+        Ok(Some(shader.source()))
     }
 
     pub(crate) fn get_uniform_location(
@@ -955,7 +949,7 @@ impl<V: Version> RenderingContext<V> {
         program: Ref<WebGLProgram>,
         name: Utf16String,
     ) -> WebIdlResult<Option<Ref<WebGLUniformLocation>>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
 
@@ -1065,14 +1059,36 @@ impl<V: Version> RenderingContext<V> {
     }
 
     pub(crate) fn link_program(&self, _: &mut CallContext, program: Ref<WebGLProgram>) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
         self.proxy.link_program(program_handle);
+        program.note_link();
         Ok(())
     }
 
     pub(crate) fn pixel_storei(&self, _: &mut CallContext, pname: u32, param: i32) -> WebIdlResult<()> {
+        let is_defined = match pname {
+            GL_PACK_ALIGNMENT
+            | GL_UNPACK_ALIGNMENT
+            | GL_UNPACK_FLIP_Y_WEBGL
+            | GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL
+            | GL_UNPACK_COLORSPACE_CONVERSION_WEBGL => true,
+            GL_PACK_ROW_LENGTH
+            | GL_PACK_SKIP_PIXELS
+            | GL_PACK_SKIP_ROWS
+            | GL_UNPACK_ROW_LENGTH
+            | GL_UNPACK_IMAGE_HEIGHT
+            | GL_UNPACK_SKIP_PIXELS
+            | GL_UNPACK_SKIP_ROWS
+            | GL_UNPACK_SKIP_IMAGES => self.is_webgl2(),
+            _ => false,
+        };
+        if !is_defined {
+            self.set_error(GL_INVALID_ENUM);
+            return Ok(());
+        }
+
         let mut unpack_state = self.unpack_state.get();
         match pname {
             GL_UNPACK_ALIGNMENT => {
@@ -1083,23 +1099,17 @@ impl<V: Version> RenderingContext<V> {
                 unpack_state.alignment = alignment;
             }
             GL_UNPACK_ROW_LENGTH => {
-                if self.is_webgl2()
-                    && let Ok(row_length) = usize::try_from(param)
-                {
+                if let Ok(row_length) = usize::try_from(param) {
                     unpack_state.row_length = row_length;
                 }
             }
             GL_UNPACK_SKIP_PIXELS => {
-                if self.is_webgl2()
-                    && let Ok(skip_pixels) = usize::try_from(param)
-                {
+                if let Ok(skip_pixels) = usize::try_from(param) {
                     unpack_state.skip_pixels = skip_pixels;
                 }
             }
             GL_UNPACK_SKIP_ROWS => {
-                if self.is_webgl2()
-                    && let Ok(skip_rows) = usize::try_from(param)
-                {
+                if let Ok(skip_rows) = usize::try_from(param) {
                     unpack_state.skip_rows = skip_rows;
                 }
             }
@@ -1162,11 +1172,12 @@ impl<V: Version> RenderingContext<V> {
         shader: Ref<WebGLShader>,
         source: Utf16String,
     ) -> WebIdlResult<()> {
-        let Some(shader_handle) = self.handle_of(shader) else {
+        let Some(shader_handle) = self.handle_of_program_or_shader(shader) else {
             return Ok(());
         };
 
         self.proxy.shader_source(shader_handle, &utf8_bytes(&source));
+        shader.set_source(source);
         Ok(())
     }
 
@@ -1367,7 +1378,7 @@ impl<V: Version> RenderingContext<V> {
     pub(crate) fn use_program(&self, _: &mut CallContext, program: Option<Ref<WebGLProgram>>) -> WebIdlResult<()> {
         let mut program_handle = 0;
         if let Some(program) = program {
-            let Some(handle) = self.handle_of(program) else {
+            let Some(handle) = self.handle_of_program_or_shader(program) else {
                 return Ok(());
             };
             program_handle = handle;
@@ -1379,7 +1390,7 @@ impl<V: Version> RenderingContext<V> {
     }
 
     pub(crate) fn validate_program(&self, _: &mut CallContext, program: Ref<WebGLProgram>) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
         self.proxy.validate_program(program_handle);
@@ -1387,16 +1398,19 @@ impl<V: Version> RenderingContext<V> {
     }
 
     pub(crate) fn vertex_attrib1f(&self, _: &mut CallContext, index: u32, x: f32) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib1f(index, x);
         Ok(())
     }
 
     pub(crate) fn vertex_attrib2f(&self, _: &mut CallContext, index: u32, x: f32, y: f32) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib2f(index, x, y);
         Ok(())
     }
 
     pub(crate) fn vertex_attrib3f(&self, _: &mut CallContext, index: u32, x: f32, y: f32, z: f32) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib3f(index, x, y, z);
         Ok(())
     }
@@ -1410,6 +1424,7 @@ impl<V: Version> RenderingContext<V> {
         z: f32,
         w: f32,
     ) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib4f(index, x, y, z, w);
         Ok(())
     }
@@ -1419,6 +1434,7 @@ impl<V: Version> RenderingContext<V> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib1fv(index, &values);
         Ok(())
     }
@@ -1428,6 +1444,7 @@ impl<V: Version> RenderingContext<V> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib2fv(index, &values);
         Ok(())
     }
@@ -1437,6 +1454,7 @@ impl<V: Version> RenderingContext<V> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib3fv(index, &values);
         Ok(())
     }
@@ -1446,6 +1464,7 @@ impl<V: Version> RenderingContext<V> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Float);
         self.proxy.vertex_attrib4fv(index, &values);
         Ok(())
     }
@@ -1460,10 +1479,7 @@ impl<V: Version> RenderingContext<V> {
         stride: i32,
         offset: i64,
     ) -> WebIdlResult<()> {
-        // If no WebGLBuffer is bound to the ARRAY_BUFFER target and offset is non-zero, an INVALID_OPERATION error will
-        // be generated.
-        if self.array_buffer_binding.get().is_none() && offset != 0 {
-            self.set_error(GL_INVALID_OPERATION);
+        if !self.validate_vertex_attrib_offset(offset) {
             return Ok(());
         }
 

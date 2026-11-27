@@ -15,7 +15,6 @@
 #include <LibJS/Runtime/JobCallback.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/PromiseCapability.h>
-#include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Script.h>
 #include <LibJS/ScriptAndModuleABIConversions.h>
@@ -50,8 +49,21 @@ static_assert(to_underlying(Promise::RejectionOperation::Handle) == JS_PROMISE_R
 static_assert(sizeof(Value) == sizeof(JSValue));
 static_assert(sizeof(JSScriptOrModule) == sizeof(ScriptOrModule));
 
-VM* VM::s_the = nullptr;
-static size_t s_vm_count = 0;
+#if defined(AK_OS_WINDOWS)
+static thread_local VM* s_the = nullptr;
+
+VM& VM::the()
+{
+    return *s_the;
+}
+
+bool VM::exists_on_this_thread()
+{
+    return s_the != nullptr;
+}
+#else
+constinit thread_local VM* VM::s_the = nullptr;
+#endif
 
 static JSVM* vm_abi(VM const& vm)
 {
@@ -122,7 +134,7 @@ static ImportedModulePayload imported_module_payload_from_abi(JSImportedModulePa
 
 static void append_utf16_string_to_sink(JSStringSink const& sink, Utf16View string)
 {
-    if (!string.has_ascii_storage()) {
+    if (!string.has_latin1_storage()) {
         sink.append(sink.context, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units());
         return;
     }
@@ -132,6 +144,18 @@ static void append_utf16_string_to_sink(JSStringSink const& sink, Utf16View stri
         code_units.unchecked_append(string.code_unit_at(index));
     sink.append(sink.context, code_units.data(), code_units.size());
 }
+
+// The goal of a spin of the event loop, which the runtime keeps on its own stack, and which holds no cell edges.
+struct SpinGoalCondition {
+    JSGoalCondition condition;
+    void* context;
+};
+
+}
+
+GC_UNTRACED_CAPTURE(JS::SpinGoalCondition);
+
+namespace JS {
 
 // The runtime calls the VM's host hooks and its agent through these, each with the facade's VM or agent as its data.
 struct HostHookThunks {
@@ -250,8 +274,8 @@ struct HostHookThunks {
     static void spin_event_loop_until(void* data, JSVM*, JSGoalCondition goal_condition, void* goal_context)
     {
         auto& agent = *static_cast<Agent*>(data);
-        agent.spin_event_loop_until(GC::create_function(VM::the().heap(), [goal_condition, goal_context] {
-            return goal_condition(goal_context);
+        agent.spin_event_loop_until(GC::create_function(VM::the().heap(), GC::captures(SpinGoalCondition { goal_condition, goal_context }), [](SpinGoalCondition& goal) {
+            return goal.condition(goal.context);
         }));
     }
 };
@@ -280,11 +304,10 @@ static constexpr JSVmHostHooks s_host_hook_thunks {
 
 NonnullRefPtr<VM> VM::create()
 {
-    // NOTE: We only allow a single VM instance per process.
+    // NOTE: We only allow a single VM instance per thread.
     //       However, test runners need to create and destroy VMs repeatedly,
     //       so we allow recreating the VM as long as the previous one was destroyed.
-    VERIFY(s_vm_count == 0);
-    ++s_vm_count;
+    VERIFY(!s_the);
 
     ErrorMessages error_messages {};
     error_messages[to_underlying(ErrorMessage::OutOfMemory)] = Utf16String::from_utf16(ErrorType::OutOfMemory.message());
@@ -297,11 +320,9 @@ VM::VM(ErrorMessages error_messages)
 {
     VERIFY(static_cast<void*>(m_engine_storage) == static_cast<void*>(this));
 
-    // The embedder's C++ cells live in the VM's heap, and a SharedArrayBuffer of a fixed length lives in memory that
-    // other processes can map.
+    // The embedder's C++ cells live in the VM's heap.
     JSVmOptions options {
-        .become_process_default_heap = true,
-        .shared_memory_shared_array_buffers = true,
+        .become_thread_default_heap = true,
     };
     VERIFY(js_vm_construct_at(m_engine_storage, sizeof(m_engine_storage), alignof(VM), &options));
 
@@ -314,6 +335,8 @@ VM::VM(ErrorMessages error_messages)
 
 VM::~VM()
 {
+    VERIFY(s_the == this);
+
     // The hooks and the agent may hold roots, which have to go before the heap does.
     js_vm_set_agent(vm_abi(*this), nullptr);
     js_vm_set_embedder(vm_abi(*this), nullptr, nullptr);
@@ -323,10 +346,7 @@ VM::~VM()
 
     js_vm_destroy_at(vm_abi(*this));
 
-    if (s_the == this)
-        s_the = nullptr;
-    --s_vm_count;
-    VERIFY(s_vm_count == 0);
+    s_the = nullptr;
 }
 
 void VM::unref() const
@@ -439,6 +459,21 @@ bool VM::debugging_enabled() const
     return js_debugger_is_enabled(vm_abi(*this));
 }
 
+void VM::request_interrupt()
+{
+    js_vm_request_interrupt(vm_abi(*this));
+}
+
+bool VM::interrupt_requested() const
+{
+    return js_vm_interrupt_requested(vm_abi(*this));
+}
+
+bool VM::is_waiting_on_shared_memory() const
+{
+    return js_vm_is_waiting_on_shared_memory(vm_abi(*this));
+}
+
 Debugger* VM::debugger()
 {
     if (!debugging_enabled())
@@ -470,6 +505,11 @@ PrimitiveString& VM::empty_string()
     return cell_ref_from_abi<PrimitiveString>(js_string_create_from_utf16_view(vm_abi(*this), utf16_view_to_abi(Utf16View {})));
 }
 
+Realm& VM::empty_realm()
+{
+    return cell_ref_from_abi<Realm>(js_vm_empty_realm(vm_abi(*this)));
+}
+
 Utf16String const& VM::error_message(ErrorMessage type) const
 {
     VERIFY(type < ErrorMessage::__Count);
@@ -478,11 +518,6 @@ Utf16String const& VM::error_message(ErrorMessage type) const
     VERIFY(!message.is_empty());
 
     return message;
-}
-
-bool VM::did_reach_stack_space_limit() const
-{
-    return js_vm_did_reach_stack_space_limit(vm_abi(*this));
 }
 
 void VM::push_execution_context_growing_the_stack(ExecutionContext& execution_context)
@@ -508,7 +543,24 @@ Vector<StackTraceElement> VM::stack_trace() const
     return stack_trace;
 }
 
-ThrowCompletionOr<Reference> VM::resolve_binding(Utf16FlyString const& name, Strict strict, GC::Ptr<Environment> environment)
+void VM::set_keeps_long_stack_traces(bool keeps_long_stack_traces)
+{
+    js_vm_set_keeps_long_stack_traces(vm_abi(*this), keeps_long_stack_traces);
+}
+
+Optional<SourceRange> VM::innermost_source_range() const
+{
+    return source_range_from_abi(js_vm_innermost_source_range(vm_abi(*this)));
+}
+
+Optional<SourceRange> VM::take_throw_site_of(Value value)
+{
+    auto throw_site = source_range_from_abi(js_vm_throw_site_of(vm_abi(*this), value_to_abi(value)));
+    js_vm_forget_throw_site_of(vm_abi(*this), value_to_abi(value));
+    return throw_site;
+}
+
+ThrowCompletionOr<GC::Ptr<Environment>> VM::resolve_binding(Utf16FlyString const& name, Strict strict, GC::Ptr<Environment> environment)
 {
     // 1. If env is not present or if env is undefined, then
     //    a. Set env to the running execution context's LexicalEnvironment.
@@ -519,10 +571,7 @@ ThrowCompletionOr<Reference> VM::resolve_binding(Utf16FlyString const& name, Str
     VERIFY(environment);
 
     // 4. Return ? GetIdentifierReference(env, name, strict).
-    auto base_environment = TRY(completion_from_abi<GC::Ptr<Environment>>(js_environment_resolve_binding(vm_abi(*this), utf16_view_to_abi(name.view()), strict == Strict::Yes, cell_to_abi<JSEnvironment>(*environment))));
-    if (!base_environment)
-        return Reference { Reference::BaseType::Unresolvable, name, strict };
-    return Reference { *base_environment, name, strict };
+    return completion_from_abi<GC::Ptr<Environment>>(js_environment_resolve_binding(vm_abi(*this), utf16_view_to_abi(name.view()), strict == Strict::Yes, cell_to_abi<JSEnvironment>(*environment)));
 }
 
 Completion VM::throw_engine_error(EngineErrorKind kind, Utf16View message)
@@ -537,7 +586,60 @@ Completion VM::throw_engine_error(EngineErrorKind kind, Utf16String message)
 
 void VM::set_source_text_syntaxes(StackFrameSyntax stack_frames, NativeFunctionSourceSyntax native_functions)
 {
-    js_vm_set_source_text_syntaxes(vm_abi(*this), to_underlying(stack_frames), to_underlying(native_functions));
+    js_vm_set_source_text_syntaxes(to_underlying(stack_frames), to_underlying(native_functions));
+}
+
+void VM::set_async_wait_hooks(AsyncWaitHooks hooks)
+{
+    JSAsyncWaitHooks abi_hooks {};
+    abi_hooks.data = new AsyncWaitHooks(hooks);
+    abi_hooks.wake = [](void* data, JSAsyncWaitQueue const* queue) {
+        auto& hooks = *static_cast<AsyncWaitHooks*>(data);
+        hooks.wake(hooks.data, reinterpret_cast<AsyncWaitQueue const*>(queue));
+    };
+    abi_hooks.destroy = [](void* data) {
+        auto* hooks = static_cast<AsyncWaitHooks*>(data);
+        hooks->destroy(hooks->data);
+        delete hooks;
+    };
+    abi_hooks.enqueue_resolution = [](void* data, JSVM*, u64 id, JSRealm* realm) {
+        auto& hooks = *static_cast<AsyncWaitHooks*>(data);
+        hooks.enqueue_resolution(hooks.data, id, *reinterpret_cast<Realm*>(realm));
+    };
+    abi_hooks.schedule_timeout = [](void* data, JSVM*, u64 id, JSRealm* realm, double milliseconds) {
+        auto& hooks = *static_cast<AsyncWaitHooks*>(data);
+        return hooks.schedule_timeout(hooks.data, id, *reinterpret_cast<Realm*>(realm), milliseconds);
+    };
+    abi_hooks.cancel_timeout = [](void* data, JSVM*, JSRealm* realm, i32 timer) {
+        auto& hooks = *static_cast<AsyncWaitHooks*>(data);
+        hooks.cancel_timeout(hooks.data, *reinterpret_cast<Realm*>(realm), timer);
+    };
+    js_vm_set_async_wait_hooks(vm_abi(*this), &abi_hooks);
+}
+
+void VM::dispatch_async_wait_queue(AsyncWaitQueue const* queue)
+{
+    js_async_wait_queue_dispatch(reinterpret_cast<JSAsyncWaitQueue const*>(queue));
+}
+
+void VM::release_async_wait_queue(AsyncWaitQueue const* queue)
+{
+    js_async_wait_queue_release(reinterpret_cast<JSAsyncWaitQueue const*>(queue));
+}
+
+void VM::resolve_async_wait(u64 id)
+{
+    js_vm_resolve_async_wait(vm_abi(*this), id);
+}
+
+void VM::timeout_async_wait(u64 id)
+{
+    js_vm_timeout_async_wait(vm_abi(*this), id);
+}
+
+void VM::async_wait_timer_fired(u64 id)
+{
+    js_vm_async_wait_timer_fired(vm_abi(*this), id);
 }
 
 void VM::set_agent(OwnPtr<Agent> agent)
@@ -581,9 +683,10 @@ ScriptOrModule VM::get_active_script_or_module() const
     // 2. Let ec be the topmost execution context on the execution context stack whose ScriptOrModule component is not null.
     ScriptOrModule script_or_module = Empty {};
     for_each_execution_context_top_to_bottom([&](ExecutionContext const& execution_context) {
-        if (execution_context.script_or_module.has<Empty>())
+        auto execution_context_script_or_module = execution_context.script_or_module();
+        if (execution_context_script_or_module.has<Empty>())
             return true;
-        script_or_module = execution_context.script_or_module;
+        script_or_module = execution_context_script_or_module;
         return false;
     });
 

@@ -6,31 +6,25 @@
 
 //! # LibJS
 //!
-//! LibJS's frontend and runtime. The frontend parses JavaScript into an AST and compiles it to bytecode, which the
+//! LibJS's frontend and runtime. The frontend parses JavaScript into a syntax tree and compiles it to bytecode, which the
 //! runtime runs in the Flap-generated interpreter, on cells allocated from LibGC.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! Source code (UTF-16)
+//! Source code (Latin-1 or UTF-16)
 //!     │
 //!     ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │  Lexer (lexer.rs)                                   │
-//! │  Tokenizes UTF-16 source into Token stream          │
+//! │  Parser (parser/)                                   │
+//! │  Lexes and parses into flat columns, analyzes       │
+//! │  scopes, and resolves identifiers                   │
 //! └──────────────────────┬──────────────────────────────┘
-//!                        │ tokens
+//!                        │ syntax tree (ast.rs)
 //!                        ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │  Parser (parser.rs + parser/*.rs)                   │
-//! │  Recursive descent with precedence climbing         │
-//! │  Builds AST (ast.rs)                                │
-//! └──────────────────────┬──────────────────────────────┘
-//!                        │ AST
-//!                        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │  Codegen (bytecode/codegen.rs)                      │
-//! │  Walks AST, emits bytecode via Generator            │
+//! │  Codegen (bytecode/codegen/)                        │
+//! │  Sweeps the rows of the tree, emits bytecode        │
 //! └──────────────────────┬──────────────────────────────┘
 //!                        │ assembled bytecode
 //!                        ▼
@@ -46,16 +40,12 @@
 //! - `host.rs` — Functions every embedding runtime provides to the frontend
 //! - `token.rs` — Token types
 //! - `tokenize.rs` — Tokens of a source without parsing it, for syntax highlighting
-//! - `lexer.rs` — Tokenizer: UTF-16 input → Token stream
-//! - `parser.rs` — Parser state, helpers, token consumption
-//! - `parser/expressions.rs` — Expression parsing (precedence climbing)
-//! - `parser/statements.rs` — Statement parsing (if, for, while, etc.)
-//! - `parser/declarations.rs` — Functions, classes, variables, modules
-//! - `ast.rs` — AST type definitions
+//! - `lexer.rs` — Tokenizer: UTF-16 input → Token stream, for tokenize.rs
+//! - `parser/` — Parse jobs and what is kept of them; the parser, the columns of its syntax tree, scope analysis and
+//!   identifier resolution are the `libjs_parser` crate (Libraries/LibJS/Parser/Rust)
+//! - `ast.rs` — The syntax tree and the typed views that everything after the parser reads it through
 //! - `bytecode/` — Bytecode generator, instruction types, and dumper
-//! - `bytecode_cache.rs` — Serialization of compiled programs for the bytecode cache
 //! - `breakpoint_positions.rs` — Where in a source a debugger can stop
-//! - `scope_collector.rs` — Scope analysis
 //! - `interpreter/`, `runtime/`, `gc/`, `layout/`, `embedding/` — The runtime and its embedding ABI
 
 #[cfg(feature = "allocator")]
@@ -99,10 +89,8 @@ pub mod ast_dump;
 #[cfg(not(test))]
 pub mod breakpoint;
 pub mod breakpoint_positions;
-#[cfg(not(test))]
 pub mod build_configuration;
 pub mod bytecode;
-pub mod bytecode_cache;
 pub mod compile;
 #[cfg(not(test))]
 pub mod console;
@@ -117,8 +105,7 @@ pub mod embedding;
 pub mod fast_hash;
 #[cfg(not(test))]
 pub mod frontend_host;
-#[cfg(not(test))]
-pub mod futex;
+#[cfg(any(not(test), target_os = "linux"))]
 #[cfg(not(test))]
 pub mod gc;
 #[cfg(not(test))]
@@ -128,52 +115,64 @@ pub mod host;
 pub mod interpreter;
 #[cfg(all(not(test), feature = "jit"))]
 pub mod jit;
+#[cfg(all(feature = "jit", windows, not(target_arch = "x86_64")))]
+compile_error!("the JIT supports Windows on x86-64 only: build without the jit feature (ENABLE_JS_JIT=OFF)");
 // NB: Without the JIT, the runtime sees the same interface to it, with nothing behind it.
 #[cfg(all(not(test), not(feature = "jit")))]
 #[path = "jit/disabled.rs"]
 pub mod jit;
+// NB: The thread pool of the compiles and the options of the JIT use nothing of the runtime, so they are part of a
+//     test build, which `jit` is not.
+#[cfg(feature = "jit")]
+pub mod jit_compile_pool;
+#[cfg(feature = "jit")]
+pub mod jit_options;
 #[cfg(not(test))]
 pub mod layout;
 #[cfg(not(test))]
 pub mod layout_forward;
+// NB: The tests build the layout module with the build script's stand-ins for the rest of the crate.
+#[cfg(test)]
+#[allow(dead_code)]
+mod layout;
+#[cfg(test)]
+#[path = "../generate/layout_forward.rs"]
+mod layout_forward;
 pub mod lexer;
 #[cfg(not(test))]
 pub mod lexical_path;
 pub mod parser;
-#[cfg(not(test))]
 pub mod parser_error;
 #[cfg(not(test))]
 pub mod random;
 #[cfg(not(test))]
 pub mod runtime;
-pub mod scope_collector;
 #[cfg(not(test))]
 pub mod script;
 #[cfg(not(test))]
 pub mod simdjson;
+pub mod slice_block;
 #[cfg(not(test))]
 pub mod source_code;
 #[cfg(not(test))]
 pub mod source_range;
+pub mod source_text;
 #[cfg(not(test))]
 pub mod standard_output;
+pub mod terminal;
 pub mod token;
 pub mod tokenize;
 #[cfg(not(test))]
 pub mod unicode;
-#[cfg(not(test))]
 pub mod utf16;
 #[cfg(not(test))]
 pub mod utilities;
+mod work_zone;
 
 #[cfg(test)]
 mod test_host;
 
-/// Convert a `usize` to `u32`, panicking if the value exceeds `u32::MAX`.
-/// Prefer this over `as u32` which silently truncates on 64-bit platforms.
-pub(crate) fn u32_from_usize(value: usize) -> u32 {
-    u32::try_from(value).expect("value exceeds u32::MAX")
-}
+pub(crate) use libjs_parser::u32_from_usize;
 
 #[cfg(not(test))]
 mod layout_static_assertions {

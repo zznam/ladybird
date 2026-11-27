@@ -16,6 +16,8 @@
 #include <LibMain/Main.h>
 #include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/RemoteVideoDecoder.h>
+#include <LibMediaCodecs/FFmpeg/BundledFFmpeg.h>
+#include <LibMediaCodecs/FFmpeg/MallocTuning.h>
 #include <MediaServer/ConnectionFromClient.h>
 #include <MediaServer/Sandbox.h>
 
@@ -26,6 +28,8 @@
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
+
+    Media::FFmpeg::set_fixed_mmap_threshold();
 
     int crash_report_fd = -1;
     StringView mach_server_name;
@@ -58,9 +62,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
+    // FFmpeg's libraries load before the sandbox would keep them from reading their files, and the system library's
+    // dependencies make syscalls the sandbox will not allow.
+    TRY(Media::FFmpeg::load_bundled_ffmpeg());
 #if defined(AK_OS_LINUX)
-    // The system library's dependencies make syscalls the sandbox will not allow, so it loads first.
-    (void)Media::FFmpeg::SystemFFmpeg::the();
+    Media::FFmpeg::SystemFFmpeg::load();
 #endif
 
     Media::install_video_decoders({ Media::remote_video_decoders(), Media::ffmpeg_video_decoders() });
@@ -76,9 +82,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Audio::ClientConnection::set_transport_factory([client] {
         return client->request_audio_server_transport();
     });
-    Media::RemoteVideoDecoder::set_transport_requester([client](auto callback) {
-        client->request_video_decoder_server_transport(move(callback));
-    });
+    Media::RemoteVideoDecoder::set_server_broker(
+        [client](auto callback) { client->request_video_decoder_server_transport(move(callback)); },
+        [client] { client->report_unresponsive_video_decoder_server(); });
 
     if (stats_log)
         stats_log->start_sampling();

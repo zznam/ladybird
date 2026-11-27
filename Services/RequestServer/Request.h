@@ -62,6 +62,7 @@ public:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext,
         Optional<Requests::RequestTransferLeaseKey>,
         Optional<u32> address_selection_hint,
         bool notify_on_cache_miss);
@@ -85,7 +86,8 @@ public:
         ByteString method,
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
-        HTTP::Cookie::IncludeCredentials include_credentials);
+        HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext);
 
     static NonnullOwnPtr<Request> import(
         u64 request_id,
@@ -103,7 +105,8 @@ public:
 
     static void set_performance_monitor_enabled(bool);
     static Vector<Requests::NetworkUsage> take_network_usage();
-    void set_performance_origin(i32 process_id, u64 page_id);
+    static void add_network_usage(Requests::NetworkUsage const&);
+    void set_performance_origin(int client_id, u64 page_id);
     void sample_network_usage();
 
     u64 request_id() const { return m_request_id; }
@@ -127,6 +130,9 @@ public:
     bool notify_retrieved_http_cookie(Badge<ControlConnectionFromClient>, u64 cookie_request_id, StringView cookie);
     bool notify_stored_response_cookies_and_hsts_policy(Badge<ControlConnectionFromClient>, u64 store_request_id);
     void notify_fetch_complete(Badge<ConnectionFromClient>, int result_code);
+
+    // Tells the client how much of the request body has been sent.
+    void did_send_request_body_bytes(u64 bytes_sent);
     void retry_after_aia(Badge<ConnectionFromClient>);
     AIACollector* aia_collector() const { return m_aia_collector.ptr(); }
 
@@ -206,6 +212,7 @@ private:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext,
         Optional<Requests::RequestTransferLeaseKey> = {});
 
     Request(
@@ -226,12 +233,15 @@ private:
     void handle_serve_substitution_state();
     void handle_dns_lookup_state();
     void continue_after_dns_lookup();
+    void set_curl_resolve_list(Optional<ByteString> host_entry);
     StringView connect_host() const;
     void reset_for_retry();
     void update_alternative_services();
     bool should_retry_without_alternative_service(int curl_result_code) const;
     u16 connect_port() const;
     void handle_retrieve_cookie_state();
+    bool configure_certificate_verification();
+    bool may_rely_on_certificate_exception() const;
     void handle_connect_state();
     void handle_fetch_state();
     void handle_read_imported_state();
@@ -246,8 +256,8 @@ private:
     static size_t on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data);
     static size_t on_data_received(void* buffer, size_t size, size_t nmemb, void* user_data);
 
-    // A state change, response bytes from curl, or bytes written to the cache entry count as progress — and a
-    // request waiting on the cache entry this request holds open judges by it whether this request has stalled.
+    // A state change or response bytes from the network count as progress, and a request waiting on the cache entry
+    // this request holds open judges by it whether this request has stalled.
     void mark_activity() { m_last_activity_time = MonotonicTime::now(); }
 
     ErrorOr<void> detach_curl_handle_from_multi();
@@ -265,8 +275,15 @@ private:
     bool defer_until_response_cookies_and_hsts_policy_are_stored(Function<void()> continuation);
     void request_response_storage(ControlConnectionFromClient&);
     void handle_fetch_complete(int result_code);
-    void send_headers_to_client(Optional<IPC::File> javascript_bytecode = {}, u64 javascript_bytecode_size = 0, Optional<u64> javascript_bytecode_cache_vary_key = {});
+    void send_headers_to_client();
     ErrorOr<void> write_queued_bytes_without_blocking();
+    void write_to_disk_cache(ReadonlyBytes);
+
+    enum class DiskCacheEntryOutcome : u8 {
+        Complete,
+        Incomplete,
+    };
+    void close_disk_cache_entry(DiskCacheEntryOutcome);
 
     virtual bool is_revalidation_request() const override;
     ErrorOr<void> revalidation_failed();
@@ -333,6 +350,8 @@ private:
 
     NonnullRefPtr<Resolver> m_resolver;
     RefPtr<DNS::LookupResult const> m_dns_result;
+    bool m_proxy_host_resolved { false };
+    Optional<HTTP::Proxy> m_resolved_proxy;
     Optional<HTTP::Proxy> m_proxy;
     CacheLevel m_connect_cache_level { CacheLevel::ResolveOnly };
 
@@ -343,14 +362,18 @@ private:
     MonotonicTime m_last_activity_time { MonotonicTime::now() };
     NonnullRefPtr<HTTP::HeaderList> m_request_headers;
     ByteBuffer m_request_body;
+    u64 m_reported_request_body_bytes { 0 };
+    Optional<MonotonicTime> m_last_request_body_report_time;
 
     HTTP::Cookie::IncludeCredentials m_include_credentials { HTTP::Cookie::IncludeCredentials::Yes };
+    HTTP::Cookie::SameSiteContext m_same_site_context;
 
     Optional<AlternativeService> m_alternative_service;
     bool m_alternative_services_disabled { false };
 
     Optional<u32> m_status_code;
     Optional<String> m_reason_phrase;
+    ByteString m_http_version;
 
     NonnullRefPtr<HTTP::HeaderList> m_response_headers;
     // Cache the first spelling of each header name to avoid repeated HeaderList searches.
@@ -402,6 +425,7 @@ private:
         RefPtr<Core::Notifier> body_notifier;
         RefPtr<Core::Notifier> status_notifier;
         bool body_ended { false };
+        bool may_rely_on_certificate_exception { false };
         ByteBuffer status_bytes;
         Optional<Requests::RequestTimingInfo> timing_info;
         Optional<Requests::NetworkError> network_error;

@@ -47,6 +47,8 @@ pub struct SetPrototype {
 
 define_object_class!(SetPrototype, extends: [Object], methods: {
     initialize: SetPrototype::initialize,
+    // NB: The field of the prototype only caches its values function.
+    has_internal_slots: Some(false),
     ..ORDINARY_OBJECT_METHODS
 });
 
@@ -60,18 +62,16 @@ fn current_realm(vm: &Vm) -> Gc<Realm> {
 
 impl SetPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<SetPrototype> {
-        realm.create_object(
-            vm,
-            SetPrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-                values_function: Cell::new(None),
-            },
-        )
+        realm.create_object(vm, |_| SetPrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            values_function: Cell::new(None),
+        })
     }
 
     /// The original Set.prototype.values, which is also the original Set.prototype.keys and

@@ -49,6 +49,29 @@ const FRAME_SIDES_IN_PHYSICAL_PLANE: [[u8; 4]; 5] = [
 /// The frame side that each physical side lies on, indexed by the physical side.
 const PHYSICAL_SIDES_IN_FRAME: [[u8; 4]; 5] = [[0, 1, 2, 3], [3, 0, 1, 2], [3, 2, 1, 0], [3, 0, 1, 2], [1, 2, 3, 0]];
 
+/// The widths of the sides of a box, such as its borders or paddings, in a frame or in the physical plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Sides {
+    pub(crate) top: CssPixels,
+    pub(crate) right: CssPixels,
+    pub(crate) bottom: CssPixels,
+    pub(crate) left: CssPixels,
+}
+
+impl Sides {
+    /// The sides, which frame `from` holds, as frame `to` holds them.
+    #[inline]
+    pub(crate) fn in_frame(self, from: Frame, to: Frame) -> Self {
+        let [top, right, bottom, left] = from.sides_in([self.top, self.right, self.bottom, self.left], to);
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+}
+
 /// The frame of a writing mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Frame(u8);
@@ -171,6 +194,52 @@ impl Frame {
             return rect;
         }
         other.rect_from_physical(self.rect_to_physical(rect, container_size), container_size)
+    }
+
+    /// Maps an offset in this frame to the physical plane, as the corner of an empty rect at the origin of an empty box
+    /// maps.
+    pub(crate) fn offset_to_physical(self, offset: FfiCssPixelPoint) -> FfiCssPixelPoint {
+        let corner = self.rect_to_physical(
+            CssPixelRect::new(offset.x, offset.y, CssPixels::default(), CssPixels::default()),
+            FfiCssPixelSize::default(),
+        );
+        FfiCssPixelPoint {
+            x: corner.x,
+            y: corner.y,
+        }
+    }
+
+    /// Maps a physical offset to this frame.
+    pub(crate) fn offset_from_physical(self, offset: FfiCssPixelPoint) -> FfiCssPixelPoint {
+        let corner = self.rect_from_physical(
+            CssPixelRect::new(offset.x, offset.y, CssPixels::default(), CssPixels::default()),
+            FfiCssPixelSize::default(),
+        );
+        FfiCssPixelPoint {
+            x: corner.x,
+            y: corner.y,
+        }
+    }
+
+    /// The physical half-plane before the block-end edge of a content box whose contents use this frame and whose
+    /// physical size is `content_size`, relative to that content box.
+    pub(crate) fn half_plane_before_block_end(self, content_size: FfiCssPixelSize) -> CssPixelRect {
+        let extent = CssPixels::from_integer((crate::css::css_pixels::MAX_INTEGER_VALUE / 4) as i64);
+        let block_size = if self.is_transposed() {
+            content_size.width
+        } else {
+            content_size.height
+        };
+        self.rect_to_physical(
+            CssPixelRect::new(-extent, -extent, extent * 2, extent + block_size),
+            content_size,
+        )
+    }
+
+    /// Maps a physical size to this frame.
+    #[inline]
+    pub(crate) fn size_from_physical(self, size: FfiCssPixelSize) -> FfiCssPixelSize {
+        self.size_to_physical(size.width, size.height)
     }
 
     /// Maps a size in this frame to the physical plane.
@@ -318,49 +387,114 @@ impl ContainingBlockConstraints {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PackedOptionalCssPixels(i32);
+
+impl PackedOptionalCssPixels {
+    const NONE_RAW_VALUE: i32 = i32::MIN;
+
+    pub(crate) fn get(self) -> Option<CssPixels> {
+        (self.0 != Self::NONE_RAW_VALUE).then(|| CssPixels::from_raw(self.0))
+    }
+
+    pub(crate) fn is_none(self) -> bool {
+        self.0 == Self::NONE_RAW_VALUE
+    }
+}
+
+impl Default for PackedOptionalCssPixels {
+    fn default() -> Self {
+        Self(Self::NONE_RAW_VALUE)
+    }
+}
+
+impl From<Option<CssPixels>> for PackedOptionalCssPixels {
+    fn from(value: Option<CssPixels>) -> Self {
+        match value {
+            Some(pixels) => Self(pixels.raw_value().max(Self::NONE_RAW_VALUE + 1)),
+            None => Self::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RootSizingDirectives {
-    pub(crate) forced_content_inline_size: Option<CssPixels>,
-    pub(crate) forced_content_block_size: Option<CssPixels>,
-    pub(crate) forced_min_border_box_block_size: Option<CssPixels>,
-    // Input-only: the parent block formatting context supplies the inline size it resolved while
-    // positioning an independent child, so the child's run prelude can commit it without resolving it again.
-    pub(crate) block_parent_resolved_content_inline_size: Option<CssPixels>,
-    // Input-only: the table formatting context supplies the cell's intrinsic block padding
-    // (the vertical-alignment stretch) before laying out the cell's contents.
-    pub(crate) table_cell_intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
+    // Input-only: a fieldset's content wrapper fills the fieldset's definite content block size.
+    pub(crate) forced_content_block_size: PackedOptionalCssPixels,
+    pub(crate) forced_min_border_box_block_size: PackedOptionalCssPixels,
+    // Input-only: a flex container that sizes a table wrapper along the table's inline axis tells the table box the
+    // border box inline size it takes.
+    pub(crate) forced_table_box_border_box_inline_size: PackedOptionalCssPixels,
     // Input-only: the wrapper's BFC tells the table formatting context where the table box's
     // content box sits in the wrapper, so rows and row groups (whose containing block is the
     // wrapper) can be placed in wrapper coordinates.
-    pub(crate) table_box_content_block_offset_in_wrapper: Option<CssPixels>,
-    pub(crate) adopt_automatic_content_block_size: bool,
-    // Input-only: a flex item lays out its content against the block size transferred through its aspect ratio, then
-    // takes this block size, which the automatic minimum size grew to fit the content.
-    pub(crate) content_block_size_after_inside_layout: Option<CssPixels>,
-    pub(crate) flex_self_block_size_resolution_space: Option<AvailableSpace>,
-    pub(crate) float_avoidance_inline_size: Option<CssPixels>,
+    pub(crate) table_box_content_block_offset_in_wrapper: PackedOptionalCssPixels,
+    pub(crate) content_block_size_after_run: ContentBlockSizeAfterRun,
+    // Input-only: how far the run of a table cell moves the contents of its root along the block axis, to align them
+    // in the block size the rows it spans give it after the run (see ContentBlockSizeAfterRun::Given).
+    pub(crate) table_cell_contents_block_offset: CssPixels,
     pub(crate) outer_float_intrusion_before_list_item_children: inline_formatting_context::SpaceUsedByFloats,
     pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
+    pub(crate) root_is_measured_for_its_content_block_size: bool,
+    // Input-only: MathML layout lays out an embellished operator with the size its core operator should stretch to
+    // cover.
+    pub(crate) math_stretch_size_constraint: Option<MathStretchSizeConstraint>,
 }
 
+/// The content block size the root of an item's run takes once its contents are laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContentBlockSizeAfterRun {
+    /// The one its container handed it.
+    #[default]
+    HandedOver,
+    /// Its automatic content block size.
+    Automatic,
+    /// This one, once its contents are laid out against the one its container handed it: a flex or grid item laid out
+    /// against the block size transferred through its aspect ratio takes the one its automatic minimum size grew to
+    /// fit the content, and a table cell takes the block size of the rows it spans.
+    Given(CssPixels),
+}
+
+/// The size that MathML layout asks the core operator of an embellished operator to stretch to cover.
+// https://w3c.github.io/mathml-core/#box-model
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathStretchSizeConstraint {
+    /// The ink line-ascent and ink line-descent that a core operator stretched along the block axis should cover.
+    Block { ascent: CssPixels, descent: CssPixels },
+    /// The target size that a core operator stretched along the inline axis should cover.
+    Inline(CssPixels),
+    /// AD-HOC: A block stretch size constraint that also covers the in-flow children of the embellished operators
+    ///         it passes through. It stands in for laying out an embellished operator with the block stretch size
+    ///         constraint (0, 0) and then with its own ink line-ascent and ink line-descent, as a box is laid out
+    ///         only once in a run.
+    BlockCoveringContent { ascent: CssPixels, descent: CssPixels },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ParticipationInParentFormattingContext {
     BlockLevel,
-    Float,
+    /// A float, which its parent block formatting context sizes against the floats beside it before the run and places
+    /// after it. The run lays the float out from its own origin.
+    Float {
+        /// Whether the float is a flex container that resolves its own automatic block size in its available space,
+        /// which its parent finds ahead of the float's inline size.
+        flex_container_resolves_its_own_automatic_block_size: bool,
+    },
     AtomicInline,
-    AbsolutelyPositioned(abspos_inputs::AbsposLayoutInputs),
+    AbsolutelyPositioned(std::sync::Arc<abspos_inputs::AbsposLayoutInputs>),
     Item,
     Root,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LayoutInput {
     pub(crate) available_space: AvailableSpace,
     pub(crate) containing_block_constraints: ContainingBlockConstraints,
-    pub(crate) content_box_position_in_bfc_root: Option<FfiCssPixelPoint>,
     pub(crate) sizing: RootSizingDirectives,
     pub(crate) participation: ParticipationInParentFormattingContext,
 }
+
+const _: () = assert!(size_of::<LayoutInput>() <= 144);
 
 impl LayoutInput {
     pub(crate) fn new(
@@ -371,19 +505,8 @@ impl LayoutInput {
         Self {
             available_space,
             containing_block_constraints,
-            content_box_position_in_bfc_root: None,
             sizing: RootSizingDirectives::default(),
             participation,
         }
-    }
-
-    pub(crate) fn with_forced_sizes(
-        mut self,
-        forced_content_inline_size: CssPixels,
-        forced_content_block_size: CssPixels,
-    ) -> Self {
-        self.sizing.forced_content_inline_size = Some(forced_content_inline_size);
-        self.sizing.forced_content_block_size = Some(forced_content_block_size);
-        self
     }
 }

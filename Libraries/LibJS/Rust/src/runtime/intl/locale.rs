@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{GcCell, define_cell};
-use crate::gc::gc_ref_cell::GcRefCell;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
@@ -30,23 +29,23 @@ use crate::utf16::Utf16View;
 pub struct Locale {
     base: Object,
     #[gc(untraced)]
-    locale: GcRefCell<Utf16String>, // [[Locale]]
+    locale: RefCell<Utf16String>, // [[Locale]]
     #[gc(untraced)]
-    calendar: GcRefCell<Option<Utf16String>>, // [[Calendar]]
+    calendar: RefCell<Option<Utf16String>>, // [[Calendar]]
     #[gc(untraced)]
-    case_first: GcRefCell<Option<Utf16String>>, // [[CaseFirst]]
+    case_first: RefCell<Option<Utf16String>>, // [[CaseFirst]]
     #[gc(untraced)]
-    collation: GcRefCell<Option<Utf16String>>, // [[Collation]]
+    collation: RefCell<Option<Utf16String>>, // [[Collation]]
     #[gc(untraced)]
-    first_day_of_week: GcRefCell<Option<Utf16String>>, // [[FirstDayOfWeek]]
+    first_day_of_week: RefCell<Option<Utf16String>>, // [[FirstDayOfWeek]]
     #[gc(untraced)]
-    hour_cycle: GcRefCell<Option<Utf16String>>, // [[HourCycle]]
+    hour_cycle: RefCell<Option<Utf16String>>, // [[HourCycle]]
     #[gc(untraced)]
-    numbering_system: GcRefCell<Option<Utf16String>>, // [[NumberingSystem]]
+    numbering_system: RefCell<Option<Utf16String>>, // [[NumberingSystem]]
     #[gc(untraced)]
     numeric: Cell<bool>, // [[Numeric]]
     #[gc(untraced)]
-    cached_locale_id: GcRefCell<Option<LocaleID>>,
+    cached_locale_id: RefCell<Option<LocaleID>>,
 }
 
 define_cell!(Locale, Object, extends: [Object]);
@@ -60,23 +59,31 @@ impl Deref for Locale {
 }
 
 impl Locale {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> Locale {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> Locale {
         Locale {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-            locale: GcRefCell::default(),
-            calendar: GcRefCell::default(),
-            case_first: GcRefCell::default(),
-            collation: GcRefCell::default(),
-            first_day_of_week: GcRefCell::default(),
-            hour_cycle: GcRefCell::default(),
-            numbering_system: GcRefCell::default(),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            locale: RefCell::default(),
+            calendar: RefCell::default(),
+            case_first: RefCell::default(),
+            collation: RefCell::default(),
+            first_day_of_week: RefCell::default(),
+            hour_cycle: RefCell::default(),
+            numbering_system: RefCell::default(),
             numeric: Cell::new(false),
-            cached_locale_id: GcRefCell::default(),
+            cached_locale_id: RefCell::default(),
         }
     }
 
     pub fn create(vm: &Vm, realm: Gc<Realm>, source_locale: Gc<Locale>, locale_tag: Utf16String) -> Gc<Locale> {
-        let locale = realm.create_object(vm, Locale::new(vm, realm.intrinsics().intl_locale_prototype(vm)));
+        let locale = realm.create_object(vm, |_| {
+            Locale::new(vm, realm, realm.intrinsics().intl_locale_prototype(vm))
+        });
 
         locale.set_locale(locale_tag);
         locale.calendar.replace(source_locale.calendar());
@@ -450,26 +457,34 @@ pub fn time_zones_of_locale(vm: &Vm, locale_object: &Locale) -> Value {
 }
 
 // 15.5.14 TextDirectionOfLocale ( loc ), https://tc39.es/ecma402/#sec-textdirectionoflocale
-pub fn text_direction_of_locale(locale_object: &Locale) -> &'static str {
+pub fn text_direction_of_locale(locale_object: &Locale) -> Option<&'static str> {
     // 1. Let locale be loc.[[Locale]].
     let locale = locale_object.locale();
 
     // 2. Let script be GetLocaleScript(locale).
+    let locale_id = locale_object.locale_id();
+
     // 3. If script is undefined, then
-    //     a. Let maximal be the result of the Add Likely Subtags algorithm applied to locale. If an error is signaled, return undefined.
-    //     b. Set script to GetLocaleScript(maximal).
-    //     c. If script is undefined, return undefined.
-    // NB: ICU handles maximizing the locale if there is no script.
+    let script = if let Some(script) = locale_id.language_id.script {
+        script
+    } else {
+        // a. Let maximal be the result of the Add Likely Subtags algorithm applied to locale. If an error is signaled, return undefined.
+        let maximal = unicode::add_likely_subtags(Utf16View::of_string(&locale))?;
+
+        // b. Set script to GetLocaleScript(maximal).
+        let script = unicode::parse_unicode_locale_id(Utf16View::of_string(&maximal))?
+            .language_id
+            .script;
+
+        // c. If script is undefined, return undefined.
+        script?
+    };
 
     // 4. If the default general ordering of characters within a line in script is right-to-left, return "rtl".
     // 5. If the default general ordering of characters within a line in script is left-to-right, return "ltr".
     // 6. Return undefined.
-    // FIXME: ICU does not provide a method to determine if a locale is neither rtl nor ltr.
-    if unicode::is_locale_character_ordering_right_to_left(Utf16View::of_string(&locale)) {
-        "rtl"
-    } else {
-        "ltr"
-    }
+    unicode::is_script_right_to_left(Utf16View::of_string(&script))
+        .map(|right_to_left| if right_to_left { "rtl" } else { "ltr" })
 }
 
 struct FirstDayStringAndValue {

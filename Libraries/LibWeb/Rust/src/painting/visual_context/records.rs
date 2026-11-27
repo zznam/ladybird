@@ -18,6 +18,11 @@ pub struct VisualContextState {
     pub scroll_state: scroll_state::ScrollState,
     pub needs_to_refresh_scroll_state: bool,
     pub dirty_boxes: dirty::VisualContextDirtySet,
+    pub(crate) last_compositor_scroll_inputs: Option<super::compositor_scroll_table::CompositorScrollInputs>,
+    // The owners of the tree's compositor scroll rows, in row order, so refresh can find boxes that left the table.
+    pub(crate) compositor_scroll_owners: Vec<NodeSlotId>,
+    // The paint generation the table's snap geometry was last brought up to.
+    pub(crate) compositor_snap_records_as_of: Option<crate::painting::record::change_ticks::PaintGeneration>,
     pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
     // The viewport's overflow when the tree was last updated. A sticky box finds its scrolling box by it.
     pub last_viewport_overflow: (u8, u8),
@@ -25,7 +30,9 @@ pub struct VisualContextState {
     // The list the tree was last given, which the next pass compares its own against.
     pub published_compositor_animations: Vec<VisualAnimation>,
     // The boxes whose transform node has an offset path, which depends on the geometry of their containing block.
-    pub offset_path_boxes: crate::fast_hash::FastSet<NodeSlotId>,
+    pub offset_path_boxes: crate::cow_map::CowSet<NodeSlotId>,
+    // What the updates did since a test began tracing them.
+    pub(crate) trace: Option<super::trace::VisualContextTrace>,
 }
 
 impl VisualContextState {
@@ -112,22 +119,15 @@ impl BoxVisualContextNodeHandles {
     }
 }
 
-// Nearest ancestor scroll node resolved along the containing block chain, drilled down alongside
-// the visual context indices. A fixed-position ancestor decouples its subtree from all outer
-// scrollers, but sticky boxes must still reference a scrollport through fixed-position ancestors
-// for their sticky offset computation, so both resolutions are carried.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NearestScrollNodeIndices {
-    pub stopping_at_fixed_position_ancestors: SpatialNodeIndex,
-    pub continuing_through_fixed_position_ancestors: SpatialNodeIndex,
-}
-
-// One positioning chain; effects are shared by all three chains.
+// One positioning chain; effects are shared by all three chains. The nearest scroll-like node is
+// what a sticky box sticks to, resolved along the containing block chain: a fixed-position ancestor
+// takes its subtree off the spatial chain of outer scrollers, but sticky boxes must still reference
+// a scrollport through it for their sticky offset computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PositioningContext {
     pub spatial: SpatialNodeIndex,
     pub clip: ClipNodeIndex,
-    pub nearest_scroll_nodes: NearestScrollNodeIndices,
+    pub nearest_scroll_like_node: SpatialNodeIndex,
     pub plane_root: SpatialNodeIndex,
 }
 

@@ -5,7 +5,6 @@
  */
 
 use super::BoxVisualContextNodeHandles;
-use crate::fast_hash::FastMap as HashMap;
 use crate::layout::node_data::NodeSlotId;
 pub use crate::painting::host::VisualContextUpdateScope;
 
@@ -56,6 +55,14 @@ impl BoxDirtyBits {
         self.0 == VisualContextBoxDirtyKind::StyleValueChange.bit()
     }
 
+    /// Whether only the geometry of the box changed, with its style and its place in the tree as they were.
+    pub fn changes_geometry_only(&self) -> bool {
+        let geometry_kinds = VisualContextBoxDirtyKind::RecommittedInPlace.bit()
+            | VisualContextBoxDirtyKind::MovedWithDescendants.bit()
+            | VisualContextBoxDirtyKind::InlineGeometryChanged.bit();
+        self.0 != 0 && self.0 & !geometry_kinds == 0
+    }
+
     /// Whether the box only moved, with its style and content as they were.
     pub fn is_move_only(&self) -> bool {
         self.0 == VisualContextBoxDirtyKind::MovedWithDescendants.bit()
@@ -71,7 +78,7 @@ pub struct RemovedBoxBlocks {
 
 #[derive(Clone, Default)]
 pub struct VisualContextDirtySet {
-    pub boxes: HashMap<NodeSlotId, BoxDirtyBits>,
+    pub boxes: crate::fork::ForkShared<crate::fast_hash::FastMap<NodeSlotId, BoxDirtyBits>>,
     pub removed: Vec<RemovedBoxBlocks>,
     pub scope: VisualContextUpdateScope,
 }
@@ -101,10 +108,17 @@ impl VisualContextDirtySet {
 
     pub fn request_full_rebuild(&mut self, scope: VisualContextUpdateScope) {
         self.scope = self.scope.max(scope);
-        self.boxes.clear();
+        self.forget_boxes();
     }
 
-    #[cfg(test)]
+    /// Forgets the boxes, keeping the map's room where no fork shares it.
+    fn forget_boxes(&mut self) {
+        match self.boxes.unshared_mut() {
+            Some(boxes) => boxes.clear(),
+            None => self.boxes.assign(Default::default()),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.boxes.is_empty() && self.removed.is_empty() && self.scope == VisualContextUpdateScope::DirtyPath
     }
@@ -117,7 +131,7 @@ impl VisualContextDirtySet {
     }
 
     pub fn clear(&mut self) {
-        self.boxes.clear();
+        self.forget_boxes();
         self.removed.clear();
         self.scope = VisualContextUpdateScope::DirtyPath;
     }

@@ -7,9 +7,18 @@
 #include <LibCore/Timer.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/Platform/Timer.h>
 
 namespace Web::Platform {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/platform/timer.rs.
+Timer* web_platform_timer_create_single_shot(u64 milliseconds, void* cell, void (*steps)(JSVM*, void*));
+void web_platform_timer_stop(Timer*);
+}
 
 GC_DEFINE_ALLOCATOR(Timer);
 
@@ -19,8 +28,6 @@ Timer::Timer()
     m_timer->on_timeout = [this] {
         if (on_timeout)
             on_timeout->function()();
-        if (!is_active())
-            m_activity_root.release();
     };
 }
 
@@ -65,40 +72,31 @@ GC::Ref<Timer> Timer::create_single_shot(GC::Heap& heap, AK::Duration interval, 
 void Timer::start()
 {
     m_timer->start();
-    m_activity_root.take(*this);
 }
 
 void Timer::start(AK::Duration interval)
 {
     m_timer->start(interval);
-    m_activity_root.take(*this);
 }
 
 void Timer::restart()
 {
     m_timer->restart();
-    m_activity_root.take(*this);
 }
 
 void Timer::restart(AK::Duration interval)
 {
     m_timer->restart(interval);
-    m_activity_root.take(*this);
 }
 
 void Timer::stop()
 {
     m_timer->stop();
-    m_activity_root.release();
 }
 
 void Timer::set_active(bool active)
 {
     m_timer->set_active(active);
-    if (active)
-        m_activity_root.take(*this);
-    else
-        m_activity_root.release();
 }
 
 bool Timer::is_active() const
@@ -124,6 +122,23 @@ bool Timer::is_single_shot() const
 void Timer::set_single_shot(bool single_shot)
 {
     m_timer->set_single_shot(single_shot);
+}
+
+Timer* web_platform_timer_create_single_shot(u64 milliseconds, void* cell, void (*steps)(JSVM*, void*))
+{
+    // NB: The timer's captures, which the collector traces, keep the cell alive until the steps run or the timer stops.
+    auto timeout_handler = GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), cell.ptr());
+    });
+    auto timer = Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(static_cast<i64>(milliseconds)), timeout_handler);
+    timer->start();
+    return timer.ptr();
+}
+
+void web_platform_timer_stop(Timer* timer)
+{
+    timer->stop();
+    timer->on_timeout = nullptr;
 }
 
 }

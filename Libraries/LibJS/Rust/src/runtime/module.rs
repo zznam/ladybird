@@ -34,7 +34,7 @@ use crate::runtime::module_environment::ModuleEnvironment;
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_namespace_object::ModuleNamespaceObject;
 use crate::runtime::module_request::{LoadedModuleRequest, ModuleRequest, module_requests_equal};
-use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
+use crate::runtime::promise::{Promise, PromiseState};
 use crate::runtime::promise_capability::PromiseCapability;
 use crate::runtime::source_text_module::SOURCE_TEXT_MODULE_METHODS;
 use crate::runtime::synthetic_module::SYNTHETIC_MODULE_METHODS;
@@ -133,7 +133,7 @@ impl GraphLoadingState {
         pending_module_count: usize,
         host_defined: ForeignCellSlot,
     ) -> Gc<GraphLoadingState> {
-        vm.heap().allocate(GraphLoadingState {
+        vm.heap().allocate(|_| GraphLoadingState {
             header: CellHeader::for_class(Self::CLASS),
             promise_capability,
             is_loading: Cell::new(is_loading),
@@ -171,8 +171,8 @@ impl GraphLoadingState {
         self.visited.borrow().contains(&module)
     }
 
-    pub fn append_to_visited(&self, module: Gc<CyclicModule>) {
-        self.visited.borrow_mut().push(module);
+    pub fn append_to_visited(&self, vm: &Vm, module: Gc<CyclicModule>) {
+        self.visited.borrow_mut(vm).push(module);
     }
 
     /// The modules of [[Visited]], kept alive by the returned list.
@@ -240,7 +240,7 @@ impl Module {
     }
 
     pub fn class(&self) -> &'static Class {
-        self.header.class
+        self.header.class()
     }
 
     pub(crate) fn methods(&self) -> &'static ModuleMethods {
@@ -351,12 +351,8 @@ impl Module {
         // 4. If promise.[[PromiseState]] is REJECTED, then
         if promise.state() == PromiseState::Rejected {
             // a. If promise.[[PromiseIsHandled]] is false, perform HostPromiseRejectionTracker(promise, "handle").
-            if !promise.is_handled() {
-                vm.host_promise_rejection_tracker()(vm, promise, RejectionOperation::Handle);
-            }
-
             // b. Set promise.[[PromiseIsHandled]] to true.
-            promise.set_is_handled();
+            promise.mark_handled(vm);
 
             // c. Return ThrowCompletion(promise.[[PromiseResult]]).
             crate::embedding::completion::log_exception_if_enabled(vm, promise.result());
@@ -490,7 +486,7 @@ pub fn finish_loading_imported_module(
         // b. Else,
         if !found_record {
             // i. Append the LoadedModuleRequest Record { [[Specifier]]: moduleRequest.[[Specifier]], [[Attributes]]: moduleRequest.[[Attributes]], [[Module]]: result.[[Value]] } to referrer.[[LoadedModules]].
-            loaded_modules.borrow_mut().push(LoadedModuleRequest {
+            loaded_modules.borrow_mut(vm).push(LoadedModuleRequest {
                 specifier: Utf16String::from(&module_request.module_specifier),
                 attributes: module_request.attributes.clone(),
                 module,

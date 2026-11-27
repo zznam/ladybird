@@ -4,11 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Array.h>
 #include <AK/Debug.h>
 #include <AK/Format.h>
 #include <AK/Vector.h>
 #include <LibGfx/VulkanContext.h>
+#include <string.h>
+
+#if defined(USE_VULKAN_DMABUF_IMAGES) && defined(AK_OS_LINUX)
+#    include <sys/sysmacros.h>
+#endif
 
 namespace Gfx {
 
@@ -51,7 +57,7 @@ static ErrorOr<VkInstance> create_instance(uint32_t api_version)
     return instance;
 }
 
-static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
+ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance, Optional<GpuDeviceIdentity> const& preferred_device)
 {
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
@@ -62,6 +68,14 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
     Vector<VkPhysicalDevice> devices;
     devices.resize(device_count);
     vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
+
+    if (preferred_device.has_value()) {
+        for (auto const& device : devices) {
+            if (gpu_device_identity_of(device) == *preferred_device)
+                return device;
+        }
+        dbgln("The preferred GPU is not a Vulkan device here, picking another one");
+    }
 
     VkPhysicalDevice picked_device = VK_NULL_HANDLE;
     // Pick discrete GPU or the first device in the list
@@ -82,17 +96,56 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
 }
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
-static constexpr Array<char const*, 4> s_enabled_device_extensions = {
+// NB: The last one is optional, and is only enabled on devices that have it.
+static constexpr Array<char const*, 5> s_enabled_device_extensions = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
     VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 };
+
+static bool device_has_extension(VkPhysicalDevice physical_device, char const* extension_name)
+{
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
+    Vector<VkExtensionProperties> extensions;
+    extensions.resize(extension_count);
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, extensions.data());
+    return any_of(extensions, [&](auto const& extension) { return strcmp(extension.extensionName, extension_name) == 0; });
+}
+
+static ReadonlySpan<char const*> device_extensions_to_enable(VkPhysicalDevice physical_device)
+{
+    ReadonlySpan<char const*> enabled_extensions = s_enabled_device_extensions;
+    if (device_has_extension(physical_device, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME))
+        return enabled_extensions;
+    return enabled_extensions.trim(enabled_extensions.size() - 1);
+}
+
+static Optional<dev_t> render_node_of(VkPhysicalDevice physical_device)
+{
+    if (!device_has_extension(physical_device, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME))
+        return {};
+
+    VkPhysicalDeviceDrmPropertiesEXT drm_properties {};
+    drm_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 properties {};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &drm_properties;
+    vkGetPhysicalDeviceProperties2(physical_device, &properties);
+    if (!drm_properties.hasRender)
+        return {};
+    return makedev(drm_properties.renderMajor, drm_properties.renderMinor);
+}
 #else
-static constexpr Array<char const*, 0> s_enabled_device_extensions;
+static ReadonlySpan<char const*> device_extensions_to_enable(VkPhysicalDevice)
+{
+    return {};
+}
 #endif
 
-static bool device_can_sample_through_ycbcr_conversion(VkPhysicalDevice physical_device)
+bool device_can_sample_through_ycbcr_conversion(VkPhysicalDevice physical_device)
 {
     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_conversion_features {};
     ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
@@ -149,8 +202,9 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
     create_device_info.pNext = &features;
     create_device_info.pQueueCreateInfos = &queue_create_info;
     create_device_info.queueCreateInfoCount = 1;
-    create_device_info.enabledExtensionCount = s_enabled_device_extensions.size();
-    create_device_info.ppEnabledExtensionNames = s_enabled_device_extensions.data();
+    auto enabled_extensions = device_extensions_to_enable(physical_device);
+    create_device_info.enabledExtensionCount = enabled_extensions.size();
+    create_device_info.ppEnabledExtensionNames = enabled_extensions.data();
 
     if (vkCreateDevice(physical_device, &create_device_info, nullptr, &device) != VK_SUCCESS) {
         return Error::from_string_literal("Logical device creation failed");
@@ -212,11 +266,11 @@ GpuDeviceIdentity gpu_device_identity_of(VkPhysicalDevice physical_device)
     return identity;
 }
 
-ErrorOr<VulkanContext> create_vulkan_context()
+ErrorOr<VulkanContext> create_vulkan_context(Optional<GpuDeviceIdentity> const& preferred_device)
 {
     uint32_t const api_version = VK_API_VERSION_1_1; // v1.1 needed for vkGetPhysicalDeviceFormatProperties2
     auto* instance = TRY(create_instance(api_version));
-    auto* physical_device = TRY(pick_physical_device(instance));
+    auto* physical_device = TRY(pick_physical_device(instance, preferred_device));
 
     uint32_t graphics_queue_family = 0;
     auto can_sample_through_ycbcr_conversion = device_can_sample_through_ycbcr_conversion(physical_device);
@@ -247,14 +301,16 @@ ErrorOr<VulkanContext> create_vulkan_context()
         .instance = instance,
         .physical_device = physical_device,
         .device_identity = gpu_device_identity_of(physical_device),
+        .is_preferred_device = preferred_device.has_value() && gpu_device_identity_of(physical_device) == *preferred_device,
         .logical_device = logical_device,
         .graphics_queue = graphics_queue,
         .graphics_queue_family = graphics_queue_family,
-        .enabled_device_extensions = s_enabled_device_extensions,
+        .enabled_device_extensions = device_extensions_to_enable(physical_device),
         .can_sample_through_ycbcr_conversion = can_sample_through_ycbcr_conversion,
 #ifdef USE_VULKAN_DMABUF_IMAGES
         .command_pool = command_pool,
         .command_buffer = command_buffer,
+        .render_node = render_node_of(physical_device),
         .ext_procs = {
             .get_memory_fd = pfn_vk_get_memory_fd_khr,
             .get_memory_fd_properties = pfn_vk_get_memory_fd_properties_khr,

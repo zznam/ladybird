@@ -25,13 +25,16 @@
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
 #include <LibMediaClient/Client.h>
+#include <LibMediaCodecs/FFmpeg/BundledFFmpeg.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/Internals.h>
@@ -40,12 +43,14 @@
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWeb/WebRTC/WebRTCAgent.h>
 #include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 #include <openssl/thread.h>
 
@@ -78,7 +83,7 @@ static void crash_signal_handler(int signo)
     }
     warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
     dump_backtrace(2, 100);
-    Core::Process::terminate_immediately(128 + signo);
+    Core::Process::terminate_immediately((WebWorker::is_worker_thread() ? WebView::worker_thread_crash_exit_status : 128) + signo);
 }
 
 static void install_crash_signal_handlers()
@@ -157,17 +162,20 @@ static void install_crash_signal_handlers()
 }
 #endif
 
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id);
-static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site);
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+// What the process keeps for as long as its event loop runs.
+struct ProcessState {
+    NonnullRefPtr<WebContent::ConnectionFromClient> client;
+    OwnPtr<Core::StatsLog> stats_log;
+};
+
+// NB: NEVER_INLINE so that the locals of the setup are gone from the stack before the event loop runs. ladybird_main()
+//     stays on the stack for the life of the process, below every collection. A collection from the outermost turn of
+//     the event loop takes no roots from the stack, so no frame that is still on the stack then may hold the only
+//     reference to a cell. Keep ladybird_main() down to what has to outlive the event loop, and never a cell.
+NEVER_INLINE static ErrorOr<ProcessState> initialize_process(Main::Arguments arguments)
 {
-    AK::set_rich_debug_enabled(true);
-
-    install_crash_signal_handlers();
-
-    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
-
     WebView::platform_init();
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
@@ -278,16 +286,22 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
     Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
-    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
+    Web::Bindings::set_collect_garbage_on_every_allocation_in_new_agents(collect_garbage_on_every_allocation);
+    Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
+    // See initialize_process() and ladybird_main() for what keeps this true.
+    Web::Bindings::main_thread_vm().heap().set_outermost_event_loop_turn_holds_no_cells(true);
     if (stats_log)
         Web::Bindings::main_thread_vm().heap().enable_stats();
-
-    if (collect_garbage_on_every_allocation)
-        Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
 
     if (log_all_js_exceptions) {
         JS::set_log_all_js_exceptions(true);
     }
+
+    // WebRTC and Web Audio encode and convert audio through FFmpeg, whose libraries load before the sandbox would keep
+    // them from reading their files.
+    TRY(Media::FFmpeg::load_bundled_ffmpeg());
 
     if (!disable_sandbox)
         TRY(RendererSandbox::apply_sandbox(mach_server_name));
@@ -295,14 +309,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name, enable_test_mode));
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
-    webcontent_client->on_request_server_connection = [&heap](auto const& handle, auto client_id) {
-        if (auto result = connect_to_resource_loader(heap, handle, client_id); result.is_error())
+    webcontent_client->on_request_server_connection = [&heap](auto const& handle, auto client_id, auto const& top_level_site) {
+        if (auto result = connect_to_resource_loader(heap, handle, client_id, top_level_site); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());
     };
-    webcontent_client->on_image_decoder_connection = [](auto const& handle) {
-        if (auto result = connect_to_image_decoder(handle); result.is_error())
-            dbgln("Failed to connect to image decoder: {}", result.error());
-    };
+    // Many processes never decode an image, so the Browser connects this one to a decoder when it first has one to decode.
+    Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(
+        [webcontent_client] -> ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> {
+            return try_make_ref_counted<ImageDecoderClient::Client>(TRY(webcontent_client->request_image_decoder_transport()));
+        },
+        [webcontent_client] { webcontent_client->async_did_release_image_decoder(); }));
 
     MediaClient::Client::set_transport_factory([webcontent_client] {
         return webcontent_client->request_media_server_transport();
@@ -311,39 +327,43 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Audio::ClientConnection::set_transport_factory([webcontent_client] {
         return webcontent_client->request_audio_server_transport();
     });
+    // The sandbox keeps this process from spawning the WebRTC helper, so the Browser launches one for it.
+    Web::WebRTC::WebRTCAgent::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_webrtc_client_transport();
+    });
 
     if (stats_log) {
         stats_log->start_sampling([&heap](JsonObject& values) {
             heap.add_stats(values);
             Web::HTML::main_thread_event_loop().add_stats(values);
+            values.set("workers.agents"sv, Web::Bindings::worker_agent_count());
             values.set("fonts.system_fallback_cache_entries"sv, Gfx::system_fallback_font_cache_size());
         });
     }
 
+    return ProcessState { move(webcontent_client), move(stats_log) };
+}
+
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
+{
+    AK::set_rich_debug_enabled(true);
+
+    install_crash_signal_handlers();
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+    auto process_state = TRY(initialize_process(arguments));
     return event_loop.exec();
 }
 
-ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id)
+ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site)
 {
     auto transport = TRY(handle.create_transport());
     // Querying the client ID runs the event loop and could dispatch a request before the client is ready.
     auto request_client = client_id.has_value()
         ? TRY(try_make_ref_counted<Requests::RequestClient>(move(transport), *client_id))
         : TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
-    if (Web::ResourceLoader::is_initialized())
-        Web::ResourceLoader::the().set_client(move(request_client));
-    else
-        Web::ResourceLoader::initialize(heap, move(request_client));
-    return {};
-}
-
-ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
-{
-    auto transport = TRY(handle.create_transport());
-    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(move(transport)));
-    if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
-    else
-        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
+    if (!Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(heap);
+    Web::ResourceLoader::the().set_client(top_level_site, move(request_client));
     return {};
 }

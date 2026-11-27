@@ -4,20 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include "ReportServer.h"
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
-#include <LibCore/Directory.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/WebCompatReport.h>
 
@@ -87,6 +84,12 @@ void verify_diagnostics()
     VERIFY(diagnostics.contains("\nZoom level: 110%\n"sv));
     VERIFY(diagnostics.contains("\nGit commit: "sv));
 
+    // The platform features are only in a report whose sender chose to include them.
+    constexpr auto platform_features = "Platform features: [{\"id\":\"gpu_painting\",\"state\":\"Enabled\"}]\nPlatform facts: {}\n"sv;
+    report.set_platform_features(String::from_utf8_without_validation(platform_features.bytes()));
+    VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::No) == diagnostics);
+    VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::No, WebCompatReport::IncludePlatformFeatures::Yes) == ByteString::formatted("{}{}", diagnostics, platform_features));
+
     report.set_page_dumps(String::from_utf8_without_validation(page_dumps.bytes()));
     VERIFY(report.has_page_dumps());
     VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::Yes).ends_with(ByteString::formatted("\n\n{}", page_dumps)));
@@ -110,20 +113,14 @@ void verify_diagnostics()
 
 }
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(web_compat_report)
 {
-    auto test_directory = ByteString::formatted("{}/Ladybird-TestWebCompatReport-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_directory, FileSystem::RecursionMode::Allowed));
-    });
+    Test::HeadlessTestEnvironment environment { "TestWebCompatReport"sv };
+    auto const& test_directory = environment.directory();
+
     MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, LexicalPath::join(test_directory, "config"sv).string(), Core::Environment::Overwrite::Yes));
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     verify_validation();
     verify_diagnostics();
@@ -159,7 +156,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     auto manifest = JsonValue::from_string(manifest_text).release_value().as_object();
     VERIFY(manifest.get_string("kind"sv) == "web_compat"sv);
-    VERIFY(manifest.get_string("client_version"sv) == "1.0"sv);
+    VERIFY(manifest.get_string("client_version"sv) == BROWSER_VERSION ""sv);
     VERIFY(manifest_field(manifest, "description"sv)->as_string() == "The menu does not open"sv);
     VERIFY(manifest_field(manifest, "url"sv)->as_string() == "https://example.com/broken?query"sv);
     VERIFY(manifest_field(manifest, "user_agent"sv)->as_string() == "Mozilla/5.0 Ladybird/1.0"sv);
@@ -168,6 +165,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(manifest_field(manifest, "zoom_level"sv)->get_double_with_precision_loss() == 1.1);
     VERIFY(manifest_field(manifest, "platform"sv).has_value());
     VERIFY(manifest_field(manifest, "git_commit"sv).has_value());
+    // The platform features are only sent when chosen.
+    VERIFY(!manifest_field(manifest, "platform_features"sv).has_value());
 
     auto attachments = manifest.get_array("attachments"sv).value();
     VERIFY(attachments.size() == 2);
@@ -227,5 +226,22 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(server.requests.size() == 1);
 
     outln("PASS: Web compatibility reports reach the report server in the format it expects");
-    return 0;
+}
+
+TEST_CASE(new_bug_report_url)
+{
+    auto plain_url = WebView::new_bug_report_url({}).serialize();
+    auto plain = plain_url.bytes_as_string_view();
+    EXPECT(plain.starts_with("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml&"sv));
+    EXPECT(plain.contains("&build-flags=Ladybird%20"sv));
+    EXPECT(!plain.contains("sandbox"sv));
+    EXPECT(!plain.contains("painting"sv));
+
+    WebView::BugReportDetails details {
+        .disable_sandbox = WebView::DisableSandbox::Yes,
+        .gpu_painting_enabled = false,
+    };
+    auto detailed_url = WebView::new_bug_report_url(details).serialize();
+    auto detailed = detailed_url.bytes_as_string_view();
+    EXPECT(detailed.ends_with("%2C%20sandbox%3A%20off%2C%20GPU%20painting%3A%20off"sv));
 }

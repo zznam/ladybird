@@ -42,7 +42,7 @@ static Optional<CSSPixelRect> scrollport_rect_in_viewport(Layout::Node const& la
 
     // The viewport's scrollport is already in viewport coordinates.
     if (!Painting::is_viewport_paintable(layout_node))
-        scrollport = Painting::transform_rect_to_viewport(layout_node, scrollport);
+        scrollport = Painting::rect_to_viewport(layout_node, scrollport, Layout::RustFFI::ViewportSpace::VisualViewport);
 
     // A scrollport smaller than a pixel has no point the mouse can be constrained to.
     if (scrollport.width() < 1 || scrollport.height() < 1)
@@ -87,6 +87,14 @@ void AutoScrollHandler::visit_edges(JS::Cell::Visitor& visitor) const
 {
     visitor.visit(m_navigable);
     visitor.visit(m_container_element);
+}
+
+Optional<CSSPixelRect> AutoScrollHandler::scrollport_in_viewport(Layout::BegunRead const& read) const
+{
+    auto* layout_node = auto_scroll_layout_node(read, m_container_element);
+    if (!layout_node)
+        return {};
+    return scrollport_rect_in_viewport(*layout_node);
 }
 
 CSSPixelPoint AutoScrollHandler::process(CSSPixelPoint mouse_position)
@@ -205,6 +213,8 @@ void AutoScrollHandler::perform_tick()
     int scroll_y = m_fractional_delta.y().to_int();
     m_fractional_delta -= CSSPixelPoint { scroll_x, scroll_y };
 
+    if (auto stable_node_id = Painting::async_scroll_node_stable_id(*layout_node); stable_node_id.has_value() && m_scroll_gesture_hold)
+        m_scroll_gesture_hold->hold(stable_node_id.value());
     m_navigable->note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type::EndPosition);
     if (Painting::scroll_by(*layout_node, scroll_x, scroll_y) == Painting::ScrollHandled::No)
         return;

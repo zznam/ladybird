@@ -9,6 +9,10 @@
 #include <AK/NeverDestroyed.h>
 #include <LibCore/File.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Heap.h>
+#include <LibGC/Root.h>
+#include <LibGC/RootHashMap.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Array.h>
@@ -68,18 +72,41 @@ namespace {
 
 static constexpr JSHostClass web_assembly_module_host_class = JS::make_host_class(JS_HOST_CLASS_OBJECT, "WebAssemblyModule"sv, nullptr, nullptr, nullptr, 0);
 
-// Host references (`ref.extern n` in the spec tests) are encoded so that they are never null, and never look like a
-// pointer or an i31 reference.
+// The value of a host reference (`ref.extern n` in the spec tests). A host reference is the address of a cell with bit
+// 1 set, which the garbage collector follows.
+class HostValue final : public GC::Cell {
+    GC_CELL(HostValue, GC::Cell);
+    GC_DECLARE_ALLOCATOR(HostValue);
+
+public:
+    explicit HostValue(u64 value)
+        : value(value)
+    {
+    }
+
+    u64 value { 0 };
+};
+
+GC_DEFINE_ALLOCATOR(HostValue);
+
+// NB: Each value has one cell, so that equal values are equal references. The cells live until the store is reset.
+static HashMap<u64, GC::Root<HostValue>>& host_values()
+{
+    static NeverDestroyed<HashMap<u64, GC::Root<HostValue>>> host_values;
+    return *host_values;
+}
+
 static u64 host_reference_bits(u64 value)
 {
-    return (value << 2) | 2;
+    auto& cell = host_values().ensure(value, [&] { return GC::make_root(GC::Heap::the().allocate<HostValue>(value)); });
+    return bit_cast<FlatPtr>(cell.ptr()) | 2;
 }
 
 static Optional<u64> host_reference_value(u64 bits)
 {
     if ((bits & 3) != 2)
         return {};
-    return bits >> 2;
+    return bit_cast<HostValue*>(static_cast<FlatPtr>(bits & ~u64(3)))->value;
 }
 
 struct ImportName {
@@ -123,6 +150,7 @@ public:
     {
         s_spec_test_namespace.clear();
         roots().clear();
+        host_values().clear();
         delete s_store;
         s_store = nullptr;
     }
@@ -136,7 +164,6 @@ public:
         return entity;
     }
 
-    // NB: Like the last store, the last roots are left for the process to reclaim, since the heap is gone at exit.
     static Vector<GC::Root<GC::ForeignCell>>& roots()
     {
         static NeverDestroyed<Vector<GC::Root<GC::ForeignCell>>> roots;
@@ -147,7 +174,7 @@ public:
     {
         auto& vm = realm.vm();
         auto const& spectest = spec_test_namespace();
-        Vector<Wasm::Runtime::Extern> imports;
+        GC::RootVector<Wasm::Runtime::Extern> imports;
         for (size_t index = 0; index < module->import_count(); ++index) {
             auto import = module->import(index);
             ImportName name { import.module, import.name };
@@ -193,10 +220,10 @@ private:
             return s_spec_test_namespace;
 
         auto add_print = [](StringView name, Vector<ValueType> parameters) {
-            auto address = keep(store().allocate_host_function({ move(parameters), {} }, [](auto&, auto, auto) -> ErrorOr<void, Wasm::Runtime::HostError> {
+            auto address = keep(store().allocate_host_function({ move(parameters), {} }, GC::create_function(GC::Heap::the(), [](Store&, ReadonlySpan<Value>, Span<Value>) -> ErrorOr<void, Wasm::Runtime::HostError> {
                 // Noop, this just needs to exist.
                 return {};
-            }));
+            })));
             s_spec_test_namespace.set({ "spectest", name }, { ExternKind::Function, address });
         };
         auto i32 = ValueType::scalar(ValueKind::I32);
@@ -242,9 +269,17 @@ HashMap<ImportName, Wasm::Runtime::Extern> WebAssemblyModule::s_spec_test_namesp
 
 }
 
+TESTJS_MAIN_HOOK()
+{
+    ::Test::JS::g_main_exit_hook = WebAssemblyModule::reset_store;
+}
+
 TESTJS_RUN_FILE_FUNCTION(ByteString const&, JS::Realm&, JS::ExecutionContext&)
 {
     WebAssemblyModule::reset_store();
+    // NB: The memories of the last file hold on to their address space until they are collected, and running out of it
+    //     is not something that makes the heap collect them.
+    GC::Heap::the().collect_garbage();
     return Test::JS::RunFileHookResult::RunAsNormal;
 }
 
@@ -266,7 +301,7 @@ TESTJS_GLOBAL_FUNCTION(parse_webassembly_module, parseWebAssemblyModule)
     if (module.is_error())
         return vm.throw_completion<JS::SyntaxError>(Utf16String::from_utf8(module.error()));
 
-    HashMap<ImportName, Wasm::Runtime::Extern> imports;
+    GC::RootHashMap<ImportName, Wasm::Runtime::Extern> imports;
     auto import_value = vm.argument(1);
     if (auto import_object = import_value.template as_if<JS::Object>()) {
         for (auto property_key_value : TRY(import_object->ordinary_own_property_keys())) {
@@ -278,7 +313,8 @@ TESTJS_GLOBAL_FUNCTION(parse_webassembly_module, parseWebAssemblyModule)
             if (!module_object)
                 continue;
             auto module_name = property_key.as_string().to_utf16_string().to_byte_string();
-            for (auto& entry : WebAssemblyModule::store().instance_exports(module_object->instance()))
+            GC::RootVector<Wasm::Runtime::InstanceExport> exports(WebAssemblyModule::store().instance_exports(module_object->instance()));
+            for (auto& entry : exports)
                 imports.set({ module_name, entry.name }, entry.value);
         }
     }
@@ -448,11 +484,11 @@ static JS::ThrowCompletionOr<JS::Value> to_js_value(JS::VM& vm, Wasm::Runtime::V
     case ValueKind::I32:
         return JS::Value(static_cast<double>(value.to_i32()));
     case ValueKind::I64:
-        return JS::Value(JS::BigInt::create(vm, Crypto::SignedBigInteger { value.to_i64() }));
+        return JS::Value(JS::BigInt::create_from_i64(vm, value.to_i64()));
     case ValueKind::F32:
         return JS::Value(static_cast<double>(value.f32_bits()));
     case ValueKind::F64:
-        return JS::Value(JS::BigInt::create(vm, Crypto::SignedBigInteger { Crypto::UnsignedBigInteger { value.f64_bits() } }));
+        return JS::Value(JS::BigInt::create_from_u64(vm, value.f64_bits()));
     case ValueKind::V128: {
         auto buffer = TRY(JS::ArrayBuffer::create(*vm.current_realm(), 16));
         u64 halves[2] = { value.low, value.high };
@@ -492,14 +528,15 @@ JS_DEFINE_NATIVE_FUNCTION(WebAssemblyModule::get_export)
         case ValueKind::I32:
             return JS::Value(static_cast<double>(global.to_i32()));
         case ValueKind::I64:
-            return JS::BigInt::create(vm, Crypto::SignedBigInteger { global.to_i64() });
+            return JS::BigInt::create_from_i64(vm, global.to_i64());
         case ValueKind::F32:
             return JS::Value(static_cast<double>(global.to_f32()));
         case ValueKind::F64:
             return JS::Value(global.to_f64());
         case ValueKind::V128: {
-            u64 halves[2] = { global.low, global.high };
-            return JS::BigInt::create(vm, Crypto::SignedBigInteger::import_data({ reinterpret_cast<u8 const*>(halves), sizeof(halves) }));
+            // NB: The vector is the unsigned 128-bit integer with the low half first.
+            u32 const words[] = { static_cast<u32>(global.low), static_cast<u32>(global.low >> 32), static_cast<u32>(global.high), static_cast<u32>(global.high >> 32) };
+            return JS::BigInt::create(vm, false, words);
         }
         case ValueKind::Reference:
             return reference_to_js_value(global, type);
@@ -514,7 +551,7 @@ JS_DEFINE_NATIVE_FUNCTION(WebAssemblyModule::wasm_invoke)
     auto address = function_entity(TRY(vm.argument(0).to_double(vm)));
     auto type = store().function_type(address);
 
-    Vector<Value> arguments;
+    Values arguments;
     if (type.parameters.size() + 1 > vm.argument_count())
         return vm.throw_completion<JS::TypeError>(Utf16String::formatted("Expected {} arguments for call, but found {}", type.parameters.size() + 1, vm.argument_count()));
     size_t index = 1;
@@ -562,7 +599,7 @@ JS_DEFINE_NATIVE_FUNCTION(WebAssemblyModule::wasm_invoke)
             }
             switch (parameter.heap) {
             case HeapKind::Function:
-                arguments.append(Value::from_reference(store().function_reference(function_entity(double_value))));
+                arguments.append(store().function_reference(function_entity(double_value)));
                 break;
             case HeapKind::Extern:
             case HeapKind::Any:

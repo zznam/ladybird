@@ -6,12 +6,10 @@
 
 //! https://html.spec.whatwg.org/multipage/canvas.html#canvasdrawimage
 
-use core::ptr::NonNull;
-
 use ak::Utf16String;
 use libcompositing_rust::display_list::commands::CanvasId;
 use libgfx_rust::image_frame::ImageFrameHandle;
-use libgfx_rust::{FloatRect, ScalingMode};
+use libgfx_rust::{AffineTransform, FloatRect, IntSize, ScalingMode};
 
 use super::image_bitmap::ImageBitmap;
 use crate::bindings::conversions::CppInterface;
@@ -20,7 +18,6 @@ use crate::bindings::{CallContext, Exception, WebIdlResult};
 use crate::canvas_2d::canvas::{CanvasImageSourceKind, Usability, capture_video_frame};
 use crate::canvas_2d::context::{CanvasKind, ContextState, RenderingContext2D};
 use crate::canvas_2d::float;
-use crate::canvas_2d::host::{LentImageFrame, LentVideoFrameHold};
 
 /// The union CanvasImageSource of HTML/Canvas/CanvasDrawImage.idl, whose members the bindings convert.
 #[derive(Clone, Copy)]
@@ -70,10 +67,11 @@ impl CanvasImageSource {
         }
     }
 
-    /// The width and the height of the image, as the operations that do not take its size use them.
-    pub(crate) fn size(self) -> (i32, i32) {
+    /// The width and the height of the image, as the operations that do not take its size use them. An image without a
+    /// natural size is sized against the default object size, the size of the canvas it is drawn into.
+    pub(crate) fn size(self, default_object_size: IntSize) -> (i32, i32) {
         match self.cpp_source() {
-            Some((source, kind)) => kind.size(source),
+            Some((source, kind)) => kind.size(source, default_object_size),
             None => {
                 let Self::ImageBitmap(image_bitmap) = self else {
                     unreachable!("an image source that is not implemented in C++ is an ImageBitmap");
@@ -114,6 +112,58 @@ impl CanvasImageSource {
                 kind.frame(source)
             }
         }
+    }
+
+    /// The frame to paint the source rectangle of the image from, and that rectangle in the frame's pixels. A vector
+    /// image is rasterized at the size it is painted at, so that it stays sharp when it is scaled up.
+    fn frame_for_painting(
+        self,
+        source_rect: FloatRect,
+        destination_rect: FloatRect,
+        transform: AffineTransform,
+        canvas_size: IntSize,
+    ) -> Option<(ImageFrameHandle, FloatRect)> {
+        let (Self::HTMLImageElement(source) | Self::SVGImageElement(source)) = self else {
+            return self.frame().map(|frame| (frame, source_rect));
+        };
+        let kind = self.cpp_source().expect("an image element is implemented in C++").1;
+        let (natural_width, natural_height) = kind.size(source, canvas_size);
+        if natural_width <= 0 || natural_height <= 0 {
+            return kind.frame(source).map(|frame| (frame, source_rect));
+        }
+        let scale_x = destination_rect.width / source_rect.width * transform.x_scale();
+        let scale_y = destination_rect.height / source_rect.height * transform.y_scale();
+        if scale_x <= 1.0 && scale_y <= 1.0 {
+            // A vector image without a natural size has no frame of its own, so it's rasterized at the size it's drawn
+            // from.
+            return kind
+                .frame_rasterized_at(source, natural_width, natural_height)
+                .map(|(frame, _)| (frame, source_rect));
+        }
+
+        // The image is rasterized at one scale in both directions, as the vector image would be fitted into a raster of
+        // another aspect ratio rather than stretched. The raster is capped at the canvas's size, so that painting a
+        // small part of an image enlarged can't allocate a raster much larger than the canvas.
+        let scale = scale_x
+            .max(scale_y)
+            .min(canvas_size.width.max(natural_width) as f32 / natural_width as f32)
+            .min(canvas_size.height.max(natural_height) as f32 / natural_height as f32);
+        let raster_width = (natural_width as f32 * scale).ceil() as i32;
+        let raster_height = (natural_height as f32 * scale).ceil() as i32;
+        let (frame, rasterized) = kind.frame_rasterized_at(source, raster_width, raster_height)?;
+        if !rasterized {
+            return Some((frame, source_rect));
+        }
+
+        let frame_scale_x = frame.width() as f32 / natural_width as f32;
+        let frame_scale_y = frame.height() as f32 / natural_height as f32;
+        let frame_source_rect = FloatRect::new(
+            source_rect.x * frame_scale_x,
+            source_rect.y * frame_scale_y,
+            source_rect.width * frame_scale_x,
+            source_rect.height * frame_scale_y,
+        );
+        Some((frame, frame_source_rect))
     }
 }
 
@@ -249,7 +299,7 @@ impl ContextState {
                 let state = self.drawing_state();
                 self.record(|recorder| {
                     recorder.draw_video_frame(
-                        &LentVideoFrameHold(captured_frame.hold()),
+                        &captured_frame.hold,
                         captured_frame.sink_handle,
                         captured_frame.generation,
                         destination_rect,
@@ -265,7 +315,10 @@ impl ContextState {
             return Ok(());
         }
 
-        let Some(frame) = image.frame() else {
+        let transform = self.drawing_state().transform;
+        let Some((frame, source_rect)) =
+            image.frame_for_painting(source_rect, destination_rect, transform, self.size())
+        else {
             return Ok(());
         };
 
@@ -273,7 +326,6 @@ impl ContextState {
         //       only afterwards.
         if self.recorder_is_ready() {
             let state = self.drawing_state();
-            let frame = LentImageFrame(NonNull::new(frame.as_raw().cast_mut()).expect("an image frame has a frame"));
             self.record(|recorder| {
                 recorder.draw_image_frame(
                     &frame,
@@ -308,7 +360,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // If the sx, sy, sw, and sh arguments are omitted, then they must default to 0, 0, the image's natural
         // width in image pixels, and the image's natural height in image pixels, respectively.
         let (dx, dy) = (float(dx), float(dy));
-        let (width, height) = image.size();
+        let (width, height) = image.size(self.size());
         let (width, height) = (int_to_float(width), int_to_float(height));
         self.draw_image_internal(image, 0.0, 0.0, width, height, dx, dy, width, height)
     }
@@ -327,7 +379,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // If the sx, sy, sw, and sh arguments are omitted, then they must default to 0, 0, the image's natural
         // width in image pixels, and the image's natural height in image pixels, respectively.
         let (dx, dy, dw, dh) = (float(dx), float(dy), float(dw), float(dh));
-        let (width, height) = image.size();
+        let (width, height) = image.size(self.size());
         let (width, height) = (int_to_float(width), int_to_float(height));
         self.draw_image_internal(image, 0.0, 0.0, width, height, dx, dy, dw, dh)
     }

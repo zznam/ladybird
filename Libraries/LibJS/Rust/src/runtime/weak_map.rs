@@ -10,8 +10,9 @@ use hashbrown::HashMap;
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{ExternalMemorySize, Finalize, GcCell, define_cell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
-use crate::gc::heap::cell_is_dead;
+use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak_container::WeakContainer;
 use crate::interpreter::vm::Vm;
@@ -26,11 +27,14 @@ use crate::runtime::realm::Realm;
 #[derive(Default)]
 struct WeakMapValues(HashMap<Gc<CellHeader>, Value, foldhash::fast::RandomState>);
 
-// SAFETY: Visits every value. The keys are held weakly, and removed in remove_dead_cells() once they die.
+// SAFETY: Visits every value as reachable only while its key is. The keys are held weakly, and removed in
+//         remove_dead_cells() once they die, together with their values, which then also hands the slots of the
+//         surviving entries to a collection that moves cells.
 unsafe impl Trace for WeakMapValues {
     fn trace(&self, visitor: &mut Visitor) {
-        for value in self.0.values() {
-            value.trace(visitor);
+        for (&key, value) in &self.0 {
+            // SAFETY: See above.
+            unsafe { visitor.visit_ephemeron_without_pinning(key, value) };
         }
     }
 }
@@ -79,15 +83,23 @@ impl Finalize for WeakMap {
 }
 
 impl WeakMap {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> WeakMap {
+    pub fn new(_: &DeferGc<'_>, vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> WeakMap {
         WeakMap {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             values: GcRefCell::new(WeakMapValues::default()),
         }
     }
 
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<WeakMap> {
-        realm.create_object(vm, WeakMap::new(vm, realm.intrinsics().weak_map_prototype(vm)))
+        realm.create_object(vm, |defer_gc| {
+            WeakMap::new(defer_gc, vm, realm, realm.intrinsics().weak_map_prototype(vm))
+        })
     }
 
     /// Registers the new WeakMap as a weak container.
@@ -104,7 +116,7 @@ impl WeakMap {
     }
 
     pub fn weak_map_set(&self, vm: &Vm, key: Gc<CellHeader>, value: Value) {
-        let mut values = self.values.borrow_mut();
+        let mut values = self.values.borrow_mut(vm);
         let old_size = values.0.allocation_size();
         values.0.insert(key, value);
         let new_size = values.0.allocation_size();
@@ -112,19 +124,30 @@ impl WeakMap {
         vm.heap().account_external_memory_change(old_size, new_size);
     }
 
-    pub fn weak_map_remove(&self, key: Gc<CellHeader>) -> bool {
-        self.values.borrow_mut().0.remove(&key).is_some()
+    pub fn weak_map_remove(&self, vm: &Vm, key: Gc<CellHeader>) -> bool {
+        self.values.borrow_mut(vm).0.remove(&key).is_some()
     }
 
     pub fn weak_map_size(&self) -> usize {
         self.values.borrow().0.len()
     }
 
-    fn remove_dead_cells(object: &Object, _: &Vm) {
+    fn remove_dead_cells(object: &Object, sweep: &Sweep<'_>) {
         let weak_map = object
             .as_gc()
             .downcast::<WeakMap>()
             .expect("the weak container is a WeakMap");
-        weak_map.values.borrow_mut().0.retain(|&key, _| !cell_is_dead(key));
+        let mut values = weak_map.values.borrow_mut_in_sweep(sweep);
+        values.0.retain(|&key, _| !sweep.is_dead(key));
+        if sweep.moves_cells() {
+            // NB: The keys are hashed by their identity hash, which moves do not change, so the table stays as it is.
+            for (key, value) in &values.0 {
+                // SAFETY: Only the map's own methods change the table, and none runs until the collection is over.
+                unsafe {
+                    sweep.record_slot(key);
+                    sweep.record_value_slot(value);
+                }
+            }
+        }
     }
 }

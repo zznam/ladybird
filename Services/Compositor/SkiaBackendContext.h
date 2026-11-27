@@ -9,6 +9,10 @@
 #include <AK/AtomicRefCounted.h>
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
+#include <AK/Optional.h>
+#include <LibCore/Timer.h>
+#include <LibGfx/GpuDeviceIdentity.h>
+#include <LibGfx/Size.h>
 
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
@@ -49,8 +53,9 @@ public:
     static RefPtr<SkiaBackendContext> create_metal_context(NonnullRefPtr<MetalContext>);
 #endif
 
-    static void initialize_gpu_backend();
-    static RefPtr<SkiaBackendContext> create_independent_gpu_backend();
+    // The preferred GPU is used when there is one, so that the backing stores can be shared with the presentation.
+    static void initialize_gpu_backend(Optional<GpuDeviceIdentity> const& preferred_device = {});
+    static RefPtr<SkiaBackendContext> create_independent_gpu_backend(Optional<GpuDeviceIdentity> const& preferred_device = {});
     static RefPtr<SkiaBackendContext> the_main_thread_context();
 
     SkiaBackendContext() { }
@@ -58,8 +63,13 @@ public:
 
     void flush_and_submit(PaintingSurface&);
     void flush_and_submit_async(PaintingSurface&, Function<void()>&&);
+    // Flushes the work drawn into every surface.
+    void flush_and_submit_async(Function<void()>&&);
     void check_async_work_completion();
     size_t resource_cache_bytes() const;
+    // Whether a texture of this size fits within the largest the GPU allows. On macOS, asking Metal for a larger
+    // texture over an IOSurface aborts the process, rather than failing.
+    bool can_hold_texture_of_size(IntSize) const;
     virtual GrDirectContext* sk_context() const = 0;
 
     virtual MetalContext& metal_context() = 0;
@@ -68,6 +78,8 @@ public:
 
 private:
     void perform_post_flush_cleanup();
+
+    RefPtr<Core::Timer> m_idle_cleanup_timer;
 };
 
 }

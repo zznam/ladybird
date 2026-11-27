@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/StringBuilder.h>
+#include <AK/Utf8View.h>
 #include <LibJS/Console.h>
 #include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/Realm.h>
@@ -160,57 +162,78 @@ Realm& Console::realm() const
     return cell_ref_from_abi<Realm>(js_console_realm(console_to_abi(*this)));
 }
 
-void Console::output_debug_message(LogLevel log_level, StringView output) const
+static bool is_terminal_control_character(u32 code_point)
+{
+    if (code_point == '\n' || code_point == '\t')
+        return false;
+    return code_point < 0x20 || (code_point >= 0x7f && code_point < 0xa0);
+}
+
+template<typename CodePoints>
+static ByteString escape_control_characters(CodePoints const& code_points)
+{
+    StringBuilder builder;
+    for (u32 code_point : code_points) {
+        if (is_terminal_control_character(code_point))
+            builder.appendff("\\x{:02x}", code_point);
+        else
+            builder.append_code_point(code_point);
+    }
+    return builder.to_byte_string();
+}
+
+ByteString Console::escape_for_terminal(StringView text)
+{
+    return escape_control_characters(Utf8View { text });
+}
+
+ByteString Console::escape_for_terminal(Utf16View text)
+{
+    return escape_control_characters(text);
+}
+
+static void print_debug_message(Console::LogLevel log_level, StringView escaped_output)
 {
     switch (log_level) {
     case Console::LogLevel::Debug:
-        dbgln("\033[32;1m(js debug)\033[0m {}", output);
+        dbgln("\033[32;1m(js debug)\033[0m {}", escaped_output);
         break;
     case Console::LogLevel::Error:
-        dbgln("\033[32;1m(js error)\033[0m {}", output);
+        dbgln("\033[32;1m(js error)\033[0m {}", escaped_output);
         break;
     case Console::LogLevel::Info:
-        dbgln("\033[32;1m(js info)\033[0m {}", output);
+        dbgln("\033[32;1m(js info)\033[0m {}", escaped_output);
         break;
     case Console::LogLevel::Log:
-        dbgln("\033[32;1m(js log)\033[0m {}", output);
+        dbgln("\033[32;1m(js log)\033[0m {}", escaped_output);
         break;
     case Console::LogLevel::Warn:
-        dbgln("\033[32;1m(js warn)\033[0m {}", output);
+        dbgln("\033[32;1m(js warn)\033[0m {}", escaped_output);
         break;
     default:
-        dbgln("\033[32;1m(js)\033[0m {}", output);
+        dbgln("\033[32;1m(js)\033[0m {}", escaped_output);
         break;
     }
 }
 
+void Console::output_debug_message(LogLevel log_level, StringView output) const
+{
+    print_debug_message(log_level, escape_for_terminal(output));
+}
+
 void Console::output_debug_message(LogLevel log_level, Utf16View output) const
 {
-    switch (log_level) {
-    case Console::LogLevel::Debug:
-        dbgln("\033[32;1m(js debug)\033[0m {}", output);
-        break;
-    case Console::LogLevel::Error:
-        dbgln("\033[32;1m(js error)\033[0m {}", output);
-        break;
-    case Console::LogLevel::Info:
-        dbgln("\033[32;1m(js info)\033[0m {}", output);
-        break;
-    case Console::LogLevel::Log:
-        dbgln("\033[32;1m(js log)\033[0m {}", output);
-        break;
-    case Console::LogLevel::Warn:
-        dbgln("\033[32;1m(js warn)\033[0m {}", output);
-        break;
-    default:
-        dbgln("\033[32;1m(js)\033[0m {}", output);
-        break;
-    }
+    print_debug_message(log_level, escape_for_terminal(output));
 }
 
 void Console::report_exception(Utf16View name, Utf16View message, ErrorData const& error_data, bool in_promise) const
 {
     js_console_report_exception(console_to_abi(*this), utf16_view_to_abi(name), utf16_view_to_abi(message), error_data_to_abi(error_data), in_promise);
+}
+
+void Console::report_exception(Utf16View name, Utf16View message, Utf16View filename, u32 line, u32 column, bool in_promise) const
+{
+    js_console_report_exception_with_location(vm_to_abi(vm()), console_to_abi(*this), utf16_view_to_abi(name), utf16_view_to_abi(message), utf16_view_to_abi(filename), line, column, in_promise);
 }
 
 static GC::Ref<EngineConsoleClient> create_engine_console_client(Console& console, ConsoleClient& client)

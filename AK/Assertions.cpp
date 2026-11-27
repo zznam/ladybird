@@ -47,9 +47,15 @@ static AK::AssertionBacktraceCallback s_assertion_backtrace_callback;
 
 static thread_local Array<char, 8193> s_rust_panic_message;
 static thread_local bool (*s_rust_is_panicking)();
+static thread_local u32 s_rust_panic_hook_depth;
+static thread_local bool s_rust_panic_backtrace_captured;
+#if defined(AK_HAS_CPPTRACE)
+static thread_local bool s_capturing_backtrace_quietly;
+#endif
 
-void ladybird_rust_panic(char const* message, size_t message_length, char const* filename, size_t filename_length, u32 line, u32 column, bool (*is_panicking)())
+void ladybird_rust_panic(u8 const* message, size_t message_length, u8 const* filename, size_t filename_length, u32 line, u32 column, bool (*is_panicking)())
 {
+    ++s_rust_panic_hook_depth;
     __atomic_store_n(&s_rust_is_panicking, nullptr, __ATOMIC_RELEASE);
     size_t length = 0;
     auto append = [&](StringView text) {
@@ -59,7 +65,7 @@ void ladybird_rust_panic(char const* message, size_t message_length, char const*
             s_rust_panic_message[length++] = ch ? ch : '?';
         }
     };
-    append({ message, min(message_length, 4096uz) });
+    append({ reinterpret_cast<char const*>(message), min(message_length, 4096uz) });
     if (message_length > 4096)
         append(" [truncated]"sv);
     if (filename_length) {
@@ -67,7 +73,7 @@ void ladybird_rust_panic(char const* message, size_t message_length, char const*
         if (filename_length > 4096) {
             append("[location unavailable]"sv);
         } else {
-            append({ filename, filename_length });
+            append({ reinterpret_cast<char const*>(filename), filename_length });
             Array<char, 24> location;
             auto count = snprintf(location.data(), location.size(), ":%u:%u", line, column);
             if (count > 0)
@@ -88,15 +94,30 @@ char const* AK::current_rust_panic_message()
     return nullptr;
 }
 
+void ladybird_rust_panic_hook_returned()
+{
+    if (s_rust_panic_hook_depth > 0 && --s_rust_panic_hook_depth == 0)
+        s_rust_panic_backtrace_captured = false;
+}
+
+void ladybird_rust_panic_may_abort()
+{
+    // The panic hooks of the process's Rust crates chain into each other, so capture the backtrace once per run of that
+    // chain. Code built with unwinding may still catch the panic, so only hand the backtrace to the crash handler,
+    // which uses it if the thread is still panicking when it crashes.
+    if (s_rust_panic_backtrace_captured)
+        return;
+    s_rust_panic_backtrace_captured = true;
+
+#if defined(AK_HAS_CPPTRACE)
+    s_capturing_backtrace_quietly = true;
+    dump_backtrace(1, 100);
+    s_capturing_backtrace_quietly = false;
+#endif
+}
+
 void ladybird_rust_panic_will_abort()
 {
-    // The panic hooks of the process's Rust crates chain into each other, and each of them that knows the panic is
-    // fatal asks for the backtrace.
-    static thread_local bool s_backtrace_captured;
-    if (s_backtrace_captured)
-        return;
-    s_backtrace_captured = true;
-
     if (__atomic_load_n(&s_rust_is_panicking, __ATOMIC_ACQUIRE)) {
         if (auto callback = __atomic_load_n(&s_assertion_failure_callback, __ATOMIC_ACQUIRE))
             callback(AK::AssertionFailureKind::RustPanic, s_rust_panic_message.data());
@@ -114,13 +135,63 @@ void AK::set_assertion_backtrace_callback(AssertionBacktraceCallback callback)
     __atomic_store_n(&s_assertion_backtrace_callback, callback, __ATOMIC_RELEASE);
 }
 
+#if defined(AK_HAS_CPPTRACE) && defined(AK_OS_WINDOWS) && ARCH(X86_64)
+// cpptrace walks the stack with StackWalk64(), which does not see the unwind info of code generated at run time, and
+// takes the values on the stack for return addresses from the first JIT frame on. This walks it like the dispatch of an
+// exception does, which sees that unwind info, and leaves only the symbols to cpptrace.
+[[gnu::noinline]] static cpptrace::stacktrace generate_stacktrace(unsigned frames_to_skip, unsigned max_depth)
+{
+    CONTEXT context {};
+    RtlCaptureContext(&context);
+
+    ULONG_PTR stack_low = 0;
+    ULONG_PTR stack_high = 0;
+    GetCurrentThreadStackLimits(&stack_low, &stack_high);
+
+    cpptrace::raw_trace trace;
+    // NB: This function is a frame of its own, which is no part of the trace.
+    auto frames_left_to_skip = frames_to_skip + 1;
+    auto frames_without_unwind_info = 0;
+    // NB: Unwinding the thread's first function leaves a program counter of 0.
+    while (trace.frames.size() < max_depth && context.Rip != 0 && context.Rsp >= stack_low && context.Rsp < stack_high && frames_without_unwind_info < 2) {
+        auto program_counter = context.Rip;
+        if (frames_left_to_skip > 0) {
+            --frames_left_to_skip;
+        } else {
+            // NB: A return address is that of what comes after the call, which may be in the next line or function.
+            trace.frames.push_back(program_counter - 1);
+        }
+
+        DWORD64 image_base = 0;
+        if (auto* function = RtlLookupFunctionEntry(program_counter, &image_base, nullptr)) {
+            frames_without_unwind_info = 0;
+            void* handler_data = nullptr;
+            DWORD64 establisher_frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, program_counter, function, &context, &handler_data, &establisher_frame, nullptr);
+        } else {
+            // NB: Code without unwind info is a leaf function, or a call through a bad pointer that faulted, and has its
+            //     return address on top of the stack. Two of those in a row mean the walk has gone off the rails, which
+            //     the frames of the Wasm interpreter make it do.
+            ++frames_without_unwind_info;
+            context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+            context.Rsp += sizeof(DWORD64);
+        }
+    }
+    return trace.resolve();
+}
+#endif
+
 extern "C" {
 
 #if defined(AK_HAS_CPPTRACE)
 void dump_backtrace(unsigned frames_to_skip, unsigned max_depth)
 {
     // We should be using cpptrace for everything but android.
+#    if defined(AK_OS_WINDOWS) && ARCH(X86_64)
+    auto stacktrace = generate_stacktrace(frames_to_skip, max_depth);
+#    else
     auto stacktrace = cpptrace::generate_trace(frames_to_skip, max_depth);
+#    endif
 
     for (auto& frame : stacktrace.frames) {
         if (frame.symbol.empty()) {
@@ -156,6 +227,8 @@ void dump_backtrace(unsigned frames_to_skip, unsigned max_depth)
         }
         callback(frames.span().trim(count));
     }
+    if (s_capturing_backtrace_quietly)
+        return;
     auto* var = getenv("LADYBIRD_BACKTRACE_SNIPPETS");
     bool print_snippets = var && strnlen(var, 1) > 0;
     static NeverDestroyed<cpptrace::formatter> formatter { cpptrace::formatter {}.snippets(print_snippets) };

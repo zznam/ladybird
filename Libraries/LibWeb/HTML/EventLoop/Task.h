@@ -9,6 +9,7 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/IntrusiveList.h>
 #include <AK/RefCounted.h>
+#include <AK/kmalloc.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
@@ -103,6 +104,9 @@ public:
         // https://storage.spec.whatwg.org/#task-source
         Storage,
 
+        // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#embed-task-source
+        Embed,
+
         // !!! IMPORTANT: Keep this field last!
         // This serves as the base value of all unique task sources.
         // Some elements, such as the HTMLMediaElement, must have a unique task source per instance.
@@ -149,6 +153,8 @@ public:
 };
 
 struct WEB_API UniqueTaskSource {
+    AK_ALLOC_WITH_KMALLOC;
+
     UniqueTaskSource();
     ~UniqueTaskSource();
 

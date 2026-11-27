@@ -16,7 +16,6 @@
 #include <LibWeb/HTML/Parser/Entities.h>
 #include <LibWeb/HTML/Parser/NamedCharacterReferences.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/XML/XMLDocumentBuilder.h>
 
@@ -47,16 +46,15 @@ Optional<String> resolve_named_html_entity(StringView entity_name)
 
 XMLDocumentBuilder::XMLDocumentBuilder(DOM::Document& document, XMLScriptingSupport scripting_support)
     : m_document(document)
-    , m_current_node(m_document)
     , m_scripting_support(scripting_support)
 {
     m_namespace_stack.append({ {}, 1 });
 }
 
-ErrorOr<void> XMLDocumentBuilder::set_source(ByteString source)
+ErrorOr<void> XMLDocumentBuilder::set_source(StringView source)
 {
     m_document->update_readiness(HTML::DocumentReadyState::Loading);
-    m_document->set_source(Utf16String::from_utf8_with_replacement_character(source.view()));
+    m_document->set_source(Utf16String::from_utf8_with_replacement_character(source));
     return {};
 }
 
@@ -66,7 +64,7 @@ void XMLDocumentBuilder::set_doctype(XML::Doctype doctype)
         return;
     }
 
-    auto document_type = DOM::DocumentType::create(m_document);
+    auto document_type = DOM::DocumentType::create(*m_document);
     auto name = Utf16FlyString::from_utf8(doctype.type.view());
     document_type->set_name(name);
 
@@ -114,9 +112,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         m_namespace_stack.last().depth += 1;
     }
 
-    auto namespace_ = namespace_for_name(name);
-    auto utf8_name = MUST(name.view().to_utf8());
-    auto qualified_name_or_error = DOM::validate_and_extract(namespace_.map([](auto const& value) { return FlyString(MUST(value.view().to_utf8())); }), FlyString(utf8_name), DOM::ValidationContext::Element);
+    auto qualified_name_or_error = DOM::validate_and_extract(namespace_for_name(name), name, DOM::ValidationContext::Element);
 
     if (qualified_name_or_error.is_error()) {
         m_has_error = true;
@@ -125,7 +121,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
 
     auto qualified_name = qualified_name_or_error.value();
 
-    auto node_or_error = DOM::create_element(m_document, qualified_name.local_name(), qualified_name.namespace_(), qualified_name.prefix());
+    auto node_or_error = DOM::create_element(*m_document, qualified_name.local_name(), qualified_name.namespace_(), qualified_name.prefix());
 
     if (node_or_error.is_error()) {
         m_has_error = true;
@@ -137,33 +133,33 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
     // When an XML parser with XML scripting support enabled creates a script element,
     // it must have its parser document set and its "force async" flag must be unset.
     // FIXME: If the parser was created as part of the XML fragment parsing algorithm, then the element must be marked as "already started" also.
-    if (m_scripting_support == XMLScriptingSupport::Enabled && node->is_html_script_element()) {
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*node);
-        script_element.set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
-        script_element.set_force_async(Badge<XMLDocumentBuilder> {}, false);
+    // AD-HOC: SVG script elements are processed like HTML script elements, since SVG defines them as equivalent.
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*node); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
+        script_element->set_parser_document(Badge<XMLDocumentBuilder> {}, *m_document);
+        script_element->set_force_async(Badge<XMLDocumentBuilder> {}, false);
     }
 
     // AD-HOC: Let <link> elements know which document they were originally parsed for.
     //         This is used for the script-blocking and render-blocking logic.
     if (auto* link_element = as_if<HTML::HTMLLinkElement>(*node)) {
-        link_element->set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
+        link_element->set_parser_document(Badge<XMLDocumentBuilder> {}, *m_document);
         auto has_disabled_attribute = any_of(attributes, [](auto const& attribute) { return attribute.name == "disabled"sv; });
         link_element->set_was_enabled_when_created_by_parser(Badge<XMLDocumentBuilder> {}, !has_disabled_attribute);
     }
 
-    if (m_current_node->is_html_template_element()) {
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *current_node() };
+    if (current_node()->is_html_template_element()) {
         // When an XML parser would append a node to a template element, it must instead append it to the template element's template contents (a DocumentFragment node).
-        m_template_node_stack.append(*m_current_node);
-        MUST(static_cast<HTML::HTMLTemplateElement&>(*m_current_node).content()->append_child(node));
+        MUST(static_cast<HTML::HTMLTemplateElement&>(*current_node()).content()->append_child(node));
     } else {
-        MUST(m_current_node->append_child(node));
+        MUST(current_node()->append_child(node));
     }
 
     for (auto const& attribute : attributes) {
         if (attribute.name == "xmlns"sv || attribute.name.starts_with("xmlns:"sv)) {
             // The prefix xmlns is used only to declare namespace bindings and is by definition bound to the namespace name http://www.w3.org/2000/xmlns/.
             if (!attribute.name.is_one_of("xmlns:"sv, "xmlns:xmlns"sv)) {
-                auto maybe_extracted_qualified_name = DOM::validate_and_extract(FlyString(MUST(Namespace::XMLNS.view().to_utf8())), FlyString(MUST(attribute.name.view().to_utf8())), DOM::ValidationContext::Element);
+                auto maybe_extracted_qualified_name = DOM::validate_and_extract(Namespace::XMLNS, attribute.name, DOM::ValidationContext::Element);
                 if (!maybe_extracted_qualified_name.is_error()) {
                     auto extracted_qualified_name = maybe_extracted_qualified_name.release_value();
                     node->set_attribute_value(extracted_qualified_name.local_name(), attribute.value, extracted_qualified_name.prefix(), extracted_qualified_name.namespace_());
@@ -174,7 +170,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
             m_has_error = true;
         } else if (attribute.name.view().contains(':')) {
             if (auto namespace_for_key = namespace_for_name(attribute.name); namespace_for_key.has_value()) {
-                auto maybe_extracted_qualified_name = DOM::validate_and_extract(FlyString(MUST(namespace_for_key->view().to_utf8())), FlyString(MUST(attribute.name.view().to_utf8())), DOM::ValidationContext::Element);
+                auto maybe_extracted_qualified_name = DOM::validate_and_extract(namespace_for_key, attribute.name, DOM::ValidationContext::Element);
                 if (!maybe_extracted_qualified_name.is_error()) {
                     auto extracted_qualified_name = maybe_extracted_qualified_name.release_value();
                     node->set_attribute_value(extracted_qualified_name.local_name(), attribute.value, extracted_qualified_name.prefix(), extracted_qualified_name.namespace_());
@@ -188,7 +184,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         }
     }
 
-    m_current_node = node.ptr();
+    m_open_elements.append(node);
 }
 
 void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
@@ -200,15 +196,16 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
         m_namespace_stack.take_last();
     }
 
-    VERIFY(m_current_node->node_name().equals_ignoring_ascii_case(name));
+    VERIFY(current_node()->node_name().equals_ignoring_ascii_case(name));
     // When an XML parser with XML scripting support enabled creates a script element, [...]
     // When the element's end tag is subsequently parsed,
-    if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_html_script_element()) {
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*current_node()); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
         // the user agent must perform a microtask checkpoint,
         HTML::perform_a_microtask_checkpoint();
         // and then prepare the script element.
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*m_current_node);
-        script_element.prepare_script(Badge<XMLDocumentBuilder> {});
+        // AD-HOC: Set the script text value for Trusted Types as the HTML parser does, matching other engines.
+        script_element->set_script_text_from_parser();
+        script_element->prepare_script(Badge<XMLDocumentBuilder> {});
 
         // If this causes there to be a pending parsing-blocking script, then the user agent must run the following steps:
         if (auto pending_parsing_blocking_script = m_document->pending_parsing_blocking_script()) {
@@ -217,8 +214,8 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
 
             // 2. Spin the event loop until the parser's Document has no style sheet that is blocking scripts and the pending parsing-blocking script's "ready to be parser-executed" flag is set.
             if (m_document->has_a_style_sheet_that_is_blocking_scripts() || !pending_parsing_blocking_script->is_ready_to_be_parser_executed()) {
-                HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [&] {
-                    return !m_document->has_a_style_sheet_that_is_blocking_scripts() && pending_parsing_blocking_script->is_ready_to_be_parser_executed();
+                HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *m_document }, pending_parsing_blocking_script->as_element()), [](GC::Ref<DOM::Document>& document, DOM::Element& script) {
+                    return !document->has_a_style_sheet_that_is_blocking_scripts() && as<HTML::HTMLOrSVGScriptElement>(script).is_ready_to_be_parser_executed();
                 }));
             }
 
@@ -231,21 +228,9 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
             // 5. Set the pending parsing-blocking script to null.
             m_document->set_pending_parsing_blocking_script(nullptr);
         }
-    } else if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_svg_script_element()) {
-        // https://www.w3.org/TR/SVGMobile12/struct.html#ProgressiveRendering
-        // When an end element event occurs for a 'script' element, that element is processed according to the
-        // Script processing section of the Scripting chapter. Further parsing of the document will be blocked
-        // until processing of the 'script' is complete.
-        auto& script_element = static_cast<SVG::SVGScriptElement&>(*m_current_node);
-        script_element.process_the_script_element();
-    };
-
-    auto* parent = m_current_node->parent_node();
-    if (parent && parent->is_document_fragment()) {
-        auto template_parent_node = m_template_node_stack.take_last();
-        parent = template_parent_node.ptr();
     }
-    m_current_node = parent;
+
+    (void)m_open_elements.take_last();
 }
 
 void XMLDocumentBuilder::text(StringView data)
@@ -253,7 +238,8 @@ void XMLDocumentBuilder::text(StringView data)
     if (m_has_error)
         return;
 
-    if (auto* last = m_current_node->last_child(); last && last->is_text()) {
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *current_node() };
+    if (auto* last = current_node()->last_child(); last && last->is_text()) {
         auto& text_node = static_cast<DOM::Text&>(*last);
         m_text_builder.append(text_node.data());
         m_text_builder.append(Utf16String::from_utf8(data));
@@ -261,43 +247,55 @@ void XMLDocumentBuilder::text(StringView data)
         m_text_builder.clear();
     } else if (!data.is_empty()) {
         auto node = m_document->create_text_node(Utf16String::from_utf8(data));
-        MUST(m_current_node->append_child(node));
+        MUST(current_node()->append_child(node));
     }
 }
 
 void XMLDocumentBuilder::comment(StringView data)
 {
-    if (m_has_error || !m_current_node)
+    if (m_has_error || !current_node())
         return;
 
-    MUST(m_current_node->append_child(m_document->create_comment(Utf16String::from_utf8(data))));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *current_node() };
+    MUST(current_node()->append_child(m_document->create_comment(Utf16String::from_utf8(data))));
 }
 
 void XMLDocumentBuilder::cdata_section(StringView data)
 {
-    if (m_has_error || !m_current_node)
+    if (m_has_error || !current_node())
         return;
 
     auto section = MUST(m_document->create_cdata_section(Utf16String::from_utf8(data)));
-    MUST(m_current_node->append_child(section));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *current_node() };
+    MUST(current_node()->append_child(section));
 }
 
 void XMLDocumentBuilder::processing_instruction(Utf16FlyString const& target, Utf16String const& data)
 {
-    if (m_has_error || !m_current_node)
+    if (m_has_error || !current_node())
         return;
 
     auto processing_instruction = MUST(m_document->create_processing_instruction(target, data));
-    MUST(m_current_node->append_child(processing_instruction));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *current_node() };
+    MUST(current_node()->append_child(processing_instruction));
+}
+
+DOM::Node* XMLDocumentBuilder::current_node() const
+{
+    if (m_document_ended)
+        return nullptr;
+    if (m_open_elements.is_empty())
+        return m_document.ptr();
+    return m_open_elements.last().ptr();
 }
 
 void XMLDocumentBuilder::document_end()
 {
     // When an XML parser reaches the end of its input, it must stop parsing, following the same rules as the HTML parser.
-    m_template_node_stack.clear();
-    m_current_node = nullptr;
+    m_open_elements.clear();
+    m_document_ended = true;
 
-    HTML::HTMLParser::the_end(m_document, nullptr);
+    HTML::HTMLParser::the_end(*m_document, nullptr);
 }
 
 Optional<Utf16FlyString> XMLDocumentBuilder::namespace_for_name(Utf16FlyString const& name)
@@ -315,9 +313,8 @@ Optional<Utf16FlyString> XMLDocumentBuilder::namespace_for_name(Utf16FlyString c
         prefix = Utf16FlyString::from_utf16(view.substring_view(0, *first_colon_position));
     }
 
-    // The xml prefix is bound to the XML namespace by definition (Namespaces in XML 1.0 §3), so it never appears among
-    // the declarations below: libxml2 drops every declaration of it before the SAX callback (xmlParserNsPush), the way
-    // expat pre-binds it (implicitContext) — and Blink and WebKit take the XML namespace libxml2 resolves it to.
+    // The xml prefix is bound to the XML namespace by definition (Namespaces in XML 1.0 §3), whether or not anything
+    // declares it, and a declaration of it can only say the same.
     if (prefix == "xml"sv)
         return Namespace::XML;
 

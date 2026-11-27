@@ -28,7 +28,6 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 
 namespace Web::HTML {
@@ -78,13 +77,6 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
 {
     // 1. Let browsingContext be a new browsing context.
     GC::Ref<BrowsingContext> browsing_context = *GC::Heap::the().allocate<BrowsingContext>(page);
-
-    // NB: Upgrade Insecure Requests has a nested browsing context inherit its embedding document's insecure requests
-    //     policy when it is created.
-    if (embedder) {
-        auto const& embedding_document_settings = embedder->document().relevant_settings_object();
-        UpgradeInsecureRequests::inherit_the_insecure_requests_policy_into_a_nested_browsing_context(*browsing_context, embedding_document_settings.insecure_requests_policy(), embedding_document_settings.upgrade_insecure_navigations_set());
-    }
 
     // 2. Let unsafeContextCreationTime be the unsafe shared current time.
     [[maybe_unused]] auto unsafe_context_creation_time = HighResolutionTime::unsafe_shared_current_time();
@@ -147,7 +139,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
             return browsing_context->window_proxy()->object();
         });
 
-    auto& realm = *realm_execution_context->realm;
+    auto& realm = *realm_execution_context->realm();
 
     // 11. Let topLevelCreationURL be the return value of running these steps:
     auto top_level_creation_url = [&] {
@@ -176,6 +168,10 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         top_level_origin,
         agent_cluster_id,
         agent_cluster_cross_origin_isolation_mode);
+
+    auto agent_cluster_is_origin_keyed = origin.is_opaque()
+        || (creator && origin.is_same_origin(*creator_origin) && as<WindowEnvironmentSettingsObject>(creator->relevant_settings_object()).agent_cluster_is_origin_keyed());
+    as<WindowEnvironmentSettingsObject>(relevant_settings_object(*window)).set_agent_cluster_is_origin_keyed(agent_cluster_is_origin_keyed);
 
     // 14. Let loadTimingInfo be a new document load timing info with its navigation start time set to the result of calling
     //     coarsen time with unsafeContextCreationTime and the new environment settings object's cross-origin isolated capability.
@@ -230,9 +226,6 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     // custom element registry: A new CustomElementRegistry object.
     document->set_custom_element_registry(CustomElementRegistry::create_global(*document));
 
-    // NB: Upgrade Insecure Requests has a new Document inherit its browsing context's insecure requests policy.
-    UpgradeInsecureRequests::inherit_the_insecure_requests_policy_into_a_new_document(document->relevant_settings_object(), browsing_context);
-
     // 16. Let iframeReferrerPolicy be the result of determining the iframe element referrer policy given embedder.
     auto iframe_referrer_policy = determine_iframe_element_referrer_policy(embedder);
 
@@ -249,7 +242,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         document->set_referrer(utf16_string_from_url_ascii(creator->url().serialize()));
 
         // 2. Set document's policy container to a clone of creator's policy container.
-        document->set_policy_container(creator->policy_container()->clone(document->heap()));
+        document->set_policy_container(creator->policy_container()->clone());
 
         // 3. If creator's origin is same origin with creator's relevant settings object's top-level origin,
         if (creator->origin().is_same_origin(creator->relevant_settings_object().top_level_origin.value())) {
@@ -314,6 +307,20 @@ GC::Ptr<Navigable> BrowsingContext::opener_navigable() const
     return navigable;
 }
 
+Optional<CrossProcessId> BrowsingContext::one_permitted_sandboxed_navigator_navigable_id() const
+{
+    if (auto navigable = one_permitted_sandboxed_navigator_navigable())
+        return navigable->id();
+    return {};
+}
+
+GC::Ptr<Navigable> BrowsingContext::one_permitted_sandboxed_navigator_navigable() const
+{
+    if (!m_the_one_permitted_sandboxed_navigator || !m_the_one_permitted_sandboxed_navigator->active_document())
+        return nullptr;
+    return m_the_one_permitted_sandboxed_navigator->active_document()->navigable();
+}
+
 void BrowsingContext::set_opener_browsing_context(GC::Ptr<BrowsingContext> opener)
 {
     m_opener_browsing_context_window_proxy = opener ? opener->window_proxy() : nullptr;
@@ -322,10 +329,7 @@ void BrowsingContext::set_opener_browsing_context(GC::Ptr<BrowsingContext> opene
 // NB: The browsing context active in a navigable another process hosts is there, and its WindowProxy stands for it.
 void BrowsingContext::set_opener_browsing_context(Navigable& navigable)
 {
-    if (auto* remote_navigable = as_if<RemoteNavigable>(navigable))
-        m_opener_browsing_context_window_proxy = remote_navigable->active_window_proxy_in_realm_of(*m_window_proxy->window());
-    else
-        m_opener_browsing_context_window_proxy = navigable.active_window_proxy();
+    m_opener_browsing_context_window_proxy = navigable.active_window_proxy();
 }
 
 void BrowsingContext::visit_edges(Cell::Visitor& visitor)

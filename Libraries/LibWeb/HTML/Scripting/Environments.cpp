@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <LibGC/Heap.h>
 #include <LibGC/WeakInlines.h>
 #include <LibURL/InternalURLs.h>
@@ -14,8 +15,6 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
-#include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -23,6 +22,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -34,6 +34,7 @@
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/MixedContent/AbstractOperations.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/ServiceWorker/ServiceWorker.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerRegistration.h>
@@ -62,8 +63,16 @@ Environment::Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::
 
 Environment::~Environment() = default;
 
+static EnvironmentSettingsObjectAddress allocate_an_address()
+{
+    static Atomic<u64> s_next_address { 1 };
+    return EnvironmentSettingsObjectAddress { s_next_address.fetch_add(1) };
+}
+
 EnvironmentSettingsObject::EnvironmentSettingsObject(NonnullOwnPtr<JS::ExecutionContext> realm_execution_context)
     : m_realm_execution_context(move(realm_execution_context))
+    , m_address(allocate_an_address())
+    , m_keepalive_quota_accountant(Fetch::Infrastructure::KeepaliveQuotaAccountant::create())
 {
     m_module_map = GC::Heap::the().allocate<ModuleMap>();
 
@@ -94,7 +103,7 @@ void EnvironmentSettingsObject::visit_edges(Cell::Visitor& visitor)
     // it's finalized.
     for (auto& fetch_record : m_fetch_group) {
         auto controller = fetch_record.fetch_controller();
-        if (fetch_record.request()->done())
+        if (fetch_record.request().done())
             continue;
         if (controller && controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
             continue;
@@ -151,12 +160,12 @@ ModuleMap& EnvironmentSettingsObject::module_map()
 JS::Realm& EnvironmentSettingsObject::realm()
 {
     // An environment settings object's realm execution context's Realm component is the environment settings object's Realm.
-    return *realm_execution_context().realm;
+    return *realm_execution_context().realm();
 }
 
 JS::Realm const& EnvironmentSettingsObject::realm() const
 {
-    return *realm_execution_context().realm;
+    return *realm_execution_context().realm();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-global
@@ -219,7 +228,7 @@ void clean_up_after_running_script(EnvironmentSettingsObject const& settings)
 
     // 3. If the JavaScript execution context stack is now empty, perform a microtask checkpoint. (If this runs scripts, these algorithms will be invoked reentrantly.)
     if (!vm.has_running_execution_context())
-        main_thread_event_loop().perform_a_microtask_checkpoint();
+        current_event_loop().perform_a_microtask_checkpoint();
 }
 
 static JS::ExecutionContext* top_most_script_having_execution_context(JS::VM& vm)
@@ -227,7 +236,7 @@ static JS::ExecutionContext* top_most_script_having_execution_context(JS::VM& vm
     // Here, the topmost script-having execution context is the topmost entry of the JavaScript execution context stack that has a non-null ScriptOrModule component,
     // or null if there is no such entry in the JavaScript execution context stack.
     auto execution_context = vm.last_execution_context_matching([&](JS::ExecutionContext* context) {
-        return !context->script_or_module.has<Empty>();
+        return !context->script_or_module().has<Empty>();
     });
 
     if (!execution_context.has_value())
@@ -243,15 +252,15 @@ void prepare_to_run_callback(EnvironmentSettingsObject& settings)
 
     // 1. Push settings onto the backup incumbent settings object stack.
     // NOTE: The spec doesn't say which event loop's stack to put this on. However, all the examples of the incumbent settings object use iframes and cross browsing context communication to demonstrate the concept.
-    //       This means that it must rely on some global state that can be accessed by all browsing contexts, which is the main thread event loop.
-    HTML::main_thread_event_loop().push_onto_backup_incumbent_realm_stack(settings);
+    //       This means that it must rely on some global state that can be accessed by all browsing contexts, which is the event loop of their agent.
+    HTML::current_event_loop().push_onto_backup_incumbent_realm_stack(settings);
 
     // 2. Let context be the topmost script-having execution context.
     auto* context = top_most_script_having_execution_context(vm);
 
     // 3. If context is not null, increment context's skip-when-determining-incumbent counter.
     if (context) {
-        context->skip_when_determining_incumbent_counter++;
+        HTML::current_event_loop().increment_skip_when_determining_incumbent_counter(*context);
     }
 }
 
@@ -309,11 +318,11 @@ void clean_up_after_running_callback(EnvironmentSettingsObject const& settings)
 
     // 2. If context is not null, decrement context's skip-when-determining-incumbent counter.
     if (context) {
-        context->skip_when_determining_incumbent_counter--;
+        HTML::current_event_loop().decrement_skip_when_determining_incumbent_counter(*context);
     }
 
     // 3. Assert: the topmost entry of the backup incumbent realm stack is settings.
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     VERIFY(&event_loop.top_of_backup_incumbent_realm_stack() == &settings);
 
     // 4. Remove settings from the backup incumbent realm stack.
@@ -400,17 +409,27 @@ JS::Realm& incumbent_realm()
     return incumbent_settings_object().realm();
 }
 
+GC::Ptr<EnvironmentSettingsObject> environment_settings_object_at(EnvironmentSettingsObjectAddress address)
+{
+    return current_event_loop().environment_settings_object_at(address);
+}
+
+GC::Ptr<EnvironmentSettingsObject> environment_settings_object_with_id(EnvironmentId const& id)
+{
+    return current_event_loop().environment_settings_object_with_id(id);
+}
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#incumbent-settings-object
 EnvironmentSettingsObject& incumbent_settings_object()
 {
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     auto& vm = event_loop.vm();
 
     // 1. Let context be the topmost script-having execution context.
     auto* context = top_most_script_having_execution_context(vm);
 
     // 2. If context is null, or if context's skip-when-determining-incumbent counter is greater than zero, then:
-    if (!context || context->skip_when_determining_incumbent_counter > 0) {
+    if (!context || event_loop.skip_when_determining_incumbent_counter(*context) > 0) {
         // 1. Assert: the backup incumbent settings object stack is not empty.
         // 1. Assert: the backup incumbent realm stack is not empty.
         // NOTE: If this assertion fails, it's because the incumbent realm was used with no involvement of JavaScript.
@@ -421,7 +440,7 @@ EnvironmentSettingsObject& incumbent_settings_object()
     }
 
     // 3. Return context's Realm component's settings object.
-    return principal_realm_settings_object(*context->realm);
+    return principal_realm_settings_object(*context->realm());
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-incumbent-global
@@ -453,14 +472,14 @@ EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm& realm)
 EnvironmentSettingsObject& current_settings_object()
 {
     // Then, the current settings object is the environment settings object of the current realm.
-    return principal_realm_settings_object(*Bindings::main_thread_vm().current_realm());
+    return principal_realm_settings_object(*JS::VM::the().current_realm());
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#current-global-object
 JS::Object& current_global_object()
 {
     // Similarly, the current global object is the global object of the current realm.
-    return Bindings::main_thread_vm().current_realm()->global_object();
+    return JS::VM::the().current_realm()->global_object();
 }
 
 Window& current_window()
@@ -633,19 +652,19 @@ WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(Window co
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-entry-realm
 JS::Realm& entry_realm()
 {
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     auto& vm = event_loop.vm();
 
     // With this in hand, we define the entry execution context to be the most recently pushed item in the JavaScript execution context stack that is a realm execution context.
     // The entry realm is the entry execution context's Realm component.
     auto entry_execution_context = vm.last_execution_context_matching([](JS::ExecutionContext* context) {
-        if (!context->realm)
+        if (!context->realm())
             return false;
-        return &principal_realm_settings_object(*context->realm).realm_execution_context() == context;
+        return &principal_realm_settings_object(*context->realm()).realm_execution_context() == context;
     });
 
     VERIFY(entry_execution_context.has_value());
-    return *entry_execution_context.value()->realm;
+    return *entry_execution_context.value()->realm();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#entry-settings-object
@@ -713,12 +732,15 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         auto relevant_settings_object_policy_container = policy_container()->serialize();
         auto& global = global_object();
         if (auto const* window = window_from_global_object(global)) {
+            auto navigable = window->navigable();
             return SerializedWindow {
                 .associated_document {
                     .url = window->associated_document().url(),
+                    .site_for_cookies = window->associated_document().site_for_cookies(),
                     .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
                     .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
-                }
+                },
+                .navigable_is_top_level = navigable && navigable->is_top_level_traversable(),
             };
         }
         VERIFY(Bindings::worker_global_scope_from_global_object(global));
@@ -726,6 +748,7 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         auto const* dedicated_worker_global_scope = as_if<DedicatedWorkerGlobalScope>(worker_global_scope);
         auto supported_animation_frame_provider = dedicated_worker_global_scope && dedicated_worker_global_scope->is_supported();
         return SerializedWorkerGlobalScope {
+            .site_for_cookies = worker_global_scope->site_for_cookies(),
             .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
             .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
             .is_supported_animation_frame_provider = supported_animation_frame_provider,
@@ -742,63 +765,18 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         .has_cross_site_ancestor = has_cross_site_ancestor(),
         .policy_container = policy_container()->serialize(),
         .cross_origin_isolated_capability = cross_origin_isolated_capability(),
+        .prohibits_mixed_security_contexts = MixedContent::does_settings_prohibit_mixed_security_contexts(*this),
         .agent_cluster_id = agent_cluster_id(),
         .agent_cluster_cross_origin_isolation_mode = agent_cluster_cross_origin_isolation_mode(),
         .time_origin = this->time_origin(),
-        .insecure_requests_policy = insecure_requests_policy(),
-        .upgrade_insecure_navigations_set = upgrade_insecure_navigations_set(),
         .global = move(serialized_global),
     };
-}
-
-// https://w3c.github.io/webappsec-upgrade-insecure-requests/#delivery
-// AD-HOC: Enforcing the upgrade-insecure-requests directive sets the protected resource's settings' insecure requests
-//         policy to "Upgrade", and inserts a tuple of the protected resource's URL's host and port into settings'
-//         upgrade insecure navigations set. We instead derive both from the policies enforced in settings' policy
-//         container's CSP list, whether they were delivered with a response or by a meta element, and use each
-//         policy's self-origin as the protected resource's URL. Monitoring the directive has no effect, so only
-//         enforced policies count. The stored values hold what settings inherited.
-template<typename Callback>
-static void for_each_enforced_policy_with_upgrade_insecure_requests(EnvironmentSettingsObject const& settings, Callback callback)
-{
-    for (auto const& policy : settings.policy_container()->csp_list->policies()) {
-        if (policy->disposition() != ContentSecurityPolicy::Policy::Disposition::Enforce)
-            continue;
-        if (!policy->contains_directive_with_name(ContentSecurityPolicy::Directives::Names::UpgradeInsecureRequests))
-            continue;
-        if (callback(*policy) == IterationDecision::Break)
-            return;
-    }
-}
-
-UpgradeInsecureRequests::InsecureRequestsPolicy EnvironmentSettingsObject::insecure_requests_policy() const
-{
-    auto result = m_insecure_requests_policy;
-    if (result == UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade)
-        return result;
-    for_each_enforced_policy_with_upgrade_insecure_requests(*this, [&](auto const&) {
-        result = UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade;
-        return IterationDecision::Break;
-    });
-    return result;
-}
-
-UpgradeInsecureRequests::UpgradeInsecureNavigationsSet EnvironmentSettingsObject::upgrade_insecure_navigations_set() const
-{
-    auto result = m_upgrade_insecure_navigations_set;
-    for_each_enforced_policy_with_upgrade_insecure_requests(*this, [&](ContentSecurityPolicy::Policy const& policy) {
-        auto const& self_origin = policy.self_origin();
-        if (!self_origin.is_opaque())
-            result.insert({ self_origin.host(), self_origin.port() });
-        return IterationDecision::Continue;
-    });
-    return result;
 }
 
 GC::Ref<StorageAPI::StorageManager> EnvironmentSettingsObject::storage_manager()
 {
     if (!m_storage_manager)
-        m_storage_manager = StorageAPI::StorageManager::create(*this);
+        m_storage_manager = StorageAPI::StorageManager::create(realm());
     return *m_storage_manager;
 }
 
@@ -815,11 +793,8 @@ GC::Ref<ServiceWorker::ServiceWorkerRegistration> EnvironmentSettingsObject::get
     // 1. Let objectMap be environment’s service worker registration object map.
     auto& object_map = this->m_service_worker_registration_object_map;
 
-    // FIXME: File spec issue asking if this should be keyed on the registration's scope url only or on the url and the storage key
-    auto const key = ServiceWorker::RegistrationKey { registration.storage_key(), registration.scope_url().serialize(URL::ExcludeFragment::Yes).to_byte_string() };
-
     // 2. If objectMap[registration] does not exist, then:
-    if (!object_map.contains(key)) {
+    if (!object_map.contains(&registration)) {
         // 1. Let registrationObject be a new ServiceWorkerRegistration in environment’s Realm.
         // 2. Set registrationObject’s service worker registration to registration.
         // 3. Set registrationObject’s installing attribute to null.
@@ -840,11 +815,11 @@ GC::Ref<ServiceWorker::ServiceWorkerRegistration> EnvironmentSettingsObject::get
             registration_object->set_active(get_service_worker_object(registration.active_worker()));
 
         // 9. Set objectMap[registration] to registrationObject.
-        object_map.set(key, registration_object);
+        object_map.set(&registration, registration_object);
     }
 
     // 3. Return objectMap[registration].
-    return *object_map.get(key);
+    return *object_map.get(&registration);
 }
 
 GC::Ref<ServiceWorker::ServiceWorker> EnvironmentSettingsObject::get_service_worker_object(ServiceWorker::ServiceWorkerRecord* service_worker)

@@ -7,22 +7,30 @@
 //! Rust-owned custom-property data with the same structurally shared parent shape as the C++
 //! `CustomPropertyData` shell.
 
+use crate::css::style_value::{RandomValueSharingPayload, UnresolvedPayload};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use ak::ScopeGuard;
+use crate::css::thin_slice::ThinSlice;
+use smallvec::SmallVec;
+
+use ak::{ScopeGuard, Utf16FlyString};
 
 use crate::css::calc::CanonicalNumericType;
-use crate::css::css_tokenizer::{CssNumberType, ParserTokenKind, TokenizerInput, tokenize_for_parser};
-use crate::css::ffi_support::{FfiUtf16View, OwnedArc};
+use crate::css::cascaded_properties::parse_substituted_value;
+use crate::css::css_enums::keyword_from_ascii_case_insensitive;
+use crate::css::css_tokenizer::{CssNumberType, ParserString, ParserTokenKind, TokenizerInput, tokenize_for_parser};
+use crate::css::ffi_support::{ArcRef, FfiUtf16View, OwnedArc};
 use crate::css::function_signature::FunctionSignature;
 use crate::css::parser::arbitrary_substitution::{
     arbitrary_substitution_function, arguments_are_valid, collect_arbitrary_substitution_function_presence,
+    contains_arbitrary_substitution_function, declaration_value_is_valid,
 };
 use crate::css::parser::component_value::{
     ComponentKind, ComponentSerializationMode, ComponentValue, ComponentValueList, ComponentValueSlice,
@@ -32,21 +40,21 @@ use crate::css::parser::query_parser::{
     FeatureComparison, FfiMediaEnvironment, MatchResult, StyleFeature, StyleRangeValue as ParsedStyleRangeValue,
     parse_and_evaluate_media_if_condition, parse_and_evaluate_supports_if_condition, parse_style_range,
 };
-use crate::css::parser::syntax::{
-    SyntaxNode, SyntaxType, clone_syntax_handle, parse_syntax_values, parse_with_syntax_component_values,
-};
+use crate::css::parser::syntax::{SyntaxNode, SyntaxType, parse_syntax_values, parse_with_syntax_component_values};
 use crate::css::parser::value_parser::{
-    FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, RandomFunctionIndex,
+    FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, RandomFunctionIndex, is_css_wide_keyword,
 };
-use crate::css::retained_fly_string::RetainedUtf16FlyString;
-use crate::css::serialize::serialize_component_values_to_utf16;
+use crate::css::property_metadata::property_id;
+use crate::css::serialize::{
+    normalized_component_values_equal, serialize_component_values_to_utf16, serialize_resolved_style_value_to_utf16,
+};
+use crate::css::style_value::RetainedString;
 use crate::css::style_value::RetainedStyleValueData;
 use crate::css::style_value::StyleValueData;
+use crate::fast_hash::FastMap;
 
 include!(concat!(env!("OUT_DIR"), "/environment_variables_generated.rs"));
 
-// NB: Mirrors the lookup that Meta/Generators/generate_libweb_css_environment_variables.py
-//     emitted before this series removed that generator.
 pub(crate) fn environment_variable_is_known(name: &[u16]) -> bool {
     ENVIRONMENT_VARIABLES
         .iter()
@@ -92,28 +100,186 @@ impl Utf16SliceExt for [u16] {
 }
 
 #[repr(C)]
-pub struct FfiCustomPropertyStoreEntry<'a> {
+pub struct FfiCustomPropertyStoreEntry {
     pub name_raw: usize,
-    pub name: FfiUtf16View<'a>,
     pub important: bool,
     pub data: *const c_void,
 }
 
 #[derive(Clone)]
 pub(crate) struct CustomPropertyEntry {
-    _name: RetainedUtf16FlyString,
-    pub(crate) name: Arc<[u16]>,
+    pub(crate) name: Utf16FlyString,
     pub(crate) value: RetainedStyleValueData,
     pub(crate) important: bool,
+    /// Where the store holding the entry declared it among its own declarations, from one, or none
+    /// for a value it took in from the chain above it.
+    pub(crate) declared: Option<std::num::NonZeroU32>,
+}
+
+const _: () = assert!(size_of::<CustomPropertyEntry>() == 24);
+
+impl CustomPropertyEntry {
+    /// The entry, as one its store took in rather than declared.
+    fn taken_in(&self) -> Self {
+        Self {
+            declared: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// A store's own entries, sorted by the identities of their names, which a lookup binary-searches:
+/// as small as the entries themselves, where a hash table holds a key beside each and room for
+/// more. A store holds a few entries.
+#[derive(Clone, Default)]
+pub(crate) struct CustomPropertyEntries(ThinSlice<CustomPropertyEntry>);
+
+/// The entries of a store being built, which [`Self::finished`] makes the store's.
+#[derive(Default)]
+struct CustomPropertyEntriesBuilder(Vec<CustomPropertyEntry>);
+
+impl CustomPropertyEntriesBuilder {
+    fn position(&self, name_raw: usize) -> Result<usize, usize> {
+        self.0
+            .binary_search_by_key(&name_raw, |entry| entry.name.raw_identity())
+    }
+
+    /// Enters `entry` under its name, `name_raw`, in place of the one there.
+    fn insert(&mut self, name_raw: usize, entry: CustomPropertyEntry) {
+        debug_assert_eq!(name_raw, entry.name.raw_identity());
+        match self.position(name_raw) {
+            Ok(index) => self.0[index] = entry,
+            Err(index) => self.0.insert(index, entry),
+        }
+    }
+
+    /// Enters `entries` in order as the store's declarations, each in place of one of its name.
+    fn declare(&mut self, entries: impl IntoIterator<Item = (usize, CustomPropertyEntry)>) {
+        for (position, (name_raw, mut entry)) in entries.into_iter().enumerate() {
+            let position = u32::try_from(position + 1).expect("a store declares fewer than 2^32 custom properties");
+            entry.declared = std::num::NonZeroU32::new(position);
+            self.insert(name_raw, entry);
+        }
+    }
+
+    /// Enters a copy of `entry`, as taken in, where no entry of its name is.
+    fn insert_if_vacant(&mut self, entry: &CustomPropertyEntry) {
+        if let Err(index) = self.position(entry.name.raw_identity()) {
+            self.0.insert(index, entry.taken_in());
+        }
+    }
+
+    fn finished(self) -> CustomPropertyEntries {
+        CustomPropertyEntries(self.0.into_iter().collect())
+    }
+}
+
+impl CustomPropertyEntries {
+    fn position(&self, name_raw: usize) -> Result<usize, usize> {
+        self.0
+            .binary_search_by_key(&name_raw, |entry| entry.name.raw_identity())
+    }
+
+    pub(crate) fn get(&self, name_raw: &usize) -> Option<&CustomPropertyEntry> {
+        self.position(*name_raw).ok().map(|index| &self.0[index])
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &CustomPropertyEntry)> {
+        self.0.iter().map(|entry| (entry.name.raw_identity(), entry))
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().map(|entry| entry.name.raw_identity())
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &CustomPropertyEntry> {
+        self.0.iter()
+    }
+
+    /// A builder holding these entries, as taken in where `taken_in`.
+    fn to_builder(&self, taken_in: bool) -> CustomPropertyEntriesBuilder {
+        CustomPropertyEntriesBuilder(
+            self.0
+                .iter()
+                .map(|entry| if taken_in { entry.taken_in() } else { entry.clone() })
+                .collect(),
+        )
+    }
+}
+
+impl std::ops::Index<&usize> for CustomPropertyEntries {
+    type Output = CustomPropertyEntry;
+
+    fn index(&self, name_raw: &usize) -> &CustomPropertyEntry {
+        self.get(name_raw).expect("a store holds the entry asked for")
+    }
+}
+
+impl FromIterator<(usize, CustomPropertyEntry)> for CustomPropertyEntries {
+    fn from_iter<I: IntoIterator<Item = (usize, CustomPropertyEntry)>>(entries: I) -> Self {
+        let mut collected = CustomPropertyEntriesBuilder::default();
+        for (name_raw, entry) in entries {
+            collected.insert(name_raw, entry);
+        }
+        collected.finished()
+    }
+}
+
+/// How many answers of [`CustomPropertyStore::hold_the_same_values`] a thread keeps.
+const COMPARED_STORE_SLOTS: usize = 64;
+
+/// What comparing two stores answered, which stands for as long as it is kept: a store is immutable,
+/// and the weak references keep another store from taking the place of either without keeping
+/// anything it holds.
+struct ComparedStores {
+    first: Weak<CustomPropertyStore>,
+    second: Weak<CustomPropertyStore>,
+    same: bool,
+}
+
+thread_local! {
+    static COMPARED_STORES: RefCell<[Option<ComparedStores>; COMPARED_STORE_SLOTS]> =
+        const { RefCell::new([const { None }; COMPARED_STORE_SLOTS]) };
 }
 
 pub struct CustomPropertyStore {
-    pub(crate) own_values: HashMap<usize, CustomPropertyEntry>,
-    pub(crate) declared_names: Vec<usize>,
-    own_names: HashMap<Arc<[u16]>, usize>,
+    /// The values the store holds itself: those it declares, each knowing where among its
+    /// declarations, and those it took in from the chain above it.
+    pub(crate) own_values: CustomPropertyEntries,
     parent: Option<Arc<CustomPropertyStore>>,
     inheritance_parent: Option<Arc<CustomPropertyStore>>,
+    /// For the values an element's animations sample, the store of the environment they lie over,
+    /// whose values this one copies.
+    animation_overlay_base: Option<Arc<CustomPropertyStore>>,
     ancestor_count: u8,
+}
+
+// NB: The host holds a store as its custom-property environment itself, so this is all an
+//     environment takes.
+const _: () = assert!(size_of::<CustomPropertyStore>() == 40);
+
+impl crate::heap_size::HeapSize for CustomPropertyStore {
+    /// The store's table, its names and the stores it lies over, each counted once. A name's text
+    /// belongs to the process's fly strings and is not counted.
+    fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
+        self.own_values.0.heap_bytes()
+            + self
+                .own_values
+                .values()
+                .map(|entry| entry.value.heap_size(sizer))
+                .sum::<usize>()
+            + self.parent.heap_size(sizer)
+            + self.inheritance_parent.heap_size(sizer)
+            + self.animation_overlay_base.heap_size(sizer)
+    }
 }
 
 // SAFETY: Store nodes and their entries are immutable after construction. Style workers only
@@ -124,7 +290,7 @@ unsafe impl Send for CustomPropertyStore {}
 unsafe impl Sync for CustomPropertyStore {}
 
 pub struct CustomPropertyRegistry {
-    registrations: HashMap<Vec<u16>, RegisteredCustomProperty>,
+    registrations: FastMap<Utf16FlyString, RegisteredCustomProperty>,
     document_url: Vec<u8>,
     document_base_url: Vec<u8>,
     /// What a value parses to with a registration's syntax, by registration and value identity,
@@ -136,14 +302,52 @@ pub struct CustomPropertyRegistry {
 /// A value the registry has parsed, kept alive, and what it parsed to.
 type RegisteredValueParse = (RetainedStyleValueData, Option<RetainedStyleValueData>);
 
+pub(crate) enum CustomPropertyValueToFinalize<'a> {
+    StyleValue(RetainedStyleValueData),
+    SubstitutedComponents {
+        components: ComponentValueList,
+        parse_context: &'a ParseContext<'a>,
+        contains_attr_tainted_values: bool,
+    },
+}
+
+impl CustomPropertyValueToFinalize<'_> {
+    fn to_css_wide_keyword(&self) -> Option<u16> {
+        let keyword = match self {
+            Self::StyleValue(value) => match value.data() {
+                StyleValueData::Keyword { keyword } => *keyword,
+                _ => return None,
+            },
+            Self::SubstitutedComponents { components, .. } => {
+                keyword_from_ascii_case_insensitive(single_css_wide_keyword(components)?)?
+            }
+        };
+        is_css_wide_keyword(keyword).then_some(keyword)
+    }
+
+    fn contains_attr_tainted_values(&self) -> bool {
+        match self {
+            Self::StyleValue(value) => matches!(
+                value.data(),
+                StyleValueData::Unresolved(unresolved) if unresolved.contains_attr_tainted_values
+            ),
+            Self::SubstitutedComponents {
+                contains_attr_tainted_values,
+                ..
+            } => *contains_attr_tainted_values,
+        }
+    }
+}
+
 /// How many parses the registry keeps before it starts over.
 const MAX_REGISTERED_VALUE_PARSES: usize = 4096;
 
 #[derive(PartialEq)]
 struct RegisteredCustomProperty {
-    syntax: SyntaxNode,
+    /// The syntax the registration's rule or call parsed, shared with it.
+    syntax: Arc<SyntaxNode>,
     inherits: bool,
-    initial_source: Option<Vec<u16>>,
+    initial_source: Option<RetainedString>,
     /// The initial value as it computes, against the document rather than any element: the host
     /// computes it, memoizes it on the registration for every reader, and publishes it with the
     /// registration. The guaranteed-invalid value for a registration without one.
@@ -193,9 +397,9 @@ struct FunctionLocalValue<'a> {
 
 struct FunctionLocalScope<'a> {
     function_identity: CustomFunctionIdentity,
-    resolved_value_cache: Rc<RefCell<HashMap<Vec<u16>, ComponentValueList>>>,
-    values: HashMap<Vec<u16>, FunctionLocalValue<'a>>,
-    registrations: Rc<HashMap<Vec<u16>, FunctionLocalRegistration<'a>>>,
+    resolved_value_cache: Rc<RefCell<HashMap<Utf16FlyString, ComponentValueList>>>,
+    values: HashMap<Utf16FlyString, FunctionLocalValue<'a>>,
+    registrations: Rc<HashMap<Utf16FlyString, FunctionLocalRegistration<'a>>>,
 }
 
 #[repr(C)]
@@ -220,14 +424,21 @@ pub struct FfiCustomPropertyRegistryContext {
 /// One of an element's attributes an `attr()` reads: its local name, and its value's text.
 pub(crate) struct SubstitutionAttribute<'a> {
     pub(crate) name: &'a [u16],
-    pub(crate) value: &'a [u16],
+    /// The host's string of the value, which the element's attribute holds.
+    pub(crate) value: &'a crate::css::retained_fly_string::RetainedUtf16FlyString,
 }
 
 /// One declaration in the body of a custom function, as its conditions select it.
 pub(crate) struct SubstitutionFunctionDeclaration {
-    name: Vec<u16>,
+    name: Utf16FlyString,
     tokens: ComponentValueList,
     includes_substitution: bool,
+}
+
+impl SubstitutionFunctionDeclaration {
+    pub(crate) fn tokens(&self) -> &[ComponentValue] {
+        self.tokens.as_ref()
+    }
 }
 
 /// A definition visible to a caller scope, indexed in the prepared definition list.
@@ -239,9 +450,8 @@ pub(crate) struct CustomFunctionVisibility {
 
 /// That a call from a scope names a function: the definition its name dereferences to there, as
 /// a tree-scoped reference.
-#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FfiSubstitutionFunctionVisibility {
+pub struct SubstitutionFunctionVisibility {
     pub caller_scope_identity: usize,
     pub function_identity: u64,
 }
@@ -250,7 +460,7 @@ impl CustomPropertyRegistry {
     /// The registry of a document that registers no custom property.
     fn empty() -> Self {
         Self {
-            registrations: HashMap::new(),
+            registrations: FastMap::default(),
             document_url: Vec::new(),
             document_base_url: Vec::new(),
             parses: Default::default(),
@@ -276,17 +486,45 @@ impl CustomPropertyRegistry {
         self.registrations.values().any(|registration| !registration.inherits)
     }
 
-    pub(crate) fn name_is_registered(&self, name: &[u16]) -> bool {
+    fn registration(&self, name: &[u16]) -> Option<&RegisteredCustomProperty> {
+        if self.registrations.is_empty() {
+            return None;
+        }
+        self.registrations.get(&Utf16FlyString::from_utf16(name))
+    }
+
+    /// Whether the custom property `name` names is registered.
+    pub(crate) fn is_registered(&self, name: &Utf16FlyString) -> bool {
         self.registrations.contains_key(name)
     }
 
     /// Whether a name has the same effective registration in two document registries.
     pub(crate) fn registration_matches(&self, other: &Self, name: &[u16]) -> bool {
-        self.registrations.get(name) == other.registrations.get(name)
+        self.registration(name) == other.registration(name)
+    }
+
+    /// The names whose effective registration differs between `previous` and this registry: those
+    /// registered, unregistered or registered otherwise since.
+    pub(crate) fn names_registered_otherwise_than(&self, previous: &Self) -> Vec<Utf16FlyString> {
+        let moved_in = |registry: &Self, other: &Self| {
+            registry
+                .registrations
+                .iter()
+                .filter(|(name, registration)| other.registrations.get(*name) != Some(*registration))
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut names = moved_in(self, previous);
+        names.extend(
+            moved_in(previous, self)
+                .into_iter()
+                .filter(|name| !self.registrations.contains_key(name)),
+        );
+        names
     }
 
     /// Whether a custom property of this name inherits: only a registration can say it does not.
-    pub(crate) fn name_inherits(&self, name: &[u16]) -> bool {
+    pub(crate) fn name_inherits(&self, name: &Utf16FlyString) -> bool {
         self.registrations
             .get(name)
             .is_none_or(|registration| registration.inherits)
@@ -295,9 +533,15 @@ impl CustomPropertyRegistry {
     /// Whether a custom property of this name is registered with a syntax other than the universal
     /// one, which its values compute against.
     pub(crate) fn name_has_syntax(&self, name: &[u16]) -> bool {
+        self.registration(name)
+            .is_some_and(|registration| !matches!(*registration.syntax, SyntaxNode::Universal))
+    }
+
+    /// [`Self::name_has_syntax`], for the custom property `name` names.
+    pub(crate) fn has_syntax(&self, name: &Utf16FlyString) -> bool {
         self.registrations
             .get(name)
-            .is_some_and(|registration| !matches!(registration.syntax, SyntaxNode::Universal))
+            .is_some_and(|registration| !matches!(*registration.syntax, SyntaxNode::Universal))
     }
 
     /// Whether a registration's syntax permits smooth interpolation.
@@ -314,15 +558,34 @@ impl CustomPropertyRegistry {
                 SyntaxNode::Alternatives(alternatives) => alternatives.iter().any(is_interpolable),
             }
         }
-        self.registrations
-            .get(name)
+        self.registration(name)
             .is_some_and(|registration| is_interpolable(&registration.syntax))
+    }
+
+    /// https://drafts.csswg.org/css-variables-2/#invalid-at-computed-value-time
+    /// What a custom property computes to where it is invalid at computed-value time: as `unset`, what it
+    /// inherits from `inherited` where its registration inherits, and otherwise its initial value.
+    pub(crate) fn invalid_at_computed_value_time(
+        &self,
+        name: &crate::css::retained_fly_string::RetainedUtf16FlyString,
+        inherited: Option<&CustomPropertyStore>,
+    ) -> RetainedStyleValueData {
+        let inherits = self
+            .registration(name.to_utf16().as_ref())
+            .is_none_or(|registration| registration.inherits);
+        inherited
+            .filter(|_| inherits)
+            .and_then(|inherited| inherited.get(name.raw()))
+            .map_or_else(
+                || self.initial_value(name.to_utf16().as_ref()),
+                |entry| entry.value.clone(),
+            )
     }
 
     /// A custom property's initial value: what its registration's initial value computes to, and
     /// the guaranteed-invalid value for an unregistered name or a registration without one.
     pub(crate) fn initial_value(&self, name: &[u16]) -> RetainedStyleValueData {
-        self.registrations.get(name).map_or_else(
+        self.registration(name).map_or_else(
             || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
             |registration| registration.computed_initial.clone(),
         )
@@ -366,13 +629,17 @@ pub(crate) struct CustomPropertyFinalization<'a> {
 pub(crate) type DrawRandomBaseValue<'a> = dyn Fn(&[u16], bool) -> f64 + 'a;
 
 /// What computing registered values read of their element beyond the fonts of its lengths: the
-/// viewport, its place among its siblings, and the container-relative units it resolved against
-/// its query containers, as a `container_relative_length_unit_mask`.
+/// viewport, its place among its siblings, the container-relative units it resolved against its
+/// query containers, as a `container_relative_length_unit_mask`, the root element's font, and the
+/// used color scheme.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RegisteredValueReads {
     pub(crate) viewport: bool,
     pub(crate) sibling_position: bool,
     pub(crate) container_unit_mask: u8,
+    pub(crate) root_font: crate::css::style_compute::RootFontReads,
+    pub(crate) font_metrics: bool,
+    pub(crate) color_scheme: bool,
 }
 
 impl std::ops::BitOrAssign for RegisteredValueReads {
@@ -380,6 +647,9 @@ impl std::ops::BitOrAssign for RegisteredValueReads {
         self.viewport |= other.viewport;
         self.sibling_position |= other.sibling_position;
         self.container_unit_mask |= other.container_unit_mask;
+        self.root_font = self.root_font.max(other.root_font);
+        self.font_metrics |= other.font_metrics;
+        self.color_scheme |= other.color_scheme;
     }
 }
 
@@ -413,15 +683,60 @@ impl CustomPropertyRegistry {
         if let Some((_, parsed)) = parses.get(&key) {
             return parsed.clone();
         }
-        let source = crate::css::serialize::serialize_resolved_style_value_to_utf16(value.data());
-        let parsed = parse_substitution_values(&source)
-            .and_then(|values| self.parse_registered_value(registration, &values))
-            .map(RetainedStyleValueData::from_owned);
+
+        let parsed = match value.data() {
+            StyleValueData::Unresolved(unresolved_payload) => {
+                self.parse_registered_value(registration, &unresolved_payload.components())
+            }
+            _ => {
+                let source = serialize_resolved_style_value_to_utf16(value.data());
+                parse_substitution_values(&source).and_then(|values| self.parse_registered_value(registration, &values))
+            }
+        };
+        let parsed = parsed.map(RetainedStyleValueData::from_owned);
+
         if parses.len() >= MAX_REGISTERED_VALUE_PARSES {
             parses.clear();
         }
         parses.insert(key, (value.clone(), parsed.clone()));
         parsed
+    }
+
+    fn parse_custom_property_value_for_finalization(
+        &self,
+        registration: Option<&RegisteredCustomProperty>,
+        value: CustomPropertyValueToFinalize<'_>,
+    ) -> Option<RetainedStyleValueData> {
+        use CustomPropertyValueToFinalize::{StyleValue, SubstitutedComponents};
+
+        match (registration, value) {
+            (_, StyleValue(value)) if matches!(value.data(), StyleValueData::GuaranteedInvalid) => None,
+            (Some(registration), StyleValue(value)) => self.parse_registered_value_memoized(registration, &value),
+            (None, StyleValue(value)) => Some(value),
+            (Some(registration), SubstitutedComponents { components, .. }) => {
+                // Substitution results have no reusable value identity, so parse their components
+                // directly rather than constructing an unresolved value and retaining it in the memo.
+                collect_arbitrary_substitution_function_presence(&components, &mut Default::default()).ok()?;
+                if !declaration_value_is_valid(&components) {
+                    return None;
+                }
+                self.parse_registered_value(registration, &components)
+                    .map(RetainedStyleValueData::from_owned)
+            }
+            (
+                None,
+                SubstitutedComponents {
+                    components,
+                    parse_context,
+                    contains_attr_tainted_values,
+                },
+            ) => Some(parse_substituted_value(
+                parse_context,
+                property_id::CUSTOM,
+                &components,
+                contains_attr_tainted_values,
+            )),
+        }
     }
 
     /// Finalize a custom property's substituted value as its element's style computes it, as
@@ -435,8 +750,8 @@ impl CustomPropertyRegistry {
         &self,
         inherited: Option<&CustomPropertyStore>,
         name_raw: usize,
-        name: &[u16],
-        value: RetainedStyleValueData,
+        name: &Utf16FlyString,
+        value: CustomPropertyValueToFinalize<'_>,
         finalization: &CustomPropertyFinalization<'_>,
     ) -> Result<(RetainedStyleValueData, RegisteredValueReads), RetainedStyleValueData> {
         use crate::css::style_compute::keyword;
@@ -453,11 +768,11 @@ impl CustomPropertyRegistry {
                 .map_or_else(initial, |entry| entry.value.clone())
         };
 
-        let value = match value.data() {
+        let value = match value.to_css_wide_keyword() {
             // https://drafts.csswg.org/css-mixins/#resolve-function-styles
             // On result, all CSS-wide keywords are left unresolved.
-            StyleValueData::Keyword { keyword } if !name.iter().copied().eq("result".encode_utf16()) => {
-                match *keyword {
+            Some(keyword) if *name != Utf16FlyString::from_utf8("result") => {
+                let resolved = match keyword {
                     keyword::INITIAL => initial(),
                     keyword::INHERIT => inherited_value(),
                     // Unset is the same as inherit for an inherited property, and every unregistered
@@ -472,8 +787,9 @@ impl CustomPropertyRegistry {
                             inherited_value()
                         }
                     }
-                    _ => value,
-                }
+                    _ => unreachable!("all CSS-wide keywords are handled above"),
+                };
+                CustomPropertyValueToFinalize::StyleValue(resolved)
             }
             _ => value,
         };
@@ -483,33 +799,30 @@ impl CustomPropertyRegistry {
         // guaranteed-invalid value; any other to its inherited value or its initial value, as if
         // its value had been specified as unset.
         let syntax_registration =
-            registration.filter(|registration| !matches!(registration.syntax, SyntaxNode::Universal));
+            registration.filter(|registration| !matches!(*registration.syntax, SyntaxNode::Universal));
         let invalid_fallback = || match syntax_registration {
             Some(registration) if registration.inherits => inherited_value(),
             Some(_) => initial(),
             None => RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
         };
-        if matches!(value.data(), StyleValueData::GuaranteedInvalid) {
+
+        let contains_attr_tainted_values = value.contains_attr_tainted_values();
+
+        let Some(parsed) = self.parse_custom_property_value_for_finalization(syntax_registration, value) else {
             return Ok((invalid_fallback(), RegisteredValueReads::default()));
-        }
-        let Some(registration) = syntax_registration else {
-            return Ok((value, RegisteredValueReads::default()));
         };
 
-        let contains_attr_tainted_values = matches!(
-            value.data(),
-            StyleValueData::Unresolved {
-                contains_attr_tainted_values: true,
-                ..
-            }
-        );
-        let Some(parsed) = self.parse_registered_value_memoized(registration, &value) else {
-            return Ok((invalid_fallback(), RegisteredValueReads::default()));
-        };
+        if syntax_registration.is_none() {
+            return Ok((parsed, RegisteredValueReads::default()));
+        }
+
         // Without the element's lengths the value stays as parsed, as the host leaves one it has
         // no computed style to compute against.
         let Some(length) = finalization.length else {
-            return Ok((parsed, RegisteredValueReads::default()));
+            return Ok((
+                attr_tainted(parsed, contains_attr_tainted_values),
+                RegisteredValueReads::default(),
+            ));
         };
         let dependencies = crate::css::style_compute::collect_external_value_dependencies(parsed.data());
         let random_base_values = random_base_values_for_registered_value(parsed.data(), finalization);
@@ -532,31 +845,36 @@ impl CustomPropertyRegistry {
             viewport: context.resolved_viewport_relative_length.get(),
             sibling_position: dependencies.uses_tree_counting_function,
             container_unit_mask: dependencies.container_relative_length_unit_mask,
+            root_font: dependencies.root_font_reads,
+            font_metrics: dependencies.font_metric_relative_length,
+            color_scheme: dependencies.color_scheme_dependent,
         };
-        if !contains_attr_tainted_values {
-            return Ok((computed, reads));
-        }
-
-        // A value an attr() substituted into stays tainted, as an unresolved value carrying what
-        // it computed to.
-        let source = crate::css::serialize::serialize_resolved_style_value_to_utf16(computed.data());
-        let mut wrapped = crate::css::parser::value_parser::unresolved_value_from_string(
-            &source,
-            &[],
-            crate::css::parser::arbitrary_substitution::SubstitutionFunctionsPresence::default(),
-        );
-        let StyleValueData::Unresolved {
-            contains_attr_tainted_values,
-            parsed_value,
-            ..
-        } = &mut wrapped
-        else {
-            unreachable!("an unresolved value is built");
-        };
-        *contains_attr_tainted_values = true;
-        *parsed_value = computed;
-        Ok((RetainedStyleValueData::from_owned(wrapped), reads))
+        Ok((attr_tainted(computed, contains_attr_tainted_values), reads))
     }
+}
+
+/// A registered value an attr() substituted into, where `tainted` says it did, which stays
+/// tainted as an unresolved value carrying what it computed to.
+fn attr_tainted(value: RetainedStyleValueData, tainted: bool) -> RetainedStyleValueData {
+    if !tainted {
+        return value;
+    }
+    let source = crate::css::serialize::serialize_resolved_style_value_to_utf16(value.data());
+    let mut wrapped = crate::css::parser::value_parser::unresolved_value_from_string(
+        &source,
+        crate::css::parser::arbitrary_substitution::SubstitutionFunctionsPresence::default(),
+    );
+    let StyleValueData::Unresolved(unresolved_payload) = &mut wrapped else {
+        unreachable!("an unresolved value is built");
+    };
+    let UnresolvedPayload {
+        contains_attr_tainted_values,
+        parsed_value,
+        ..
+    } = unresolved_payload.payload_mut();
+    *contains_attr_tainted_values = true;
+    *parsed_value = value;
+    RetainedStyleValueData::from_owned(wrapped)
 }
 
 /// The random base values a registered value draws from once parsed after substitution. Its random
@@ -569,12 +887,15 @@ fn random_base_values_for_registered_value(
 ) -> Vec<crate::css::style_compute::FfiRandomBaseValue> {
     let published = finalization.random_base_values;
     let kind = |sharing: *const StyleValueData| match unsafe { &*sharing } {
-        StyleValueData::RandomValueSharing {
-            is_auto,
-            name,
-            element_shared,
-            ..
-        } => Some((*is_auto, name, *element_shared)),
+        StyleValueData::RandomValueSharing(random_value_sharing_payload) => {
+            let RandomValueSharingPayload {
+                is_auto,
+                name,
+                element_shared,
+                ..
+            } = &**random_value_sharing_payload;
+            Some((*is_auto, name, *element_shared))
+        }
         _ => None,
     };
     let mut sharings = Vec::new();
@@ -603,50 +924,76 @@ impl CustomPropertyStore {
     /// An element's animated custom property values laid over its own environment, `base`.
     fn animation_overlay(
         animated: impl ExactSizeIterator<Item = (usize, CustomPropertyEntry)>,
-        base: Option<&Self>,
+        base: Option<Arc<Self>>,
     ) -> Self {
-        let (mut own_values, mut own_names, parent, inheritance_parent, ancestor_count) = match base {
+        let (mut own_values, parent, inheritance_parent, ancestor_count) = match base.as_deref() {
             Some(base) => (
-                base.own_values.clone(),
-                base.own_names.clone(),
+                base.own_values.to_builder(true),
                 base.parent.clone(),
                 base.inheritance_parent.clone(),
                 base.ancestor_count,
             ),
-            None => (HashMap::new(), HashMap::new(), None, None, 0),
+            None => (CustomPropertyEntriesBuilder::default(), None, None, 0),
         };
-        let mut declared_names = Vec::with_capacity(animated.len());
-        for (name_raw, entry) in animated {
-            declared_names.push(name_raw);
-            own_names.insert(entry.name.clone(), name_raw);
-            own_values.insert(name_raw, entry);
-        }
+        own_values.declare(animated);
         Self {
-            own_values,
-            declared_names,
-            own_names,
+            own_values: own_values.finished(),
             ancestor_count,
             parent,
             inheritance_parent,
+            animation_overlay_base: base,
         }
     }
 
-    /// The values `overlay`, an animation overlay, laid over its base, laid over `base` instead.
-    pub(crate) fn animated_values_over(overlay: &Self, base: Option<&Self>) -> Self {
-        let animated = overlay
-            .declared_names
+    /// This animation overlay's animated values over `base`, the custom properties a pass resolved
+    /// beneath the element's animations, which the host sampled over the ones before: the names the
+    /// element inherits read what the pass resolved.
+    pub(crate) fn animation_overlay_over(self: &Arc<Self>, base: Option<&Arc<Self>>) -> Arc<Self> {
+        let sampled_over = self.animation_overlay_base.as_ref();
+        if Self::absent_or_holding_the_same_values(sampled_over, base) {
+            return self.clone();
+        }
+        let animated: SmallVec<[(usize, CustomPropertyEntry); 8]> = self
+            .own_values
             .iter()
-            .map(|name_raw| (*name_raw, overlay.own_values[name_raw].clone()));
-        Self::animation_overlay(animated, base)
+            .filter(|(name_raw, entry)| {
+                !sampled_over.is_some_and(|sampled_over| {
+                    sampled_over.value_is_identical(*name_raw, entry.value.pointer().cast())
+                })
+            })
+            .map(|(name_raw, entry)| (name_raw, entry.clone()))
+            .collect();
+        Arc::new(Self::animation_overlay(animated.into_iter(), base.cloned()))
     }
 
     pub(crate) fn parent(&self) -> Option<&Arc<CustomPropertyStore>> {
         self.parent.as_ref()
     }
 
-    /// The store this one was built over, whichever of its values it took in.
-    pub(crate) fn inheritance_parent(&self) -> Option<&Arc<CustomPropertyStore>> {
-        self.inheritance_parent.as_ref()
+    /// The names of the custom properties the store declares itself, in declaration order.
+    pub(crate) fn declared_names(&self) -> SmallVec<[usize; 8]> {
+        let mut declared: SmallVec<[(std::num::NonZeroU32, usize); 8]> = self
+            .own_values
+            .iter()
+            .filter_map(|(name_raw, entry)| Some((entry.declared?, name_raw)))
+            .collect();
+        declared.sort_unstable();
+        declared.into_iter().map(|(_, name_raw)| name_raw).collect()
+    }
+
+    /// How many custom properties the store declares itself.
+    pub(crate) fn declared_count(&self) -> usize {
+        self.own_values
+            .values()
+            .filter(|entry| entry.declared.is_some())
+            .count()
+    }
+
+    /// Whether the store declares `name_raw` itself.
+    pub(crate) fn declares(&self, name_raw: usize) -> bool {
+        self.own_values
+            .get(&name_raw)
+            .is_some_and(|entry| entry.declared.is_some())
     }
 
     pub(crate) fn get(&self, name_raw: usize) -> Option<&CustomPropertyEntry> {
@@ -655,18 +1002,41 @@ impl CustomPropertyStore {
             .or_else(|| self.parent.as_ref()?.get(name_raw))
     }
 
-    fn get_by_name_with_owner(&self, name: &[u16]) -> Option<(&CustomPropertyEntry, &CustomPropertyStore)> {
-        self.own_names
-            .get(name)
-            .and_then(|name_raw| self.own_values.get(name_raw))
+    /// The names of the values the store, or a store it is built over, holds. A name can come more than once.
+    pub(crate) fn held_names(&self) -> impl Iterator<Item = &Utf16FlyString> {
+        std::iter::successors(Some(self), |store| store.parent.as_deref())
+            .flat_map(|store| store.own_values.values().map(|entry| &entry.name))
+    }
+
+    /// Whether the store, or a store it is built over, holds a value of `name`.
+    pub(crate) fn holds(&self, name: &Utf16FlyString) -> bool {
+        self.get_by_name_with_owner(name).is_some()
+    }
+
+    /// The identity of the value `name` resolves to in this store, zero for a name it holds no
+    /// value of, or none where the value says more than its identity: a lone CSS-wide keyword,
+    /// which resolves against the store holding it, or a value still waiting on a substitution.
+    pub(crate) fn resolved_value_identity(&self, name: &Utf16FlyString) -> Option<usize> {
+        let Some((entry, _)) = self.get_by_name_with_owner(name) else {
+            return Some(0);
+        };
+        if let Some(StyleValueData::Unresolved(unresolved)) = entry.value.optional_data()
+            && (unresolved.presence().has_any() || unresolved.facts().is_lone_css_wide_keyword())
+        {
+            return None;
+        }
+        Some(entry.value.pointer() as usize)
+    }
+
+    fn get_by_name_with_owner(&self, name: &Utf16FlyString) -> Option<(&CustomPropertyEntry, &CustomPropertyStore)> {
+        self.own_values
+            .get(&name.raw_identity())
             .map(|entry| (entry, self))
             .or_else(|| self.parent.as_ref()?.get_by_name_with_owner(name))
     }
 
-    fn get_own_by_name(&self, name: &[u16]) -> Option<&CustomPropertyEntry> {
-        self.own_names
-            .get(name)
-            .and_then(|name_raw| self.own_values.get(name_raw))
+    fn get_own_by_name(&self, name: &Utf16FlyString) -> Option<&CustomPropertyEntry> {
+        self.own_values.get(&name.raw_identity())
     }
 
     /// What a child inherits of this store: the store without the entries a registration keeps
@@ -676,48 +1046,109 @@ impl CustomPropertyStore {
             return None;
         }
         let inherits = |entry: &CustomPropertyEntry| registry.name_inherits(&entry.name);
-        let own_values: HashMap<usize, CustomPropertyEntry> = self
+        let own_values: CustomPropertyEntries = self
             .own_values
             .iter()
             .filter(|(_, entry)| inherits(entry))
-            .map(|(&name_raw, entry)| (name_raw, entry.clone()))
+            .map(|(name_raw, entry)| (name_raw, entry.clone()))
             .collect();
         Some(Arc::new(Self {
-            own_names: own_values
-                .iter()
-                .map(|(&name_raw, entry)| (entry.name.clone(), name_raw))
-                .collect(),
-            declared_names: self
-                .declared_names
-                .iter()
-                .copied()
-                .filter(|name_raw| own_values.contains_key(name_raw))
-                .collect(),
             own_values,
             parent: self.parent.clone(),
             inheritance_parent: self.inheritance_parent.clone(),
+            animation_overlay_base: None,
             ancestor_count: self.ancestor_count,
         }))
     }
 
+    /// Whether `other` declares the custom properties the store does, in the same order. Both hold
+    /// their entries by name, so this takes no sorting, which a store of a design system's thousands
+    /// of custom properties would pay for each element compared against it.
+    fn declares_the_same_names_as(&self, other: &Self) -> bool {
+        fn declared(store: &CustomPropertyStore) -> impl Iterator<Item = (usize, std::num::NonZeroU32)> + '_ {
+            store
+                .own_values
+                .iter()
+                .filter_map(|(name_raw, entry)| Some((name_raw, entry.declared?)))
+        }
+        declared(self).eq(declared(other))
+    }
+
+    /// Whether `first` and `second` hold the same values, as [`Self::holds_same_values_as`] tells.
+    /// Every element below a store asks this of the same two stores, each answer taking a walk of
+    /// their values, so a thread keeps the answers it found.
+    pub(crate) fn hold_the_same_values(first: &Arc<Self>, second: &Arc<Self>) -> bool {
+        if Arc::ptr_eq(first, second) {
+            return true;
+        }
+        // NB: The answer is the same whichever of the two is asked.
+        let (first, second) = if Arc::as_ptr(first) < Arc::as_ptr(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let identities = (Arc::as_ptr(first) as u64) ^ (Arc::as_ptr(second) as u64).rotate_left(32);
+        let slot =
+            (identities.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - COMPARED_STORE_SLOTS.ilog2())) as usize;
+        let known = COMPARED_STORES.with_borrow(|compared| {
+            compared[slot]
+                .as_ref()
+                .filter(|compared| {
+                    compared.first.as_ptr() == Arc::as_ptr(first) && compared.second.as_ptr() == Arc::as_ptr(second)
+                })
+                .map(|compared| compared.same)
+        });
+        if let Some(same) = known {
+            return same;
+        }
+        let same = first.holds_same_values_as(second);
+        COMPARED_STORES.with_borrow_mut(|compared| {
+            compared[slot] = Some(ComparedStores {
+                first: Arc::downgrade(first),
+                second: Arc::downgrade(second),
+                same,
+            });
+        });
+        same
+    }
+
+    /// Whether `first` and `second` are both absent, or hold the same values.
+    pub(crate) fn absent_or_holding_the_same_values(first: Option<&Arc<Self>>, second: Option<&Arc<Self>>) -> bool {
+        match (first, second) {
+            (None, None) => true,
+            (Some(first), Some(second)) => Self::hold_the_same_values(first, second),
+            _ => false,
+        }
+    }
+
     /// Whether the store holds the same values as `other`, built over the same store and chained to
     /// the same parent.
-    pub(crate) fn holds_same_values_as(&self, other: &Self) -> bool {
-        let same = |first: &Option<Arc<Self>>, second: &Option<Arc<Self>>| match (first, second) {
-            (None, None) => true,
-            (Some(first), Some(second)) => Arc::ptr_eq(first, second),
-            _ => false,
-        };
-        same(&self.parent, &other.parent)
-            && same(&self.inheritance_parent, &other.inheritance_parent)
-            && self.declared_names == other.declared_names
-            && self.own_values.len() == other.own_values.len()
-            && self.own_values.iter().all(|(name_raw, entry)| {
-                other.own_values.get(name_raw).is_some_and(|other_entry| {
-                    other_entry.important == entry.important
-                        && crate::css::style_value::retained_style_values_equal(&other_entry.value, &entry.value)
+    fn holds_same_values_as(&self, other: &Self) -> bool {
+        let same_inheritance = Self::absent_or_holding_the_same_values(
+            self.inheritance_parent.as_ref(),
+            other.inheritance_parent.as_ref(),
+        );
+        if !same_inheritance || !self.declares_the_same_names_as(other) {
+            return false;
+        }
+        // NB: What a store took in from the chain above it, and which stores stand there, depends on how it was built:
+        //     stores hold the same where every name reads the same, down to a store their chains share.
+        fn chain(store: &CustomPropertyStore) -> impl Iterator<Item = &CustomPropertyStore> {
+            std::iter::successors(Some(store), |store| store.parent.as_deref())
+        }
+        let reads_alike_in_both = |from: &Self, shared_with: &Self| {
+            chain(from)
+                .take_while(|store| !chain(shared_with).any(|shared| std::ptr::eq(*store, shared)))
+                .flat_map(|store| store.own_values.iter())
+                .all(|(name_raw, _)| match (self.get(name_raw), other.get(name_raw)) {
+                    (Some(first), Some(second)) => {
+                        first.important == second.important
+                            && crate::css::style_value::retained_style_values_equal(&first.value, &second.value)
+                    }
+                    _ => false,
                 })
-            })
+        };
+        reads_alike_in_both(self, other) && reads_alike_in_both(other, self)
     }
 
     /// Whether a child inherits every entry of this store.
@@ -740,36 +1171,24 @@ impl CustomPropertyStore {
         mut parent: Option<Arc<CustomPropertyStore>>,
         entries: Vec<(usize, CustomPropertyEntry)>,
     ) -> Arc<CustomPropertyStore> {
-        let mut own_names = HashMap::with_capacity(entries.len());
-        let mut own_values = HashMap::with_capacity(entries.len());
-        let mut declared_names = Vec::with_capacity(entries.len());
-        for (name_raw, entry) in entries {
-            declared_names.push(name_raw);
-            own_names.insert(entry.name.clone(), name_raw);
-            own_values.insert(name_raw, entry);
-        }
+        let mut own_values = CustomPropertyEntriesBuilder(Vec::with_capacity(entries.len()));
+        own_values.declare(entries);
 
         let inheritance_parent = parent.clone();
         let ancestor_count = if let Some(current_parent) = parent.clone() {
             if current_parent.ancestor_count >= MAX_ANCESTOR_COUNT - 1 {
                 let mut ancestor = Some(current_parent.as_ref());
                 while let Some(current) = ancestor {
-                    for (&name_raw, entry) in &current.own_values {
-                        if let std::collections::hash_map::Entry::Vacant(slot) = own_values.entry(name_raw) {
-                            own_names.insert(entry.name.clone(), name_raw);
-                            slot.insert(entry.clone());
-                        }
+                    for entry in current.own_values.values() {
+                        own_values.insert_if_vacant(entry);
                     }
                     ancestor = current.parent.as_deref();
                 }
                 parent = None;
                 0
             } else if current_parent.own_values.len() <= ABSORB_THRESHOLD {
-                for (&name_raw, entry) in &current_parent.own_values {
-                    if let std::collections::hash_map::Entry::Vacant(slot) = own_values.entry(name_raw) {
-                        own_names.insert(entry.name.clone(), name_raw);
-                        slot.insert(entry.clone());
-                    }
+                for entry in current_parent.own_values.values() {
+                    own_values.insert_if_vacant(entry);
                 }
                 parent = current_parent.parent.clone();
                 parent.as_ref().map_or(0, |parent| parent.ancestor_count + 1)
@@ -781,11 +1200,10 @@ impl CustomPropertyStore {
         };
 
         Arc::new(CustomPropertyStore {
-            own_values,
-            declared_names,
-            own_names,
+            own_values: own_values.finished(),
             inheritance_parent,
             parent,
+            animation_overlay_base: None,
             ancestor_count,
         })
     }
@@ -805,10 +1223,10 @@ impl CustomPropertyStore {
                 (
                     name_raw,
                     CustomPropertyEntry {
-                        _name: source._name.clone(),
                         name: source.name.clone(),
                         value,
                         important: source.important,
+                        declared: None,
                     },
                 )
             })
@@ -820,22 +1238,22 @@ impl CustomPropertyStore {
     /// Every name and value pointer must remain live for this call.
     pub(crate) unsafe fn cascaded_child(
         parent: Option<Arc<CustomPropertyStore>>,
-        values: Vec<(usize, Arc<[u16]>, bool, *const c_void)>,
+        values: Vec<(usize, bool, *const c_void)>,
     ) -> Arc<CustomPropertyStore> {
         let entries = values
             .into_iter()
-            .map(|(name_raw, name, important, value)| {
+            .map(|(name_raw, important, value)| {
                 (
                     name_raw,
                     CustomPropertyEntry {
-                        _name: unsafe { RetainedUtf16FlyString::from_borrowed_raw(name_raw) },
-                        name,
+                        name: unsafe { Utf16FlyString::from_raw_borrowed(name_raw) },
                         value: unsafe {
                             RetainedStyleValueData::from_retained_pointer(
                                 crate::css::style_value::retain_style_value(value.cast()).cast(),
                             )
                         },
                         important,
+                        declared: None,
                     },
                 )
             })
@@ -849,7 +1267,8 @@ const MAX_SUBSTITUTION_RECURSION_DEPTH: u32 = 64;
 
 pub(crate) enum NativeVarResolution {
     Resolved {
-        source: Vec<u16>,
+        /// The substituted components.
+        components: ComponentValueList,
         contains_attr_tainted_values: bool,
     },
     Invalid,
@@ -876,7 +1295,7 @@ impl TokenResolution {
 // https://drafts.csswg.org/css-values-5/#substitution-context
 #[derive(PartialEq, Eq)]
 enum SubstitutionContextDependency {
-    Property(Vec<u16>, Option<CustomFunctionIdentity>),
+    Property(Utf16FlyString, Option<CustomFunctionIdentity>),
     // FIXME: Attribute substitution context equality should compare names ASCII-case-insensitively, as attribute lookup
     // does.
     Attribute(Vec<u16>),
@@ -954,24 +1373,20 @@ struct ASFResolutionContext<'a> {
     /// The queried element's sibling count and index, which tree-counting functions in a style
     /// query resolve against, where they are known.
     style_query_tree_counting: Option<(u64, u64)>,
-    /// Where the custom properties and sibling position a style query reads are noted, for the host to record.
+    /// Where whether a style query reads the sibling position is noted.
     style_query_dependencies: Option<&'a mut Option<Box<StyleQueryDependencies>>>,
     custom_property_finalization: CustomPropertyFinalization<'a>,
     registered_value_reads: Option<&'a mut RegisteredValueReads>,
     element_store: Option<&'a CustomPropertyStore>,
-    element_values: Option<&'a mut HashMap<usize, RetainedStyleValueData>>,
+    element_values: Option<&'a mut FastMap<usize, RetainedStyleValueData>>,
     substitution_limit_hits: u64,
     function_local_scopes: Vec<FunctionLocalScope<'a>>,
     token_cache: Option<&'a mut CustomPropertyTokenCache>,
+    /// Where the custom properties of the element the substitution under way looks up are noted, if anywhere.
+    element_property_reads: Option<&'a mut HashSet<Utf16FlyString>>,
 }
 
 impl ASFResolutionContext<'_> {
-    fn note_style_query_dependency(&mut self, name: &[u16]) {
-        if let Some(dependencies) = self.style_query_dependencies.as_deref_mut() {
-            dependencies.get_or_insert_default().note(name);
-        }
-    }
-
     fn note_style_query_sibling_position_dependency(&mut self) {
         if let Some(reads) = self.registered_value_reads.as_deref_mut() {
             reads.sibling_position = true;
@@ -982,54 +1397,16 @@ impl ASFResolutionContext<'_> {
     }
 }
 
-/// The custom properties and sibling position style queries read in one resolution.
+/// What the style queries of one resolution read beside the custom properties: whether they
+/// read the element's sibling position.
 #[derive(Clone, Default)]
 pub(crate) struct StyleQueryDependencies {
-    names: Vec<Vec<u16>>,
     pub(crate) sibling_position: bool,
 }
 
-impl StyleQueryDependencies {
-    fn note(&mut self, name: &[u16]) {
-        if !self.names.iter().any(|noted| noted == name) {
-            self.names.push(name.to_vec());
-        }
-    }
-
-    pub(crate) fn extend(&mut self, other: &Self) {
-        self.sibling_position |= other.sibling_position;
-        for name in other.names() {
-            self.note(name);
-        }
-    }
-
-    pub(crate) fn names(&self) -> impl Iterator<Item = &[u16]> {
-        self.names.iter().map(Vec::as_slice)
-    }
-}
-
-/// Visits each custom property the style queries of a resolution read, and frees them.
-///
-/// # Safety
-/// `dependencies` must be null or what a resolution left in its `style_query_dependencies`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_query_dependencies_take(
-    dependencies: *mut c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, FfiUtf16View),
-) {
-    if dependencies.is_null() {
-        return;
-    }
-    let dependencies = unsafe { Box::from_raw(dependencies.cast::<StyleQueryDependencies>()) };
-    for name in dependencies.names() {
-        unsafe {
-            visit(context, FfiUtf16View::from_utf16(name));
-        }
-    }
-}
-
-type CustomPropertyTokenCache = HashMap<*const StyleValueData, Arc<ComponentValueList>>;
+/// The tokens of each value by its address, with the value where nothing else keeps it for as long as the cache.
+type CustomPropertyTokenCache =
+    HashMap<*const StyleValueData, (Option<RetainedStyleValueData>, Arc<ComponentValueList>)>;
 
 pub(crate) struct VarResolutionEnvironment<'a> {
     attributes: HashMap<Vec<u16>, Vec<u16>>,
@@ -1039,7 +1416,7 @@ pub(crate) struct VarResolutionEnvironment<'a> {
 
 fn source_ends_with_comment(source: crate::css::css_tokenizer::TokenizerInput<'_>) -> bool {
     match source {
-        crate::css::css_tokenizer::TokenizerInput::Ascii(source) => source
+        crate::css::css_tokenizer::TokenizerInput::Latin1(source) => source
             .iter()
             .rposition(|unit| !unit.is_ascii_whitespace())
             .is_some_and(|end| end > 0 && source[end - 1..=end] == *b"*/"),
@@ -1050,7 +1427,7 @@ fn source_ends_with_comment(source: crate::css::css_tokenizer::TokenizerInput<'_
     }
 }
 
-fn single_css_wide_keyword(tokens: &[ComponentValue]) -> Option<&[u16]> {
+pub(crate) fn single_css_wide_keyword(tokens: &[ComponentValue]) -> Option<&[u16]> {
     let [value] = trim_whitespace(tokens) else {
         return None;
     };
@@ -1063,75 +1440,90 @@ fn single_css_wide_keyword(tokens: &[ComponentValue]) -> Option<&[u16]> {
     .then_some(keyword)
 }
 
-fn tokens_for_unresolved_custom_property_value(data: &StyleValueData) -> (ComponentValueSlice<'_>, bool, bool) {
-    let StyleValueData::Unresolved {
-        components,
-        presence_attr,
-        presence_dashed_function,
-        presence_env,
-        presence_if,
-        presence_inherit,
-        presence_var,
-        contains_attr_tainted_values,
-        source_text,
-        ..
-    } = data
-    else {
-        unreachable!("expected an unresolved custom property value");
-    };
-
-    let mut values = components.as_counted_slice();
-
-    // Discard trailing comments
-    if source_ends_with_comment(TokenizerInput::from(source_text)) {
-        values = values.trim_end_whitespace();
-    }
-
-    (
-        values,
-        *presence_var
-            || *presence_attr
-            || *presence_dashed_function
-            || *presence_env
-            || *presence_if
-            || *presence_inherit,
-        *contains_attr_tainted_values,
-    )
+/// The tokens of an unresolved custom property value as one read has them.
+struct CustomPropertyTokens {
+    components: ComponentValueList,
+    /// Whether the text ends with a comment, after which trailing whitespace is discarded.
+    trims_trailing_whitespace: bool,
 }
 
-fn resolve_typed_custom_property_value(
-    data: &StyleValueData,
+impl CustomPropertyTokens {
+    fn slice(&self) -> ComponentValueSlice<'_> {
+        let values = ComponentValueSlice::from(&self.components);
+        if self.trims_trailing_whitespace {
+            values.trim_end_whitespace()
+        } else {
+            values
+        }
+    }
+
+    fn into_list(self) -> ComponentValueList {
+        if self.trims_trailing_whitespace {
+            self.slice().to_owned()
+        } else {
+            self.components
+        }
+    }
+}
+
+fn tokens_for_unresolved_custom_property_value(unresolved_payload: &UnresolvedPayload) -> CustomPropertyTokens {
+    CustomPropertyTokens {
+        components: unresolved_payload.components(),
+        // Discard trailing comments
+        trims_trailing_whitespace: source_ends_with_comment(unresolved_payload.source_text()),
+    }
+}
+
+/// The tokens of a value a resolution reads, which it tokenizes once however often it reads them.
+/// The value must outlive the resolution's token cache.
+fn cached_value_tokens(data: &StyleValueData, context: &mut ASFResolutionContext<'_>) -> Arc<ComponentValueList> {
+    cached_tokens(data, None, context)
+}
+
+/// The tokens of `value`, which the resolution's token cache holds as long as it holds them.
+fn cached_held_value_tokens(
+    value: &RetainedStyleValueData,
     context: &mut ASFResolutionContext<'_>,
-) -> TokenResolution {
+) -> Arc<ComponentValueList> {
+    cached_tokens(value.data(), Some(value), context)
+}
+
+fn cached_tokens(
+    data: &StyleValueData,
+    held: Option<&RetainedStyleValueData>,
+    context: &mut ASFResolutionContext<'_>,
+) -> Arc<ComponentValueList> {
     let key = std::ptr::from_ref(data);
-    if let Some(tokens) = context.token_cache.as_deref().and_then(|cache| cache.get(&key)) {
-        return TokenResolution::Resolved(tokens.as_ref().clone());
+    if let Some((_, tokens)) = context.token_cache.as_deref().and_then(|cache| cache.get(&key)) {
+        return Arc::clone(tokens);
     }
-    let source = crate::css::serialize::serialize_style_value_to_utf16(data);
-    let tokens: Arc<ComponentValueList> = parse_substitution_values(&source)
-        .expect("serialized style values tokenize correctly")
-        .into();
+    let tokens: Arc<ComponentValueList> = match data {
+        StyleValueData::Unresolved(unresolved_payload) => {
+            tokens_for_unresolved_custom_property_value(unresolved_payload).into_list()
+        }
+        _ => parse_substitution_values(&crate::css::serialize::serialize_style_value_to_utf16(data))
+            .expect("serialized style values tokenize correctly"),
+    }
+    .into();
     if let Some(cache) = context.token_cache.as_deref_mut() {
-        cache.insert(key, Arc::clone(&tokens));
+        cache.insert(key, (held.cloned(), Arc::clone(&tokens)));
     }
-    TokenResolution::Resolved(tokens.as_ref().clone())
+    tokens
 }
 
 /// Tokens, substitution-function presence, and attribute reads for a function value.
 fn tokens_for_function_value(data: &StyleValueData) -> (ComponentValueList, bool, bool) {
-    if let StyleValueData::Unresolved {
-        components,
-        presence_attr,
-        presence_dashed_function,
-        presence_env,
-        presence_if,
-        presence_inherit,
-        presence_var,
-        ..
-    } = data
-    {
+    if let StyleValueData::Unresolved(unresolved_payload) = data {
+        let presence_attr = &unresolved_payload.presence().attr;
+        let presence_dashed_function = &unresolved_payload.presence().dashed_function;
+        let presence_env = &unresolved_payload.presence().env;
+        let presence_if = &unresolved_payload.presence().if_;
+        let presence_inherit = &unresolved_payload.presence().inherit;
+        let presence_var = &unresolved_payload.presence().var;
         return (
-            components.as_counted_slice().trim_whitespace().to_owned(),
+            ComponentValueSlice::from(&unresolved_payload.components())
+                .trim_whitespace()
+                .to_owned(),
             *presence_var
                 || *presence_attr
                 || *presence_dashed_function
@@ -1178,7 +1570,7 @@ pub(crate) fn prepare_function_declarations(
         reads_attributes |= value_reads_attributes;
 
         declarations.push(SubstitutionFunctionDeclaration {
-            name: declaration.name.units().to_vec(),
+            name: Utf16FlyString::from_utf16(declaration.name.units()),
             tokens,
             includes_substitution,
         });
@@ -1194,7 +1586,7 @@ pub(crate) fn prepare_var_resolution_environment<'a>(
 ) -> VarResolutionEnvironment<'a> {
     let attributes = attributes
         .iter()
-        .map(|attribute| (attribute.name.to_vec(), attribute.value.to_vec()))
+        .map(|attribute| (attribute.name.to_vec(), attribute.value.to_utf16().into_owned()))
         .collect();
     VarResolutionEnvironment {
         attributes,
@@ -1210,8 +1602,8 @@ pub(crate) fn finalize_element_custom_property(
     finalization: &CustomPropertyFinalization,
     reads: &mut RegisteredValueReads,
     name_raw: usize,
-    name: &[u16],
-    value: RetainedStyleValueData,
+    name: &Utf16FlyString,
+    value: CustomPropertyValueToFinalize<'_>,
 ) -> RetainedStyleValueData {
     let (value, value_reads) = registry
         .finalize_custom_property_value(inherited, name_raw, name, value, finalization)
@@ -1228,11 +1620,11 @@ thread_local! {
 fn compute_element_custom_property(
     store: &CustomPropertyStore,
     registry: &CustomPropertyRegistry,
-    name: &[u16],
+    name: &Utf16FlyString,
     context: &mut ASFResolutionContext,
     recursion_depth: u32,
 ) -> Result<RetainedStyleValueData, ()> {
-    let name_raw = store.own_names[name];
+    let name_raw = name.raw_identity();
 
     if let Some(cached) = context.element_values.as_deref().ok_or(())?.get(&name_raw) {
         return Ok(cached.clone());
@@ -1244,12 +1636,16 @@ fn compute_element_custom_property(
     CUSTOM_PROPERTY_COMPUTATIONS.with(|count| count.set(count.get() + 1));
 
     let entry = &store.own_values[&name_raw];
-    let (tokens, includes_substitution, tainted) = match entry.value.data() {
-        data @ StyleValueData::Unresolved { .. } => tokens_for_unresolved_custom_property_value(data),
-        _ => (ComponentValueSlice::new(&[]), false, false),
+    let substituted = match entry.value.data() {
+        StyleValueData::Unresolved(unresolved_payload) if unresolved_payload.presence().has_any() => {
+            Some(unresolved_payload)
+        }
+        _ => None,
     };
 
-    let value = if includes_substitution {
+    let value = if let Some(unresolved_payload) = substituted {
+        let tokens = tokens_for_unresolved_custom_property_value(unresolved_payload);
+        let tainted = unresolved_payload.contains_attr_tainted_values;
         let guarded_contexts = GuardedSubstitutionContexts {
             contexts: Rc::new(RefCell::new(
                 context
@@ -1273,34 +1669,34 @@ fn compute_element_custom_property(
             element_values: context.element_values.as_deref_mut(),
             function_local_scopes: Vec::new(),
             token_cache: context.token_cache.as_deref_mut(),
+            element_property_reads: context.element_property_reads.as_deref_mut(),
             ..*context
         };
 
         let result = substitute_arbitrary_substitution_functions(
             Some(store),
             Some(registry),
-            tokens,
+            tokens.slice(),
             &mut property_context,
             recursion_depth,
-            Some(SubstitutionContextDependency::Property(name.to_vec(), None)),
+            Some(SubstitutionContextDependency::Property(name.clone(), None)),
         );
 
         context.substitution_limit_hits = property_context.substitution_limit_hits;
 
         match result {
-            TokenResolution::Resolved(tokens) => crate::css::cascaded_properties::parse_substituted_value(
-                property_context.parse_context.ok_or(())?,
-                crate::css::property_metadata::property_id::CUSTOM,
-                &serialize_tokens(&tokens),
-                property_context.contains_attr_tainted_values,
+            TokenResolution::Resolved(components) => CustomPropertyValueToFinalize::SubstitutedComponents {
+                components,
+                parse_context: context.parse_context.ok_or(())?,
+                contains_attr_tainted_values: property_context.contains_attr_tainted_values,
+            },
+            TokenResolution::Invalid | TokenResolution::Cyclic => CustomPropertyValueToFinalize::StyleValue(
+                RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
             ),
-            TokenResolution::Invalid | TokenResolution::Cyclic => {
-                RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid)
-            }
             TokenResolution::NotHandled => return Err(()),
         }
     } else {
-        entry.value.clone()
+        CustomPropertyValueToFinalize::StyleValue(entry.value.clone())
     };
 
     let finalized_value = finalize_element_custom_property(
@@ -1349,7 +1745,7 @@ pub(crate) fn resolve_element_custom_properties(
         custom_property_finalization: finalization,
         registered_value_reads: Some(&mut reads),
         element_store: Some(store),
-        element_values: Some(&mut HashMap::new()),
+        element_values: Some(&mut FastMap::default()),
         token_cache: Some(&mut environment.token_cache),
         ..Default::default()
     };
@@ -1359,9 +1755,9 @@ pub(crate) fn resolve_element_custom_properties(
         .unwrap_or_else(|| CustomPropertyRegistry::shared_empty());
 
     let values = store
-        .declared_names
-        .iter()
-        .map(|&name_raw| {
+        .declared_names()
+        .into_iter()
+        .map(|name_raw| {
             let name = &store.own_values[&name_raw].name;
             match compute_element_custom_property(store, registry, name, &mut context, 0) {
                 Ok(value) => value,
@@ -1372,7 +1768,9 @@ pub(crate) fn resolve_element_custom_properties(
                     context.registered_value_reads.as_deref_mut().unwrap(),
                     name_raw,
                     name,
-                    RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
+                    CustomPropertyValueToFinalize::StyleValue(RetainedStyleValueData::from_owned(
+                        StyleValueData::GuaranteedInvalid,
+                    )),
                 ),
             }
         })
@@ -1384,12 +1782,13 @@ pub(crate) fn resolve_element_custom_properties(
 fn computed_property_tokens(value: &RetainedStyleValueData, context: &mut ASFResolutionContext) -> TokenResolution {
     match value.data() {
         StyleValueData::GuaranteedInvalid => TokenResolution::Invalid,
-        data @ StyleValueData::Unresolved { .. } => {
-            let (tokens, _, tainted) = tokens_for_unresolved_custom_property_value(data);
-            context.contains_attr_tainted_values |= tainted;
-            TokenResolution::Resolved(tokens.to_owned())
+        // NB: A computed value can be one the element computed just now, which need not outlive the
+        //     resolution, so its tokens are not cached by its address, or the cache holds it.
+        StyleValueData::Unresolved(unresolved_payload) => {
+            context.contains_attr_tainted_values |= unresolved_payload.contains_attr_tainted_values;
+            TokenResolution::Resolved(tokens_for_unresolved_custom_property_value(unresolved_payload).into_list())
         }
-        data => resolve_typed_custom_property_value(data, context),
+        _ => TokenResolution::Resolved(cached_held_value_tokens(value, context).as_ref().clone()),
     }
 }
 
@@ -1398,7 +1797,7 @@ fn registration_accepts_tokens(
     registration: &RegisteredCustomProperty,
     tokens: &[ComponentValue],
 ) -> bool {
-    matches!(registration.syntax, SyntaxNode::Universal)
+    matches!(*registration.syntax, SyntaxNode::Universal)
         || registry.parse_registered_value(registration, tokens).is_some()
 }
 
@@ -1406,7 +1805,7 @@ fn registered_property_fallback(
     inheritance_store: Option<&CustomPropertyStore>,
     registry: &CustomPropertyRegistry,
     registration: &RegisteredCustomProperty,
-    name: &[u16],
+    name: &Utf16FlyString,
     recursion_depth: u32,
 ) -> TokenResolution {
     if registration.inherits
@@ -1424,13 +1823,14 @@ fn registered_property_fallback(
     registration
         .initial_source
         .as_ref()
+        .map(RetainedString::units)
         .map_or(TokenResolution::Invalid, TokenResolution::from_source)
 }
 
 fn resolve_css_wide_keyword(
     owner: &CustomPropertyStore,
     registry: Option<&CustomPropertyRegistry>,
-    name: &[u16],
+    name: &Utf16FlyString,
     keyword: &[u16],
     context: &mut ASFResolutionContext,
     recursion_depth: u32,
@@ -1441,6 +1841,7 @@ fn resolve_css_wide_keyword(
     if keyword.eq_ignore_ascii_case("initial") {
         return registration
             .and_then(|registration| registration.initial_source.as_ref())
+            .map(RetainedString::units)
             .map_or(TokenResolution::Invalid, TokenResolution::from_source);
     }
     // FIXME: Roll `revert` and `revert-layer` back to a declaration of the custom property from a lower cascade layer
@@ -1466,6 +1867,7 @@ fn resolve_css_wide_keyword(
     }
     registration
         .and_then(|registration| registration.initial_source.as_ref())
+        .map(RetainedString::units)
         .map_or(TokenResolution::Invalid, TokenResolution::from_source)
 }
 
@@ -1498,7 +1900,7 @@ fn normalize_function_tokens(
 fn resolve_function_local_property(
     store: Option<&CustomPropertyStore>,
     registry: Option<&CustomPropertyRegistry>,
-    name: &[u16],
+    name: &Utf16FlyString,
     function_identity: CustomFunctionIdentity,
     value: Option<FunctionLocalValue<'_>>,
     registration: FunctionLocalRegistration<'_>,
@@ -1518,7 +1920,7 @@ fn resolve_function_local_property(
             context,
             recursion_depth + 1,
             Some(SubstitutionContextDependency::Property(
-                name.to_owned(),
+                name.clone(),
                 Some(function_identity),
             )),
         )
@@ -1562,7 +1964,7 @@ enum CustomPropertyLookup {
 fn resolve_custom_property(
     store: Option<&CustomPropertyStore>,
     registry: Option<&CustomPropertyRegistry>,
-    name: &[u16],
+    name: &Utf16FlyString,
     context: &mut ASFResolutionContext,
     recursion_depth: u32,
 ) -> TokenResolution {
@@ -1579,7 +1981,7 @@ fn resolve_custom_property(
 fn resolve_custom_property_with_lookup(
     store: Option<&CustomPropertyStore>,
     registry: Option<&CustomPropertyRegistry>,
-    name: &[u16],
+    name: &Utf16FlyString,
     context: &mut ASFResolutionContext,
     recursion_depth: u32,
     lookup: CustomPropertyLookup,
@@ -1619,10 +2021,16 @@ fn resolve_custom_property_with_lookup(
             context.function_local_scopes[local_scope_index]
                 .resolved_value_cache
                 .borrow_mut()
-                .insert(name.to_owned(), tokens.clone());
+                .insert(name.clone(), tokens.clone());
         }
 
         return result;
+    }
+
+    if lookup == CustomPropertyLookup::Normal
+        && let Some(reads) = context.element_property_reads.as_deref_mut()
+    {
+        reads.insert(name.clone());
     }
 
     // Pop the function local scopes while we resolve the element level custom property.
@@ -1631,7 +2039,7 @@ fn resolve_custom_property_with_lookup(
     let _guard = ScopeGuard::new(|| context_ref.borrow_mut().function_local_scopes = std::mem::take(&mut local_scopes));
     let context = &mut **context_ref.borrow_mut();
 
-    let substitution_context = SubstitutionContextDependency::Property(name.to_owned(), None);
+    let substitution_context = SubstitutionContextDependency::Property(name.clone(), None);
     // AD-HOC: The root custom property's unresolved value is passed directly to `resolve_vars()` rather than read
     //         through this lookup. If it contains a `var()` that refers back to itself, this function is entered while
     //         the caller's root context is already guarded, so mark that context cyclic before consulting stored or
@@ -1652,12 +2060,14 @@ fn resolve_custom_property_with_lookup(
     let Some((entry, owner)) = entry_and_owner else {
         return registration
             .and_then(|registration| registration.initial_source.as_ref())
+            .map(RetainedString::units)
             .map_or(TokenResolution::Invalid, TokenResolution::from_source);
     };
+    // Declared names are unique keys from own_values; equal counts mean the owner lookup proves membership.
     if lookup == CustomPropertyLookup::Normal
         && context.element_store.is_some_and(|store| std::ptr::eq(store, owner))
-        && owner.declared_names.contains(&owner.own_names[name])
         && store.is_some_and(|store| std::ptr::eq(store, owner))
+        && owner.declares(name.raw_identity())
     {
         let computed_value = compute_element_custom_property(
             owner,
@@ -1685,23 +2095,23 @@ fn resolve_custom_property_with_lookup(
     {
         return computed_property_tokens(&entry.value, context);
     }
-    let result = if matches!(data, StyleValueData::Unresolved { .. }) {
-        let (source, includes_var, contains_attr_tainted_values) = tokens_for_unresolved_custom_property_value(data);
-        context.contains_attr_tainted_values |= contains_attr_tainted_values;
-        if includes_var {
+    let result = if let StyleValueData::Unresolved(unresolved_payload) = data {
+        context.contains_attr_tainted_values |= unresolved_payload.contains_attr_tainted_values;
+        let tokens = cached_value_tokens(data, context);
+        if unresolved_payload.presence().has_any() {
             substitute_arbitrary_substitution_functions(
                 store,
                 registry,
-                source,
+                tokens.as_ref(),
                 context,
                 recursion_depth + 1,
                 Some(substitution_context),
             )
         } else {
-            TokenResolution::Resolved(source.to_owned())
+            TokenResolution::Resolved(tokens.as_ref().clone())
         }
     } else {
-        resolve_typed_custom_property_value(data, context)
+        TokenResolution::Resolved(cached_value_tokens(data, context).as_ref().clone())
     };
     if let TokenResolution::Resolved(tokens) = &result
         && let Some(keyword) = single_css_wide_keyword(tokens)
@@ -1749,11 +2159,12 @@ fn replace_var_function(
         TokenResolution::NotHandled => return TokenResolution::NotHandled,
     };
     let name = match trim_whitespace(&substituted_first) {
-        [value] => value.ident().filter(|name| name.starts_with_ascii("--")),
+        [value] => value.ident_string().filter(|name| name.starts_with_ascii("--")),
         _ => None,
     };
     if let Some(name) = name {
-        match resolve_custom_property(store, registry, name, context, recursion_depth) {
+        let name = name.fly_string();
+        match resolve_custom_property(store, registry, &name, context, recursion_depth) {
             TokenResolution::Cyclic if comma.is_none() => return TokenResolution::Cyclic,
             TokenResolution::Invalid | TokenResolution::Cyclic => {}
             result => return result,
@@ -1783,10 +2194,11 @@ fn replace_inherit_function(
         TokenResolution::NotHandled => return TokenResolution::NotHandled,
     };
     let name = match trim_whitespace(&substituted_first) {
-        [value] => value.ident().filter(|name| name.starts_with_ascii("--")),
+        [value] => value.ident_string().filter(|name| name.starts_with_ascii("--")),
         _ => None,
     };
     if let Some(name) = name {
+        let name = name.fly_string();
         let local_scope = context.function_local_scopes.pop();
         let inherited_store = if local_scope.is_some() {
             store
@@ -1796,7 +2208,7 @@ fn replace_inherit_function(
         let result = resolve_custom_property_with_lookup(
             inherited_store,
             registry,
-            name,
+            &name,
             context,
             recursion_depth + 1,
             if local_scope.is_some() {
@@ -2084,6 +2496,12 @@ impl StyleRangeValue {
             ),
             // A tree-counting function resolves against the queried element's place among its
             // siblings first.
+            StyleValueData::TreeCountingFunction { function, .. } => {
+                context.note_style_query_sibling_position_dependency();
+                let (sibling_count, sibling_index) = tree_counting?;
+                let value = if function == 0 { sibling_count } else { sibling_index };
+                (CanonicalNumericType::Number, value as f64)
+            }
             StyleValueData::Calculated { .. } => {
                 if crate::css::style_compute::collect_external_value_dependencies(value).uses_tree_counting_function {
                     context.note_style_query_sibling_position_dependency();
@@ -2142,8 +2560,8 @@ fn evaluate_style_range_value(
 ) -> Result<Option<StyleRangeValue>, ConditionEvaluation> {
     let resolution = match operand {
         ParsedStyleRangeValue::Property(name) => {
-            context.note_style_query_dependency(name);
-            resolve_custom_property(store, registry, name, context, recursion_depth + 1)
+            let name = name.fly_string();
+            resolve_custom_property(store, registry, &name, context, recursion_depth + 1)
         }
         ParsedStyleRangeValue::Components(values) => {
             let values = values.as_slice();
@@ -2262,7 +2680,7 @@ fn evaluate_style_feature(
     let [name] = name_tokens else {
         return ConditionEvaluation::Invalid;
     };
-    let Some(name) = name.ident() else {
+    let Some(name) = name.ident_string() else {
         return ConditionEvaluation::Invalid;
     };
     let query = colon.map(|colon| &tokens[colon + 1..]);
@@ -2273,7 +2691,7 @@ fn evaluate_style_feature(
 fn evaluate_named_style_feature(
     store: Option<&CustomPropertyStore>,
     registry: Option<&CustomPropertyRegistry>,
-    name: &[u16],
+    name: &ParserString,
     query: Option<&[ComponentValue]>,
     context: &mut ASFResolutionContext,
     recursion_depth: u32,
@@ -2282,6 +2700,8 @@ fn evaluate_named_style_feature(
         return ConditionEvaluation::Match(false);
     }
 
+    let name = name.fly_string();
+    let name = name.as_ref();
     let local_registration = context
         .function_local_scopes
         .last()
@@ -2292,7 +2712,6 @@ fn evaluate_named_style_feature(
         .is_empty()
         .then(|| registry.and_then(|registry| registry.registrations.get(name)))
         .flatten();
-    context.note_style_query_dependency(name);
     let computed = resolve_custom_property(store, registry, name, context, recursion_depth + 1);
     let computed = match computed {
         TokenResolution::Resolved(tokens) => Some(tokens),
@@ -2312,7 +2731,7 @@ fn evaluate_named_style_feature(
             registry,
             &registration.syntax,
             computed,
-            &parse_substitution_values(initial).expect("registered initial value has valid components"),
+            &parse_substitution_values(initial.units()).expect("registered initial value has valid components"),
             context,
         ));
     };
@@ -2330,7 +2749,10 @@ fn evaluate_named_style_feature(
                 .and_then(|registration| registration.initial_tokens.clone())
                 .or_else(|| {
                     registration.and_then(|registration| {
-                        registration.initial_source.as_ref().and_then(parse_substitution_values)
+                        registration
+                            .initial_source
+                            .as_ref()
+                            .and_then(|initial| parse_substitution_values(initial.units()))
                     })
                 })
         } else {
@@ -2364,11 +2786,7 @@ fn evaluate_named_style_feature(
                 )
             }
             (Some(computed), Some(expected)) => {
-                serialize_component_values_to_utf16(trim_whitespace(&computed), ComponentSerializationMode::Normalized)
-                    == serialize_component_values_to_utf16(
-                        trim_whitespace(&expected),
-                        ComponentSerializationMode::Normalized,
-                    )
+                normalized_component_values_equal(trim_whitespace(&computed), trim_whitespace(&expected))
             }
             _ => false,
         });
@@ -2382,21 +2800,17 @@ fn evaluate_named_style_feature(
         local_registration
             .as_ref()
             .map(|registration| registration.syntax)
-            .or_else(|| registration.map(|registration| &registration.syntax)),
+            .or_else(|| registration.map(|registration| &*registration.syntax)),
     ) {
         return ConditionEvaluation::Match(registered_style_query_values_are_equal(
             registry, syntax, &computed, query, context,
         ));
     }
-    ConditionEvaluation::Match(
-        serialize_component_values_to_utf16(trim_whitespace(&computed), ComponentSerializationMode::Normalized)
-            == serialize_component_values_to_utf16(query, ComponentSerializationMode::Normalized),
-    )
+    ConditionEvaluation::Match(normalized_component_values_equal(trim_whitespace(&computed), query))
 }
 
 /// Evaluate a container query's style feature against a container's retained style: its
-/// custom-property environment, and lengths and colors as its record computes them. The custom
-/// properties the feature reads are noted in `dependencies`.
+/// custom-property environment, and lengths and colors as its record computes them.
 pub(crate) fn evaluate_retained_container_style_feature(
     store: Option<&CustomPropertyStore>,
     registry: &CustomPropertyRegistry,
@@ -2404,24 +2818,46 @@ pub(crate) fn evaluate_retained_container_style_feature(
     length_resolution_context: &crate::css::style_compute::FfiLengthResolutionContext,
     color_resolution_input: crate::css::color_resolution::ColorResolutionInput<'_>,
     tree_counting: Option<(u64, u64)>,
-    dependencies: &mut Option<Box<StyleQueryDependencies>>,
+    read_sibling_position: &mut bool,
 ) -> MatchResult {
+    let mut dependencies = None;
     let mut context = ASFResolutionContext {
         inheritance_store: store.and_then(|store| store.inheritance_parent.as_deref()),
         style_query_length_resolution_context: Some(length_resolution_context),
         style_query_color_resolution_input: Some(color_resolution_input),
         style_query_tree_counting: tree_counting,
-        style_query_dependencies: Some(dependencies),
+        style_query_dependencies: Some(&mut dependencies),
         ..Default::default()
     };
     let registry = Some(registry);
     let result = match feature {
         StyleFeature::Boolean(name) => evaluate_named_style_feature(store, registry, name, None, &mut context, 0),
+        // The value is computed with respect to the query container, as the property it is compared with was.
+        StyleFeature::Plain { name, value, .. }
+            if name.starts_with_ascii("--") && contains_arbitrary_substitution_function(value) =>
+        {
+            match substitute_tokens(store, registry, value.as_slice(), &mut context, 0) {
+                TokenResolution::Resolved(query) => {
+                    evaluate_named_style_feature(store, registry, name, Some(&query), &mut context, 0)
+                }
+                // NB: A value that substitutes to nothing valid matches a property that holds nothing valid either.
+                TokenResolution::Invalid | TokenResolution::Cyclic => {
+                    match resolve_custom_property(store, registry, name.fly_string().as_ref(), &mut context, 1) {
+                        TokenResolution::Resolved(_) => ConditionEvaluation::Match(false),
+                        TokenResolution::Invalid | TokenResolution::Cyclic => ConditionEvaluation::Match(true),
+                        TokenResolution::NotHandled => ConditionEvaluation::NotHandled,
+                    }
+                }
+                TokenResolution::NotHandled => ConditionEvaluation::NotHandled,
+            }
+        }
         StyleFeature::Plain { name, value, .. } => {
             evaluate_named_style_feature(store, registry, name, Some(value), &mut context, 0)
         }
         StyleFeature::Range { .. } => evaluate_style_range(store, registry, feature, &mut context, 0),
     };
+    *read_sibling_position |=
+        dependencies.is_some_and(|dependencies: Box<StyleQueryDependencies>| dependencies.sibling_position);
     match result {
         ConditionEvaluation::Match(true) => MatchResult::True,
         ConditionEvaluation::Match(false) => MatchResult::False,
@@ -2518,10 +2954,10 @@ fn resolve_function_styles<'a, 'names>(
     store: Option<&CustomPropertyStore>,
     registry: Option<&CustomPropertyRegistry>,
     local_scope: FunctionLocalScope<'a>,
-    property_names: impl IntoIterator<Item = &'names [u16]>,
+    property_names: impl IntoIterator<Item = &'names Utf16FlyString>,
     context: &mut ASFResolutionContext<'a>,
     recursion_depth: u32,
-) -> HashMap<Vec<u16>, TokenResolution> {
+) -> HashMap<Utf16FlyString, TokenResolution> {
     // 1. Create a "hypothetical element" el that acts as a child of calling context's element. el is featureless, and
     //    only custom properties and the result descriptor apply to it.
 
@@ -2563,7 +2999,7 @@ fn resolve_function_styles<'a, 'names>(
                 .get(name)
                 .is_some_and(|value| matches!(value, TokenResolution::Resolved(_)))
         {
-            computed_values.insert(name.to_vec(), value);
+            computed_values.insert(name.clone(), value);
         }
     }
 
@@ -2609,7 +3045,7 @@ fn evaluate_a_custom_function<'a>(
     //    registrations.
     for parameter in &custom_function.signature.parameters {
         registrations.insert(
-            parameter.name.units().to_vec(),
+            parameter.name.clone(),
             FunctionLocalRegistration {
                 syntax: &parameter.syntax,
                 initial_tokens: None,
@@ -2621,7 +3057,7 @@ fn evaluate_a_custom_function<'a>(
     // 6. If custom function has a return type, create a custom property registration with the name "result", a syntax
     //    of the return type, an inherit flag of "false", and no initial value. Add the registration to registrations.
     // NB: Custom functions always have a return type, defaulting to the universal syntax.
-    let result_name: Vec<u16> = b"result".iter().copied().map(u16::from).collect();
+    let result_name = Utf16FlyString::from_utf16(&b"result".map(u16::from));
     registrations.insert(
         result_name.clone(),
         FunctionLocalRegistration {
@@ -2676,7 +3112,7 @@ fn evaluate_a_custom_function<'a>(
         // NB: If neither value is valid, the missing declaration represents the guaranteed-invalid value: the
         //     parameter's registration has no initial value, so resolve_function_local_property() returns Invalid.
         if let Some(value) = value {
-            argument_rule.insert(parameter.name.units().to_vec(), value);
+            argument_rule.insert(parameter.name.clone(), value);
         }
     }
 
@@ -2696,7 +3132,7 @@ fn evaluate_a_custom_function<'a>(
             .signature
             .parameters
             .iter()
-            .map(|parameter| parameter.name.units()),
+            .map(|parameter| &parameter.name),
         context,
         recursion_depth,
     );
@@ -2758,9 +3194,9 @@ fn evaluate_a_custom_function<'a>(
         custom_function
             .declarations
             .iter()
-            .map(|declaration| declaration.name.as_slice())
-            .filter(|name| *name != result_name.as_slice())
-            .chain(std::iter::once(result_name.as_slice())),
+            .map(|declaration| &declaration.name)
+            .filter(|name| *name != &result_name)
+            .chain(std::iter::once(&result_name)),
         context,
         recursion_depth,
     );
@@ -2883,10 +3319,14 @@ fn replace_if_function(
         let Some(colon) = branch.iter().position(ComponentValue::is_colon) else {
             return TokenResolution::Invalid;
         };
-        let condition = match substitute_tokens(store, registry, &branch[..colon], context, recursion_depth + 1) {
-            TokenResolution::Resolved(tokens) => tokens,
-            TokenResolution::Invalid | TokenResolution::Cyclic => branch[..colon].to_vec().into(),
-            TokenResolution::NotHandled => return TokenResolution::NotHandled,
+        let condition = if contains_arbitrary_substitution_function(&branch[..colon]) {
+            match substitute_tokens(store, registry, &branch[..colon], context, recursion_depth + 1) {
+                TokenResolution::Resolved(tokens) => Cow::Owned(tokens.into_vec()),
+                TokenResolution::Invalid | TokenResolution::Cyclic => Cow::Borrowed(&branch[..colon]),
+                TokenResolution::NotHandled => return TokenResolution::NotHandled,
+            }
+        } else {
+            Cow::Borrowed(&branch[..colon])
         };
         match evaluate_if_condition(store, registry, &condition, context, recursion_depth + 1) {
             ConditionEvaluation::Match(true) => {
@@ -2919,9 +3359,12 @@ fn parse_attr_syntax(tokens: &[ComponentValue]) -> Result<(Vec<u16>, AttrSyntax)
     let Some(name) = tokens.first().and_then(ComponentValue::ident) else {
         return Err(AttrSyntaxParseFailure::SyntaxOmitted);
     };
-    let rest = trim_whitespace(&tokens[1..]);
+    Ok((name.to_vec(), parse_attr_type(trim_whitespace(&tokens[1..]))?))
+}
+
+fn parse_attr_type(rest: &[ComponentValue]) -> Result<AttrSyntax, AttrSyntaxParseFailure> {
     if rest.is_empty() {
-        return Ok((name.to_vec(), AttrSyntax::Omitted));
+        return Ok(AttrSyntax::Omitted);
     }
     if let Some(syntax) = rest[0].ident() {
         let syntax = if syntax.eq_ignore_ascii_case("raw-string") {
@@ -2936,13 +3379,13 @@ fn parse_attr_syntax(tokens: &[ComponentValue]) -> Result<(Vec<u16>, AttrSyntax)
         if rest.len() != 1 {
             return Err(AttrSyntaxParseFailure::SyntaxSpecified);
         }
-        return Ok((name.to_vec(), syntax));
+        return Ok(syntax);
     }
     if rest[0].is_delim(b'%') {
         if rest.len() != 1 {
             return Err(AttrSyntaxParseFailure::SyntaxSpecified);
         }
-        return Ok((name.to_vec(), AttrSyntax::Unit(vec![u16::from(b'%')])));
+        return Ok(AttrSyntax::Unit(vec![u16::from(b'%')]));
     }
     if let Some((function, values)) = rest[0].function()
         && function.eq_ignore_ascii_case("type")
@@ -2953,9 +3396,42 @@ fn parse_attr_syntax(tokens: &[ComponentValue]) -> Result<(Vec<u16>, AttrSyntax)
         if rest.len() != 1 {
             return Err(AttrSyntaxParseFailure::SyntaxSpecified);
         }
-        return Ok((name.to_vec(), AttrSyntax::Syntax(syntax)));
+        return Ok(AttrSyntax::Syntax(syntax));
     }
     Err(AttrSyntaxParseFailure::SyntaxOmitted)
+}
+
+pub(crate) fn literal_attr_arguments_are_valid(values: &[ComponentValue]) -> bool {
+    let comma = values.iter().position(ComponentValue::is_comma).unwrap_or(values.len());
+    let first_argument = trim_whitespace(&values[..comma]);
+    if contains_arbitrary_substitution_function(first_argument) {
+        return true;
+    }
+    // https://drafts.csswg.org/css-values-5/#attr-notation
+    // INTEROP: Chrome and Firefox reject malformed literal names and types at parse time,
+    //          rather than using the replacement algorithm's fallback. Defer substituted arguments.
+    // NB: Namespace components cannot contain intervening whitespace.
+    let name_end = if first_argument.first().is_some_and(|value| value.is_delim(b'|')) {
+        2
+    } else if first_argument.first().and_then(ComponentValue::ident).is_some() {
+        if first_argument.get(1).is_some_and(|value| value.is_delim(b'|')) {
+            3
+        } else {
+            1
+        }
+    } else {
+        return false;
+    };
+    if first_argument
+        .get(name_end - 1)
+        .and_then(ComponentValue::ident)
+        .is_none()
+    {
+        return false;
+    }
+    let attr_type = trim_whitespace(&first_argument[name_end..]);
+    // NB: An unknown unit identifier is grammatically valid and uses the computed-value fallback.
+    (attr_type.len() == 1 && attr_type[0].ident().is_some()) || parse_attr_type(attr_type).is_ok()
 }
 
 fn parse_attr_value_with_syntax(
@@ -2967,8 +3443,8 @@ fn parse_attr_value_with_syntax(
     let random_function_index = RandomFunctionIndex::default();
     let parsed =
         parse_with_syntax_component_values(&registry.parse_context(&random_function_index), values, syntax, None)?;
-    if let StyleValueData::Unresolved { components, .. } = parsed {
-        return Some(components.as_counted_slice().to_owned());
+    if let StyleValueData::Unresolved(unresolved_payload) = &parsed {
+        return Some(unresolved_payload.components());
     }
     let serialized = crate::css::serialize::serialize_style_value_to_utf16(&parsed);
     parse_substitution_values(&serialized)
@@ -3307,7 +3783,50 @@ pub(crate) struct VarResolutionInputs<'a> {
     pub(crate) parse_context: Option<&'a ParseContext<'a>>,
     pub(crate) media_environment: Option<&'a FfiMediaEnvironment<'a>>,
     pub(crate) attribute_names_are_ascii_case_insensitive: bool,
-    pub(crate) style_query_inputs: Option<&'a crate::css::cascaded_properties::FfiStyleQueryInputs>,
+    pub(crate) style_query_inputs: Option<&'a crate::css::cascaded_properties::StyleQueryInputs>,
+}
+
+/// The custom properties of the element that substituting `value`, as the custom property `name`, looks up with the
+/// values `inputs` holds: what its `var()` functions and `if()` conditions name, wherever a function, a branch, a
+/// fallback or an attribute's value takes that, and only where they do.
+pub(crate) fn custom_properties_a_substitution_reads(
+    inputs: &VarResolutionInputs,
+    name: &Utf16FlyString,
+    value: &UnresolvedPayload,
+    environment: &mut VarResolutionEnvironment<'_>,
+) -> HashSet<Utf16FlyString> {
+    let VarResolutionEnvironment {
+        attributes,
+        custom_functions,
+        token_cache,
+    } = environment;
+    let mut reads = HashSet::new();
+    let mut context = ASFResolutionContext {
+        attributes: Some(attributes),
+        inheritance_store: inputs.inheritance_store,
+        attribute_names_are_ascii_case_insensitive: inputs.attribute_names_are_ascii_case_insensitive,
+        custom_functions: Some(custom_functions),
+        parse_context: inputs.parse_context,
+        media_environment: inputs.media_environment,
+        style_query_length_resolution_context: inputs.style_query_inputs.map(|inputs| &inputs.length),
+        style_query_color_resolution_input: inputs.style_query_inputs.map(|inputs| inputs.color_input()),
+        style_query_tree_counting: inputs.style_query_inputs.and_then(|inputs| inputs.tree_counting),
+        token_cache: Some(token_cache),
+        element_property_reads: Some(&mut reads),
+        ..Default::default()
+    };
+    let tokens = value.components();
+    // NB: What the substitution comes to is of no interest here, only what it looked at.
+    let _ = substitute_arbitrary_substitution_functions(
+        inputs.store,
+        inputs.registry,
+        tokens.as_ref(),
+        &mut context,
+        0,
+        Some(SubstitutionContextDependency::Property(name.clone(), None)),
+    );
+    drop(context);
+    reads
 }
 
 pub(crate) fn resolve_vars(
@@ -3338,7 +3857,10 @@ pub(crate) fn resolve_vars(
             .encode_utf16()
             .collect()
     });
-    let substitution_context = Some(SubstitutionContextDependency::Property(root_property_name, None));
+    let substitution_context = Some(SubstitutionContextDependency::Property(
+        Utf16FlyString::from_utf16(&root_property_name),
+        None,
+    ));
     let VarResolutionEnvironment {
         attributes,
         custom_functions,
@@ -3359,24 +3881,29 @@ pub(crate) fn resolve_vars(
         token_cache: Some(token_cache),
         ..Default::default()
     };
-    if !matches!(value_data, StyleValueData::Unresolved { .. }) {
+    let StyleValueData::Unresolved(unresolved_payload) = value_data else {
         return NativeVarResolution::NotHandled;
-    }
-    let (source, includes_substitution, contains_attr_tainted_values) =
-        tokens_for_unresolved_custom_property_value(value_data);
+    };
     // A value holding no substitution function has nothing to resolve: it is invalid at
     // computed-value time, as every caller takes an unresolved value it cannot substitute.
-    if !includes_substitution {
+    if !unresolved_payload.presence().has_any() {
         return NativeVarResolution::Invalid;
     }
-    context.contains_attr_tainted_values = contains_attr_tainted_values;
-    let result =
-        substitute_arbitrary_substitution_functions(store, registry, source, &mut context, 0, substitution_context);
+    context.contains_attr_tainted_values = unresolved_payload.contains_attr_tainted_values;
+    let tokens = cached_value_tokens(value_data, &mut context);
+    let result = substitute_arbitrary_substitution_functions(
+        store,
+        registry,
+        tokens.as_ref(),
+        &mut context,
+        0,
+        substitution_context,
+    );
     match result {
         // A custom property carries its taint to the values that substitute it; another property is invalid where a
         // tainted value reaches a URL.
-        TokenResolution::Resolved(tokens) => NativeVarResolution::Resolved {
-            source: serialize_tokens(&tokens),
+        TokenResolution::Resolved(components) => NativeVarResolution::Resolved {
+            components,
             contains_attr_tainted_values: if property_id == crate::css::property_metadata::property_id::CUSTOM {
                 context.contains_attr_tainted_values
             } else {
@@ -3429,22 +3956,103 @@ mod tests {
         }
     }
 
+    fn store(
+        parent: Option<Arc<CustomPropertyStore>>,
+        names: impl IntoIterator<Item = u32>,
+        value: f64,
+    ) -> Arc<CustomPropertyStore> {
+        let entries = names
+            .into_iter()
+            .map(|index| {
+                let name = Utf16FlyString::from_utf16(&utf16(&format!("--name-{index}")));
+                let entry = CustomPropertyEntry {
+                    name: name.clone(),
+                    value: RetainedStyleValueData::from_owned(StyleValueData::Number { value }),
+                    important: false,
+                    declared: None,
+                };
+                (name.raw_identity(), entry)
+            })
+            .collect();
+        CustomPropertyStore::child(parent, entries)
+    }
+
+    #[test]
+    fn stores_built_apart_hold_the_same_values_where_every_name_reads_the_same() {
+        // NB: A parent of more names than a child takes in stays a store of the child's chain.
+        let child_over = |value| store(Some(store(None, 0..20, value)), 20..22, 2.0);
+        let (first, second) = (child_over(1.0), child_over(1.0));
+        assert!(!Arc::ptr_eq(first.parent().unwrap(), second.parent().unwrap()));
+        assert!(first.holds_same_values_as(&second));
+        assert!(!first.holds_same_values_as(&child_over(3.0)));
+        // NB: A name only the other chain holds differs too, whichever store is asked.
+        let wider = store(Some(store(None, 0..21, 1.0)), 21..22, 2.0);
+        assert!(!first.holds_same_values_as(&wider));
+        assert!(!wider.holds_same_values_as(&first));
+    }
+
+    #[test]
+    fn stores_declaring_the_same_names_in_another_order_do_not_hold_the_same_values() {
+        let (first, second) = (store(None, [0, 1], 1.0), store(None, [1, 0], 1.0));
+        assert!(!first.holds_same_values_as(&second));
+        assert!(first.holds_same_values_as(&store(None, [0, 1], 1.0)));
+    }
+
+    #[test]
+    fn stores_compared_again_answer_as_they_did_whichever_is_asked() {
+        // NB: Turning every answer kept around shows that the next one is the one kept, and not a walk of the values.
+        fn turn_kept_answers() {
+            COMPARED_STORES.with_borrow_mut(|compared| {
+                for compared in compared.iter_mut().flatten() {
+                    compared.same = !compared.same;
+                }
+            });
+        }
+        let (first, second, other) = (
+            store(None, 0..20, 1.0),
+            store(None, 0..20, 1.0),
+            store(None, 0..20, 2.0),
+        );
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &first));
+
+        // NB: Two pairs can share a slot, so each pair is asked about again before the next is compared.
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &second));
+        turn_kept_answers();
+        assert!(!CustomPropertyStore::hold_the_same_values(&second, &first));
+        assert!(first.holds_same_values_as(&second));
+
+        assert!(!CustomPropertyStore::hold_the_same_values(&first, &other));
+        turn_kept_answers();
+        assert!(CustomPropertyStore::hold_the_same_values(&other, &first));
+        assert!(!first.holds_same_values_as(&other));
+    }
+
+    #[test]
+    fn a_kept_answer_keeps_no_store_alive() {
+        let (first, second) = (store(None, 0..1, 1.0), store(None, 0..1, 1.0));
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn custom_property_values_outlive_their_store() {
-        let name = utf16("--value");
+        let name = Utf16FlyString::default();
+        let name_raw = name.raw_identity();
         let store = CustomPropertyStore::child(
             None,
             vec![(
-                0,
+                name_raw,
                 CustomPropertyEntry {
-                    _name: RetainedUtf16FlyString::none(),
-                    name: name.into(),
+                    name,
                     value: RetainedStyleValueData::from_owned(StyleValueData::Number { value: 1.0 }),
                     important: false,
+                    declared: None,
                 },
             )],
         );
-        let value = store.get(0).unwrap().value.clone();
+        let value = store.get(name_raw).unwrap().value.clone();
         drop(store);
         assert!(matches!(value.data(), StyleValueData::Number { value } if *value == 1.0));
     }
@@ -3514,7 +4122,10 @@ mod tests {
                 &parse_substitution_values(b"var(--root, fallback)").unwrap(),
                 &mut context,
                 0,
-                Some(SubstitutionContextDependency::Property(utf16("--root"), None)),
+                Some(SubstitutionContextDependency::Property(
+                    Utf16FlyString::from_utf16(&utf16("--root")),
+                    None
+                )),
             ),
             TokenResolution::Cyclic
         ));
@@ -3528,7 +4139,10 @@ mod tests {
             let guard = guarded_contexts.guard(&context).unwrap();
             (context, guard)
         };
-        let (root_context, _root_guard) = guard(SubstitutionContextDependency::Property(utf16("--root"), None));
+        let (root_context, _root_guard) = guard(SubstitutionContextDependency::Property(
+            Utf16FlyString::from_utf16(&utf16("--root")),
+            None,
+        ));
         let (attribute_context, _attribute_guard) =
             guard(SubstitutionContextDependency::Attribute(utf16("data-value")));
         let (function_context, _function_guard) = guard(SubstitutionContextDependency::Function(1));
@@ -3554,15 +4168,6 @@ mod tests {
             panic!("expected environment fallback");
         };
         assert_eq!(serialize_tokens(&tokens), utf16(" 4px"));
-
-        assert!(matches!(
-            substitute_without_custom_properties("env(\"unknown-environment-variable\", 4px)"),
-            TokenResolution::Invalid
-        ));
-        assert!(matches!(
-            substitute_without_custom_properties("env(safe-area-inset-top 1.5, 4px)"),
-            TokenResolution::Invalid
-        ));
     }
 
     #[test]
@@ -3797,8 +4402,8 @@ mod tests {
     ) -> Arc<CustomPropertyStore> {
         let entries = properties
             .iter()
-            .enumerate()
-            .map(|(name_raw, (name, source))| {
+            .map(|(name, source)| {
+                let name = Utf16FlyString::from_utf16(&utf16(name));
                 let source = utf16(source);
                 let values = consume_a_counted_list_of_component_values(tokenize_for_parser(&source)).unwrap();
                 let crate::css::parser::value_parser::ParseOutcome::Parsed(value) =
@@ -3807,18 +4412,17 @@ mod tests {
                         crate::css::property_metadata::property_id::CUSTOM,
                         &values,
                         &source,
-                        &source,
                     )
                 else {
                     panic!("custom property value should parse");
                 };
                 (
-                    name_raw,
+                    name.raw_identity(),
                     CustomPropertyEntry {
-                        _name: RetainedUtf16FlyString::none(),
-                        name: utf16(name).into(),
+                        name,
                         value: RetainedStyleValueData::from_arc(value),
                         important: false,
+                        declared: None,
                     },
                 )
             })
@@ -3926,17 +4530,22 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
             .to_utf16()
             .expect("invalid registered custom property name");
         let initial_source = if registration.has_initial_value {
-            Some(
-                registration
-                    .initial_value
-                    .to_utf16()
-                    .expect("invalid registered custom property initial value"),
-            )
+            let units = registration
+                .initial_value
+                .to_utf16()
+                .expect("invalid registered custom property initial value");
+            Some(RetainedString::from_utf16(&units).expect("invalid registered custom property initial value"))
         } else {
             None
         };
-        let Some(syntax) = (unsafe { clone_syntax_handle(registration.syntax) }) else {
+        if registration.syntax.is_null() {
             continue;
+        }
+        // SAFETY: The host lends its counted reference to the parsed syntax for the call.
+        let syntax = unsafe {
+            let syntax = registration.syntax.cast::<SyntaxNode>();
+            Arc::increment_strong_count(syntax);
+            Arc::from_raw(syntax)
         };
         // SAFETY: The host lends a live style value for the call; the registry keeps a reference of
         //         its own for as long as it holds the registration.
@@ -3946,7 +4555,7 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
             ))
         };
         registry.registrations.insert(
-            name,
+            Utf16FlyString::from_utf16(&name),
             RegisteredCustomProperty {
                 syntax,
                 inherits: registration.inherits,
@@ -3964,7 +4573,7 @@ pub extern "C" fn rust_custom_property_registry_destroy(registry: OwnedArc<Custo
     drop(registry);
 }
 
-/// Takes a reference of its own to the document registry `registry`, for a style transaction that
+/// Takes a reference of its own to the document registry `registry`, for a style update that
 /// reads it beside the document, which may make the document's registry anew meanwhile.
 ///
 /// # Safety
@@ -4016,30 +4625,29 @@ pub unsafe extern "C" fn rust_custom_property_store_create(
         unsafe { Arc::increment_strong_count(inheritance_parent) };
         Some(unsafe { Arc::from_raw(inheritance_parent) })
     };
-    let mut own_names = HashMap::with_capacity(entries.len());
-    let own_values = entries
-        .iter()
-        .map(|entry| {
-            let name: Arc<[u16]> = entry.name.to_utf16().expect("invalid custom property name").into();
-            own_names.insert(name.clone(), entry.name_raw);
-            (
-                entry.name_raw,
-                CustomPropertyEntry {
-                    _name: unsafe { RetainedUtf16FlyString::from_leaked_raw(entry.name_raw) },
-                    name,
-                    value: unsafe { RetainedStyleValueData::from_retained_pointer(entry.data.cast()) },
-                    important: entry.important,
-                },
-            )
-        })
-        .collect();
+    let entry_of = |entry: &FfiCustomPropertyStoreEntry| {
+        (
+            entry.name_raw,
+            CustomPropertyEntry {
+                name: unsafe { Utf16FlyString::from_raw_owned(entry.name_raw) },
+                value: unsafe { RetainedStyleValueData::from_retained_pointer(entry.data.cast()) },
+                important: entry.important,
+                declared: None,
+            },
+        )
+    };
+    let (declared, taken_in) = entries.split_at(declared_count);
+    let mut own_values = CustomPropertyEntriesBuilder::default();
+    own_values.declare(declared.iter().map(entry_of));
+    for (name_raw, entry) in taken_in.iter().map(entry_of) {
+        own_values.insert(name_raw, entry);
+    }
     Arc::into_raw(Arc::new(CustomPropertyStore {
-        own_values,
-        declared_names: entries[..declared_count].iter().map(|entry| entry.name_raw).collect(),
-        own_names,
+        own_values: own_values.finished(),
         ancestor_count: parent.as_ref().map_or(0, |parent| parent.ancestor_count + 1),
         parent,
         inheritance_parent,
+        animation_overlay_base: None,
     }))
     .cast()
 }
@@ -4062,16 +4670,22 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
     } else {
         unsafe { ak::slice_from_raw_parts(entries, entry_count) }
     };
-    let base = unsafe { base.cast::<CustomPropertyStore>().as_ref() };
+    let base = (!base.is_null()).then(|| {
+        let base = base.cast::<CustomPropertyStore>();
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            Arc::increment_strong_count(base);
+            Arc::from_raw(base)
+        }
+    });
     let animated = entries.iter().map(|entry| {
-        let name: Arc<[u16]> = entry.name.to_utf16().expect("invalid custom property name").into();
         (
             entry.name_raw,
             CustomPropertyEntry {
-                _name: unsafe { RetainedUtf16FlyString::from_leaked_raw(entry.name_raw) },
-                name,
+                name: unsafe { Utf16FlyString::from_raw_owned(entry.name_raw) },
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(entry.data.cast()) },
                 important: entry.important,
+                declared: None,
             },
         )
     });
@@ -4084,26 +4698,148 @@ pub extern "C" fn rust_custom_property_store_destroy(store: OwnedArc<CustomPrope
     drop(store);
 }
 
+/// Takes another reference to `store`, which the host holds as an environment.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_retain(store: ArcRef<'_, CustomPropertyStore>) {
+    let _ = Arc::into_raw(store.to_arc());
+}
+
+/// How many references to `store` there are.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_reference_count(store: ArcRef<'_, CustomPropertyStore>) -> usize {
+    // NB: The reference this takes is not one of those it counts.
+    Arc::strong_count(&store.to_arc()) - 1
+}
+
+/// How many stores `store` lies over, as its chain counts them.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_ancestor_count(store: &CustomPropertyStore) -> u8 {
+    store.ancestor_count
+}
+
+/// The store `store` lies over in its chain, or, for the values an element's animations sample,
+/// the store of the environment they lie over; borrowed, or null.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_chain_parent(store: &CustomPropertyStore) -> *const c_void {
+    store
+        .animation_overlay_base
+        .as_ref()
+        .or(store.parent.as_ref())
+        .map_or(std::ptr::null(), |parent| Arc::as_ptr(parent).cast())
+}
+
+/// The value `name_raw` takes in `store`, or in a store it lies over, borrowed, with whether it
+/// is important in `important`; null where none of them holds a value of it.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_get(
+    store: &CustomPropertyStore,
+    name_raw: usize,
+    important: &mut bool,
+) -> *const c_void {
+    match store.get(name_raw) {
+        Some(entry) => {
+            *important = entry.important;
+            entry.value.pointer().cast()
+        }
+        None => std::ptr::null(),
+    }
+}
+
+/// Hands every custom property `store` holds a value of, its own or one of a store it lies over,
+/// to `callback`, each name once with the value the nearest store holds.
+///
+/// # Safety
+/// As for [`rust_custom_property_store_for_each_own_entry`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_custom_property_store_for_each_entry(
+    store: &CustomPropertyStore,
+    context: *mut c_void,
+    callback: unsafe extern "C" fn(*mut c_void, usize, bool, *const c_void),
+) {
+    let mut seen = crate::fast_hash::FastSet::default();
+    let mut current = Some(store);
+    while let Some(store) = current {
+        for (name_raw, entry) in store.own_values.iter() {
+            if seen.insert(name_raw) {
+                unsafe { callback(context, name_raw, entry.important, entry.value.pointer().cast()) };
+            }
+        }
+        current = store.parent.as_deref();
+    }
+}
+
+/// Hands every custom property `store` holds a value of itself to `callback`: the ones it
+/// declares in declaration order, then the ones it took in from the stores it lies over.
+///
+/// # Safety
+/// As for [`rust_custom_property_store_for_each_own_entry`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_custom_property_store_for_each_own_value(
+    store: &CustomPropertyStore,
+    context: *mut c_void,
+    callback: unsafe extern "C" fn(*mut c_void, usize, bool, *const c_void),
+) {
+    unsafe { rust_custom_property_store_for_each_own_entry(store, context, callback) };
+    for (name_raw, entry) in store.own_values.iter() {
+        if entry.declared.is_none() {
+            unsafe { callback(context, name_raw, entry.important, entry.value.pointer().cast()) };
+        }
+    }
+}
+
+/// How many custom properties `store` declares itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_declared_count(store: &CustomPropertyStore) -> usize {
+    store.declared_count()
+}
+
+/// How many custom properties `store` holds a value of itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_own_count(store: &CustomPropertyStore) -> usize {
+    store.own_values.len()
+}
+
+/// Whether neither `store` nor any store it lies over holds a value.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_is_empty(store: &CustomPropertyStore) -> bool {
+    let mut current = Some(store);
+    while let Some(store) = current {
+        if !store.own_values.is_empty() {
+            return false;
+        }
+        current = store.parent.as_deref();
+    }
+    true
+}
+
+/// Whether `store` declares `name_raw` itself with a value equal to `data`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_custom_property_store_declares_value(
+    store: &CustomPropertyStore,
+    name_raw: usize,
+    data: &StyleValueData,
+) -> bool {
+    store
+        .own_values
+        .get(&name_raw)
+        .is_some_and(|entry| entry.declared.is_some() && entry.value.data() == data)
+}
+
 /// Hands every custom property a store declares itself to `callback`, in declaration order, with
 /// the fly string it is named by and a borrowed value.
 ///
 /// # Safety
-/// `store` must be a live store pointer, and `callback` must not retain the value past the call
-/// without retaining it.
+/// `callback` must not retain the value past the call without retaining it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_custom_property_store_for_each_own_entry(
-    store: *const c_void,
+    store: &CustomPropertyStore,
     context: *mut c_void,
     callback: unsafe extern "C" fn(*mut c_void, usize, bool, *const c_void),
 ) {
-    let store = unsafe { &*store.cast::<CustomPropertyStore>() };
-    for name_raw in &store.declared_names {
-        let entry = store
-            .own_values
-            .get(name_raw)
-            .expect("declared custom property must be an own value");
+    for name_raw in store.declared_names() {
+        let entry = &store.own_values[&name_raw];
         unsafe {
-            callback(context, *name_raw, entry.important, entry.value.pointer().cast());
+            callback(context, name_raw, entry.important, entry.value.pointer().cast());
         }
     }
 }

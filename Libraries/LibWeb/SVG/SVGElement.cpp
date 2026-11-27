@@ -8,13 +8,16 @@
 
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/ElementRareData.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -36,6 +39,41 @@
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGElement);
+
+struct SVGElement::RareData final : DOM::Element::RareData {
+    AK_ALLOC_WITH_KMALLOC;
+
+    virtual void visit_edges(Cell::Visitor& visitor) override
+    {
+        DOM::Element::RareData::visit_edges(visitor);
+        visitor.visit(corresponding_element);
+    }
+
+    GC::Ptr<SVGElement> corresponding_element;
+
+    // https://svgwg.org/svg2-draft/struct.html#TermElementInstance
+    GC::WeakHashSet<SVGElement> element_instances;
+};
+
+OwnPtr<DOM::Node::RareData> SVGElement::create_rare_data() const
+{
+    return make<RareData>();
+}
+
+// https://svgwg.org/svg2-draft/struct.html#TermCorrespondingElement
+GC::Ptr<SVGElement const> SVGElement::corresponding_element() const
+{
+    auto const* data = static_cast<RareData const*>(rare_data());
+    if (!data)
+        return nullptr;
+    return data->corresponding_element;
+}
+
+void SVGElement::set_corresponding_element(Badge<SVGUseElement>, SVGElement& corresponding_element)
+{
+    static_cast<RareData&>(ensure_rare_data()).corresponding_element = corresponding_element;
+    static_cast<RareData&>(corresponding_element.ensure_rare_data()).element_instances.set(*this);
+}
 
 SVGElement::SVGElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : Element(document, move(qualified_name))
@@ -84,7 +122,8 @@ bool SVGElement::is_focusable() const
 
 bool SVGElement::is_in_never_rendered_subtree() const
 {
-    for (auto element = this; element; element = as_if<SVGElement>(element->parent_element().ptr())) {
+    // NB: A use-element shadow tree is rendered where its host is, so the walk continues at the host.
+    for (auto element = this; element; element = as_if<SVGElement>(element->parent_or_shadow_host_element())) {
         if (is_never_rendered_element(*element))
             return true;
     }
@@ -384,7 +423,10 @@ void SVGElement::publish_presentation_attribute_style()
 bool SVGElement::should_include_in_accessibility_tree() const
 {
     bool has_title_or_desc = false;
-    auto role = role_from_role_attribute_value();
+    // Whether the element has a role token decides inclusion, so the name-dependent landmark check doesn't apply
+    // here. It computes the accessible name, and computing that asks for this element's default role, which depends
+    // on this check — so applying it here would recurse until the stack overflows.
+    auto role = role_from_role_value(this->role(), RoleSource::DefaultSemantics);
     for_each_child_of_type<SVGElement>([&has_title_or_desc](auto& child) {
         if ((is<SVGTitleElement>(child) || is<SVGDescElement>(child)) && !child.text_content()->utf16_view().trim_ascii_whitespace().is_empty()) {
             has_title_or_desc = true;
@@ -432,9 +474,23 @@ void SVGElement::attribute_changed(Utf16FlyString const& local_name, Optional<Ut
     Base::attribute_changed(local_name, old_value, value, namespace_);
     HTMLOrSVGOrMathMLElement::attribute_changed(local_name, old_value, value, namespace_);
 
-    if (old_value != value)
+    // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:concept-element-attributes-change-ext
+    // 1. If namespace is not null, or localName is not the name of an event handler content attribute on element, then return.
+    if (!namespace_.has_value() && local_name.view().starts_with(u"on"sv)) {
+#undef __ENUMERATE
+#define __ENUMERATE(attribute_name, event_name)                     \
+    if (local_name == HTML::AttributeNames::attribute_name) {       \
+        element_event_handler_attribute_changed(local_name, value); \
+    }
+        ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
+#undef __ENUMERATE
+    }
+
+    if (old_value != value) {
         update_presentation_attribute_style(local_name, value, namespace_);
-    update_use_elements_that_reference_this();
+        invalidate_element_instances(ElementInstancesToInvalidate::All);
+        update_use_elements_that_reference_this();
+    }
     note_svg_paint_resource_description_may_have_changed();
 }
 
@@ -503,6 +559,7 @@ void SVGElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
 
+    invalidate_element_instances(ElementInstancesToInvalidate::All);
     update_use_elements_that_reference_this();
     note_svg_paint_resource_description_may_have_changed();
 }
@@ -529,6 +586,27 @@ void SVGElement::update_use_elements_that_reference_this()
     }
 }
 
+void SVGElement::invalidate_element_instances(ElementInstancesToInvalidate element_instances_to_invalidate)
+{
+    auto* data = static_cast<RareData*>(rare_data());
+    if (!data)
+        return;
+
+    GC::RootVector<GC::Ref<SVGElement>> invalidated_element_instances;
+    for (auto& element_instance : data->element_instances) {
+        if (element_instances_to_invalidate == ElementInstancesToInvalidate::All || element_instance.shadow_including_root().is_document())
+            invalidated_element_instances.append(element_instance);
+    }
+
+    for (auto& element_instance : invalidated_element_instances) {
+        data->element_instances.remove(element_instance);
+        static_cast<RareData&>(*element_instance->rare_data()).corresponding_element = nullptr;
+        auto* shadow_root = as_if<DOM::ShadowRoot>(element_instance->root());
+        if (auto* use_element = shadow_root ? as_if<SVGUseElement>(shadow_root->host()) : nullptr)
+            use_element->element_instance_changed({});
+    }
+}
+
 void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
 {
     Base::removed_from(is_subtree_root, old_ancestor, old_root);
@@ -539,6 +617,11 @@ void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor,
         return shadow_root && shadow_root->host() && is<SVGUseElement>(*shadow_root->host());
     };
 
+    if (auto* data = static_cast<RareData*>(rare_data()); data && data->corresponding_element && !is_use_element_shadow_root(root())) {
+        static_cast<RareData&>(*data->corresponding_element->rare_data()).element_instances.remove(*this);
+        data->corresponding_element = nullptr;
+    }
+
     // If this element is in a shadow root hosted by a use element,
     // it already represents a clone and is not itself referenced.
     // NB: We check both old_root (for when the element is removed from the shadow tree directly)
@@ -547,6 +630,7 @@ void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor,
         return;
 
     remove_from_use_element_that_reference_this();
+    invalidate_element_instances(ElementInstancesToInvalidate::InDocument);
 
     // A <mask>, <clipPath>, or <pattern> referenced via url(#id) is laid out as a resource box attached to the
     // referencing element's layout subtree. So it outlives this element's own DOM node. Rebuild those referencing
@@ -687,41 +771,28 @@ GC::Ptr<SVGElement> SVGElement::viewport_element()
 
 Gfx::Size<double> SVGElement::viewport_size_for_percentage_resolution(Layout::BegunRead const& read)
 {
-    auto viewport_size_from_layout = [&](SVGSVGElement const& viewport_element) -> Gfx::Size<double> {
+    auto committed_geometry = [&](SVGElement const& element) -> Optional<Layout::RustFFI::SvgGeometry> {
         // NB: A disconnected element may have stale layout objects from before it was removed.
-        if (!viewport_element.is_connected())
+        auto const* layout_node = element.is_connected() ? element.layout_node(read) : nullptr;
+        if (!layout_node)
             return {};
-
-        auto const* layout_node = viewport_element.layout_node(read);
-        if (layout_node && Painting::has_committed_box(*layout_node) && Painting::is_svg_svg_paintable(*layout_node))
-            return Painting::svg_viewport_size(*layout_node).to_type<double>();
-
-        return {};
+        return Painting::svg_geometry(*layout_node);
     };
 
-    // NB: Percentages for SVGSVGElements are resolved irrespective of it's own viewBox (which only affects the internal
-    //     coordinate system)
-    if (auto* svg_element = as_if<SVGSVGElement>(*this)) {
-        auto const* parent = svg_element->parent_or_shadow_host_element();
+    // NB: Layout committed the SVG viewport that a rendered element's own lengths resolve against. An outermost svg
+    //     element resolves against its own size, irrespective of its viewBox.
+    if (auto geometry = committed_geometry(*this); geometry.has_value())
+        return geometry->viewport_user_rect.size().to_type<double>();
 
-        // https://w3c.github.io/svgwg/svg2-draft/coords.html#InitialViewport
-        if (!parent || !is<SVGElement>(*parent))
-            return viewport_size_from_layout(*svg_element);
-
-        // https://w3c.github.io/svgwg/svg2-draft/coords.html#EstablishingANewSVGViewport
-        if (is<SVGForeignObjectElement>(*parent))
-            return viewport_size_from_layout(*svg_element);
-    }
-
-    auto const& viewport_element = const_cast<SVGElement*>(this)->owner_svg_element().ptr();
-
+    // An element without geometry resolves against the SVG viewport that its nearest svg ancestor establishes.
+    auto viewport_element = owner_svg_element();
     if (!viewport_element)
         return {};
-
+    if (auto geometry = committed_geometry(*viewport_element); geometry.has_value() && geometry->establishes_viewport)
+        return geometry->established_viewport_user_rect.size().to_type<double>();
     if (auto view_box = viewport_element->active_view_box(); view_box.has_value() && view_box->width > 0 && view_box->height > 0)
         return { view_box->width, view_box->height };
-
-    return viewport_size_from_layout(*viewport_element);
+    return {};
 }
 
 GC::Ref<SVGAnimatedLength> SVGElement::svg_animated_length_for_attribute(Utf16FlyString const& attribute_name, SVGLength::Directionality directionality, SVGLengthValue default_value)

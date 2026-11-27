@@ -71,20 +71,18 @@ impl ArrayIterator {
         // 3. Set iterator.[[ArrayLikeNextIndex]] to 0.
         // 4. Set iterator.[[ArrayLikeIterationKind]] to kind.
         // 5. Return iterator.
-        realm.create_object(
-            vm,
-            ArrayIterator {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.intrinsics().array_iterator_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-                array: Cell::new(array),
-                iteration_kind,
-                index: Cell::new(0),
-            },
-        )
+        realm.create_object(vm, |_| ArrayIterator {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.intrinsics().array_iterator_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            array: Cell::new(array),
+            iteration_kind,
+            index: Cell::new(0),
+        })
     }
 
     fn as_builtin_iterator_if_next_is_not_redefined(_: &Object, next_method: Value) -> Option<BuiltinIteratorNext> {
@@ -152,8 +150,7 @@ impl ArrayIterator {
         self.index.set(index + 1);
 
         // 12. Let indexNumber be 𝔽(index).
-        // NB: The index is made an i32, which wraps for indices past 2^31 - 1.
-        let index_number = Value::from_i32(index as i32);
+        let index_number = Value::from_f64(index as f64);
 
         // 13. If kind is KEY, then
         let result = if kind == PropertyKind::Key {
@@ -203,7 +200,7 @@ pub fn iterated_array_like_length(vm: &Vm, array: &Object) -> ThrowCompletionOr<
         }
 
         // c. Let len be TypedArrayLength(taRecord).
-        return Ok(u64::from(typed_array_length(&typed_array_record)));
+        return Ok(typed_array_length(&typed_array_record) as u64);
     }
 
     // 9. Else,

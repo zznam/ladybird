@@ -4,37 +4,43 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::bytecode::instruction::OpCode;
 use core::cell::{Cell, OnceCell, RefCell};
+use core::ptr::NonNull;
 use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ak::Utf16FlyString;
 
 use crate::breakpoint::BreakpointID;
-use crate::bytecode::basic_block::SourceMapEntry;
 use crate::bytecode::class_blueprint::ClassBlueprint;
 use crate::bytecode::constant::{AbstractOperationKind, WellKnownSymbolKind};
 use crate::bytecode::dump::{count_basic_blocks, dump_bytecode};
 use crate::bytecode::encoding::{IdentifierTableIndex, PropertyKeyTableIndex, StringTableIndex};
-use crate::bytecode::executable_data::ExecutableCacheCounts as FrontendExecutableCacheCounts;
-use crate::bytecode::executable_data::ExecutableData;
+use crate::bytecode::executable_data::{ConstantValue, ExceptionHandler, MAXIMUM_INTERNED_CONSTANT_LENGTH};
+use crate::bytecode::executable_data::{ExecutableData, LocalVariableMetadata};
 use crate::bytecode::feedback::{ExecutableFeedback, FeedbackSlotCounts};
-use crate::bytecode::generator::{ConstantValue, ExceptionHandler};
-use crate::bytecode::generator::{LocalVariable, PendingClassBlueprint};
-use crate::bytecode_cache::{DecodedBytecodeBytes, DecodedExecutableRecord};
-use crate::gc::class::{Finalize, GcCell, define_cell};
-use crate::gc::heap::cell_is_dead;
+use crate::bytecode::operand::UNCACHED_SITE;
+use crate::bytecode::source_map::{SourceMapEntries, SourceMapEntry, SourceOffset};
+use crate::gc::class::{ExternalMemorySize, Finalize, GcCell, define_cell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::root::MarkedVec;
+use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
+use crate::gc::weak::SweptAfterCollection;
 use crate::interpreter::vm::Vm;
 use crate::jit::InterpreterTier;
 use crate::jit::code::ExecutableJitState;
-use crate::layout::buffer::InterpreterBuffer;
-use crate::layout::cell::{CellHeader, Gc};
-use crate::layout::executable::ExecutableHead;
+use crate::layout::buffer::{BlockSlice, InterpreterBuffer, ThinSlice};
+use crate::layout::cell::{CellHeader, CellHeaderTail, Gc};
+use crate::layout::executable::{
+    CALL_CACHE_EMPTY_CALLEE, CALL_CACHE_TARGET_EXECUTABLE, CALL_CACHE_TARGET_TAG_MASK, CallCache, ExecutableHead,
+};
 use crate::layout::feedback::ExecutableFeedbackHead;
 use crate::layout::function_object::FunctionObject;
+use crate::layout::member::NullableMember;
 use crate::layout::object::Object;
 use crate::layout::property_lookup_cache::KeyedPropertyLookupCacheEntryLayout;
 pub use crate::layout::property_lookup_cache::{
@@ -51,11 +57,14 @@ use crate::runtime::big_int::{BigInt, SignedBigInteger};
 use crate::runtime::environment_shape::{EnvironmentShape, EnvironmentShapeCache};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_key::PropertyKey;
-use crate::runtime::shared_function_instance_data::SharedFunctionInstanceData;
+use crate::runtime::shape::ShapeKey;
+use crate::runtime::shared_function_instance_data::{FlushedCode, SharedFunctionInstanceData};
 use crate::runtime::value::number_to_string;
+use crate::slice_block::{SliceBlock, SliceBlockBuilder};
 use crate::source_code::SourceCode;
 use crate::source_range::{Position, SourceRange};
 use crate::utf16::Utf16View;
+use crate::utf16::to_utf16_fly_string;
 use libjs_runtime_macros::Trace;
 
 /// The contents of a cache entry, copied out of the cache so that no reference into its storage outlives a call that
@@ -64,10 +73,9 @@ use libjs_runtime_macros::Trace;
 pub struct PropertyLookupCacheEntryData {
     pub entry_type: PropertyLookupCacheEntryType,
     pub property_offset: u32,
-    pub shape_dictionary_generation: u32,
     pub writes_data_property: bool,
-    pub from_shape: Option<Gc<Shape>>,
-    pub shape: Option<Gc<Shape>>,
+    pub new_shape: Option<Gc<Shape>>,
+    pub shape: Option<ShapeKey>,
     pub prototype: Option<Gc<Object>>,
     pub prototype_chain_validity: Option<Gc<WatchpointSet>>,
     /// See PropertyLookupCacheEntry::key.
@@ -80,9 +88,8 @@ impl Default for PropertyLookupCacheEntryData {
         Self {
             entry_type: PropertyLookupCacheEntryType::Empty,
             property_offset: 0,
-            shape_dictionary_generation: 0,
             writes_data_property: false,
-            from_shape: None,
+            new_shape: None,
             shape: None,
             prototype: None,
             prototype_chain_validity: None,
@@ -93,15 +100,6 @@ impl Default for PropertyLookupCacheEntryData {
 }
 
 impl PropertyLookupCacheEntryData {
-    /// The shape an entry is looked up by: the shape before the addition for AddOwnProperty, the receiver's shape
-    /// otherwise.
-    pub fn lookup_shape(&self) -> Option<Gc<Shape>> {
-        if self.entry_type == PropertyLookupCacheEntryType::AddOwnProperty {
-            return self.from_shape;
-        }
-        self.shape
-    }
-
     fn has_same_cache_key_as(&self, other: &Self) -> bool {
         if self.entry_type == PropertyLookupCacheEntryType::Empty
             || other.entry_type == PropertyLookupCacheEntryType::Empty
@@ -112,44 +110,64 @@ impl PropertyLookupCacheEntryData {
             return false;
         }
 
+        // NB: An entry for an earlier dictionary generation of the shape is replaced too.
+        let same_shape = self.shape.map(|key| key.shape) == other.shape.map(|key| key.shape);
         match self.entry_type {
-            PropertyLookupCacheEntryType::AddOwnProperty => {
-                self.from_shape == other.from_shape && self.shape == other.shape
-            }
+            PropertyLookupCacheEntryType::AddOwnProperty => same_shape && self.new_shape == other.new_shape,
             PropertyLookupCacheEntryType::ChangeOwnProperty
             | PropertyLookupCacheEntryType::GetOwnProperty
             | PropertyLookupCacheEntryType::GetMissingProperty
-            | PropertyLookupCacheEntryType::MissingOwnProperty => self.shape == other.shape,
+            | PropertyLookupCacheEntryType::MissingOwnProperty => same_shape,
             PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain
             | PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
-                self.shape == other.shape && self.prototype == other.prototype
+                same_shape && self.prototype == other.prototype
             }
             PropertyLookupCacheEntryType::Empty => unreachable!("empty entries have no cache key"),
         }
     }
 
-    fn has_dead_cell(&self) -> bool {
-        (self.key != 0 && cell_is_dead(Value(self.key).as_cell()))
-            || self.from_shape.is_some_and(cell_is_dead)
-            || self.shape.is_some_and(cell_is_dead)
-            || self.prototype.is_some_and(cell_is_dead)
-            || self.prototype_chain_validity.is_some_and(cell_is_dead)
+    fn has_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
+        (self.key != 0 && sweep.is_dead_or_moving(Value::from_bits(self.key).as_cell()))
+            || self.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
+            || self.shape.is_some_and(|key| sweep.is_dead_or_moving(key.shape))
+            || self
+                .prototype
+                .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
+            || self
+                .prototype_chain_validity
+                .is_some_and(|validity| sweep.is_dead_or_moving(validity))
     }
 }
 
+// SAFETY: Entries live in the inline caches of executables and of the VM, which the VM sweeps after each collection (see
+// Vm::remove_dead_cells_from_property_lookup_caches()).
+unsafe impl SweptAfterCollection for PropertyLookupCacheEntry {}
+
 impl PropertyLookupCacheEntry {
-    pub fn new() -> Self {
-        Self::from_data(PropertyLookupCacheEntryData::default())
+    /// An empty entry, like the default PropertyLookupCacheEntryData.
+    pub const fn new() -> Self {
+        Self {
+            entry_type: Cell::new(PropertyLookupCacheEntryType::Empty),
+            property_offset: Cell::new(0),
+            shape_dictionary_generation: Cell::new(0),
+            writes_data_property: Cell::new(false),
+            new_shape: Cell::new(None),
+            shape: Cell::new(None),
+            prototype: Cell::new(None),
+            prototype_chain_validity: Cell::new(None),
+            key: Cell::new(0),
+            getter: Cell::new(None),
+        }
     }
 
     fn from_data(data: PropertyLookupCacheEntryData) -> Self {
         Self {
             entry_type: Cell::new(data.entry_type),
             property_offset: Cell::new(data.property_offset),
-            shape_dictionary_generation: Cell::new(data.shape_dictionary_generation),
+            shape_dictionary_generation: Cell::new(data.shape.map_or(0, |key| key.dictionary_generation)),
             writes_data_property: Cell::new(data.writes_data_property),
-            from_shape: Cell::new(data.from_shape),
-            shape: Cell::new(data.shape),
+            new_shape: Cell::new(data.new_shape),
+            shape: Cell::new(data.shape.map(|key| key.shape)),
             prototype: Cell::new(data.prototype),
             prototype_chain_validity: Cell::new(data.prototype_chain_validity),
             key: Cell::new(data.key),
@@ -161,10 +179,9 @@ impl PropertyLookupCacheEntry {
         PropertyLookupCacheEntryData {
             entry_type: self.entry_type.get(),
             property_offset: self.property_offset.get(),
-            shape_dictionary_generation: self.shape_dictionary_generation.get(),
             writes_data_property: self.writes_data_property.get(),
-            from_shape: self.from_shape.get(),
-            shape: self.shape.get(),
+            new_shape: self.new_shape.get(),
+            shape: self.shape_key(),
             prototype: self.prototype.get(),
             prototype_chain_validity: self.prototype_chain_validity.get(),
             key: self.key.get(),
@@ -175,22 +192,30 @@ impl PropertyLookupCacheEntry {
     pub fn set(&self, data: PropertyLookupCacheEntryData) {
         self.entry_type.set(data.entry_type);
         self.property_offset.set(data.property_offset);
-        self.shape_dictionary_generation.set(data.shape_dictionary_generation);
+        self.shape_dictionary_generation
+            .set(data.shape.map_or(0, |key| key.dictionary_generation));
         self.writes_data_property.set(data.writes_data_property);
-        self.from_shape.set(data.from_shape);
-        self.shape.set(data.shape);
+        self.new_shape.set(data.new_shape);
+        self.shape.set(data.shape.map(|key| key.shape));
         self.prototype.set(data.prototype);
         self.prototype_chain_validity.set(data.prototype_chain_validity);
         self.key.set(data.key);
         self.getter.set(data.getter);
     }
 
+    pub fn shape_key(&self) -> Option<ShapeKey> {
+        self.shape.get().map(|shape| ShapeKey {
+            shape,
+            dictionary_generation: self.shape_dictionary_generation.get(),
+        })
+    }
+
     /// Forgets the whole entry if one of its cells died in this collection, as clear_cache_entry_if_dead does.
-    fn clear_if_it_has_a_dead_cell(&self) {
-        if self.get().has_dead_cell() {
+    fn clear_if_it_has_a_dead_cell(&self, sweep: &Sweep<'_>) {
+        if self.get().has_dead_cell(sweep) {
             self.set(PropertyLookupCacheEntryData::default());
         }
-        if self.getter.get().is_some_and(cell_is_dead) {
+        if self.getter.get().is_some_and(|getter| sweep.is_dead_or_moving(getter)) {
             self.getter.set(None);
         }
     }
@@ -205,7 +230,7 @@ impl Default for PropertyLookupCacheEntry {
 pub const MAX_NUMBER_OF_SHAPES_TO_REMEMBER: usize = 4;
 // NB: GetById probes the entries of polymorphic caches unrolled.
 const _: () = assert!(MAX_NUMBER_OF_SHAPES_TO_REMEMBER == 4);
-pub const MEGAMORPHIC_INDEX_BITS: u32 = 6;
+pub const MEGAMORPHIC_INDEX_BITS: u32 = 4;
 pub const MEGAMORPHIC_PRIMARY_CACHE_SIZE: usize = 1 << MEGAMORPHIC_INDEX_BITS;
 pub const MEGAMORPHIC_SECONDARY_CACHE_SIZE: usize = 1 << MEGAMORPHIC_INDEX_BITS;
 /// Fibonacci hashing (see megamorphic_hash()).
@@ -215,6 +240,11 @@ pub const MEGAMORPHIC_DATA_TAG: usize = 2;
 /// How many (shape, key) pairs a megamorphic cache of a keyed access may miss and learn before it gives up (see
 /// PropertyLookupCache::is_keyed_generic()).
 const MAX_KEYED_MEGAMORPHIC_MISSES: u32 = 1024;
+/// How many entries JIT code may copy into the tables of a megamorphic cache of a named access from the VM's keyed
+/// property lookup cache, where it found them after missing the tables (see
+/// PropertyLookupCache::take_vm_cache_lesson()). An access whose tables keep missing sees more shapes than they hold,
+/// and then only uses the VM's cache.
+pub const MAX_MEGAMORPHIC_VM_CACHE_LESSONS: u32 = 16;
 
 /// Which tier a property lookup cache is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +264,25 @@ struct MonomorphicData {
     entry: PropertyLookupCacheEntry,
 }
 
+/// The data of the caches of the slot that the sites past the last one share, in every thread. Its entry stays empty,
+/// so that their accesses go straight to their slow paths.
+#[repr(transparent)]
+struct UncacheableData(MonomorphicData);
+
+// SAFETY: Nothing writes the entry, so threads only ever read it: monomorphic_data() does not hand it out, so neither
+//         do first_entry_slot(), entries() and entry_slots_for_shape(), update(), forget_entries() and
+//         remove_dead_entries() skip the caches that share it, and clear() does not free it.
+unsafe impl Sync for UncacheableData {}
+
+static UNCACHEABLE_DATA: UncacheableData = UncacheableData(MonomorphicData {
+    entry: PropertyLookupCacheEntry::new(),
+});
+
+/// The data pointer of the caches that share UNCACHEABLE_DATA.
+fn uncacheable_data() -> usize {
+    core::ptr::addr_of!(UNCACHEABLE_DATA.0).expose_provenance()
+}
+
 #[repr(C)]
 struct PolymorphicData {
     entries: [PropertyLookupCacheEntry; MAX_NUMBER_OF_SHAPES_TO_REMEMBER],
@@ -248,6 +297,8 @@ struct MegamorphicData {
     secondary_entries: [PropertyLookupCacheEntry; MEGAMORPHIC_SECONDARY_CACHE_SIZE],
     /// Misses of a keyed access (see MAX_KEYED_MEGAMORPHIC_MISSES).
     keyed_misses: Cell<u32>,
+    /// Entries JIT code copied from the VM's keyed property lookup cache (see MAX_MEGAMORPHIC_VM_CACHE_LESSONS).
+    vm_cache_lessons: Cell<u32>,
 }
 
 const _: () = assert!(align_of::<MonomorphicData>() > PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK);
@@ -260,6 +311,7 @@ const _: () = assert!(core::mem::offset_of!(MegamorphicData, entry) == 0);
 /// Where the hash tables of a megamorphic cache's data are, for JIT code that probes them.
 pub const MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET: usize = core::mem::offset_of!(MegamorphicData, primary_entries);
 pub const MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET: usize = core::mem::offset_of!(MegamorphicData, secondary_entries);
+pub const MEGAMORPHIC_VM_CACHE_LESSONS_OFFSET: usize = core::mem::offset_of!(MegamorphicData, vm_cache_lessons);
 
 /// Fibonacci hashing of the low 32 bits of the shape pointer, mixed with the key of keyed caches: the indices are the
 /// top bits of the product, which takes a multiply and a shift.
@@ -280,7 +332,7 @@ fn megamorphic_secondary_index(shape: Gc<Shape>, key: u64) -> usize {
 fn megamorphic_slot_for_shape(data: &MegamorphicData, shape: Gc<Shape>, key: u64) -> Option<&PropertyLookupCacheEntry> {
     let is_for_shape = |slot: &&PropertyLookupCacheEntry| {
         let entry = slot.get();
-        entry.lookup_shape() == Some(shape) && entry.key == key
+        entry.shape.is_some_and(|entry_shape| entry_shape.shape == shape) && entry.key == key
     };
     Some(&data.primary_entries[megamorphic_primary_index(shape, key)])
         .filter(is_for_shape)
@@ -288,11 +340,11 @@ fn megamorphic_slot_for_shape(data: &MegamorphicData, shape: Gc<Shape>, key: u64
 }
 
 fn insert_megamorphic_entry(data: &MegamorphicData, entry: &PropertyLookupCacheEntryData) {
-    let lookup_shape = entry.lookup_shape().expect("a megamorphic entry has a lookup shape");
+    let lookup_shape = entry.shape.expect("a megamorphic entry has a shape").shape;
 
     let primary_entry = &data.primary_entries[megamorphic_primary_index(lookup_shape, entry.key)];
     let primary = primary_entry.get();
-    if let Some(displaced_shape) = primary.lookup_shape()
+    if let Some(displaced_shape) = primary.shape.map(|key| key.shape)
         && (displaced_shape != lookup_shape || primary.key != entry.key)
     {
         data.secondary_entries[megamorphic_secondary_index(displaced_shape, primary.key)].set(primary);
@@ -318,17 +370,33 @@ impl PropertyLookupCache {
         Self { data: Cell::new(0) }
     }
 
+    /// The cache of the slot that the sites past the last one share.
+    fn new_uncacheable() -> Self {
+        Self {
+            data: Cell::new(uncacheable_data()),
+        }
+    }
+
+    fn is_uncacheable(&self) -> bool {
+        self.data.get() == uncacheable_data()
+    }
+
     fn data_pointer<T>(&self, tag: usize) -> Option<&T> {
         let data = self.data.get();
         if data == 0 || data & PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK != tag {
             return None;
         }
         let pointer = core::ptr::with_exposed_provenance::<T>(data & !PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK);
-        // SAFETY: The tagged pointer came from Box::into_raw of a T with this tag, and the cache owns it until clear().
+        // SAFETY: The tagged pointer came from Box::into_raw of a T with this tag, and the cache owns it until clear(), or
+        //         it is UNCACHEABLE_DATA, which is static.
         Some(unsafe { &*pointer })
     }
 
+    /// The data of a monomorphic cache, never UNCACHEABLE_DATA, whose entry must not be lent out.
     fn monomorphic_data(&self) -> Option<&MonomorphicData> {
+        if self.is_uncacheable() {
+            return None;
+        }
         self.data_pointer(0)
     }
 
@@ -340,10 +408,29 @@ impl PropertyLookupCache {
         self.data_pointer(MEGAMORPHIC_DATA_TAG)
     }
 
+    /// Whether this megamorphic cache may learn one more entry from the VM's keyed property lookup cache (see
+    /// MAX_MEGAMORPHIC_VM_CACHE_LESSONS), counting it if so.
+    pub fn take_vm_cache_lesson(&self) -> bool {
+        let Some(data) = self.megamorphic_data() else {
+            return false;
+        };
+        let lessons = data.vm_cache_lessons.get();
+        if lessons >= MAX_MEGAMORPHIC_VM_CACHE_LESSONS {
+            return false;
+        }
+        data.vm_cache_lessons.set(lessons + 1);
+        true
+    }
+
     fn set_data<T>(&self, data: Box<T>, tag: usize) {
         let address = Box::into_raw(data).expose_provenance();
         assert!(address & PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK == 0);
         self.data.set(address | tag);
+    }
+
+    /// Whether this cache keeps the entries of more shapes than a polymorphic cache can hold in hash tables.
+    pub fn is_megamorphic(&self) -> bool {
+        self.megamorphic_data().is_some()
     }
 
     /// Whether this is the cache of a keyed access that saw too many (shape, key) pairs to keep track of. Such a cache
@@ -449,7 +536,7 @@ impl PropertyLookupCache {
         entry_type: PropertyLookupCacheEntryType,
         callback: impl FnOnce(&mut PropertyLookupCacheEntryData),
     ) {
-        if self.is_keyed_generic() {
+        if self.is_keyed_generic() || self.is_uncacheable() {
             return;
         }
 
@@ -463,12 +550,10 @@ impl PropertyLookupCache {
             // NB: A keyed access that keeps missing cycles through more keys than the cache can hold, and filling it
             //     would cost more than it saves.
             if new_entry.key != 0 {
-                let lookup_shape = new_entry
-                    .lookup_shape()
-                    .expect("a megamorphic entry has a lookup shape");
+                let lookup_shape = new_entry.shape.expect("a megamorphic entry has a shape").shape;
                 let is_known = |entry: &PropertyLookupCacheEntry| {
                     let entry = entry.get();
-                    entry.lookup_shape() == Some(lookup_shape) && entry.key == new_entry.key
+                    entry.shape.is_some_and(|key| key.shape == lookup_shape) && entry.key == new_entry.key
                 };
                 let known = is_known(&data.primary_entries[megamorphic_primary_index(lookup_shape, new_entry.key)])
                     || is_known(&data.secondary_entries[megamorphic_secondary_index(lookup_shape, new_entry.key)]);
@@ -541,8 +626,8 @@ impl PropertyLookupCache {
         entries[0].set(new_entry);
     }
 
-    /// Boxing a MegamorphicData builds it on the stack first, in a frame of about 12 KB that is probed page by page on
-    /// every entry to the function holding it, so this stays out of line from update(), which runs on every miss.
+    /// Boxing a MegamorphicData builds it on the stack first, in a frame of a few KB, so this stays out of line from
+    /// update(), which runs on every miss.
     #[cold]
     #[inline(never)]
     fn move_full_polymorphic_entries_to_megamorphic_tier(&self, new_entry: &PropertyLookupCacheEntryData) {
@@ -555,10 +640,11 @@ impl PropertyLookupCache {
             primary_entries: core::array::from_fn(|_| PropertyLookupCacheEntry::new()),
             secondary_entries: core::array::from_fn(|_| PropertyLookupCacheEntry::new()),
             keyed_misses: Cell::new(0),
+            vm_cache_lessons: Cell::new(0),
         });
         for entry in entries.iter().rev() {
             let entry = entry.get();
-            if entry.lookup_shape().is_some() {
+            if entry.shape.is_some() {
                 insert_megamorphic_entry(&new_data, &entry);
             }
         }
@@ -571,6 +657,9 @@ impl PropertyLookupCache {
     /// Forgets the entries, but keeps the storage of a monomorphic cache, whose next entry then takes the place of the
     /// empty one.
     pub fn forget_entries(&self) {
+        if self.is_uncacheable() {
+            return;
+        }
         if let Some(data) = self.monomorphic_data() {
             data.entry.set(PropertyLookupCacheEntryData::default());
             return;
@@ -579,6 +668,12 @@ impl PropertyLookupCache {
     }
 
     pub fn clear(&self) {
+        if !self.is_uncacheable() {
+            self.free_data();
+        }
+    }
+
+    fn free_data(&self) {
         let data = self.data.get();
         if data == 0 || data == PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA {
             self.data.set(0);
@@ -607,51 +702,11 @@ impl PropertyLookupCache {
         self.data.set(0);
     }
 
-    pub fn copy_from(&self, other: &PropertyLookupCache) {
-        self.clear();
-        if other.is_keyed_generic() {
-            self.data.set(PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA);
+    /// Forgets the entries with a cell that died in this collection.
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
+        if self.is_uncacheable() {
             return;
         }
-        if let Some(data) = other.monomorphic_data() {
-            self.set_data(
-                Box::new(MonomorphicData {
-                    entry: PropertyLookupCacheEntry::from_data(data.entry.get()),
-                }),
-                0,
-            );
-            return;
-        }
-        if let Some(data) = other.polymorphic_data() {
-            self.set_data(
-                Box::new(PolymorphicData {
-                    entries: core::array::from_fn(|index| {
-                        PropertyLookupCacheEntry::from_data(data.entries[index].get())
-                    }),
-                }),
-                POLYMORPHIC_DATA_TAG,
-            );
-            return;
-        }
-        if let Some(data) = other.megamorphic_data() {
-            self.set_data(
-                Box::new(MegamorphicData {
-                    entry: PropertyLookupCacheEntry::from_data(data.entry.get()),
-                    primary_entries: core::array::from_fn(|index| {
-                        PropertyLookupCacheEntry::from_data(data.primary_entries[index].get())
-                    }),
-                    secondary_entries: core::array::from_fn(|index| {
-                        PropertyLookupCacheEntry::from_data(data.secondary_entries[index].get())
-                    }),
-                    keyed_misses: Cell::new(data.keyed_misses.get()),
-                }),
-                MEGAMORPHIC_DATA_TAG,
-            );
-        }
-    }
-
-    /// Forgets the entries with a cell that died in this collection. Only the VM's sweep callback calls this.
-    pub fn remove_dead_entries(&self) {
         if let Some(data) = self.megamorphic_data() {
             for entry in data
                 .primary_entries
@@ -659,13 +714,13 @@ impl PropertyLookupCache {
                 .chain(&data.secondary_entries)
                 .chain(core::iter::once(&data.entry))
             {
-                entry.clear_if_it_has_a_dead_cell();
+                entry.clear_if_it_has_a_dead_cell(sweep);
             }
             return;
         }
 
         for entry in self.entries() {
-            entry.clear_if_it_has_a_dead_cell();
+            entry.clear_if_it_has_a_dead_cell(sweep);
         }
     }
 }
@@ -827,9 +882,13 @@ impl StaticPropertyLookupCaches {
         &self.caches[site as usize]
     }
 
-    pub fn remove_dead_entries(&self) {
+    pub fn contains(&self, cache: &PropertyLookupCache) -> bool {
+        self.caches.as_ptr_range().contains(&core::ptr::from_ref(cache))
+    }
+
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
         for cache in &self.caches {
-            cache.remove_dead_entries();
+            cache.remove_dead_entries(sweep);
         }
     }
 }
@@ -859,6 +918,23 @@ pub struct KeyedPropertyLookup {
     pub new_shape: Option<Gc<Shape>>,
 }
 
+impl KeyedPropertyLookup {
+    pub fn for_shape(shape: ShapeKey) -> Self {
+        Self {
+            shape_dictionary_generation: shape.dictionary_generation,
+            shape: Some(shape.shape),
+            ..Default::default()
+        }
+    }
+
+    pub fn shape_key(&self) -> Option<ShapeKey> {
+        self.shape.map(|shape| ShapeKey {
+            shape,
+            dictionary_generation: self.shape_dictionary_generation,
+        })
+    }
+}
+
 impl Default for KeyedPropertyLookup {
     fn default() -> Self {
         Self {
@@ -884,6 +960,10 @@ pub struct KeyedPropertyLookupCacheEntry {
 }
 
 const _: () = assert!(size_of::<KeyedPropertyLookupCacheEntry>() == 64);
+
+// SAFETY: Entries only live in the VM's keyed property lookup caches, which the VM sweeps after each collection (see
+// Vm::remove_dead_cells_from_property_lookup_caches()).
+unsafe impl SweptAfterCollection for KeyedPropertyLookupCacheEntry {}
 // NB: The interpreter reads entries with the layout of KeyedPropertyLookupCacheEntryLayout, and finds them the way
 //     entry_index_for() does.
 const _: () = assert!(
@@ -921,6 +1001,7 @@ pub struct KeyedPropertyLookupCacheLayout {
     pub shape_dictionary_generation: u32,
     pub shape: u32,
     pub property_name: u32,
+    pub prototype: u32,
     pub prototype_chain_validity: u32,
     pub new_shape: u32,
 }
@@ -946,7 +1027,11 @@ impl KeyedPropertyLookupCache {
     /// Fibonacci hash of the low 32 bits of the shape's address and the name's identity, which the interpreter computes
     /// the same way. Fly strings are interned, so the identity of the name stands in for the hash of its contents.
     pub fn entry_index_for(shape: Gc<Shape>, property_name: &Utf16FlyString) -> usize {
-        let hash = (shape.as_ptr().addr() as u32) ^ (property_name.raw_identity() as u32);
+        Self::entry_index_for_name_identity(shape, property_name.raw_identity())
+    }
+
+    fn entry_index_for_name_identity(shape: Gc<Shape>, name_identity: usize) -> usize {
+        let hash = (shape.as_ptr().addr() as u32) ^ (name_identity as u32);
         (hash.wrapping_mul(MEGAMORPHIC_HASH_MULTIPLIER) >> (32 - KEYED_PROPERTY_LOOKUP_CACHE_INDEX_BITS)) as usize
     }
 
@@ -963,6 +1048,7 @@ impl KeyedPropertyLookupCache {
             shape_dictionary_generation: (lookup + offset_of!(KeyedPropertyLookup, shape_dictionary_generation)) as u32,
             shape: (lookup + offset_of!(KeyedPropertyLookup, shape)) as u32,
             property_name: offset_of!(KeyedPropertyLookupCacheEntry, property_name) as u32,
+            prototype: (lookup + offset_of!(KeyedPropertyLookup, prototype)) as u32,
             prototype_chain_validity: (lookup + offset_of!(KeyedPropertyLookup, prototype_chain_validity)) as u32,
             new_shape: (lookup + offset_of!(KeyedPropertyLookup, new_shape)) as u32,
         }
@@ -987,6 +1073,19 @@ impl KeyedPropertyLookupCache {
             .then_some(entry.lookup)
     }
 
+    /// The entry for `shape` and the name whose identity (see Utf16FlyString::raw_identity()) is `name_identity`, as
+    /// JIT code finds it.
+    pub fn lookup_by_name_identity(&self, shape: Gc<Shape>, name_identity: usize) -> Option<KeyedPropertyLookup> {
+        let entries = self.entries.borrow();
+        let entry = &entries[Self::entry_index_for_name_identity(shape, name_identity)];
+        (entry.lookup.shape == Some(shape)
+            && entry
+                .property_name
+                .as_ref()
+                .is_some_and(|name| name.raw_identity() == name_identity))
+        .then_some(entry.lookup)
+    }
+
     pub fn set_entry(&self, index: usize, lookup: KeyedPropertyLookup, property_name: &Utf16FlyString) {
         let mut entries = self.entries.borrow_mut();
         let entry = &mut entries[index];
@@ -996,15 +1095,19 @@ impl KeyedPropertyLookupCache {
         }
     }
 
-    /// Forgets the entries with a cell that died in this collection. Only the VM's sweep callback calls this.
-    pub fn remove_dead_entries(&self) {
+    /// Forgets the entries with a cell that died in this collection.
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
         for entry in self.entries.borrow_mut().iter_mut() {
             let lookup = &entry.lookup;
             // NB: Entries of the keyed property store cache for puts it does not make have a shape but no type.
-            if lookup.shape.is_some_and(cell_is_dead)
-                || lookup.prototype.is_some_and(cell_is_dead)
-                || lookup.prototype_chain_validity.is_some_and(cell_is_dead)
-                || lookup.new_shape.is_some_and(cell_is_dead)
+            if lookup.shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
+                || lookup
+                    .prototype
+                    .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
+                || lookup
+                    .prototype_chain_validity
+                    .is_some_and(|validity| sweep.is_dead_or_moving(validity))
+                || lookup.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
             {
                 *entry = KeyedPropertyLookupCacheEntry::default();
             }
@@ -1031,7 +1134,7 @@ define_cell!(TemplateObjectCache, Other);
 
 impl TemplateObjectCache {
     pub fn create(vm: &Vm) -> Gc<TemplateObjectCache> {
-        vm.heap().allocate(TemplateObjectCache {
+        vm.heap().allocate(|_| TemplateObjectCache {
             header: CellHeader::for_class(Self::CLASS),
             cached_template_object: Cell::new(None),
         })
@@ -1060,20 +1163,23 @@ pub struct ObjectShapeCache {
 }
 
 /// The parts of an ObjectPropertyIteratorCacheData the interpreter does not read.
-#[derive(Default)]
+#[derive(Default, Trace)]
 pub struct ObjectPropertyIteratorCacheDataStorage {
     properties: Box<[PropertyKey]>,
 }
 
 define_cell!(ObjectPropertyIteratorCacheData, Other, finalize: finalize);
 
+const _: () = assert!(size_of::<ObjectPropertyIteratorCacheData>() == 72);
+
 // SAFETY: Visits the shape, the validity, the materialized key values and the keys.
 unsafe impl Trace for ObjectPropertyIteratorCacheData {
     fn trace(&self, visitor: &mut Visitor) {
         self.shape.trace(visitor);
         self.prototype_chain_validity.trace(visitor);
-        self.property_values.trace(visitor);
-        self.storage.properties.trace(visitor);
+        // SAFETY: The values are written once, when the cell is made, and only its finalizer frees them.
+        unsafe { self.property_values.trace_owned(visitor) };
+        self.storage.trace(visitor);
     }
 }
 
@@ -1094,21 +1200,17 @@ impl ObjectPropertyIteratorCacheData {
         shape: Gc<Shape>,
         prototype_chain_validity: Option<Gc<WatchpointSet>>,
     ) -> Gc<ObjectPropertyIteratorCacheData> {
-        let (shape_is_dictionary, shape_dictionary_generation) = if shape.is_dictionary() {
-            (true, shape.dictionary_generation())
-        } else {
-            (false, 0)
-        };
-        let cache_data = vm.heap().allocate(Self {
+        let cache_data = vm.heap().allocate(|_| Self {
             header: CellHeader::for_class(Self::CLASS),
-            shape_is_dictionary: Cell::new(shape_is_dictionary),
+            shape_is_dictionary: Cell::new(shape.is_dictionary()),
             fast_path: Cell::new(fast_path),
             receiver_has_magical_length: Cell::new(receiver_has_magical_length_property),
             indexed_property_count: Cell::new(indexed_property_count),
-            shape_dictionary_generation: Cell::new(shape_dictionary_generation),
-            shape: Cell::new(Some(shape)),
-            prototype_chain_validity: Cell::new(prototype_chain_validity),
+            shape_dictionary_generation: Cell::new(shape.dictionary_generation()),
+            shape: NullableMember::new(Some(shape)),
+            prototype_chain_validity: NullableMember::new(prototype_chain_validity),
             property_values: InterpreterBuffer::new(),
+            property_offsets: Self::property_offsets(&shape, properties, indexed_property_count),
             storage: ObjectPropertyIteratorCacheDataStorage {
                 properties: properties.to_vec().into_boxed_slice(),
             },
@@ -1131,21 +1233,40 @@ impl ObjectPropertyIteratorCacheData {
         cache_data
     }
 
+    /// The offsets of the own properties of objects of `shape` that the keys name, after the indices (see
+    /// `ObjectPropertyIteratorCacheData::property_offsets`).
+    fn property_offsets(
+        shape: &Shape,
+        properties: &MarkedVec<'_, PropertyKey>,
+        indexed_property_count: u32,
+    ) -> ThinSlice<u32> {
+        if shape.is_dictionary() {
+            return ThinSlice::empty();
+        }
+        let indices = core::iter::repeat_n(u32::MAX, indexed_property_count as usize);
+        let named = (0..properties.len()).map(|index| {
+            let key = properties.get(index).expect("the index is in bounds");
+            shape.lookup(&key).map_or(u32::MAX, |metadata| metadata.offset)
+        });
+        indices.chain(named).collect()
+    }
+
     /// Slow-path snapshot: a plain key list with no fast path. Enumeration filters deleted keys with has_property() at
     /// each step, so there is no shape to revalidate against.
     pub fn create(vm: &Vm, properties: &MarkedVec<'_, PropertyKey>) -> Gc<ObjectPropertyIteratorCacheData> {
         // The slow path keeps only the key list. Values are converted lazily during enumeration,
         // because deleted keys have to be filtered with has_property() at each step anyway.
-        vm.heap().allocate(Self {
+        vm.heap().allocate(|_| Self {
             header: CellHeader::for_class(Self::CLASS),
             shape_is_dictionary: Cell::new(false),
             fast_path: Cell::new(ObjectPropertyIteratorFastPath::None),
             receiver_has_magical_length: Cell::new(false),
             indexed_property_count: Cell::new(0),
             shape_dictionary_generation: Cell::new(0),
-            shape: Cell::new(None),
-            prototype_chain_validity: Cell::new(None),
+            shape: NullableMember::null(),
+            prototype_chain_validity: NullableMember::null(),
             property_values: InterpreterBuffer::new(),
+            property_offsets: ThinSlice::empty(),
             storage: ObjectPropertyIteratorCacheDataStorage {
                 properties: properties.to_vec().into_boxed_slice(),
             },
@@ -1172,16 +1293,15 @@ impl ObjectPropertyIteratorCacheData {
         self.receiver_has_magical_length.get()
     }
 
-    pub fn shape(&self) -> Option<Gc<Shape>> {
-        self.shape.get()
+    pub fn shape_key(&self) -> Option<ShapeKey> {
+        self.shape.get().map(|shape| ShapeKey {
+            shape,
+            dictionary_generation: self.shape_dictionary_generation.get(),
+        })
     }
 
     pub fn prototype_chain_validity(&self) -> Option<Gc<WatchpointSet>> {
         self.prototype_chain_validity.get()
-    }
-
-    pub fn shape_dictionary_generation(&self) -> u32 {
-        self.shape_dictionary_generation.get()
     }
 
     /// The key values the interpreter's fast path hands out, one per indexed and named key.
@@ -1194,93 +1314,77 @@ impl ObjectPropertyIteratorCacheData {
     }
 }
 
-/// Where the bytecode of an executable lives: in memory of its own, or in place in the bytecode cache blob it was
-/// materialized from, which it keeps alive.
-pub enum ExecutableBytecode {
-    Owned(Box<[u8]>),
-    InBytecodeCacheBlob(DecodedBytecodeBytes),
-}
-
-impl ExecutableBytecode {
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(bytecode) => bytecode,
-            Self::InBytecodeCacheBlob(bytecode) => bytecode.as_slice(),
-        }
-    }
+/// The parts of an executable that few executables need.
+#[derive(Default)]
+struct ExecutableRareData {
+    /// The global variable caches of the dynamic binding accesses that found their binding in the global environment,
+    /// indexed like the environment coordinate caches. Made when the first such access needs one.
+    dynamic_global_variable_caches: OnceCell<Box<[GlobalVariableCache]>>,
+    /// The breakpoints of the debugger at the offsets of the instructions it pauses before.
+    debugger_breakpoint_sites: RefCell<HashMap<u32, DebuggerBreakpointSite, foldhash::fast::RandomState>>,
+    template_object_caches: ThinSlice<Gc<TemplateObjectCache>>,
+    object_property_iterator_caches: ThinSlice<ObjectPropertyIteratorCache>,
+    class_blueprints: ThinSlice<ClassBlueprint>,
+    environment_shape_caches: ThinSlice<NullableMember<EnvironmentShape>>,
+    /// Whether LIBJS_JIT=dump-feedback printed the executable's feedback already.
+    has_dumped_feedback: Cell<bool>,
 }
 
 /// A unit of bytecode: a script, a module, a function body or an eval, with what the interpreter needs to run it.
 #[repr(C)]
 pub struct Executable {
     pub head: ExecutableHead,
-    bytecode: ExecutableBytecode,
-    constants: Box<[Value]>,
-    property_lookup_caches: Box<[PropertyLookupCache]>,
-    global_variable_caches: Box<[GlobalVariableCache]>,
-    environment_coordinate_caches: Box<[Cell<EnvironmentCoordinate>]>,
-    /// The global variable caches of the dynamic binding accesses that found their binding in the global environment,
-    /// indexed like the environment coordinate caches. Made when the first such access needs one.
-    dynamic_global_variable_caches: OnceCell<Box<[GlobalVariableCache]>>,
-    environment_shape_caches: Box<[Cell<Option<Gc<EnvironmentShape>>>]>,
-    template_object_caches: Box<[Gc<TemplateObjectCache>]>,
-    object_shape_caches: Box<[ObjectShapeCache]>,
-    object_property_iterator_caches: Box<[ObjectPropertyIteratorCache]>,
+    /// What this executable runs, which other executables of the same code share.
+    code: Arc<ExecutableData>,
+    object_shape_caches: BlockSlice<ObjectShapeCache>,
+    /// What the interpreter observed running the bytecode, for the optimizing JIT. Only executables that left the
+    /// plain tier collect feedback, so it is made when the executable first does, and the part that only the profiling
+    /// tier collects when the executable gets there.
+    feedback: OnceCell<Box<ExecutableFeedback>>,
+    /// The executable's JIT code and what its exits taught the JIT. Made when the JIT first looks at the executable.
+    jit: OnceCell<Box<ExecutableJitState>>,
+    rare_data: OnceCell<Box<ExecutableRareData>>,
     /// Which interpreter handlers the executable's frames run with, see `head.dispatch_table_index`.
     interpreter_tier: Cell<InterpreterTier>,
-    /// How many feedback slots of each kind the bytecode indexes into.
-    feedback_slot_counts: FeedbackSlotCounts,
-    /// What the interpreter observed running the bytecode, for the optimizing JIT. Only executables that left the
-    /// plain tier collect feedback, so it is made when the executable first does.
-    feedback: OnceCell<ExecutableFeedback>,
-    /// Whether LIBJS_JIT=dump-feedback printed the executable's feedback already.
-    has_dumped_feedback: Cell<bool>,
-    /// The executable's JIT code and what its exits taught the JIT.
-    jit: ExecutableJitState,
-    pub number_of_registers: u32,
-    pub number_of_arguments: u32,
-    pub is_strict_mode: bool,
-    pub identifier_table: Vec<ak::Utf16FlyString>,
-    /// The property keys as the strings they were made from, which is how the bytecode dump prints them.
-    property_key_table: Vec<ak::Utf16FlyString>,
-    /// The property keys themselves, made once, since turning a string into a property key checks whether it is an
-    /// array index.
-    property_keys: Box<[PropertyKey]>,
-    pub string_table: Vec<ak::Utf16FlyString>,
-    /// Sorted by start offset, and not overlapping.
-    pub exception_handlers: Box<[ExceptionHandler]>,
+    /// The property keys, made once, since turning a string into a property key checks whether it is an array index.
+    property_keys: BlockSlice<PropertyKey>,
     /// The functions the bytecode creates, which NewFunction and NewClass refer to by index.
-    shared_function_data: Box<[Gc<SharedFunctionInstanceData>]>,
-    class_blueprints: Box<[ClassBlueprint]>,
-    pub length_identifier: Option<PropertyKeyTableIndex>,
+    shared_function_data: BlockSlice<Gc<SharedFunctionInstanceData>>,
     /// The name of the function the executable is the body of, given when the function is first compiled. Empty for
     /// other code.
     name: FlyStringSlot,
-    /// Sorted by bytecode offset: where in the source code the instructions from each offset on came from.
-    pub source_map: Box<[SourceMapEntry]>,
-    pub local_variable_names: Box<[Utf16FlyString]>,
-    pub argument_variable_names: Box<[Utf16FlyString]>,
-    /// One for each of the local variables.
-    pub local_variable_metadata: Box<[LocalVariableMetadata]>,
     pub source_code: Option<Rc<SourceCode>>,
-    /// The breakpoints of the debugger at the offsets of the instructions it pauses before.
-    debugger_breakpoint_sites: RefCell<HashMap<u32, DebuggerBreakpointSite, foldhash::fast::RandomState>>,
+    /// The memory of the slices above, which get dropped before it.
+    tables: SliceBlock,
 }
 
-define_cell!(Executable, Other);
+// NB: Every function that was called has these bytes.
+const _: () = assert!(size_of::<Executable>() == 200);
+
+define_cell!(Executable, Other, external_memory_size: external_memory_size);
+
+// Executable::external_memory_size(): the tables of the executable, and its code while nothing else holds the code.
+// Code that something else holds, like a program that gets linked again, is that holder's memory. A property lookup
+// cache makes its data once its access runs, so each one counts as if it had the one entry that most caches that run
+// have. The cache of the slot that the sites past the last one share has no data of its own.
+impl ExternalMemorySize for Executable {
+    fn external_memory_size(&self) -> usize {
+        let code_size = if Arc::strong_count(&self.code) == 1 {
+            self.code.memory_size()
+        } else {
+            0
+        };
+        let cache_data_size =
+            self.head.property_lookup_caches.len().min(UNCACHED_SITE as usize) * size_of::<MonomorphicData>();
+        code_size + self.tables_memory_size() + cache_data_size + size_of_val(self.call_caches())
+    }
+}
 
 /// Executable::LocalVariableScopeRange: the part of the source code in which a local variable is in scope.
 #[derive(Clone, Copy)]
 pub struct LocalVariableScopeRange {
     pub start: Position,
     pub end: Position,
-}
-
-/// Executable::LocalVariableMetadata
-#[derive(Clone, Copy)]
-pub struct LocalVariableMetadata {
-    pub is_mutable: bool,
-    pub scope_range: Option<LocalVariableScopeRange>,
 }
 
 #[derive(Default)]
@@ -1290,63 +1394,44 @@ struct DebuggerBreakpointSite {
 
 const _: () = assert!(core::mem::offset_of!(Executable, head) == 0);
 
-/// The cache counts an executable's bytecode refers to.
-pub struct ExecutableCacheCounts {
-    pub property_lookup_caches: u32,
-    pub global_variable_caches: u32,
-    pub environment_coordinate_caches: u32,
-    pub environment_shape_caches: u32,
-}
-
-/// What an executable is made of, as the frontend compiled it or a bytecode cache blob holds it.
-struct ExecutableParts {
-    bytecode: ExecutableBytecode,
-    number_of_registers: u32,
-    number_of_arguments: u32,
-    is_strict: bool,
-    cache_counts: FrontendExecutableCacheCounts,
-    identifier_table: Vec<Utf16FlyString>,
-    property_key_table: Vec<Utf16FlyString>,
-    string_table: Vec<Utf16FlyString>,
-    constants: Vec<ConstantValue>,
-    exception_handlers: Vec<ExceptionHandler>,
-    source_map: Vec<SourceMapEntry>,
-    local_variables: Vec<LocalVariable>,
-    argument_variable_names: Vec<Utf16FlyString>,
-    length_identifier: Option<u32>,
-    class_blueprints: Vec<PendingClassBlueprint>,
-}
-
-fn interpreter_buffer<T>(elements: &[T]) -> InterpreterBuffer<T> {
-    InterpreterBuffer {
-        data: Cell::new(elements.as_ptr().cast_mut()),
-        size: Cell::new(elements.len()),
-        capacity: Cell::new(elements.len()),
+impl CallCache {
+    /// Whether the callee or the executable of the entry died in this collection, or moves in it.
+    fn has_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
+        let callee = self.callee.get();
+        if callee == CALL_CACHE_EMPTY_CALLEE {
+            return false;
+        }
+        if sweep.is_dead_or_moving(Value::from_bits(callee).as_cell()) {
+            return true;
+        }
+        let target = self.target.get();
+        if target & CALL_CACHE_TARGET_TAG_MASK != CALL_CACHE_TARGET_EXECUTABLE {
+            return false;
+        }
+        let executable = NonNull::new(core::ptr::with_exposed_provenance_mut::<ExecutableHead>(
+            target as usize,
+        ))
+        .expect("a linked call cache has an executable");
+        // SAFETY: The entry was linked to a live executable, which stays intact until the sweep after it died.
+        sweep.is_dead_or_moving(Executable::from_head(unsafe { Gc::from_non_null(executable) }))
     }
 }
 
 impl Executable {
-    /// Moves `executable` into the heap and has the VM prune its inline caches after every collection.
-    pub fn create_from_parts(vm: &Vm, executable: Executable) -> Gc<Executable> {
-        let executable = vm.heap().allocate(executable);
-        vm.register_executable(executable);
-        executable
-    }
-
     pub fn property_lookup_cache(&self, index: usize) -> &PropertyLookupCache {
-        &self.property_lookup_caches[index]
+        &self.head.property_lookup_caches[index]
     }
 
     pub fn template_object_cache(&self, index: u32) -> Gc<TemplateObjectCache> {
-        self.template_object_caches[index as usize]
+        self.template_object_caches()[index as usize]
     }
 
     pub fn property_lookup_caches(&self) -> &[PropertyLookupCache] {
-        &self.property_lookup_caches
+        &self.head.property_lookup_caches
     }
 
     pub fn global_variable_caches(&self) -> &[GlobalVariableCache] {
-        &self.global_variable_caches
+        &self.head.global_variable_caches
     }
 
     pub fn object_shape_caches(&self) -> &[ObjectShapeCache] {
@@ -1358,361 +1443,278 @@ impl Executable {
     }
 
     pub fn object_property_iterator_cache(&self, index: u32) -> &ObjectPropertyIteratorCache {
-        &self.object_property_iterator_caches[index as usize]
+        &self.object_property_iterator_caches()[index as usize]
     }
 
-    pub fn get_identifier(&self, index: IdentifierTableIndex) -> &Utf16FlyString {
-        &self.identifier_table[index.0 as usize]
+    /// The identifier that `index`, a field of an instruction of this executable, refers to.
+    pub fn get_identifier(&self, index: &IdentifierTableIndex) -> &Utf16FlyString {
+        self.identifier(index.index_in(self.bytecode()))
     }
 
-    pub fn get_property_key(&self, index: PropertyKeyTableIndex) -> &PropertyKey {
-        &self.property_keys[index.0 as usize]
+    pub fn identifier(&self, index: usize) -> &Utf16FlyString {
+        &self.code.identifier_table[index]
     }
 
-    pub fn property_key_table(&self) -> &[ak::Utf16FlyString] {
-        &self.property_key_table
+    /// The property key that `index`, a field of an instruction of this executable, refers to.
+    pub fn get_property_key(&self, index: &PropertyKeyTableIndex) -> &PropertyKey {
+        self.property_key(index.index_in(self.bytecode()))
     }
 
-    pub fn set_property_key_table(&mut self, property_key_table: Vec<ak::Utf16FlyString>) {
-        self.property_keys = property_key_table.iter().cloned().map(PropertyKey::from).collect();
-        self.property_key_table = property_key_table;
+    pub fn property_key(&self, index: usize) -> &PropertyKey {
+        &self.property_keys[index]
     }
 
-    pub fn get_string(&self, index: StringTableIndex) -> &Utf16FlyString {
-        &self.string_table[index.0 as usize]
+    pub fn property_keys(&self) -> &[PropertyKey] {
+        &self.property_keys
+    }
+
+    /// The string that `index`, a field of an instruction of this executable, refers to.
+    pub fn get_string(&self, index: &StringTableIndex) -> &Utf16FlyString {
+        &self.code.string_table()[index.index_in(self.bytecode())]
     }
 
     /// Forgets the cells the inline caches remember that died in this collection.
-    pub fn remove_dead_cells(&self) {
-        for cache in &self.property_lookup_caches {
-            cache.remove_dead_entries();
+    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>) {
+        for cache in &self.head.property_lookup_caches {
+            cache.remove_dead_entries(sweep);
         }
+        let dynamic_global_variable_caches = self
+            .rare_data
+            .get()
+            .and_then(|rare_data| rare_data.dynamic_global_variable_caches.get());
         for cache in self
+            .head
             .global_variable_caches
             .iter()
-            .chain(self.dynamic_global_variable_caches.get().into_iter().flatten())
+            .chain(dynamic_global_variable_caches.into_iter().flatten())
         {
-            cache.entry.clear_if_it_has_a_dead_cell();
+            cache.entry.clear_if_it_has_a_dead_cell(sweep);
+        }
+        for cache in self.call_caches() {
+            if cache.has_dead_cell(sweep) {
+                cache.clear();
+            }
         }
         for cache in &self.object_shape_caches {
-            if cache.shape.get().is_some_and(cell_is_dead) {
+            if cache.shape.get().is_some_and(|shape| sweep.is_dead_or_moving(shape)) {
                 cache.shape.set(None);
             }
         }
         if let Some(feedback) = self.feedback() {
-            feedback.remove_dead_cells();
+            feedback.remove_dead_cells(sweep);
         }
     }
 
-    pub fn new(
-        bytecode: Box<[u8]>,
-        number_of_registers: u32,
-        number_of_locals: u32,
-        number_of_arguments: u32,
-        constants: Box<[Value]>,
-        cache_counts: &ExecutableCacheCounts,
-        is_strict_mode: bool,
+    /// An executable of `code`, with empty caches. `code` is the only thing that keeps the bytecode alive, and it lives
+    /// for as long as the executable, which is what makes the address of the bytecode good to hand out.
+    fn new_with_code(
+        code: Arc<ExecutableData>,
+        mut tables: SliceBlockBuilder,
+        constants: BlockSlice<Value>,
+        property_keys: BlockSlice<PropertyKey>,
+        shared_function_data: BlockSlice<Gc<SharedFunctionInstanceData>>,
+        _defer_gc: &DeferGc<'_>,
     ) -> Self {
-        Self::new_with_bytecode(
-            ExecutableBytecode::Owned(bytecode),
-            number_of_registers,
-            number_of_locals,
-            number_of_arguments,
-            constants,
-            cache_counts,
-            is_strict_mode,
-        )
-    }
-
-    pub fn new_with_bytecode(
-        bytecode: ExecutableBytecode,
-        number_of_registers: u32,
-        number_of_locals: u32,
-        number_of_arguments: u32,
-        constants: Box<[Value]>,
-        cache_counts: &ExecutableCacheCounts,
-        is_strict_mode: bool,
-    ) -> Self {
-        let property_lookup_caches: Box<[PropertyLookupCache]> = (0..cache_counts.property_lookup_caches)
-            .map(|_| PropertyLookupCache::new())
-            .collect();
-        let global_variable_caches: Box<[GlobalVariableCache]> = (0..cache_counts.global_variable_caches)
-            .map(|_| GlobalVariableCache::default())
-            .collect();
-        let environment_coordinate_caches: Box<[Cell<EnvironmentCoordinate>]> = (0..cache_counts
-            .environment_coordinate_caches)
-            .map(|_| Cell::new(EnvironmentCoordinate::invalid()))
-            .collect();
-        let environment_shape_caches = (0..cache_counts.environment_shape_caches)
-            .map(|_| Cell::new(None))
-            .collect();
-        let registers_and_locals_count = number_of_registers + number_of_locals;
+        let cache_counts = &code.cache_counts();
+        let property_lookup_caches = tables.slice((0..cache_counts.property_lookup).map(|index| {
+            if index == UNCACHED_SITE {
+                PropertyLookupCache::new_uncacheable()
+            } else {
+                PropertyLookupCache::new()
+            }
+        }));
+        let global_variable_caches =
+            tables.slice((0..cache_counts.global_variable).map(|_| GlobalVariableCache::default()));
+        let environment_coordinate_caches =
+            tables.slice((0..cache_counts.environment_coordinate).map(|_| Cell::new(EnvironmentCoordinate::invalid())));
+        let number_of_locals = u32::try_from(code.local_variable_metadata.len()).expect("local count fits in u32");
+        let registers_and_locals_count = code.number_of_registers + number_of_locals;
         let constant_count = u32::try_from(constants.len()).expect("constant count fits in u32");
         let head = ExecutableHead {
-            header: CellHeader::for_class(Self::CLASS),
             registers_and_locals_count: Cell::new(registers_and_locals_count),
             registers_and_locals_and_constants_count: Cell::new(registers_and_locals_count + constant_count),
-            asm_constants_size: Cell::new(constants.len() as u64),
-            asm_constants_data: Cell::new(constants.as_ptr()),
-            bytecode_data: Cell::new(bytecode.as_slice().as_ptr()),
-            bytecode_size: Cell::new(bytecode.as_slice().len()),
+            header: CellHeaderTail::for_class(Self::CLASS),
             // The VM picks the table when it registers the executable.
             dispatch_table_index: Cell::new(InterpreterTier::Plain as u8),
-            feedback: ExecutableFeedbackHead::empty(),
             tier_up_budget: Cell::new(i32::MAX),
+            bytecode_data: Cell::new(code.bytecode.as_ptr()),
             jit_entry_slot: Cell::new(0),
             jit_compile_state: Cell::new(0),
-            constants: interpreter_buffer(&constants),
-            property_lookup_caches: interpreter_buffer(&property_lookup_caches),
-            global_variable_caches: interpreter_buffer(&global_variable_caches),
-            // The interpreter only reads the caches, which slow paths update through their cells.
-            environment_coordinate_caches: InterpreterBuffer {
-                data: Cell::new(environment_coordinate_caches.as_ptr().cast_mut().cast()),
-                size: Cell::new(environment_coordinate_caches.len()),
-                capacity: Cell::new(environment_coordinate_caches.len()),
-            },
-        };
-        Self {
-            head,
-            bytecode,
+            idle_collection_count: Cell::new(0),
+            feedback: ExecutableFeedbackHead::empty(),
             constants,
             property_lookup_caches,
             global_variable_caches,
+            // The interpreter only reads the caches, which slow paths update through their cells.
             environment_coordinate_caches,
-            dynamic_global_variable_caches: OnceCell::new(),
-            environment_shape_caches,
-            template_object_caches: Box::new([]),
-            object_shape_caches: Box::new([]),
-            object_property_iterator_caches: Box::new([]),
-            interpreter_tier: Cell::new(InterpreterTier::Plain),
-            feedback_slot_counts: FeedbackSlotCounts::default(),
+            call_caches: Cell::new(core::ptr::null()),
+            call_metadata: Cell::new(0),
+        };
+        let object_shape_caches = tables.slice((0..cache_counts.object_shape).map(|_| ObjectShapeCache::default()));
+        Self {
+            head,
+            object_shape_caches,
             feedback: OnceCell::new(),
-            has_dumped_feedback: Cell::new(false),
-            jit: ExecutableJitState::default(),
-            number_of_registers,
-            number_of_arguments,
-            is_strict_mode,
-            identifier_table: Vec::new(),
-            property_key_table: Vec::new(),
-            property_keys: Box::new([]),
-            string_table: Vec::new(),
-            exception_handlers: Box::new([]),
-            shared_function_data: Box::new([]),
-            class_blueprints: Box::new([]),
-            length_identifier: None,
+            jit: OnceCell::new(),
+            rare_data: OnceCell::new(),
+            interpreter_tier: Cell::new(InterpreterTier::Plain),
+            property_keys,
+            shared_function_data,
             name: FlyStringSlot::new(None),
-            source_map: Box::new([]),
-            local_variable_names: Box::new([]),
-            argument_variable_names: Box::new([]),
-            local_variable_metadata: Box::new([]),
             source_code: None,
-            debugger_breakpoint_sites: RefCell::new(HashMap::default()),
+            tables: tables.finish(),
+            code,
         }
     }
 
-    /// Gives the executable the object literal shape caches and for-in key snapshot caches its bytecode refers to.
-    pub fn allocate_object_caches(&mut self, object_shape_caches: u32, object_property_iterator_caches: u32) {
-        self.object_shape_caches = (0..object_shape_caches).map(|_| ObjectShapeCache::default()).collect();
-        self.object_property_iterator_caches = (0..object_property_iterator_caches)
-            .map(|_| ObjectPropertyIteratorCache { data: Cell::new(None) })
-            .collect();
-    }
-
-    /// Creates the executable for what the frontend compiled from code it does not know the source of.
-    pub fn create(vm: &Vm, data: ExecutableData) -> Gc<Executable> {
-        Self::create_with_source_code(vm, data, None)
-    }
-
-    /// Creates the executable for what the frontend compiled from `source_code`, with the functions and classes it
-    /// declares.
+    /// Links what the frontend compiled from `source_code` into a new executable, with the functions and classes it
+    /// declares and caches of its own. While something else holds `data`, it stays as it is and can be linked again,
+    /// into any realm. Without another holder nothing can link it again, so what only linking reads goes away.
     pub fn create_with_source_code(
         vm: &Vm,
-        mut data: ExecutableData,
+        data: Arc<ExecutableData>,
         source_code: Option<&Rc<SourceCode>>,
     ) -> Gc<Executable> {
-        // The shared function data stays rooted until the executable that holds it is allocated.
-        let rooted_shared_function_data = MarkedVec::with_capacity(vm, data.shared_function_data.len());
-        let is_strict = data.is_strict;
-        for pending in &mut data.shared_function_data {
-            rooted_shared_function_data.push(SharedFunctionInstanceData::create_from_pending_shared_function_data(
-                vm,
-                pending,
-                is_strict,
-                source_code,
-            ));
-        }
-
-        let parts = ExecutableParts {
-            bytecode: ExecutableBytecode::Owned(data.bytecode.into_boxed_slice()),
-            number_of_registers: data.number_of_registers,
-            number_of_arguments: data.number_of_arguments,
-            is_strict: data.is_strict,
-            cache_counts: data.cache_counts,
-            identifier_table: data.identifier_table,
-            property_key_table: data.property_key_table,
-            string_table: data.string_table,
-            constants: data.constants,
-            exception_handlers: data.exception_handlers,
-            source_map: data.source_map,
-            local_variables: data.local_variables,
-            argument_variable_names: data.argument_variable_names,
-            length_identifier: data.length_identifier.map(|index| index.0),
-            class_blueprints: data.class_blueprints,
-        };
-        Self::assemble(vm, parts, &rooted_shared_function_data, source_code, None)
+        Self::create_with_flushed_code(vm, data, source_code, None)
     }
 
-    /// Creates the executable of a record of a bytecode cache blob that passed validation, whose bytecode runs in
-    /// place in the blob. `rooted_shared_function_data` holds the functions the bytecode creates, made from the
-    /// record's function records in their order. An executable this one replaces in a running program hands its
-    /// inline caches over. Returns `None` if the record turns out to be malformed.
-    pub fn create_from_bytecode_cache(
+    /// create_with_source_code() for the code of a function whose last executable was flushed, which takes over what
+    /// that executable left (see `bytecode::flushing`).
+    pub fn create_with_flushed_code(
         vm: &Vm,
-        record: &DecodedExecutableRecord,
-        rooted_shared_function_data: &MarkedVec<'_, Gc<SharedFunctionInstanceData>>,
-        source_code: &Rc<SourceCode>,
-        replaced_executable: Option<Gc<Executable>>,
-    ) -> Option<Gc<Executable>> {
-        let parts = ExecutableParts {
-            bytecode: ExecutableBytecode::InBytecodeCacheBlob(record.bytecode().clone()),
-            number_of_registers: record.number_of_registers(),
-            number_of_arguments: record.number_of_arguments(),
-            is_strict: record.is_strict(),
-            cache_counts: record.cache_counts(),
-            identifier_table: record.identifiers()?,
-            property_key_table: record.property_keys()?,
-            string_table: record.strings()?,
-            constants: record.constant_values()?,
-            exception_handlers: record.exception_handler_entries()?,
-            source_map: record.source_map_entries()?,
-            local_variables: record.locals()?,
-            argument_variable_names: record.argument_names()?,
-            length_identifier: record.length_identifier(),
-            class_blueprints: record.classes()?,
-        };
-        Some(Self::assemble(
-            vm,
-            parts,
-            rooted_shared_function_data,
-            Some(source_code),
-            replaced_executable,
-        ))
-    }
-
-    fn assemble(
-        vm: &Vm,
-        parts: ExecutableParts,
-        rooted_shared_function_data: &MarkedVec<'_, Gc<SharedFunctionInstanceData>>,
+        mut data: Arc<ExecutableData>,
         source_code: Option<&Rc<SourceCode>>,
-        replaced_executable: Option<Gc<Executable>>,
+        flushed_code: Option<&FlushedCode>,
     ) -> Gc<Executable> {
-        // The literal values of class elements stay rooted until the executable that holds them is allocated.
-        let rooted_literal_values = MarkedVec::new(vm);
-        let class_blueprints: Box<[ClassBlueprint]> = parts
-            .class_blueprints
-            .iter()
-            .map(|blueprint| ClassBlueprint::create(vm, blueprint, source_code, &rooted_literal_values))
-            .collect();
-        let shared_function_data: Box<[Gc<SharedFunctionInstanceData>]> =
-            rooted_shared_function_data.to_vec().into_boxed_slice();
-
-        // The constants stay rooted until the executable that holds them is allocated.
-        let rooted_constants = MarkedVec::with_capacity(vm, parts.constants.len());
-        for constant in &parts.constants {
-            rooted_constants.push(constant_value(vm, constant));
-        }
-        let constants: Box<[Value]> = rooted_constants.to_vec().into_boxed_slice();
-        // The template object caches stay rooted until the executable that holds them is allocated. An executable this
-        // one replaces shares its own, so that both hand out the same template objects.
-        let rooted_template_object_caches = MarkedVec::with_capacity(vm, parts.cache_counts.template_object as usize);
-        match replaced_executable {
-            Some(replaced_executable)
-                if replaced_executable.template_object_caches.len() == parts.cache_counts.template_object as usize =>
-            {
-                for cache in &replaced_executable.template_object_caches {
-                    rooted_template_object_caches.push(*cache);
+        // NB: The code compiles the same every time, so it creates as many functions and has as many template objects.
+        let flushed_code = flushed_code.filter(|flushed_code| {
+            let fits = flushed_code.shared_function_data.len() == data.shared_function_data.len()
+                && flushed_code.template_object_caches.len() == data.cache_counts().template_object as usize;
+            debug_assert!(fits, "flushed code compiles to the same functions and template objects");
+            fits
+        });
+        let executable = DeferGc::scope(vm, |_| {
+            // SAFETY: The slices and the block end up in the executable, which drops the slices first.
+            let mut tables = unsafe { SliceBlock::builder(Self::size_of_tables(&data)) };
+            let is_strict = data.is_strict;
+            let shared_function_data = if let Some(flushed_code) = flushed_code {
+                tables.slice(flushed_code.shared_function_data.iter().copied())
+            } else {
+                match Arc::get_mut(&mut data) {
+                    Some(code) => tables.slice(code.shared_function_data.take_elements().map(|pending| {
+                        SharedFunctionInstanceData::create_from_owned_pending_shared_function_data(
+                            vm,
+                            pending,
+                            is_strict,
+                            source_code,
+                        )
+                    })),
+                    None => tables.slice(data.shared_function_data.iter().map(|pending| {
+                        SharedFunctionInstanceData::create_from_pending_shared_function_data(
+                            vm,
+                            pending,
+                            is_strict,
+                            source_code,
+                        )
+                    })),
                 }
-            }
-            _ => {
-                for _ in 0..parts.cache_counts.template_object {
-                    rooted_template_object_caches.push(TemplateObjectCache::create(vm));
-                }
-            }
-        }
-        let template_object_caches: Box<[Gc<TemplateObjectCache>]> =
-            rooted_template_object_caches.to_vec().into_boxed_slice();
-        let counts = ExecutableCacheCounts {
-            property_lookup_caches: parts.cache_counts.property_lookup,
-            global_variable_caches: parts.cache_counts.global_variable,
-            environment_coordinate_caches: parts.cache_counts.environment_coordinate,
-            environment_shape_caches: parts.cache_counts.environment_shape,
-        };
-        let number_of_locals = u32::try_from(parts.local_variables.len()).expect("local count fits in u32");
-        let mut executable = Self::new_with_bytecode(
-            parts.bytecode,
-            parts.number_of_registers,
-            number_of_locals,
-            parts.number_of_arguments,
-            constants,
-            &counts,
-            parts.is_strict,
-        );
-        executable.identifier_table = parts.identifier_table;
-        executable.set_property_key_table(parts.property_key_table);
-        executable.string_table = parts.string_table;
-        executable.exception_handlers = parts.exception_handlers.into_boxed_slice();
-        executable.shared_function_data = shared_function_data;
-        executable.class_blueprints = class_blueprints;
-        executable.template_object_caches = template_object_caches;
-        executable.allocate_object_caches(
-            parts.cache_counts.object_shape,
-            parts.cache_counts.object_property_iterator,
-        );
-        executable.feedback_slot_counts = FeedbackSlotCounts {
-            arith: parts.cache_counts.arith_feedback,
-            value: parts.cache_counts.value_feedback,
-            call: parts.cache_counts.call_feedback,
-            keyed: parts.cache_counts.keyed_feedback,
-        };
-        executable.length_identifier = parts.length_identifier.map(PropertyKeyTableIndex);
-        executable.source_map = parts.source_map.into_boxed_slice();
-        executable.local_variable_metadata = parts
-            .local_variables
-            .iter()
-            .map(|local_variable| LocalVariableMetadata {
-                is_mutable: local_variable.is_mutable,
-                scope_range: local_variable.scope_range.map(|range| LocalVariableScopeRange {
-                    start: Position {
-                        line: range.start.line,
-                        column: range.start.column,
-                    },
-                    end: Position {
-                        line: range.end.line,
-                        column: range.end.column,
-                    },
-                }),
+            };
+            let template_object_caches = flushed_code.map(|flushed_code| &flushed_code.template_object_caches[..]);
+            vm.heap().allocate(|defer_gc| {
+                Self::build(
+                    vm,
+                    data,
+                    tables,
+                    shared_function_data,
+                    template_object_caches,
+                    source_code,
+                    defer_gc,
+                )
             })
-            .collect();
-        executable.local_variable_names = parts
-            .local_variables
-            .into_iter()
-            .map(|local_variable| local_variable.name)
-            .collect();
-        executable.argument_variable_names = parts.argument_variable_names.into_boxed_slice();
-        executable.source_code = source_code.cloned();
-        let executable = Self::create_from_parts(vm, executable);
-        if let Some(replaced_executable) = replaced_executable {
-            Self::copy_runtime_caches_from(executable, &replaced_executable);
-            Self::take_over_warm_up_from(executable, &replaced_executable);
-        }
-        drop(rooted_template_object_caches);
-        drop(rooted_constants);
-        drop(rooted_literal_values);
+        });
+        vm.register_executable(executable);
+        vm.heap()
+            .did_allocate_external_memory(executable.external_memory_size());
 
         if let Some(debugger) = vm.debugger() {
             debugger.register_executable(vm, executable);
         }
 
+        executable
+    }
+
+    /// The bytes of the tables in `tables`.
+    fn tables_memory_size(&self) -> usize {
+        size_of_val(&*self.head.constants)
+            + size_of_val(&*self.head.property_lookup_caches)
+            + size_of_val(&*self.head.global_variable_caches)
+            + size_of_val(&*self.head.environment_coordinate_caches)
+            + size_of_val(&*self.object_shape_caches)
+            + size_of_val(&*self.property_keys)
+            + size_of_val(&*self.shared_function_data)
+    }
+
+    /// The bytes of the tables that an executable of `code` has from the start.
+    fn size_of_tables(code: &ExecutableData) -> usize {
+        let cache_counts = &code.cache_counts();
+        SliceBlock::room_for::<Gc<SharedFunctionInstanceData>>(code.shared_function_data.len())
+            + SliceBlock::room_for::<PropertyKey>(code.property_key_table.len())
+            + SliceBlock::room_for::<Value>(code.constants.len())
+            + SliceBlock::room_for::<PropertyLookupCache>(cache_counts.property_lookup as usize)
+            + SliceBlock::room_for::<GlobalVariableCache>(cache_counts.global_variable as usize)
+            + SliceBlock::room_for::<Cell<EnvironmentCoordinate>>(cache_counts.environment_coordinate as usize)
+            + SliceBlock::room_for::<ObjectShapeCache>(cache_counts.object_shape as usize)
+    }
+
+    fn build(
+        vm: &Vm,
+        mut data: Arc<ExecutableData>,
+        mut tables: SliceBlockBuilder,
+        shared_function_data: BlockSlice<Gc<SharedFunctionInstanceData>>,
+        template_object_caches: Option<&[Gc<TemplateObjectCache>]>,
+        source_code: Option<&Rc<SourceCode>>,
+        defer_gc: &DeferGc<'_>,
+    ) -> Executable {
+        let class_blueprints: ThinSlice<ClassBlueprint> = data
+            .class_blueprints
+            .iter()
+            .map(|blueprint| ClassBlueprint::create(vm, blueprint, source_code, defer_gc))
+            .collect();
+        let property_keys = match Arc::get_mut(&mut data) {
+            Some(code) => tables.slice(code.property_key_table.take_elements().map(PropertyKey::from)),
+            None => tables.slice(data.property_key_table.iter().cloned().map(PropertyKey::from)),
+        };
+        let constants = tables.slice(data.constants.iter().map(|constant| constant_value(vm, constant)));
+        let template_object_caches: ThinSlice<Gc<TemplateObjectCache>> = match template_object_caches {
+            Some(caches) => caches.iter().copied().collect(),
+            None => (0..data.cache_counts().template_object)
+                .map(|_| TemplateObjectCache::create(vm))
+                .collect(),
+        };
+        let object_property_iterator_caches = data.cache_counts().object_property_iterator;
+        let environment_shape_caches = data.cache_counts().environment_shape;
+
+        let mut executable =
+            Self::new_with_code(data, tables, constants, property_keys, shared_function_data, defer_gc);
+        if let Some(code) = Arc::get_mut(&mut executable.code) {
+            code.release_link_inputs();
+        }
+        if !class_blueprints.is_empty() {
+            executable.rare_data_mut().class_blueprints = class_blueprints;
+        }
+        if !template_object_caches.is_empty() {
+            executable.rare_data_mut().template_object_caches = template_object_caches;
+        }
+        if environment_shape_caches != 0 {
+            executable.rare_data_mut().environment_shape_caches =
+                (0..environment_shape_caches).map(|_| NullableMember::null()).collect();
+        }
+        if object_property_iterator_caches != 0 {
+            executable.rare_data_mut().object_property_iterator_caches = (0..object_property_iterator_caches)
+                .map(|_| ObjectPropertyIteratorCache { data: Cell::new(None) })
+                .collect();
+        }
+        executable.source_code = source_code.cloned();
         executable
     }
 
@@ -1734,13 +1736,30 @@ impl Executable {
         self.shared_function_data.len()
     }
 
+    /// The shared data of the functions the bytecode creates.
+    pub fn shared_function_data_slice(&self) -> &[Gc<SharedFunctionInstanceData>] {
+        &self.shared_function_data
+    }
+
+    /// The caches of the template objects of the bytecode's template literals.
+    pub fn template_object_caches_slice(&self) -> &[Gc<TemplateObjectCache>] {
+        self.template_object_caches()
+    }
+
+    /// Visits what outlives a flush of the executable, for its shared data while it leaves the executable unvisited
+    /// (see `bytecode::flushing`).
+    pub fn trace_what_outlives_a_flush(&self, visitor: &mut Visitor) {
+        self.shared_function_data.trace(visitor);
+        self.template_object_caches().trace(visitor);
+    }
+
     pub fn class_blueprint(&self, index: u32) -> &ClassBlueprint {
-        &self.class_blueprints[index as usize]
+        &self.class_blueprints()[index as usize]
     }
 
     /// The handler whose range holds the instruction at `offset`.
     pub fn exception_handlers_for_offset(&self, offset: u32) -> Option<&ExceptionHandler> {
-        self.exception_handlers
+        self.exception_handlers()
             .binary_search_by(|handler| {
                 if offset < handler.start_offset {
                     core::cmp::Ordering::Greater
@@ -1751,31 +1770,58 @@ impl Executable {
                 }
             })
             .ok()
-            .map(|index| &self.exception_handlers[index])
+            .map(|index| &self.exception_handlers()[index])
     }
 
     pub fn source_range_at(&self, offset: u32) -> Option<SourceRange> {
         if offset as usize >= self.bytecode().len() {
             return None;
         }
-        if self.source_map.is_empty() {
-            return None;
-        }
-        let entries_at_or_before_offset = self.source_map.partition_point(|entry| entry.bytecode_offset <= offset);
-        if entries_at_or_before_offset == 0 {
-            return None;
-        }
-        let entry = &self.source_map[entries_at_or_before_offset - 1];
+        let entry = self.source_map().entry_at(offset)?;
+        let (line, column) = if entry.source_offset == SourceOffset::NONE {
+            (0, 0)
+        } else {
+            let position = self.code.position_source.lines.position(entry.source_offset.0);
+            (position.line, position.column)
+        };
         Some(SourceRange {
             code: self
                 .source_code
                 .clone()
                 .unwrap_or_else(|| SourceCode::create(ak::Utf16String::default(), ak::Utf16String::default())),
-            start: Position {
-                line: entry.line,
-                column: entry.column,
-            },
+            start: Position { line, column },
         })
+    }
+
+    /// The source around the instruction at `offset`, and where in that it is.
+    fn source_around(&self, offset: u32) -> Option<(Vec<u16>, usize)> {
+        const LONGEST_TEXT: usize = 1024;
+        let positions = &self.code.position_source;
+        let source_offset = self.source_map().entry_at(offset)?.source_offset;
+        if source_offset == SourceOffset::NONE {
+            return None;
+        }
+        let source_offset = source_offset.0 as usize;
+        let source = positions.source.get();
+        let view = crate::utf16::Utf16View::of_string(&source);
+        let start = source_offset.saturating_sub(LONGEST_TEXT);
+        let end = (source_offset + LONGEST_TEXT).min(view.length_in_code_units());
+        let units = view.substring_view(start, end - start).code_units().collect();
+        Some((units, source_offset - start))
+    }
+
+    /// The text of what the call or `new` at `offset` calls, from the source.
+    pub fn callee_text_at(&self, offset: u32) -> Option<ak::Utf16FlyString> {
+        let (units, at) = self.source_around(offset)?;
+        let text = crate::bytecode::reference_text::callee_text(&units, at)?;
+        Some(ak::Utf16FlyString::from_utf16(&text))
+    }
+
+    /// The text of the base of the member access at `offset`, from the source.
+    pub fn base_text_at(&self, offset: u32) -> Option<ak::Utf16FlyString> {
+        let (units, at) = self.source_around(offset)?;
+        let text = crate::bytecode::reference_text::base_text(&units, at)?;
+        Some(ak::Utf16FlyString::from_utf16(&text))
     }
 
     /// The source range at `program_counter`, or an empty one if the source map has none.
@@ -1786,8 +1832,118 @@ impl Executable {
         })
     }
 
+    fn template_object_caches(&self) -> &[Gc<TemplateObjectCache>] {
+        self.rare_data
+            .get()
+            .map_or(&[], |rare_data| &rare_data.template_object_caches)
+    }
+
+    fn object_property_iterator_caches(&self) -> &[ObjectPropertyIteratorCache] {
+        self.rare_data
+            .get()
+            .map_or(&[], |rare_data| &rare_data.object_property_iterator_caches)
+    }
+
+    fn class_blueprints(&self) -> &[ClassBlueprint] {
+        self.rare_data
+            .get()
+            .map_or(&[], |rare_data| &rare_data.class_blueprints)
+    }
+
+    /// What this executable runs. Executables that link the same code have the same one.
+    /// This is not something to link again, as the last holder of code has nothing left to link it from.
+    pub fn code(&self) -> &Arc<ExecutableData> {
+        &self.code
+    }
+
+    pub fn identifier_table(&self) -> &[Utf16FlyString] {
+        &self.code.identifier_table
+    }
+
+    pub fn string_table(&self) -> &[Utf16FlyString] {
+        self.code.string_table()
+    }
+
+    pub fn exception_handlers(&self) -> &[ExceptionHandler] {
+        self.code.exception_handlers()
+    }
+
+    pub fn source_positions(&self) -> impl Iterator<Item = SourceMapEntry> + '_ {
+        self.code.source_positions()
+    }
+
+    pub fn source_map(&self) -> SourceMapEntries<'_> {
+        SourceMapEntries::new(&self.code.source_map)
+    }
+
+    pub fn local_variable_metadata(&self) -> &[LocalVariableMetadata] {
+        &self.code.local_variable_metadata
+    }
+
+    pub fn local_variable_scope_range(&self, index: usize) -> Option<LocalVariableScopeRange> {
+        let metadata = self.local_variable_metadata()[index];
+        if metadata.scope_start == SourceOffset::NONE {
+            return None;
+        }
+        let position = |offset: SourceOffset| {
+            let position = self.code.position_source.lines.position(offset.0);
+            Position {
+                line: position.line,
+                column: position.column,
+            }
+        };
+        Some(LocalVariableScopeRange {
+            start: position(metadata.scope_start),
+            end: position(metadata.scope_end),
+        })
+    }
+
+    pub fn local_variable_names(&self) -> &[Utf16FlyString] {
+        &self.code.variable_names[..self.local_variable_metadata().len()]
+    }
+
+    pub fn argument_variable_names(&self) -> &[Utf16FlyString] {
+        &self.code.variable_names[self.local_variable_metadata().len()..]
+    }
+
+    /// Whether the code at the bytecode offset `pc` is strict.
+    pub fn is_strict_at(&self, pc: u32) -> bool {
+        if self.is_strict_mode() {
+            return true;
+        }
+        let ranges = self.code.strict_ranges();
+        let index = ranges.partition_point(|range| range.end_offset <= pc);
+        ranges.get(index).is_some_and(|range| range.start_offset <= pc)
+    }
+
+    /// The index of the length in the property key table, if it is there.
+    pub fn length_identifier(&self) -> Option<usize> {
+        self.code.length_identifier().map(|index| index.0 as usize)
+    }
+
+    pub fn is_strict_mode(&self) -> bool {
+        self.code.is_strict
+    }
+
+    pub fn number_of_registers(&self) -> u32 {
+        self.code.number_of_registers
+    }
+
+    pub fn number_of_arguments(&self) -> u32 {
+        self.code.number_of_arguments
+    }
+
+    fn rare_data_mut(&mut self) -> &mut ExecutableRareData {
+        self.rare_data.get_or_init(Box::default);
+        self.rare_data.get_mut().expect("the rare data was just made")
+    }
+
+    fn rare_data(&self) -> &ExecutableRareData {
+        self.rare_data.get_or_init(Box::default)
+    }
+
     pub fn add_debugger_breakpoint(&self, bytecode_offset: u32, breakpoint_id: BreakpointID) {
-        let mut sites = self.debugger_breakpoint_sites.borrow_mut();
+        let mut sites = self.rare_data().debugger_breakpoint_sites.borrow_mut();
         let site = sites.entry(bytecode_offset).or_default();
         if !site.breakpoint_ids.contains(&breakpoint_id) {
             site.breakpoint_ids.push(breakpoint_id);
@@ -1795,7 +1951,10 @@ impl Executable {
     }
 
     pub fn remove_debugger_breakpoint(&self, breakpoint_id: BreakpointID) {
-        let mut sites = self.debugger_breakpoint_sites.borrow_mut();
+        let Some(rare_data) = self.rare_data.get() else {
+            return;
+        };
+        let mut sites = rare_data.debugger_breakpoint_sites.borrow_mut();
         sites.retain(|_, site| {
             if let Some(index) = site.breakpoint_ids.iter().position(|&id| id == breakpoint_id) {
                 site.breakpoint_ids.remove(index);
@@ -1808,119 +1967,55 @@ impl Executable {
     }
 
     pub fn clear_debugger_breakpoints(&self) {
-        *self.debugger_breakpoint_sites.borrow_mut() = HashMap::default();
+        if let Some(rare_data) = self.rare_data.get() {
+            *rare_data.debugger_breakpoint_sites.borrow_mut() = HashMap::default();
+        }
     }
 
     pub fn has_debugger_breakpoint_at(&self, bytecode_offset: u32) -> bool {
-        self.debugger_breakpoint_sites.borrow().contains_key(&bytecode_offset)
+        self.rare_data.get().is_some_and(|rare_data| {
+            rare_data
+                .debugger_breakpoint_sites
+                .borrow()
+                .contains_key(&bytecode_offset)
+        })
     }
 
     pub fn debugger_breakpoints_at(&self, bytecode_offset: u32) -> Vec<BreakpointID> {
-        self.debugger_breakpoint_sites
-            .borrow()
-            .get(&bytecode_offset)
-            .map(|site| site.breakpoint_ids.clone())
+        self.rare_data
+            .get()
+            .and_then(|rare_data| {
+                rare_data
+                    .debugger_breakpoint_sites
+                    .borrow()
+                    .get(&bytecode_offset)
+                    .map(|site| site.breakpoint_ids.clone())
+            })
             .unwrap_or_default()
     }
 
     pub fn has_debugger_breakpoint(&self, breakpoint_id: BreakpointID) -> bool {
-        self.debugger_breakpoint_sites
-            .borrow()
-            .values()
-            .any(|site| site.breakpoint_ids.contains(&breakpoint_id))
+        self.rare_data.get().is_some_and(|rare_data| {
+            rare_data
+                .debugger_breakpoint_sites
+                .borrow()
+                .values()
+                .any(|site| site.breakpoint_ids.contains(&breakpoint_id))
+        })
     }
 
     pub fn bytecode(&self) -> &[u8] {
-        self.bytecode.as_slice()
+        &self.code.bytecode
     }
 
-    /// Whether the bytecode runs in place in the bytecode cache blob it was materialized from.
-    pub fn runs_in_place_in_bytecode_cache_blob(&self) -> bool {
-        matches!(self.bytecode, ExecutableBytecode::InBytecodeCacheBlob(_))
-    }
-
-    /// Takes over the feedback, the tier and the tier-up budget of `other`, an executable with the same bytecode that
-    /// this one replaces, so that a function that warmed up goes on from where it was rather than start over, and
-    /// whether the JIT refused it.
-    fn take_over_warm_up_from(executable: Gc<Executable>, other: &Executable) {
-        executable.take_over_jit_refusal_from(other);
-        let Some(other_feedback) = other.feedback() else {
-            return;
-        };
-        if executable.feedback_slot_counts != other.feedback_slot_counts {
-            return;
-        }
-        executable.ensure_feedback().copy_from(other_feedback);
-        executable.set_interpreter_tier(other.interpreter_tier());
-        executable.head.tier_up_budget.set(other.head.tier_up_budget.get());
-    }
-
-    /// Executable::copy_runtime_caches_from(): makes `executable` take over what the inline caches of `other`, an
-    /// executable compiled from the same code, learned, as installing a bytecode cache into a running program does.
-    /// Each kind of cache is only taken over if the two executables have the same number of them. The template object
-    /// caches are not copied here: an executable shares those of the one it replaces from its creation.
-    /// NB: This takes an executable on the heap because the VM only forgets the dead cells in the caches of executables
-    ///     it registered. Entries copied into one not registered yet could outlive the cells they point to.
-    fn copy_runtime_caches_from(executable: Gc<Executable>, other: &Executable) {
-        let this = &*executable;
-        if this.property_lookup_caches.len() == other.property_lookup_caches.len() {
-            for (cache, other_cache) in this.property_lookup_caches.iter().zip(&other.property_lookup_caches) {
-                cache.copy_from(other_cache);
-            }
-        }
-        if this.global_variable_caches.len() == other.global_variable_caches.len() {
-            for (cache, other_cache) in this.global_variable_caches.iter().zip(&other.global_variable_caches) {
-                cache.entry.set(other_cache.entry.get());
-                cache
-                    .environment_serial_number
-                    .set(other_cache.environment_serial_number.get());
-                cache
-                    .environment_binding_index
-                    .set(other_cache.environment_binding_index.get());
-                cache
-                    .has_environment_binding_index
-                    .set(other_cache.has_environment_binding_index.get());
-            }
-        }
-        if this.environment_coordinate_caches.len() == other.environment_coordinate_caches.len() {
-            for (cache, other_cache) in this
-                .environment_coordinate_caches
-                .iter()
-                .zip(&other.environment_coordinate_caches)
-            {
-                cache.set(other_cache.get());
-            }
-        }
-        if this.object_shape_caches.len() == other.object_shape_caches.len() {
-            for (cache, other_cache) in this.object_shape_caches.iter().zip(&other.object_shape_caches) {
-                cache.shape.set(other_cache.shape.get());
-                cache
-                    .property_offsets
-                    .replace(other_cache.property_offsets.borrow().clone());
-            }
-        }
-        if this.object_property_iterator_caches.len() == other.object_property_iterator_caches.len() {
-            for (cache, other_cache) in this
-                .object_property_iterator_caches
-                .iter()
-                .zip(&other.object_property_iterator_caches)
-            {
-                cache.data.set(other_cache.data.get());
-            }
-        }
-        if this.environment_shape_caches.len() == other.environment_shape_caches.len() {
-            for (cache, other_cache) in this
-                .environment_shape_caches
-                .iter()
-                .zip(&other.environment_shape_caches)
-            {
-                cache.set(other_cache.get());
-            }
-        }
+    /// Whether the code makes private or variable environments, so that its frames keep their own (see
+    /// `ExecutionContext::keeps_private_environment()` and `ExecutionContext::keeps_variable_environment()`).
+    pub fn keeps_own_environments(&self) -> bool {
+        self.bytecode().first() == Some(&(OpCode::EnterWithOwnEnvironments as u8))
     }
 
     pub fn constants(&self) -> &[Value] {
-        &self.constants
+        &self.head.constants
     }
 
     pub fn registers_and_locals_count(&self) -> u32 {
@@ -1928,21 +2023,32 @@ impl Executable {
     }
 
     pub fn global_variable_cache(&self, index: u32) -> &GlobalVariableCache {
-        &self.global_variable_caches[index as usize]
+        &self.head.global_variable_caches[index as usize]
     }
 
     pub fn environment_coordinate_cache(&self, index: u32) -> &Cell<EnvironmentCoordinate> {
-        &self.environment_coordinate_caches[index as usize]
+        &self.head.environment_coordinate_caches[index as usize]
     }
 
     /// The global variable cache of the dynamic binding access with the environment coordinate cache `index`.
     pub fn dynamic_global_variable_cache(&self, index: u32) -> &GlobalVariableCache {
-        let caches = self.dynamic_global_variable_caches.get_or_init(|| {
-            (0..self.environment_coordinate_caches.len())
+        let caches = self.rare_data().dynamic_global_variable_caches.get_or_init(|| {
+            (0..self.head.environment_coordinate_caches.len())
                 .map(|_| GlobalVariableCache::default())
                 .collect()
         });
         &caches[index as usize]
+    }
+
+    /// The call caches, which are empty until the executable gets its feedback.
+    pub fn call_caches(&self) -> &[CallCache] {
+        self.feedback().map_or(&[], ExecutableFeedback::call_caches)
+    }
+
+    fn clear_call_caches(&self) {
+        for cache in self.call_caches() {
+            cache.clear();
+        }
     }
 
     pub fn interpreter_tier(&self) -> InterpreterTier {
@@ -1951,60 +2057,105 @@ impl Executable {
 
     /// Moves the executable's frames to the handlers of `tier`, the next time the interpreter enters one of them.
     pub fn set_interpreter_tier(&self, tier: InterpreterTier) {
-        if tier != InterpreterTier::Plain {
-            self.ensure_feedback();
+        match tier {
+            InterpreterTier::Plain => {}
+            #[cfg(feature = "jit")]
+            InterpreterTier::Profiling => {
+                self.ensure_feedback();
+                // NB: A call that hits its call cache records no call feedback, as the call that linked the entry did.
+                //     The calls that linked the entries in another tier did not.
+                self.clear_call_caches();
+            }
+            #[cfg(feature = "jit")]
+            _ => {
+                self.ensure_feedback_without_value_buckets();
+            }
         }
         self.interpreter_tier.set(tier);
         self.head.dispatch_table_index.set(tier as u8);
     }
 
-    /// Gives the executable its feedback arrays, if it has none yet, and points the interpreter at them.
-    pub fn ensure_feedback(&self) -> &ExecutableFeedback {
+    /// Gives the executable its feedback without the value buckets, which only the profiling tier writes, if it has
+    /// none yet, and points the interpreter at it.
+    fn ensure_feedback_without_value_buckets(&self) -> &ExecutableFeedback {
         if let Some(feedback) = self.feedback.get() {
             return feedback;
         }
-        let feedback = ExecutableFeedback::new(self.feedback_slot_counts);
+        let property_lookup_cache_count =
+            u32::try_from(self.head.property_lookup_caches.len()).expect("property lookup cache indices are 16-bit");
+        let cache_counts = self.code.cache_counts();
+        let slot_counts = FeedbackSlotCounts {
+            arith: cache_counts.arith_feedback,
+            value: cache_counts.value_feedback,
+            call: cache_counts.call_feedback,
+            keyed: cache_counts.keyed_feedback,
+        };
+        let feedback = Box::new(ExecutableFeedback::new(slot_counts, property_lookup_cache_count));
+        if self.feedback.set(feedback).is_err() {
+            unreachable!("the feedback is made once");
+        }
+        let feedback = self.feedback.get().expect("the feedback was just made");
+        self.head.call_caches.set(feedback.call_caches().as_ptr());
+        self.point_interpreter_at_feedback(feedback);
+        feedback
+    }
+
+    /// Gives the executable all its feedback arrays, if it does not have them yet, and points the interpreter at them.
+    pub fn ensure_feedback(&self) -> &ExecutableFeedback {
+        let feedback = self.ensure_feedback_without_value_buckets();
+        if !feedback.has_value_buckets() {
+            feedback.ensure_value_buckets();
+            self.point_interpreter_at_feedback(feedback);
+        }
+        feedback
+    }
+
+    fn point_interpreter_at_feedback(&self, feedback: &ExecutableFeedback) {
         let head = &self.head.feedback;
         let [arith, value_buckets, call, keyed] = feedback.array_offsets();
         head.arith.set(arith);
         head.value_buckets.set(value_buckets);
         head.call.set(call);
         head.keyed.set(keyed);
-        if self.feedback.set(feedback).is_err() {
-            unreachable!("the feedback is made once");
-        }
-        self.feedback.get().expect("the feedback was just made")
     }
 
     pub fn has_dumped_feedback(&self) -> bool {
-        self.has_dumped_feedback.get()
+        self.rare_data
+            .get()
+            .is_some_and(|rare_data| rare_data.has_dumped_feedback.get())
     }
 
     pub fn set_has_dumped_feedback(&self) {
-        self.has_dumped_feedback.set(true);
+        self.rare_data().has_dumped_feedback.set(true);
     }
 
     /// What the interpreter observed running the bytecode, indexed by the feedback slots of its instructions, if the
     /// executable ever left the plain tier.
     pub fn feedback(&self) -> Option<&ExecutableFeedback> {
-        self.feedback.get()
+        self.feedback.get().map(Box::as_ref)
     }
 
     pub fn jit_state(&self) -> &ExecutableJitState {
-        &self.jit
+        self.jit.get_or_init(Box::default)
+    }
+
+    fn environment_shape_caches(&self) -> &[NullableMember<EnvironmentShape>] {
+        self.rare_data
+            .get()
+            .map_or(&[], |rare_data| &rare_data.environment_shape_caches)
     }
 
     pub fn environment_shape_cache_count(&self) -> u32 {
-        u32::try_from(self.environment_shape_caches.len()).expect("the cache count fits in u32")
+        u32::try_from(self.environment_shape_caches().len()).expect("the cache count fits in u32")
     }
 
     pub fn environment_shape_cache(&self, index: u32) -> EnvironmentShapeCache {
-        assert!((index as usize) < self.environment_shape_caches.len());
+        assert!((index as usize) < self.environment_shape_caches().len());
         EnvironmentShapeCache::Executable(Gc::from_ref(self), index)
     }
 
-    pub(crate) fn environment_shape_cache_slot(&self, index: u32) -> &Cell<Option<Gc<EnvironmentShape>>> {
-        &self.environment_shape_caches[index as usize]
+    pub(crate) fn environment_shape_cache_slot(&self, index: u32) -> &NullableMember<EnvironmentShape> {
+        &self.environment_shape_caches()[index as usize]
     }
 
     pub fn name(&self) -> Utf16FlyString {
@@ -2021,7 +2172,7 @@ impl Executable {
 
     /// The operand index of the first local, which follows the registers.
     pub fn local_index_base(&self) -> u32 {
-        self.number_of_registers
+        self.code.number_of_registers
     }
 
     /// The operand index of the first argument, which follows the registers, the locals and the constants.
@@ -2050,25 +2201,19 @@ impl Executable {
     }
 }
 
-fn first_real_source_map_entry(executable: &Executable) -> Option<&SourceMapEntry> {
-    let mut first_entry: Option<&SourceMapEntry> = None;
-    for entry in &executable.source_map {
-        if entry.line == 0 && entry.column == 0 {
-            continue;
-        }
-        if first_entry.is_none_or(|first_entry| {
-            entry.line < first_entry.line || (entry.line == first_entry.line && entry.column < first_entry.column)
-        }) {
-            first_entry = Some(entry);
-        }
-    }
-    first_entry
+/// The line and the column that the first position of the code has.
+fn first_real_source_position(executable: &Executable) -> Option<(u32, u32)> {
+    executable
+        .source_positions()
+        .map(|entry| (entry.line, entry.column))
+        .filter(|&position| position != (0, 0))
+        .min()
 }
 
 fn dump_header(output: &mut Vec<u8>, executable: &Executable) {
     const WHITE_BOLD: &str = "\x1b[37;1m";
     const RESET: &str = "\x1b[0m";
-    let first_source_map_entry = first_real_source_map_entry(executable);
+    let first_source_position = first_real_source_position(executable);
 
     let mut hash: u32 = 2166136261; // FNV-1a offset basis
     let update_hash = |hash: &mut u32, value: u32| {
@@ -2089,9 +2234,9 @@ fn dump_header(output: &mut Vec<u8>, executable: &Executable) {
     for code_unit in name_view.code_units() {
         update_hash_with_code_unit(&mut hash, code_unit);
     }
-    if let Some(first_source_map_entry) = first_source_map_entry {
-        update_hash(&mut hash, first_source_map_entry.line);
-        update_hash(&mut hash, first_source_map_entry.column);
+    if let Some((line, column)) = first_source_position {
+        update_hash(&mut hash, line);
+        update_hash(&mut hash, column);
     }
     update_hash(
         &mut hash,
@@ -2103,7 +2248,7 @@ fn dump_header(output: &mut Vec<u8>, executable: &Executable) {
     let _ = write!(output, "${hash:08x}{RESET}");
 
     // Show source location if available.
-    if let Some(first_source_map_entry) = first_source_map_entry {
+    if let Some((line, column)) = first_source_position {
         let filename = executable.source_code.as_ref().map_or(Utf16View::EMPTY, |source_code| {
             Utf16View::of_string(source_code.filename())
         });
@@ -2123,17 +2268,9 @@ fn dump_header(output: &mut Vec<u8>, executable: &Executable) {
             };
             output.push(b' ');
             filename.append_as_wtf8_to(output);
-            let _ = write!(
-                output,
-                ":{}:{}",
-                first_source_map_entry.line, first_source_map_entry.column
-            );
+            let _ = write!(output, ":{line}:{column}");
         } else {
-            let _ = write!(
-                output,
-                " line {}, column {}",
-                first_source_map_entry.line, first_source_map_entry.column
-            );
+            let _ = write!(output, " line {line}, column {column}");
         }
     }
     output.push(b'\n');
@@ -2146,12 +2283,16 @@ fn dump_metadata(output: &mut Vec<u8>, executable: &Executable) {
     const CYAN: &str = "\x1b[36m";
     const RESET: &str = "\x1b[0m";
 
-    let _ = writeln!(output, "  {GREEN}Registers{RESET}: {}", executable.number_of_registers);
+    let _ = writeln!(
+        output,
+        "  {GREEN}Registers{RESET}: {}",
+        executable.number_of_registers()
+    );
     let _ = writeln!(output, "  {GREEN}Blocks{RESET}:    {}", count_basic_blocks(executable));
 
-    if !executable.local_variable_names.is_empty() {
+    if !executable.local_variable_names().is_empty() {
         let _ = write!(output, "  {GREEN}Locals{RESET}:    ");
-        for (i, local_variable_name) in executable.local_variable_names.iter().enumerate() {
+        for (i, local_variable_name) in executable.local_variable_names().iter().enumerate() {
             if i != 0 {
                 output.extend_from_slice(b", ");
             }
@@ -2162,9 +2303,9 @@ fn dump_metadata(output: &mut Vec<u8>, executable: &Executable) {
         output.push(b'\n');
     }
 
-    if !executable.constants.is_empty() {
+    if !executable.head.constants.is_empty() {
         let _ = writeln!(output, "  {GREEN}Constants{RESET}:");
-        for (i, &value) in executable.constants.iter().enumerate() {
+        for (i, &value) in executable.head.constants.iter().enumerate() {
             output.extend_from_slice(b"    ");
             let _ = write!(output, "{YELLOW}[{i}]{RESET} = ");
             output.extend_from_slice(CYAN.as_bytes());
@@ -2230,16 +2371,11 @@ fn constant_value(vm: &Vm, constant: &ConstantValue) -> Value {
         ConstantValue::Undefined => Value::UNDEFINED,
         ConstantValue::Empty => Value::EMPTY,
         ConstantValue::String(string) => {
-            // String constants are interned so that comparisons with them are pointer comparisons. Long ones are
-            // rarely compared, and not worth hashing.
-            const MAX_INTERNED_CONSTANT_LENGTH: usize = 256;
-            if string.0.len() > MAX_INTERNED_CONSTANT_LENGTH {
-                return Value::from_string(PrimitiveString::create(vm, ak::Utf16String::from_utf16(&string.0)));
+            // String constants are interned so that comparisons with them are pointer comparisons.
+            if string.length_in_code_units() > MAXIMUM_INTERNED_CONSTANT_LENGTH {
+                return Value::from_string(PrimitiveString::create(vm, string.clone()));
             }
-            Value::from_string(PrimitiveString::create_interned(
-                vm,
-                &ak::Utf16FlyString::from_utf16(&string.0),
-            ))
+            Value::from_string(PrimitiveString::create_interned(vm, &to_utf16_fly_string(string)))
         }
         ConstantValue::BigInt(literal) => Value::from_bigint(BigInt::create(vm, parse_big_int_literal(literal))),
         ConstantValue::WellKnownSymbol(WellKnownSymbolKind::SymbolIterator) => {
@@ -2286,20 +2422,42 @@ fn parse_big_int_literal(literal: &str) -> SignedBigInteger {
     SignedBigInteger::parse_bytes(digits, radix).expect("the frontend only emits valid BigInt literals")
 }
 
+// SAFETY: Visits the constants, the only cells that the head holds. Its inline caches do not keep what they remember
+// alive.
+unsafe impl Trace for ExecutableHead {
+    fn trace(&self, visitor: &mut Visitor) {
+        // NB: The constants are visited as owned values, so that a collection that moves their cells rewrites them where
+        //     they are. They are in the tables of the executable, which nothing writes once it is built, and only its
+        //     destructor frees. JIT code that embeds a constant lists its cell among the cells it embeds, which keeps
+        //     the cell where it is while the code lives.
+        // SAFETY: See above.
+        unsafe { visitor.visit_owned_values(&self.constants) };
+    }
+}
+
+// SAFETY: Visits the template object caches, the for-in key snapshots, the literal values of classes and the environment
+// shapes. The dynamic
+// global variable caches do not keep what they remember alive, and the breakpoint sites hold no cells.
+unsafe impl Trace for ExecutableRareData {
+    fn trace(&self, visitor: &mut Visitor) {
+        self.template_object_caches.trace(visitor);
+        for cache in &self.object_property_iterator_caches {
+            cache.data.trace(visitor);
+        }
+        self.class_blueprints.trace(visitor);
+        self.environment_shape_caches.trace(visitor);
+    }
+}
+
 // SAFETY: Visits the constants, the for-in key snapshots, the environment shapes, the template object caches, the
 // functions the bytecode creates and the literal values of its classes, which are all the cells an executable keeps
 // alive so far. The inline caches do not keep the shapes and objects they remember alive.
 unsafe impl Trace for Executable {
     fn trace(&self, visitor: &mut Visitor) {
-        visitor.visit_values(&self.constants);
+        self.head.trace(visitor);
         self.property_keys.trace(visitor);
-        for cache in &self.object_property_iterator_caches {
-            cache.data.trace(visitor);
-        }
-        self.environment_shape_caches.trace(visitor);
-        self.template_object_caches.trace(visitor);
         self.shared_function_data.trace(visitor);
-        self.class_blueprints.trace(visitor);
+        self.rare_data.trace(visitor);
         self.trace_jit_code(visitor);
     }
 }

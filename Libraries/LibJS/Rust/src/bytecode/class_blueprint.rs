@@ -8,12 +8,14 @@
 
 use std::rc::Rc;
 
-use ak::{Utf16FlyString, Utf16String};
+use ak::Utf16FlyString;
+
+use crate::utf16::Utf16View;
 use libjs_abi::ClassElementKind;
 use libjs_runtime_macros::Trace;
 
-use crate::bytecode::generator::{PendingClassBlueprint, PendingClassElement, PendingLiteralValueKind};
-use crate::gc::root::MarkedVec;
+use crate::bytecode::executable_data::{PendingClassBlueprint, PendingClassElement, PendingLiteralValueKind};
+use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::vm::Vm;
 use crate::layout::value::Value;
 use crate::runtime::primitive_string::PrimitiveString;
@@ -56,23 +58,21 @@ fn class_element_kind(kind: u8) -> ClassElementKind {
 }
 
 impl ClassBlueprint {
-    /// Creates the blueprint of a class the frontend compiled, as rust_create_class_blueprint does. The literal values
-    /// of its elements are also pushed to `rooted_literal_values`, which keeps them alive until something that traces
-    /// the blueprint holds it.
+    /// Creates the blueprint of a class the frontend compiled, as rust_create_class_blueprint does.
     pub fn create(
         vm: &Vm,
         blueprint: &PendingClassBlueprint,
         source_code: Option<&Rc<SourceCode>>,
-        rooted_literal_values: &MarkedVec<'_, Value>,
+        _defer_gc: &DeferGc<'_>,
     ) -> ClassBlueprint {
         let name = match &blueprint.name {
-            Some(name) if !name.is_empty() => Utf16FlyString::from_utf16(name),
+            Some(name) if !name.is_empty() => Utf16View::of_string(name).to_utf16_fly_string(),
             _ => Utf16FlyString::default(),
         };
         let elements = blueprint
             .elements
             .iter()
-            .map(|element| Self::create_element(vm, element, rooted_literal_values))
+            .map(|element| Self::create_element(vm, element))
             .collect();
         ClassBlueprint {
             constructor_shared_function_data_index: blueprint.constructor_sfd_index,
@@ -86,16 +86,12 @@ impl ClassBlueprint {
         }
     }
 
-    fn create_element(
-        vm: &Vm,
-        element: &PendingClassElement,
-        rooted_literal_values: &MarkedVec<'_, Value>,
-    ) -> ClassElementDescriptor {
+    fn create_element(vm: &Vm, element: &PendingClassElement) -> ClassElementDescriptor {
         let private_identifier = element
             .private_identifier
             .as_ref()
             .filter(|identifier| !identifier.is_empty())
-            .map(|identifier| Utf16FlyString::from_utf16(identifier));
+            .map(|identifier| Utf16View::of_string(identifier).to_utf16_fly_string());
         let literal_value = match element.literal_value_kind {
             PendingLiteralValueKind::None => None,
             PendingLiteralValueKind::Number => Some(Value::from_f64(element.literal_value_number)),
@@ -103,13 +99,8 @@ impl ClassBlueprint {
             PendingLiteralValueKind::BooleanFalse => Some(Value::FALSE),
             PendingLiteralValueKind::Null => Some(Value::NULL),
             PendingLiteralValueKind::String => {
-                let string = element
-                    .literal_value_string
-                    .as_ref()
-                    .map_or_else(Utf16String::default, |string| Utf16String::from_utf16(string));
-                let value = Value::from_string(PrimitiveString::create(vm, string));
-                rooted_literal_values.push(value);
-                Some(value)
+                let string = element.literal_value_string.clone().unwrap_or_default();
+                Some(Value::from_string(PrimitiveString::create(vm, string)))
             }
         };
         ClassElementDescriptor {

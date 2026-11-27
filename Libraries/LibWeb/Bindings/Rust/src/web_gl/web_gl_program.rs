@@ -21,11 +21,15 @@ pub(crate) struct WebGLProgram {
     object: WebGLObject,
     pub(crate) attached_vertex_shader: Cell<Option<Ref<WebGLShader>>>,
     pub(crate) attached_fragment_shader: Cell<Option<Ref<WebGLShader>>>,
+    /// How many times the program has been linked. A link assigns the program's uniforms their locations anew, so a
+    /// location from before the last one names nothing in it.
+    #[gc(untraced)]
+    link_count: Cell<u32>,
 }
 
 impl Wrappable for WebGLProgram {
-    fn relevant_realm(&self, vm: &Vm) -> Option<Gc<Realm>> {
-        self.object.relevant_realm(vm)
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
+        self.object.relevant_realm()
     }
 }
 
@@ -37,13 +41,19 @@ impl Inherits<WebGLObject> for WebGLProgram {
 
 impl WebGLProgram {
     pub(crate) fn create(vm: &Vm, context: &ContextState, handle: u32) -> Ref<Self> {
-        allocate(
-            vm,
-            Self {
-                object: WebGLObject::new(context, handle),
-                attached_vertex_shader: Cell::new(None),
-                attached_fragment_shader: Cell::new(None),
-            },
-        )
+        allocate(vm, |_| Self {
+            object: WebGLObject::new(context, handle),
+            attached_vertex_shader: Cell::new(None),
+            attached_fragment_shader: Cell::new(None),
+            link_count: Cell::new(0),
+        })
+    }
+
+    pub(crate) fn link_count(&self) -> u32 {
+        self.link_count.get()
+    }
+
+    pub(crate) fn note_link(&self) {
+        self.link_count.set(self.link_count.get().wrapping_add(1));
     }
 }

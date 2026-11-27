@@ -501,7 +501,7 @@ fn operand_store(emit: &mut Emit<'_>, offset: i64, source: &AllocatedOperand, sc
 
     emit!(emit.output, X86_64;
         Opcode::Load {
-        width: MemoryWidth::Word,
+        width: MemoryWidth::Byte,
         signed: false,
     } => [register index, address MachineMemoryAddress::indexed_offset(R14, R13, offset)];
     );
@@ -639,7 +639,7 @@ fn call_with_scalar_values(
     function: crate::low_ir::Relocation,
     layout: &crate::metadata::SlowPathLayout,
 ) -> Result<(), CompileError> {
-    use crate::metadata::ParameterMode;
+    use crate::metadata::{NO_OPERAND, ParameterMode};
     use crate::target::registers::x86_64::{R8, R9, R10, R11, R13, R14, RAX, RBX, RCX, RDX, RSP};
     let registers = [RCX, R8, R9];
     let inputs: Vec<_> = layout
@@ -655,13 +655,13 @@ fn call_with_scalar_values(
     for (index, field) in inputs.iter().enumerate() {
         let ready = emit.unique_label("scalar_value_ready");
         emit!(emit.output, X86_64;
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(R11, field.instruction_offset as i64)];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(R11, field.instruction_offset as i64)];
         );
         if field.optional {
             let empty = emit.constant(KnownLayoutConstant::EmptyValue)?;
             emit!(emit.output, X86_64;
                 Opcode::MoveAbsolute64Immediate => [register RAX, immediate empty];
-                Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate -1];
+                Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate NO_OPERAND];
                 Opcode::JumpCondition(super::Condition::Equal) => [label ready.clone()];
             );
         }
@@ -696,7 +696,7 @@ fn call_with_scalar_values(
     if let Some(output) = layout.fields.iter().find(|field| field.mode == ParameterMode::Out) {
         emit!(emit.output, X86_64;
             Opcode::LoadEffectiveAddress => [register RCX, address MachineMemoryAddress::indexed(R14, R13)];
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, output.instruction_offset as i64)];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, output.instruction_offset as i64)];
             Opcode::Store(MemoryWidth::DoubleWord) => [address MachineMemoryAddress { scale: Some(8), ..MachineMemoryAddress::indexed(RBX, R10) }, register RDX];
         );
     }
@@ -712,7 +712,7 @@ fn call_with_values(
     kind: crate::target::backend::HelperCallKind,
 ) -> Result<(), CompileError> {
     use super::{AluOperation, Condition};
-    use crate::metadata::{ParameterMode, SlowPathAbi, SlowPathArray};
+    use crate::metadata::{NO_OPERAND, ParameterMode, SlowPathAbi, SlowPathArray};
     use crate::target::registers::x86_64::{R8, R9, R10, R11, R13, R14, RAX, RBX, RCX, RDX, RSP};
 
     let Some(layout) = emit.runtime.slow_paths.get(emit.handler).cloned() else {
@@ -759,7 +759,7 @@ fn call_with_values(
         let base_offset = emit.constant(KnownLayoutConstant::VmStackInfoBase)?;
         let stack_space_limit = emit.constant(KnownLayoutConstant::VmStackSpaceLimit)?;
         emit!(emit.output, X86_64;
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, count_offset as i64)];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, count_offset as i64)];
             Opcode::ShiftImmediate { operation: ShiftOperation::Left, width: IntegerWidth::U64 } => [register R10, immediate 3];
             Opcode::AluImmediate { operation: AluOperation::Add, width: IntegerWidth::U64 } => [register R10, immediate fixed_size + 15];
             Opcode::AluImmediate { operation: AluOperation::And, width: IntegerWidth::U64 } => [register R10, immediate -16];
@@ -815,11 +815,11 @@ fn call_with_values(
             emit!(emit.output, X86_64; Opcode::MoveAbsolute64Immediate => [register RAX, immediate empty];);
         }
         emit!(emit.output, X86_64;
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
         );
         if field.optional {
             emit!(emit.output, X86_64;
-                Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate -1];
+                Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate NO_OPERAND];
                 Opcode::JumpCondition(Condition::Equal) => [label ready.clone()];
             );
         }
@@ -857,16 +857,16 @@ fn call_with_values(
         let end = emit.unique_label("array_values_end");
         emit!(emit.output, X86_64;
             Opcode::Move32Immediate => [register R11, immediate 0];
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, count_offset as i64)];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, count_offset as i64)];
             Opcode::Label => [label next.clone()];
             Opcode::CompareRegister(IntegerWidth::U64) => [register R11, register R10];
             Opcode::JumpCondition(Condition::UnsignedGreaterOrEqual) => [label end.clone()];
-            Opcode::Load { width: MemoryWidth::Word, signed: false } => [register RDX, address MachineMemoryAddress { scale: Some(4), ..MachineMemoryAddress::indexed_offset(RCX, R11, array_offset as i64) }];
+            Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register RDX, address MachineMemoryAddress::indexed_offset(RCX, R11, array_offset as i64)];
         );
         if optional {
             emit!(emit.output, X86_64;
                 Opcode::MoveAbsolute64Immediate => [register RAX, immediate empty];
-                Opcode::CompareImmediate(IntegerWidth::U32) => [register RDX, immediate -1];
+                Opcode::CompareImmediate(IntegerWidth::U32) => [register RDX, immediate NO_OPERAND];
                 Opcode::JumpCondition(Condition::Equal) => [label ready.clone()];
             );
         }
@@ -930,11 +930,11 @@ fn call_with_values(
             }
             let skip = emit.unique_label("skip_output_value");
             emit!(emit.output, X86_64;
-                Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
+                Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
             );
             if field.optional {
                 emit!(emit.output, X86_64;
-                    Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate -1];
+                    Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate NO_OPERAND];
                     Opcode::JumpCondition(Condition::Equal) => [label skip.clone()];
                 );
             }
@@ -976,11 +976,11 @@ fn call_with_values(
             let skip = emit.unique_label("skip_exceptional_output");
             emit!(emit.output, X86_64;
                 Opcode::LoadEffectiveAddress => [register RCX, address MachineMemoryAddress::indexed(R14, R13)];
-                Opcode::Load { width: MemoryWidth::Word, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
+                Opcode::Load { width: MemoryWidth::Byte, signed: false } => [register R10, address MachineMemoryAddress::offset(RCX, field.instruction_offset as i64)];
             );
             if field.optional {
                 emit!(emit.output, X86_64;
-                    Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate -1];
+                    Opcode::CompareImmediate(IntegerWidth::U32) => [register R10, immediate NO_OPERAND];
                     Opcode::JumpCondition(Condition::Equal) => [label skip.clone()];
                 );
             }
@@ -1241,6 +1241,31 @@ impl Backend for X86_64Backend {
         Ok(())
     }
 
+    fn decompress_cell_pointer(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+        nullable: bool,
+    ) {
+        let address = MachineMemoryAddress {
+            scale: Some(8),
+            ..MachineMemoryAddress::indexed(R15, source)
+        };
+        if !nullable {
+            emit!(emit.output, X86_64; Opcode::LoadEffectiveAddress => [register destination, address address];);
+            return;
+        }
+        emit!(emit.output, X86_64;
+            Opcode::LoadEffectiveAddress => [register R11, address address];
+            Opcode::TestRegister(IntegerWidth::U32) => [register source];
+        );
+        if destination != source {
+            emit!(emit.output, X86_64; Opcode::Move64Register => [register destination, register source];);
+        }
+        emit!(emit.output, X86_64; Opcode::ConditionalMoveNonZero64 => [register destination, register R11];);
+    }
+
     fn float_operation(
         &self,
         emit: &mut Emit<'_>,
@@ -1375,6 +1400,7 @@ impl Backend for X86_64Backend {
         ];
         let [result_scratch, state_scratch] = [operands.physical_register(4), operands.physical_register(5)];
         use crate::target::registers::x86_64::{R8, R9, R10, R11, R13, RAX, RBX, RCX, RDI, RDX, RSI, RSP};
+        let length = emit.binary_slow_path_instruction_length()?;
 
         store_slow_path_program_counter(emit)?;
         let result_offset = if emit.object_format == ObjectFormat::Coff {
@@ -1399,12 +1425,20 @@ impl Backend for X86_64Backend {
                 StoreSource::Register(rhs),
                 None,
             );
+            store(
+                emit,
+                MemoryWidth::Word,
+                MachineMemoryAddress::offset(RSP, 40),
+                StoreSource::Immediate(length),
+                None,
+            );
             push_parallel_register_moves(emit, &[(R9, lhs)], state_scratch);
             emit!(emit.output, X86_64; Opcode::LoadEffectiveAddress => [register R8, address MachineMemoryAddress::offset(RSP, result_offset)];);
             vm_load(emit, RCX);
             emit!(emit.output, X86_64; Opcode::Move32Register => [register RDX, register R13];);
         } else {
             push_parallel_register_moves(emit, &[(RCX, lhs), (R8, rhs)], state_scratch);
+            emit!(emit.output, X86_64; Opcode::Move32Immediate => [register R9, immediate length];);
             emit!(emit.output, X86_64; Opcode::LoadEffectiveAddress => [register RDX, address MachineMemoryAddress::offset(RSP, result_offset)];);
             vm_load(emit, RDI);
             emit!(emit.output, X86_64; Opcode::Move32Register => [register RSI, register R13];);
@@ -2410,6 +2444,7 @@ impl Backend for X86_64Backend {
             | CountTrailingZeros32 | PopulationCount32 | RotateLeft32 | RotateRight32 => IntegerWidth::U32,
             _ => IntegerWidth::U64,
         };
+        let bits: i64 = if width == IntegerWidth::U32 { 32 } else { 64 };
         match operation {
             DivideSigned32 | DivideUnsigned32 | RemainderSigned32 | RemainderUnsigned32 | DivideSigned64
             | DivideUnsigned64 | RemainderSigned64 | RemainderUnsigned64 => {
@@ -2434,11 +2469,37 @@ impl Backend for X86_64Backend {
             }
             CountLeadingZeros32 | CountLeadingZeros64 => {
                 let [destination, source] = operands.physical_registers();
-                emit!(emit.output, X86_64; Opcode::CountLeadingZeros(width) => [register destination, register source];);
+                if emit.has_lzcnt {
+                    emit!(emit.output, X86_64; Opcode::CountLeadingZeros(width) => [register destination, register source];);
+                } else {
+                    // NB: bsr finds the index of the highest set bit, and the xor turns it into bits - 1 - index, the
+                    //     count. For zero, bsr leaves the destination undefined, so it takes 2 * bits - 1 instead,
+                    //     which the xor turns into bits.
+                    let nonzero = emit.unique_label("leading_zeros_nonzero");
+                    emit!(emit.output, X86_64;
+                        Opcode::BitScanReverse(width) => [register destination, register source];
+                        Opcode::JumpCondition(super::Condition::NonZero) => [label nonzero.clone()];
+                        Opcode::Move32Immediate => [register destination, immediate 2 * bits - 1];
+                        Opcode::Label => [label nonzero];
+                    );
+                    push_alu_immediate(emit, super::AluOperation::Xor, width, destination, bits - 1);
+                }
             }
             CountTrailingZeros32 | CountTrailingZeros64 => {
                 let [destination, source] = operands.physical_registers();
-                emit!(emit.output, X86_64; Opcode::CountTrailingZeros(width) => [register destination, register source];);
+                if emit.has_bmi1 {
+                    emit!(emit.output, X86_64; Opcode::CountTrailingZeros(width) => [register destination, register source];);
+                } else {
+                    // NB: bsf finds the index of the lowest set bit, which is the count, but leaves the destination
+                    //     undefined for zero, whose count is the bit width.
+                    let nonzero = emit.unique_label("trailing_zeros_nonzero");
+                    emit!(emit.output, X86_64;
+                        Opcode::BitScanForward(width) => [register destination, register source];
+                        Opcode::JumpCondition(super::Condition::NonZero) => [label nonzero.clone()];
+                        Opcode::Move32Immediate => [register destination, immediate bits];
+                        Opcode::Label => [label nonzero];
+                    );
+                }
             }
             PopulationCount32 | PopulationCount64 => {
                 let [destination, source] = operands.physical_registers();

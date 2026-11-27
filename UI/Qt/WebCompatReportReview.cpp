@@ -5,9 +5,11 @@
  */
 
 #include <AK/Math.h>
+#include <LibWebView/URL.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/ReportReview.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/Theme.h>
 #include <UI/Qt/WebCompatReportReview.h>
 
 #include <QAbstractButton>
@@ -30,7 +32,7 @@ namespace Ladybird {
 
 using namespace ReportReview;
 
-static constexpr QSize SCREENSHOT_PREVIEW_SIZE { 480, 270 };
+static constexpr QSize SCREENSHOT_PREVIEW_SIZE { 150, 184 };
 static constexpr qreal SCREENSHOT_PREVIEW_RADIUS = 8;
 static constexpr qreal SCREENSHOT_BADGE_SIZE = 44;
 static constexpr qreal SCREENSHOT_SIZE_MARGIN = 0.9;
@@ -152,7 +154,7 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     auto* heading = new QWidget(m_review_page);
     auto* heading_layout = create_group_layout(heading);
     heading_layout->addWidget(create_title(tr("Report a website issue"), heading));
-    auto* website = create_label(qstring_from_ak_string(m_report.page().url.serialize()), heading);
+    auto* website = create_label(qstring_from_ak_string(WebView::url_for_display(m_report.page().url)), heading);
     website->setObjectName("WebCompatReportWebsite");
     website->setForegroundRole(QPalette::PlaceholderText);
     heading_layout->addWidget(website);
@@ -160,33 +162,41 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
 
     auto* description = new QWidget(m_review_page);
     auto* description_layout = create_group_layout(description);
-    description_layout->addWidget(create_label(tr("What is wrong with this website?"), description));
+    description_layout->addWidget(create_heading(tr("What’s wrong with this site?"), 1.0, description));
     m_description_edit = new QPlainTextEdit(description);
     m_description_edit->setObjectName("WebCompatReportDescription");
-    m_description_edit->setPlaceholderText(tr("Describe what you expected to see or do, and what happened instead."));
+    m_description_edit->setPlaceholderText(tr("What did you expect to see or do, and what happened instead?"));
     m_description_edit->setTabChangesFocus(true);
-    m_description_edit->setFixedHeight(m_description_edit->fontMetrics().lineSpacing() * 5);
+    m_description_edit->setFixedHeight(76);
     description_layout->addWidget(m_description_edit);
     review_layout->addWidget(description);
 
     auto* screenshot_group = new QWidget(m_review_page);
     auto* screenshot_layout = create_group_layout(screenshot_group);
-    screenshot_layout->addWidget(create_label(tr("Screenshot"), screenshot_group));
+    screenshot_layout->addWidget(create_heading(tr("Screenshot"), 1.0, screenshot_group));
+    // The screenshot sits beside its size and what can be done with it.
+    auto* screenshot_row = new QHBoxLayout;
+    screenshot_row->setSpacing(16);
     m_screenshot_preview = new ScreenshotThumbnail(screenshot_group);
     m_screenshot_preview->setObjectName("WebCompatReportScreenshot");
     QObject::connect(m_screenshot_preview, &QAbstractButton::clicked, this, [this] {
         if (on_view_screenshot)
             on_view_screenshot(m_screenshot);
     });
-    screenshot_layout->addWidget(m_screenshot_preview, 0, Qt::AlignLeft);
+    screenshot_row->addWidget(m_screenshot_preview, 0, Qt::AlignTop);
+    auto* screenshot_side = new QVBoxLayout;
+    screenshot_side->setSpacing(8);
+    m_selected_area_label = create_label(tr("Selected area"), screenshot_group);
+    m_selected_area_label->setForegroundRole(QPalette::PlaceholderText);
+    screenshot_side->addWidget(m_selected_area_label);
     m_no_screenshot_note = create_label(tr("The report will not include a screenshot."), screenshot_group);
     m_no_screenshot_note->setObjectName("WebCompatReportNoScreenshotNote");
     m_no_screenshot_note->setForegroundRole(QPalette::PlaceholderText);
-    screenshot_layout->addWidget(m_no_screenshot_note);
+    screenshot_side->addWidget(m_no_screenshot_note);
     m_select_screenshot_button = new QPushButton(screenshot_group);
     m_select_screenshot_button->setObjectName("WebCompatReportSelectScreenshotButton");
     m_select_screenshot_button->setAutoDefault(false);
-    m_remove_screenshot_button = new QPushButton(tr("Remove screenshot"), screenshot_group);
+    m_remove_screenshot_button = new QPushButton(tr("Remove"), screenshot_group);
     m_remove_screenshot_button->setObjectName("WebCompatReportRemoveScreenshotButton");
     m_remove_screenshot_button->setAutoDefault(false);
     auto* screenshot_buttons = new QHBoxLayout;
@@ -194,7 +204,10 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     screenshot_buttons->addWidget(m_select_screenshot_button);
     screenshot_buttons->addWidget(m_remove_screenshot_button);
     screenshot_buttons->addStretch();
-    screenshot_layout->addLayout(screenshot_buttons);
+    screenshot_side->addLayout(screenshot_buttons);
+    screenshot_side->addStretch();
+    screenshot_row->addLayout(screenshot_side, 1);
+    screenshot_layout->addLayout(screenshot_row);
     review_layout->addWidget(screenshot_group);
 
     auto* page_dumps = new QWidget(m_review_page);
@@ -203,61 +216,85 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     m_include_page_dumps->setObjectName("WebCompatReportIncludePageDumps");
     m_include_page_dumps->setEnabled(false);
     page_dumps_layout->addWidget(m_include_page_dumps);
-    auto* page_dumps_note = create_label(tr("This can contain personal information, such as text on the page."), page_dumps);
+    auto* page_dumps_note = create_label(tr("Helps us fix rendering bugs. It can contain text from the page."), page_dumps);
     page_dumps_note->setForegroundRole(QPalette::PlaceholderText);
     page_dumps_layout->addWidget(page_dumps_note);
     review_layout->addWidget(page_dumps);
 
-    auto* contents = new QWidget(m_review_page);
-    auto* contents_layout = create_group_layout(contents);
-    auto* contents_summary = create_label(tr("Includes the website URL, your Ladybird version, platform, user agent, window size and zoom level."), contents);
-    contents_summary->setForegroundRole(QPalette::PlaceholderText);
-    contents_layout->addWidget(contents_summary);
-    auto* details = create_details_panel(contents);
-    auto* details_layout = static_cast<QVBoxLayout*>(details->layout());
-    auto* details_form = create_details_form();
-    set_details(*details_form, m_report.details(), details);
-    details_layout->addLayout(details_form);
-    details_layout->addSpacing(item_spacing);
-    m_show_report_button = new QPushButton(tr("View full report"), details);
-    m_show_report_button->setObjectName("WebCompatReportShowReportButton");
-    m_show_report_button->setAutoDefault(false);
-    QObject::connect(m_show_report_button, &QPushButton::clicked, this, [this] { show_report_text(); });
-    details_layout->addWidget(m_show_report_button, 0, Qt::AlignLeft);
-    auto* details_toggle = create_disclosure(tr("Report details"), details, contents);
-    // The toggle comes before what it shows, although it is created after it.
-    QWidget::setTabOrder(details_toggle, m_show_report_button);
-    contents_layout->addWidget(details_toggle);
-    contents_layout->addWidget(details);
-    review_layout->addWidget(contents);
+    auto* platform_features = new QWidget(m_review_page);
+    auto* platform_features_layout = create_group_layout(platform_features);
+    m_include_platform_features = new QCheckBox(tr("Include graphics and video information"), platform_features);
+    m_include_platform_features->setObjectName("WebCompatReportIncludePlatformFeatures");
+    m_include_platform_features->setEnabled(false);
+    platform_features_layout->addWidget(m_include_platform_features);
+    auto* platform_features_note = create_label(tr("Helps us fix graphics and video bugs. It names your graphics card, its driver and your media libraries."), platform_features);
+    platform_features_note->setForegroundRole(QPalette::PlaceholderText);
+    platform_features_layout->addWidget(platform_features_note);
+    review_layout->addWidget(platform_features);
 
     m_validation = create_label({}, m_review_page);
     m_validation->setObjectName("WebCompatReportValidation");
     m_validation->hide();
     review_layout->addWidget(m_validation);
 
+    // The footer says what else the report carries, with a way to see all of it, beside the buttons that leave or send it.
+    // It stays at the bottom of the tab.
+    review_layout->addStretch(1);
+    auto* footer_line = new QFrame(m_review_page);
+    footer_line->setFrameShape(QFrame::HLine);
+    footer_line->setObjectName("WebCompatReportFooterLine");
+    review_layout->addWidget(footer_line);
+    auto* contents_summary = create_label(tr("Also sends the address and your browser setup."), m_review_page);
+    contents_summary->setForegroundRole(QPalette::PlaceholderText);
+    contents_summary->setWordWrap(false);
+    m_show_report_button = new QPushButton(tr("See everything"), m_review_page);
+    m_show_report_button->setObjectName("WebCompatReportShowReportButton");
+    m_show_report_button->setAutoDefault(false);
+    m_show_report_button->setFlat(true);
+    m_show_report_button->setCursor(Qt::PointingHandCursor);
+    QObject::connect(m_show_report_button, &QPushButton::clicked, this, [this] { show_report_text(); });
+    // The footer is set smaller than the review above it.
+    for (QWidget* widget : { static_cast<QWidget*>(contents_summary), static_cast<QWidget*>(m_show_report_button) }) {
+        auto font = contents_summary->font();
+        font.setPixelSize(12);
+        widget->setFont(font);
+    }
+
     auto* send_button = new QPushButton(tr("Send report"), m_review_page);
     send_button->setObjectName("WebCompatReportSendButton");
     send_button->setDefault(true);
-    auto* review_close_button = new QPushButton(tr("Close tab"), m_review_page);
+    auto* review_close_button = new QPushButton(tr("Cancel"), m_review_page);
     review_close_button->setObjectName("WebCompatReportReviewCloseButton");
     review_close_button->setAutoDefault(false);
     auto* review_buttons = new QHBoxLayout;
     review_buttons->setSpacing(button_spacing);
-    review_buttons->addStretch();
+    // NB: The link continues the sentence.
+    auto* contents = new QHBoxLayout;
+    contents->setSpacing(4);
+    contents->addWidget(contents_summary);
+    contents->addWidget(m_show_report_button);
+    contents->addStretch(1);
+    review_buttons->addLayout(contents, 1);
     review_buttons->addWidget(review_close_button);
     review_buttons->addWidget(send_button);
     review_layout->addLayout(review_buttons);
     layout->addWidget(m_review_page);
 
+    // The outcome of sending the report stands in the middle of the tab.
     m_status_page = new QWidget(this);
     auto* status_layout = new QVBoxLayout(m_status_page);
     status_layout->setContentsMargins(0, 0, 0, 0);
     status_layout->setSpacing(group_spacing);
+    status_layout->addStretch();
     auto* outcome = new QWidget(m_status_page);
     auto* outcome_layout = create_group_layout(outcome);
+    m_status_icon = new QLabel(outcome);
+    m_status_icon->setAlignment(Qt::AlignHCenter);
+    m_status_icon->hide();
+    outcome_layout->addWidget(m_status_icon);
     m_status_title = create_title({}, outcome);
     m_status_title->setObjectName("WebCompatReportStatusTitle");
+    m_status_title->setAlignment(Qt::AlignHCenter);
     outcome_layout->addWidget(m_status_title);
     m_progress = new QProgressBar(outcome);
     m_progress->setObjectName("WebCompatReportProgress");
@@ -267,6 +304,7 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     m_status_message = create_label({}, outcome);
     m_status_message->setObjectName("WebCompatReportStatusMessage");
     m_status_message->setForegroundRole(QPalette::PlaceholderText);
+    m_status_message->setAlignment(Qt::AlignHCenter);
     outcome_layout->addWidget(m_status_message);
     status_layout->addWidget(outcome);
 
@@ -274,6 +312,8 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     m_retry_button->setObjectName("WebCompatReportRetryButton");
     m_cancel_button = new QPushButton(tr("Cancel"), m_status_page);
     m_cancel_button->setObjectName("WebCompatReportCancelButton");
+    m_back_to_site_button = new QPushButton(tr("Back to the site"), m_status_page);
+    m_back_to_site_button->setObjectName("WebCompatReportBackToSiteButton");
     m_close_button = new QPushButton(tr("Close tab"), m_status_page);
     m_close_button->setObjectName("WebCompatReportCloseButton");
     auto* status_buttons = new QHBoxLayout;
@@ -281,7 +321,9 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
     status_buttons->addStretch();
     status_buttons->addWidget(m_retry_button);
     status_buttons->addWidget(m_cancel_button);
+    status_buttons->addWidget(m_back_to_site_button);
     status_buttons->addWidget(m_close_button);
+    status_buttons->addStretch();
     status_layout->addLayout(status_buttons);
     status_layout->addStretch();
     m_status_page->hide();
@@ -315,7 +357,13 @@ WebCompatReportReview::WebCompatReportReview(WebView::WebCompatReport::Page page
         show_page(*m_review_page);
         m_description_edit->setFocus(Qt::OtherFocusReason);
     });
-    QObject::connect(m_close_button, &QPushButton::clicked, this, [this] { exit(); });
+    QObject::connect(m_back_to_site_button, &QPushButton::clicked, this, [this] { exit(); });
+    QObject::connect(m_close_button, &QPushButton::clicked, this, [this] {
+        if (on_close_tab)
+            on_close_tab();
+        else
+            exit();
+    });
 
     m_report.on_progress = [this](auto stage) { show_progress(stage); };
     m_report.on_retry = [this](String const& reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds) {
@@ -337,8 +385,9 @@ void WebCompatReportReview::set_screenshot(QImage screenshot)
     m_screenshot_preview->set_screenshot(m_screenshot);
     m_screenshot_preview->setVisible(has_screenshot);
     m_remove_screenshot_button->setVisible(has_screenshot);
-    m_select_screenshot_button->setText(has_screenshot ? tr("Retake screenshot") : tr("Take a screenshot"));
+    m_select_screenshot_button->setText(has_screenshot ? tr("Retake") : tr("Take a screenshot"));
     m_no_screenshot_note->setVisible(!has_screenshot);
+    m_selected_area_label->setVisible(has_screenshot);
 }
 
 void WebCompatReportReview::set_page_dumps(String page_dumps)
@@ -350,6 +399,19 @@ void WebCompatReportReview::set_page_dumps(String page_dumps)
 WebView::WebCompatReport::IncludePageDumps WebCompatReportReview::include_page_dumps() const
 {
     return m_include_page_dumps->isChecked() ? WebView::WebCompatReport::IncludePageDumps::Yes : WebView::WebCompatReport::IncludePageDumps::No;
+}
+
+void WebCompatReportReview::set_platform_features(ByteString const& description)
+{
+    m_report.set_platform_features(String::from_utf8_with_replacement_character(description));
+    m_include_platform_features->setEnabled(true);
+}
+
+WebView::WebCompatReport::IncludePlatformFeatures WebCompatReportReview::include_platform_features() const
+{
+    if (!m_include_platform_features->isChecked())
+        return WebView::WebCompatReport::IncludePlatformFeatures::No;
+    return WebView::WebCompatReport::IncludePlatformFeatures::Yes;
 }
 
 void WebCompatReportReview::send()
@@ -374,7 +436,7 @@ void WebCompatReportReview::send()
 
     m_validation->hide();
     show_progress(WebView::ReportSubmission::Stage::Preparing);
-    if (auto error = m_report.send(description, AK::move(screenshot), include_page_dumps()); error.has_value()) {
+    if (auto error = m_report.send(description, AK::move(screenshot), include_page_dumps(), include_platform_features()); error.has_value()) {
         m_validation->setText(qstring_from_ak_string(*error));
         m_validation->show();
         show_page(*m_review_page);
@@ -390,7 +452,7 @@ void WebCompatReportReview::exit()
 // The report is shown with the choices made so far, such as whether it includes layout and painting information.
 void WebCompatReportReview::show_report_text()
 {
-    m_report_text->setPlainText(qstring_from_ak_string(String::from_utf8_with_replacement_character(m_report.diagnostics(include_page_dumps()))));
+    m_report_text->setPlainText(qstring_from_ak_string(String::from_utf8_with_replacement_character(m_report.diagnostics(include_page_dumps(), include_platform_features()))));
     show_page(*m_report_text_page);
     m_report_text->setFocus(Qt::OtherFocusReason);
 }
@@ -409,8 +471,9 @@ void WebCompatReportReview::show_status(QString const& title, QString const& mes
 {
     m_status_title->setText(title);
     m_status_message->setText(message);
+    m_status_icon->hide();
     show_page(*m_status_page);
-    QPushButton* all_actions[] = { m_retry_button, m_cancel_button, m_close_button };
+    QPushButton* all_actions[] = { m_retry_button, m_cancel_button, m_back_to_site_button, m_close_button };
     show_actions(all_actions, actions, primary);
 }
 
@@ -431,7 +494,11 @@ void WebCompatReportReview::show_retry(String const& reason, u32 retry_number, u
 void WebCompatReportReview::show_sent()
 {
     m_progress->setValue(100);
-    show_status(tr("Report sent"), tr("Thank you for helping Ladybird."), { m_close_button }, m_close_button);
+    show_status(tr("Report sent"), tr("Thanks for helping make the web work in Ladybird."), { m_back_to_site_button, m_close_button }, nullptr);
+    m_progress->hide();
+    auto sent_color = Theme::is_dark() ? QColor(0x30b14f) : QColor(0x208a3a);
+    m_status_icon->setPixmap(create_chrome_icon(ChromeIcon::CheckCircle, sent_color).pixmap(QSize(40, 40), devicePixelRatioF()));
+    m_status_icon->show();
 }
 
 void WebCompatReportReview::show_failure(WebView::ReportSubmission::Failure, String const& reason)

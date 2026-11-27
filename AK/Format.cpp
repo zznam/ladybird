@@ -424,78 +424,6 @@ ErrorOr<void> FormatBuilder::put_i64(
     return {};
 }
 
-ErrorOr<void> FormatBuilder::put_fixed_point(
-    bool is_negative,
-    i64 integer_value,
-    u64 fraction_value,
-    u64 fraction_one,
-    size_t precision,
-    u8 base,
-    bool upper_case,
-    bool zero_pad,
-    bool use_separator,
-    Align align,
-    size_t min_width,
-    size_t fraction_max_width,
-    char fill,
-    SignMode sign_mode)
-{
-    StringBuilder string_builder;
-    FormatBuilder format_builder { string_builder };
-
-    if (is_negative)
-        integer_value = -integer_value;
-
-    TRY(format_builder.put_u64(static_cast<u64>(integer_value), base, false, upper_case, false, use_separator, Align::Right, 0, ' ', sign_mode, is_negative));
-
-    if (fraction_max_width && (zero_pad || fraction_value)) {
-        // FIXME: This is a terrible approximation but doing it properly would be a lot of work. If someone is up for that, a good
-        // place to start would be the following video from CppCon 2019:
-        // https://youtu.be/4P_kbF0EbZM (Stephan T. Lavavej “Floating-Point <charconv>: Making Your Code 10x Faster With C++17's Final Boss”)
-
-        if (is_negative && fraction_value)
-            fraction_value = fraction_one - fraction_value;
-
-        TRY(string_builder.try_append('.'));
-
-        if (base == 10) {
-            u64 scale = pow<u64>(5, precision);
-            // FIXME: overflows (not before: fraction_value = (2^precision - 1) and precision >= 20) (use wider integer type)
-            auto fraction = scale * fraction_value;
-            TRY(format_builder.put_u64(fraction, base, false, upper_case, true, use_separator, Align::Right, precision));
-        } else if (base == 16 || base == 8 || base == 2) {
-            auto bits_per_character = log2(base);
-            auto fraction = fraction_value << ((bits_per_character - (precision % bits_per_character)) % bits_per_character);
-            TRY(format_builder.put_u64(fraction, base, false, upper_case, false, use_separator, Align::Right, precision / bits_per_character + (precision % bits_per_character != 0), '0'));
-        } else {
-            VERIFY_NOT_REACHED();
-        }
-    }
-
-    auto formatted_string = string_builder.string_view();
-    if (fraction_max_width && (zero_pad || fraction_value)) {
-        auto point_index = formatted_string.find('.').value_or(0);
-        if (!point_index)
-            VERIFY_NOT_REACHED();
-
-        if (auto formatted_length = (formatted_string.length() - point_index - 1); formatted_length > fraction_max_width) {
-            formatted_string = formatted_string.substring_view(0, 1 + point_index + fraction_max_width);
-        } else {
-            string_builder.append_repeated('0', fraction_max_width - formatted_length);
-            formatted_string = string_builder.string_view();
-        }
-
-        if (!zero_pad)
-            formatted_string = formatted_string.trim("0"sv, TrimMode::Right);
-
-        if (formatted_string.ends_with('.'))
-            formatted_string = formatted_string.trim("."sv, TrimMode::Right);
-    }
-
-    TRY(put_string(formatted_string, align, min_width, NumericLimits<size_t>::max(), fill));
-    return {};
-}
-
 template<OneOf<float, double, long double> T>
 ErrorOr<void> FormatBuilder::put_floating_point(
     T value,
@@ -1132,17 +1060,13 @@ void vout(LogLevel log_level, StringView fmtstr, TypeErasedFormatParams& params,
 
 static StringView process_name_for_logging()
 {
-    // NOTE: We use AK::Format in the DynamicLoader and LibC, which cannot use thread-safe statics
-    // Also go to extraordinary lengths here to avoid strlen() on the process name every call to dbgln
+    // Go to extraordinary lengths here to avoid strlen() on the process name every call to dbgln
     static char process_name_buf[256] = {};
-    static StringView process_name;
-    static bool process_name_retrieved = false;
-    if (!process_name_retrieved) {
+    static StringView const process_name = [] {
         auto path = LexicalPath(process_name_helper());
-        process_name_retrieved = true;
         (void)path.title().copy_characters_to_buffer(process_name_buf, sizeof(process_name_buf));
-        process_name = { process_name_buf, strlen(process_name_buf) };
-    }
+        return StringView { process_name_buf, strlen(process_name_buf) };
+    }();
     return process_name;
 }
 

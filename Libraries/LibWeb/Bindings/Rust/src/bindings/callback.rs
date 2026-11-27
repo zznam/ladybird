@@ -4,20 +4,22 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! Callback function values, https://webidl.spec.whatwg.org/#idl-callback-function, which LibWeb's C++ code
-//! represents as a WebIDL::CallbackType: the function object and its callback context.
+//! Callback function values, https://webidl.spec.whatwg.org/#idl-callback-function, and callback interface values,
+//! https://webidl.spec.whatwg.org/#idl-callback-interface, which LibWeb's C++ code represents as a WebIDL::CallbackType:
+//! the object and its callback context.
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use libjs_rust::api::{
-    ErrorKind, ErrorType, ForeignCellSlot, RawNativeFunctionResult, ThrowCompletionOr, Trace, Value, Vm,
+    ErrorKind, ErrorType, ForeignCellSlot, Gc, Object, RawNativeFunctionResult, Realm, ThrowCompletionOr, Trace, Value,
+    Vm,
 };
 
 use crate::bindings::promise::{WebIdlPromise, promise_from_abi};
 
 unsafe extern "C" {
-    /// A new WebIDL::CallbackType of the callable object, whose callback context is the incumbent settings object.
+    /// A new WebIDL::CallbackType of the object, whose callback context is the incumbent settings object.
     fn web_bindings_create_callback_function(callable: *mut c_void, returns_promise: bool) -> *mut c_void;
 
     /// WebIDL::invoke_callback() of the WebIDL::CallbackType with the this value, if `has_this_value`, and the
@@ -28,6 +30,12 @@ unsafe extern "C" {
         this_value: u64,
         arguments: ak::Span<'_, Value>,
     ) -> RawNativeFunctionResult;
+
+    /// WebIDL::invoke_callback() of the WebIDL::CallbackType with the arguments and the "report" exception behavior.
+    fn web_bindings_invoke_callback_function_and_report(callback: *mut c_void, arguments: ak::Span<'_, Value>);
+
+    /// The callback function object of the WebIDL::CallbackType.
+    fn web_bindings_callback_function_callback(callback: *mut c_void) -> *mut c_void;
 
     /// WebIDL::invoke_promise_callback() of the WebIDL::CallbackType, whose return type is a promise type, with the this
     /// value, if `has_this_value`, and the arguments.
@@ -49,7 +57,12 @@ pub(crate) struct CallbackFunction(CallbackType);
 #[gc(crate = libjs_rust)]
 pub(crate) struct PromiseCallbackFunction(CallbackType);
 
-/// The WebIDL::CallbackType of a callback function value.
+/// A callback interface value, https://webidl.spec.whatwg.org/#idl-callback-interface
+#[derive(Clone, Trace)]
+#[gc(crate = libjs_rust)]
+pub(crate) struct CallbackInterface(CallbackType);
+
+/// The WebIDL::CallbackType of a callback function value or a callback interface value.
 #[derive(Trace)]
 #[gc(crate = libjs_rust)]
 struct CallbackType(ForeignCellSlot);
@@ -94,6 +107,10 @@ impl CallbackType {
 }
 
 impl CallbackFunction {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0.0.as_ptr()
+    }
+
     /// The callback function value of a JS value, https://webidl.spec.whatwg.org/#js-callback-function
     pub(crate) fn from_js(vm: &Vm, value: Value) -> ThrowCompletionOr<Self> {
         CallbackType::from_js(vm, value, false).map(Self)
@@ -106,15 +123,59 @@ impl CallbackFunction {
             web_bindings_invoke_callback_function(
                 self.0.0.as_ptr(),
                 this_value.is_some(),
-                this_value.unwrap_or(Value::UNDEFINED).0,
+                this_value.unwrap_or(Value::UNDEFINED).to_raw(),
                 ak::Span::new(arguments),
             )
         }
         .into_completion()
     }
+
+    /// Invokes the callback function with the arguments and "report", https://webidl.spec.whatwg.org/#invoke-a-callback-function
+    pub(crate) fn invoke_and_report(&self, arguments: &[Value]) {
+        // SAFETY: The slot keeps the callback alive, and the values are live for the call.
+        unsafe { web_bindings_invoke_callback_function_and_report(self.0.0.as_ptr(), ak::Span::new(arguments)) };
+    }
+
+    pub(crate) fn callback_realm(&self) -> Gc<Realm> {
+        // SAFETY: The slot keeps the callback alive, and LibWeb returns its live callback function object.
+        let callback = unsafe { web_bindings_callback_function_callback(self.0.0.as_ptr()) };
+        // SAFETY: The callback function object is live.
+        let callback: Gc<Object> =
+            unsafe { Gc::from_non_null(NonNull::new(callback.cast()).expect("a callback has a function object")) };
+        callback.shape().realm()
+    }
+}
+
+impl CallbackInterface {
+    // https://webidl.spec.whatwg.org/#js-callback-interface
+    pub(crate) fn from_js(vm: &Vm, value: Value) -> ThrowCompletionOr<Self> {
+        // 1. If V is not an Object, then throw a TypeError.
+        if !value.is_object() {
+            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+        }
+
+        // 2. Return the IDL callback interface type value that represents a reference to V, with the incumbent realm
+        //    as the callback context.
+        // SAFETY: The value is a live object.
+        Ok(Self(unsafe {
+            CallbackType::from_raw(web_bindings_create_callback_function(
+                value.as_object().as_ptr().cast(),
+                false,
+            ))
+        }))
+    }
+
+    /// The WebIDL::CallbackType, which this keeps alive.
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0.0.as_ptr()
+    }
 }
 
 impl PromiseCallbackFunction {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0.0.as_ptr()
+    }
+
     /// The callback function value of a JS value, https://webidl.spec.whatwg.org/#js-callback-function
     pub(crate) fn from_js(vm: &Vm, value: Value) -> ThrowCompletionOr<Self> {
         CallbackType::from_js(vm, value, true).map(Self)
@@ -129,7 +190,7 @@ impl PromiseCallbackFunction {
             promise_from_abi(web_bindings_invoke_promise_callback_function(
                 self.0.0.as_ptr(),
                 this_value.is_some(),
-                this_value.unwrap_or(Value::UNDEFINED).0,
+                this_value.unwrap_or(Value::UNDEFINED).to_raw(),
                 ak::Span::new(arguments),
             ))
         }

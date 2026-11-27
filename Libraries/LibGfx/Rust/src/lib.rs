@@ -21,9 +21,12 @@ pub mod font;
 pub mod font_catalog;
 pub mod geometry;
 pub mod image_frame;
+pub mod ipc;
+pub mod math_table;
 pub mod matrix;
 pub mod paint_enums;
 pub mod path;
+pub mod png_encoder;
 pub mod text_layout;
 pub mod yuv;
 
@@ -60,4 +63,5 @@ const _: () = {
     assert_send_and_sync::<path::Path>();
     assert_send_and_sync::<image_frame::ImageFrameHandle>();
     assert_send_and_sync::<text_layout::GlyphBuffer>();
+    assert_send_and_sync::<text_layout::SharedShape>();
 };

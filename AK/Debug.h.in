@@ -14,10 +14,6 @@
 #    cmakedefine01 AUDIO_DEBUG
 #endif
 
-#ifndef BMP_DEBUG
-#    cmakedefine01 BMP_DEBUG
-#endif
-
 #ifndef CACHE_DEBUG
 #    cmakedefine01 CACHE_DEBUG
 #endif
@@ -92,14 +88,6 @@
 
 #ifndef HTTPJOB_DEBUG
 #    cmakedefine01 HTTPJOB_DEBUG
-#endif
-
-#ifndef ICO_DEBUG
-#    cmakedefine01 ICO_DEBUG
-#endif
-
-#ifndef IDB_DEBUG
-#    cmakedefine01 IDB_DEBUG
 #endif
 
 #ifndef IDL_DEBUG
@@ -198,10 +186,6 @@
 #    cmakedefine01 RESOURCE_DEBUG
 #endif
 
-#ifndef SHARED_QUEUE_DEBUG
-#    cmakedefine01 SHARED_QUEUE_DEBUG
-#endif
-
 #ifndef SPAM_DEBUG
 #    cmakedefine01 SPAM_DEBUG
 #endif
@@ -282,8 +266,8 @@
 #    cmakedefine01 WEB_WORKER_DEBUG
 #endif
 
-#ifndef WEBP_DEBUG
-#    cmakedefine01 WEBP_DEBUG
+#ifndef WEBRTC_DEBUG
+#    cmakedefine01 WEBRTC_DEBUG
 #endif
 
 #ifndef XML_PARSER_DEBUG

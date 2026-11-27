@@ -8,7 +8,7 @@
 //! and encodings of the fields it accesses, from the same layout types the interpreter is compiled against.
 
 use core::mem::offset_of;
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use libjs_abi::Builtin;
 use libjs_abi::value as nan_box;
@@ -18,36 +18,41 @@ use libjs_jit::snapshot::{
     CellId, DynamicCallLayout, Float64FunctionAddresses, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo,
     RuntimeLayout, RuntimeOffsets, TypeofStrings,
 };
+use libjs_runtime_macros::jit_function_address;
 
 use super::allocation::{AllocationInfos, FUNCTION_ENVIRONMENT_FREE_LIST_COUNT};
 use super::entry_table::{JIT_ENTRY_SLOT_MASK, JIT_ENTRY_TABLE_OWNERS_OFFSET};
 use super::offset;
 use crate::build_configuration::{HEAP_REGION_OFFSET_MASK, PRIMITIVE_STORAGE_CAGE_OFFSET_MASK};
 use crate::bytecode::executable::{
-    MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG, MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS,
-    MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET, MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET,
+    MAX_MEGAMORPHIC_VM_CACHE_LESSONS, MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG,
+    MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS, MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET,
+    MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET, MEGAMORPHIC_VM_CACHE_LESSONS_OFFSET,
 };
-use crate::gc::class::{Class, GcCell};
+use crate::gc::class::{BLOCK_CLASS_OFFSET, BLOCK_CLASS_TAIL_TAG, BLOCK_SIZE, Class, GcCell};
+use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
-    FLY_STRING_CACHE_SIZE, LARGE_NUMERIC_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
+    FLY_STRING_CACHE_SIZE, KEY_CONCATENATION_CACHE_SIZE, KeyConcatenationCacheEntry, LARGE_NUMERIC_STRING_CACHE_SIZE,
+    NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
 };
 use crate::layout::accessor::Accessor;
 use crate::layout::cell::Gc;
 use crate::layout::environment::{
     BINDING_FLAG_MUTABLE, DeclarativeEnvironment, DeclarativeEnvironmentRareData, Environment, EnvironmentShape,
-    PrivateEnvironment,
+    GlobalDeclarativeEnvironment, PrivateEnvironment,
 };
 use crate::layout::executable::ExecutableHead;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::{
-    CallEnvironmentTemplate, EcmascriptFunctionObject, FUNCTION_ENVIRONMENT_WORDS, FunctionObject,
-    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunctionTableEntry, RawNativeFunction, SharedFunctionInstanceData,
-    asm_call_metadata,
+    CallEnvironmentTemplate, ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET,
+    ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET, EcmascriptFunctionObjectWithRareData, FUNCTION_ENVIRONMENT_WORDS,
+    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunction, NativeFunctionTableEntry, SharedFunctionInstanceData,
+    asm_call_metadata, ecmascript_function_flags,
 };
 use crate::layout::object::{
     INDEXED_ELEMENTS_HEADER_SIZE, IndexedStorageKind, Object, TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID, TypedArrayBase,
-    object_flag, typed_array_kind,
+    array_flags, object_flag, typed_array_kind,
 };
 use crate::layout::primitive_string::{DEFERRED_KIND_MASK, DeferredKind, INTERNED_FLAG, InlineString, PrimitiveString};
 use crate::layout::property_lookup_cache::{
@@ -59,22 +64,25 @@ use crate::layout::realm::Realm;
 use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::layout::vm::VmHead;
-use crate::runtime::array::{ARRAY_IS_PROXY_TARGET_OFFSET, ARRAY_LENGTH_WRITABLE_OFFSET};
 use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::function_environment::{
     FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
 };
 use crate::runtime::generator_object::GeneratorObject;
 use crate::runtime::module_environment::ModuleEnvironment;
-use crate::runtime::object::{ORDINARY_OBJECT_METHODS, ObjectMethods, PropertyKind};
+use crate::runtime::object::{ObjectMethods, PropertyKind};
 use crate::runtime::string_object::StringObject;
 use crate::runtime::string_prototype::StringPrototype;
+
+// JIT code compresses and decodes the compressed cell pointers of cells like the runtime does.
+const _: () =
+    assert!(libjs_jit::snapshot::COMPRESSED_POINTER_SHIFT as u32 == crate::layout::member::COMPRESSED_POINTER_SHIFT);
 
 /// The addresses of the runtime functions JIT code calls, which every compile job's runtime info has.
 pub struct RuntimeFunctionAddresses {
     /// The address of the slow path JIT code calls for each generic opcode, indexed by opcode, or 0 for opcodes
     /// without one (the compiler refuses to compile those generically).
-    slow_paths: Arc<[u64]>,
+    slow_paths: &'static [u64],
     try_get_by_id_cache: u64,
     try_put_by_id_cache: u64,
     raw_native_exception: u64,
@@ -93,11 +101,15 @@ impl RuntimeFunctionAddresses {
                 .map(|(_, address)| *address as u64)
                 .unwrap_or_else(|| panic!("the runtime has no function {symbol}"))
         };
+        // NB: The table holds addresses of functions, which are the same for every VM of the process.
+        static SLOW_PATHS: OnceLock<Box<[u64]>> = OnceLock::new();
         Self {
-            slow_paths: (0..=u8::MAX)
-                .map_while(OpCode::from_u8)
-                .map(|opcode| slow_path_symbol(opcode).map_or(0, |symbol| address(&symbol)))
-                .collect(),
+            slow_paths: SLOW_PATHS.get_or_init(|| {
+                (0..=u8::MAX)
+                    .map_while(OpCode::from_u8)
+                    .map(|opcode| slow_path_symbol(opcode).map_or(0, |symbol| address(&symbol.to_string())))
+                    .collect()
+            }),
             try_get_by_id_cache: address("asm_try_get_by_id_cache"),
             try_put_by_id_cache: address("asm_try_put_by_id_cache"),
             raw_native_exception: if RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS {
@@ -114,11 +126,13 @@ fn runtime_offsets() -> RuntimeOffsets {
     RuntimeOffsets {
         execution_context_program_counter: offset(offset_of!(ExecutionContext, program_counter)),
         execution_context_lexical_environment: offset(offset_of!(ExecutionContext, lexical_environment)),
-        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment)),
+        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment_in_frame)),
         execution_context_frame_initialized: offset(offset_of!(ExecutionContext, frame_initialized)),
         execution_context_executable: offset(offset_of!(ExecutionContext, executable)),
+        executable_idle_collection_count: offset(offset_of!(ExecutableHead, idle_collection_count)),
         execution_context_slots: offset(size_of::<ExecutionContext>()),
         vm_running_execution_context: offset(offset_of!(VmHead, running_execution_context)),
+        vm_current_realm: offset(offset_of!(VmHead, current_realm)),
         vm_jit_native_stack_limit: offset(offset_of!(Vm, jit_native_stack_limit)),
         private_environment_outer: offset(offset_of!(PrivateEnvironment, outer)),
         object_flags: offset(offset_of!(Object, flags)),
@@ -131,14 +145,9 @@ fn runtime_offsets() -> RuntimeOffsets {
         accessor_getter: offset(offset_of!(Accessor, getter)),
         accessor_setter: offset(offset_of!(Accessor, setter)),
         execution_context_function: offset(offset_of!(ExecutionContext, function)),
-        execution_context_realm: offset(offset_of!(ExecutionContext, realm)),
-        execution_context_script_or_module: offset(offset_of!(ExecutionContext, script_or_module)),
-        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment)),
+        execution_context_realm_without_function: offset(offset_of!(ExecutionContext, realm_without_function)),
+        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment_in_frame)),
         execution_context_frame_id: offset(offset_of!(ExecutionContext, frame_id)),
-        execution_context_skip_when_determining_incumbent_counter: offset(offset_of!(
-            ExecutionContext,
-            skip_when_determining_incumbent_counter
-        )),
         execution_context_yield_continuation: offset(offset_of!(ExecutionContext, yield_continuation)),
         execution_context_yield_is_await: offset(offset_of!(ExecutionContext, yield_is_await)),
         execution_context_yield_value_is_iterator_result: offset(offset_of!(
@@ -158,9 +167,18 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_argument_count: offset(offset_of!(ExecutionContext, argument_count)),
         execution_context_returns_to_native_caller: offset(offset_of!(ExecutionContext, returns_to_native_caller)),
         execution_context_runs_jit_code: offset(offset_of!(ExecutionContext, runs_jit_code)),
-        ecmascript_function_environment: offset(offset_of!(EcmascriptFunctionObject, environment)),
-        ecmascript_function_private_environment: offset(offset_of!(EcmascriptFunctionObject, private_environment)),
-        ecmascript_function_script_or_module: offset(offset_of!(EcmascriptFunctionObject, script_or_module)),
+        execution_context_caller_is_derived_construct: offset(offset_of!(
+            ExecutionContext,
+            caller_is_derived_construct
+        )),
+        execution_context_new_target: offset(offset_of!(ExecutionContext, new_target)),
+        ecmascript_function_environment: offset(ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET),
+        ecmascript_function_private_environment: offset(offset_of!(
+            EcmascriptFunctionObjectWithRareData,
+            private_environment
+        )),
+        object_class_bits: offset(offset_of!(Object, class_bits)),
+        ecmascript_function_flag_has_rare_data: ecmascript_function_flags::HAS_RARE_DATA.into(),
         vm_execution_generation: offset(offset_of!(VmHead, execution_generation)),
     }
 }
@@ -177,11 +195,13 @@ fn runtime_layout() -> RuntimeLayout {
         indexed_storage_kind_holey: IndexedStorageKind::Holey as u8,
         object_flag_is_extensible: object_flag::IS_EXTENSIBLE,
         object_flag_has_magical_length: object_flag::HAS_MAGICAL_LENGTH_PROPERTY,
+        object_class: core::ptr::from_ref(Object::CLASS) as u64,
         string_object_class: core::ptr::from_ref(StringObject::CLASS) as u64,
         string_prototype_class: core::ptr::from_ref(StringPrototype::CLASS) as u64,
         object_flag_may_interfere: object_flag::MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS,
-        array_length_writable: offset(ARRAY_LENGTH_WRITABLE_OFFSET),
-        array_is_proxy_target: offset(ARRAY_IS_PROXY_TARGET_OFFSET),
+        array_flags: offset(offset_of!(Object, class_bits)),
+        array_flag_length_not_writable: array_flags::LENGTH_NOT_WRITABLE,
+        array_flag_is_proxy_target: array_flags::IS_PROXY_TARGET,
         shape_prototype: offset(offset_of!(Shape, prototype)),
         object_flag_is_typed_array: object_flag::IS_TYPED_ARRAY,
         object_flag_is_htmldda: object_flag::IS_HTMLDDA,
@@ -220,8 +240,7 @@ fn runtime_layout() -> RuntimeLayout {
         utf16_string_data_storage: offset(size_of::<ak::Utf16StringDataHeader>()),
         // NB: Filled in by runtime_info().
         single_ascii_character_strings: 0,
-        function_object_builtin: offset(offset_of!(FunctionObject, builtin)),
-        function_object_has_builtin: offset(offset_of!(FunctionObject, has_builtin)),
+        function_object_builtin: offset(offset_of!(Object, class_bits)),
         builtin_string_prototype_char_code_at: Builtin::StringPrototypeCharCodeAt as u8,
         builtin_string_prototype_char_at: Builtin::StringPrototypeCharAt as u8,
         builtin_math_abs: Builtin::MathAbs as u8,
@@ -239,6 +258,12 @@ fn runtime_layout() -> RuntimeLayout {
         typeof_strings: TypeofStrings::default(),
         fly_string_cache: 0,
         fly_string_cache_mask: (FLY_STRING_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache: 0,
+        key_concatenation_cache_mask: (KEY_CONCATENATION_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache_entry_size: size_of::<KeyConcatenationCacheEntry>() as u32,
+        key_concatenation_cache_lhs: offset(offset_of!(KeyConcatenationCacheEntry, lhs)),
+        key_concatenation_cache_rhs: offset(offset_of!(KeyConcatenationCacheEntry, rhs)),
+        key_concatenation_cache_string: offset(offset_of!(KeyConcatenationCacheEntry, string)),
         numeric_string_cache: 0,
         numeric_string_cache_size: NUMERIC_STRING_CACHE_SIZE as u32,
         large_numeric_string_cache: 0,
@@ -257,20 +282,17 @@ fn runtime_layout() -> RuntimeLayout {
         generator_object_class: core::ptr::from_ref(GeneratorObject::CLASS) as u64,
         generator_object_pending_completion_value: offset(offset_of!(GeneratorObject, pending_completion_value)),
         generator_object_pending_completion_type: offset(offset_of!(GeneratorObject, pending_completion_type)),
-        declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_values.size)),
-        declarative_environment_binding_values_capacity: offset(offset_of!(
-            DeclarativeEnvironment,
-            binding_values.capacity
-        )),
+        declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_count)),
+        declarative_environment_inline_binding_capacity: offset(offset_of!(Environment, inline_binding_capacity)),
         environment_shape_binding_names: offset(offset_of!(EnvironmentShape, binding_names)),
         environment_shape_has_unique_binding_names: offset(offset_of!(EnvironmentShape, has_unique_binding_names)),
-        declarative_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values.data)),
-        declarative_environment_shape: offset(offset_of!(DeclarativeEnvironment, shape)),
+        declarative_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values)),
+        declarative_environment_shape: offset(offset_of!(Environment, shape)),
         declarative_environment_rare_data: offset(offset_of!(DeclarativeEnvironment, rare_data)),
         rare_data_binding_flags: offset(offset_of!(DeclarativeEnvironmentRareData, binding_flags.data)),
         environment_shape_binding_flags_size: offset(offset_of!(EnvironmentShape, binding_flags.size)),
         environment_shape_binding_flags: offset(offset_of!(EnvironmentShape, binding_flags.data)),
-        declarative_environment_serial: offset(offset_of!(DeclarativeEnvironment, serial_number)),
+        declarative_environment_serial: offset(offset_of!(GlobalDeclarativeEnvironment, serial_number)),
         realm_global_object: offset(offset_of!(Realm, global_object)),
         realm_global_declarative_environment: offset(offset_of!(Realm, global_declarative_environment)),
         executable_global_variable_caches: offset(offset_of!(ExecutableHead, global_variable_caches.data)),
@@ -314,6 +336,7 @@ fn runtime_layout() -> RuntimeLayout {
             ObjectPropertyIteratorCacheData,
             property_values.size
         )),
+        property_iterator_property_offsets: offset(offset_of!(ObjectPropertyIteratorCacheData, property_offsets)),
         property_iterator_fast_path_none: ObjectPropertyIteratorFastPath::None as u8,
         property_iterator_fast_path_packed_indexed: ObjectPropertyIteratorFastPath::PackedIndexed as u8,
         executable_property_lookup_caches: offset(offset_of!(ExecutableHead, property_lookup_caches.data)),
@@ -339,23 +362,29 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: PropertyLookupCacheEntryType::AddOwnProperty as u32,
         property_lookup_cache_entry_type_get_own_property: PropertyLookupCacheEntryType::GetOwnProperty as u32,
         property_lookup_cache_entry_type_change_own_property: PropertyLookupCacheEntryType::ChangeOwnProperty as u32,
+        property_lookup_cache_entry_type_get_property_in_prototype_chain:
+            PropertyLookupCacheEntryType::GetPropertyInPrototypeChain as u32,
+        cell_block_mask: !(BLOCK_SIZE as u64 - 1),
+        block_class_offset: offset(BLOCK_CLASS_OFFSET),
+        block_class_tail_tag: BLOCK_CLASS_TAIL_TAG as u64,
+        class_cell_size: offset(offset_of!(Class, type_info.cell_size)),
         class_object_methods: offset(offset_of!(Class, object_methods)),
         object_methods_get_prototype_of: offset(offset_of!(ObjectMethods, internal_get_prototype_of)),
         object_methods_is_cacheable_for_property_absence: offset(offset_of!(
             ObjectMethods,
             is_cacheable_for_property_absence
         )),
-        default_is_cacheable_for_property_absence: ORDINARY_OBJECT_METHODS.is_cacheable_for_property_absence as usize
-            as u64,
         property_lookup_cache_polymorphic_tag: PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG as u64,
         property_lookup_cache_polymorphic_entry_count: MAX_NUMBER_OF_SHAPES_TO_REMEMBER as u32,
         property_lookup_cache_entry_size: offset(size_of::<PropertyLookupCacheEntry>()),
         property_lookup_cache_entry_key: offset(offset_of!(PropertyLookupCacheEntry, key)),
         property_lookup_cache_keyed_generic: PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA as u64,
-        property_lookup_cache_entry_from_shape: offset(offset_of!(PropertyLookupCacheEntry, from_shape)),
+        property_lookup_cache_entry_new_shape: offset(offset_of!(PropertyLookupCacheEntry, new_shape)),
         property_lookup_cache_megamorphic_tag: MEGAMORPHIC_DATA_TAG as u64,
         property_lookup_cache_megamorphic_primary_entries: offset(MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET),
         property_lookup_cache_megamorphic_secondary_entries: offset(MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET),
+        property_lookup_cache_megamorphic_vm_cache_lessons: offset(MEGAMORPHIC_VM_CACHE_LESSONS_OFFSET),
+        property_lookup_cache_megamorphic_max_vm_cache_lessons: MAX_MEGAMORPHIC_VM_CACHE_LESSONS,
         property_lookup_cache_megamorphic_index_bits: MEGAMORPHIC_INDEX_BITS,
         property_lookup_cache_megamorphic_hash_multiplier: MEGAMORPHIC_HASH_MULTIPLIER,
         // NB: Filled in by runtime_info().
@@ -370,6 +399,7 @@ fn runtime_layout() -> RuntimeLayout {
         keyed_lookup_cache_dictionary_generation: 0,
         keyed_lookup_cache_shape: 0,
         keyed_lookup_cache_name: 0,
+        keyed_lookup_cache_prototype: 0,
         keyed_lookup_cache_prototype_chain_validity: 0,
         keyed_lookup_cache_new_shape: 0,
     }
@@ -379,6 +409,9 @@ const _: () = assert!(
     libjs_jit::bytecode::NO_YIELD_CONTINUATION
         == crate::layout::execution_context::ExecutionContext::NO_YIELD_CONTINUATION
 );
+
+// NB: JIT code takes an offset of 0 to mean that there is no such field for it to read.
+const _: () = assert!(offset_of!(ObjectMethods, is_cacheable_for_property_absence) != 0);
 
 // NB: The compiler has its own copy of the bits of the interpreter's feedback.
 const _: () = {
@@ -445,7 +478,12 @@ const _: () = assert!(size_of::<core::cell::Cell<Option<Gc<PrimitiveString>>>>()
 
 /// The runtime info of a compile job for code of `realm`, with what JIT code needs to allocate cells itself (which
 /// refers to the cells in `allocation.cells`).
-pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> RuntimeInfo {
+pub fn runtime_info(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    allocation: AllocationInfos<'_>,
+    _defer_gc: &DeferGc<'_>,
+) -> RuntimeInfo {
     let addresses = vm.jit.runtime_function_addresses();
     let mut layout = runtime_layout();
     layout.try_get_by_id_cache = addresses.try_get_by_id_cache;
@@ -460,10 +498,12 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
     layout.keyed_lookup_cache_dictionary_generation = keyed_lookup_cache.shape_dictionary_generation;
     layout.keyed_lookup_cache_shape = keyed_lookup_cache.shape;
     layout.keyed_lookup_cache_name = keyed_lookup_cache.property_name;
+    layout.keyed_lookup_cache_prototype = keyed_lookup_cache.prototype;
     layout.keyed_lookup_cache_prototype_chain_validity = keyed_lookup_cache.prototype_chain_validity;
     layout.keyed_lookup_cache_new_shape = keyed_lookup_cache.new_shape;
     layout.single_ascii_character_strings = vm.single_ascii_character_strings_address();
     layout.fly_string_cache = vm.fly_string_cache().as_ptr().expose_provenance() as u64;
+    layout.key_concatenation_cache = vm.key_concatenation_cache().as_ptr().expose_provenance() as u64;
     layout.numeric_string_cache = vm.numeric_string_cache().as_ptr().expose_provenance() as u64;
     layout.large_numeric_string_cache = vm.large_numeric_string_cache().as_ptr().expose_provenance() as u64;
     let strings = vm.cached_strings();
@@ -480,44 +520,52 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
     };
     let mut info = RuntimeInfo {
         no_htmldda_objects: !vm.jit.htmldda_objects_exist(),
-        slow_paths: Arc::clone(&addresses.slow_paths),
-        jit_call: super::calls::libjs_jit_call as *const () as u64,
-        call_forwarding_arguments: super::calls::libjs_jit_call_forwarding_arguments as *const () as u64,
-        finish_direct_call: super::calls::libjs_jit_finish_direct_call as *const () as u64,
+        slow_paths: addresses.slow_paths,
+        jit_call: jit_function_address!(super::calls::libjs_jit_call),
+        call_forwarding_arguments: jit_function_address!(super::calls::libjs_jit_call_forwarding_arguments),
+        finish_direct_call: jit_function_address!(super::calls::libjs_jit_finish_direct_call),
+        prepare_construct: jit_function_address!(super::calls::libjs_jit_prepare_construct),
+        construct_result_error: jit_function_address!(super::calls::libjs_jit_construct_result_error),
+        finish_direct_construct: jit_function_address!(super::calls::libjs_jit_finish_direct_construct),
+        construct_stub: 0,
+        construct_this: jit_function_address!(super::calls::libjs_jit_construct_this),
+        throw_call_stack_size_exceeded: jit_function_address!(super::calls::libjs_jit_throw_call_stack_size_exceeded),
         raw_native_exception: addresses.raw_native_exception,
-        push_inlined_call_frames: super::entry_exit::libjs_jit_push_inlined_call_frames as *const () as u64,
-        finish_inlined_direct_call: super::entry_exit::libjs_jit_finish_inlined_direct_call as *const () as u64,
+        push_inlined_call_frames: jit_function_address!(super::entry_exit::libjs_jit_push_inlined_call_frames),
+        finish_inlined_direct_call: jit_function_address!(super::entry_exit::libjs_jit_finish_inlined_direct_call),
         inlined_raw_native_exception: if RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS {
-            super::entry_exit::libjs_jit_inlined_raw_native_exception as *const () as u64
+            jit_function_address!(super::entry_exit::libjs_jit_inlined_raw_native_exception)
         } else {
             0
         },
-        array_push: super::calls::libjs_jit_array_push as *const () as u64,
-        store_holey_element: super::calls::libjs_jit_store_holey_element as *const () as u64,
-        slice_arguments: super::calls::libjs_jit_slice_arguments as *const () as u64,
-        open_array_iteration: super::intrinsics::libjs_jit_open_array_iteration as *const () as u64,
+        array_push: jit_function_address!(super::calls::libjs_jit_array_push),
+        array_splice: jit_function_address!(super::intrinsics::libjs_jit_array_splice),
+        store_holey_element: jit_function_address!(super::calls::libjs_jit_store_holey_element),
+        slice_arguments: jit_function_address!(super::calls::libjs_jit_slice_arguments),
+        open_array_iteration: jit_function_address!(super::intrinsics::libjs_jit_open_array_iteration),
         // NB: Filled in by capture_snapshot(), which lists the cells as embedded cells.
         array_iterator_next: None,
         array_iterator_return_watchpoint_set: None,
         array_iterator_next_watchpoint_set_address: None,
         array_iterator_method_watchpoint_set_address: None,
-        jit_exit: super::entry_exit::libjs_jit_exit as *const () as u64,
+        jit_exit: jit_function_address!(super::entry_exit::libjs_jit_exit),
         to_boolean: addresses.to_boolean,
-        primitive_to_string: super::calls::libjs_jit_primitive_to_string as *const () as u64,
+        primitive_to_string: jit_function_address!(super::calls::libjs_jit_primitive_to_string),
         helper_calls: HelperCallAddresses(super::helper_calls::address),
         float64_functions: Float64FunctionAddresses(super::calls::float64_function_address),
-        to_object: super::calls::libjs_jit_to_object as *const () as u64,
-        array_create: super::calls::libjs_jit_array_create as *const () as u64,
+        to_object: jit_function_address!(super::calls::libjs_jit_to_object),
+        remember_vm_cache_get: jit_function_address!(super::calls::libjs_jit_remember_vm_cache_get),
+        array_create: jit_function_address!(super::calls::libjs_jit_array_create),
         intrinsic_helpers: IntrinsicHelpers {
-            has_own_property: super::intrinsics::libjs_jit_has_own_property as *const () as u64,
-            has_property: super::intrinsics::libjs_jit_has_property as *const () as u64,
+            has_own_property: jit_function_address!(super::intrinsics::libjs_jit_has_own_property),
+            has_property: jit_function_address!(super::intrinsics::libjs_jit_has_property),
         },
-        create_arguments: super::entry_exit::libjs_jit_create_arguments as *const () as u64,
+        create_arguments: jit_function_address!(super::entry_exit::libjs_jit_create_arguments),
         object_allocation: allocation.object,
         array_allocation: allocation.array,
         rope_allocation: allocation.rope,
         function_allocation: allocation.function,
-        create_lexical_environment: super::allocation::libjs_jit_create_lexical_environment as *const () as u64,
+        create_lexical_environment: jit_function_address!(super::allocation::libjs_jit_create_lexical_environment),
         realm: CellId(realm.as_ptr() as u64),
         array_prototype: CellId(realm.array_prototype().as_ptr() as u64),
         object_prototype: CellId(realm.object_prototype().as_ptr() as u64),
@@ -533,6 +581,7 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
         dynamic_calls: dynamic_call_layout(vm),
     };
     info.dynamic_calls.call_stub = vm.jit.call_stub(&info);
+    info.construct_stub = vm.jit.construct_stub(&info);
     info
 }
 
@@ -551,7 +600,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         .expect("the VM has a JIT entry table while the JIT is on");
     DynamicCallLayout {
         object_flag_is_ecmascript_function: object_flag::IS_ECMASCRIPT_FUNCTION_OBJECT,
-        ecmascript_function_shared_data: offset(offset_of!(EcmascriptFunctionObject, shared_data)),
+        ecmascript_function_shared_data: offset(ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET),
         shared_data_executable: offset(offset_of!(SharedFunctionInstanceData, executable)),
         shared_data_asm_call_metadata: offset(offset_of!(SharedFunctionInstanceData, asm_call_metadata)),
         executable_jit_entry_slot: offset(offset_of!(ExecutableHead, jit_entry_slot)),
@@ -573,12 +622,12 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         } else {
             0
         },
-        raw_native_function_index: offset(offset_of!(RawNativeFunction, native_function_index)),
+        raw_native_function_index: offset(offset_of!(NativeFunction, raw_native_function_index)),
         vm_native_function_table: offset(offset_of!(VmHead, native_function_table_data)),
         native_function_table_index_mask: NATIVE_FUNCTION_TABLE_INDEX_MASK,
         native_function_table_entry_size: offset(size_of::<NativeFunctionTableEntry>()),
         native_function_table_entry_function: offset(offset_of!(NativeFunctionTableEntry, function)),
-        prepare_call_environment: super::calls::libjs_jit_prepare_call_environment as *const () as u64,
+        prepare_call_environment: jit_function_address!(super::calls::libjs_jit_prepare_call_environment),
         shared_data_call_environment_template: offset(offset_of!(
             SharedFunctionInstanceData,
             call_environment_template
@@ -592,9 +641,11 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
             binding_values_offset
         )),
         call_environment_template_binds_this: offset(offset_of!(CallEnvironmentTemplate, binds_this)),
+        call_environment_template_has_function_fields: offset(offset_of!(CallEnvironmentTemplate, has_function_fields)),
         call_environment_template_words: offset(offset_of!(CallEnvironmentTemplate, words)),
         function_environment_words: offset(FUNCTION_ENVIRONMENT_WORDS),
-        function_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values.data)),
+        declarative_environment_words: offset(size_of::<DeclarativeEnvironment>() / 8),
+        function_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values)),
         function_environment_outer: offset(offset_of!(Environment, outer)),
         function_environment_function_object: offset(FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET),
         function_environment_this_value: offset(FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET),

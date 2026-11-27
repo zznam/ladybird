@@ -7,8 +7,9 @@
 //! Lowering of the array ops that `Array.prototype.push` of one value is
 //! built from, the way its own fast path for packed arrays appends.
 
-use super::Codegen;
+use super::RegisterList;
 use super::slow_path_calls::slow_path_saved_registers;
+use super::{Codegen, InputValue};
 use crate::asm::Address;
 use crate::asm::Condition;
 use crate::asm::Gpr;
@@ -16,8 +17,34 @@ use crate::asm::Label;
 use crate::asm::PortableMacroAssembler;
 use crate::asm::Scale;
 use crate::ir::NodeId;
+use crate::snapshot::CellId;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
+    /// Calls the splice helper with the inserted values on the native
+    /// stack. The receiver, start and delete count are in argument registers;
+    /// store the other inputs before setting up the remaining arguments.
+    pub(in crate::codegen) fn emit_call_array_splice(&mut self, node: NodeId) {
+        let count = self.graph.node(node).inputs.len() - 3;
+        let bytes = ((count * 8 + 15) & !15) as i64;
+        if bytes != 0 {
+            self.masm.allocate_stack(bytes);
+        }
+        for index in 0..count {
+            let address = Address::new(M::STACK_POINTER, (index * 8) as i32);
+            match self.input_value(node, index + 3) {
+                InputValue::Register(value) => self.masm.store64(&address, value),
+                InputValue::Constant(value) => self.masm.store_imm64(&address, value),
+            }
+        }
+        self.masm.move64(M::ARGUMENT_GPRS[0], self.pinned.vm);
+        self.masm.move64(M::ARGUMENT_GPRS[4], M::STACK_POINTER);
+        self.masm.move_imm32(M::ARGUMENT_GPRS[5], count as u32);
+        self.masm.call_absolute(self.runtime.array_splice);
+        if bytes != 0 {
+            self.masm.add64_imm(M::STACK_POINTER, M::STACK_POINTER, bytes);
+        }
+    }
+
     /// `CheckAppendableArray`: exits unless the input is an array that
     /// `Array.prototype.push` appends to without any observable step.
     pub(in crate::codegen) fn emit_check_appendable_array(&mut self, node: NodeId) {
@@ -30,8 +57,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.unbox_object_or_branch(array, receiver, exit);
         self.branch_unless_plain_array(array, prototype, exit);
         self.masm
-            .load8(scratch, &Address::new(array, layout.array_length_writable as i32));
-        self.masm.branch_test32(Condition::Zero, scratch, 0xFF, exit);
+            .load8(scratch, &Address::new(array, layout.array_flags as i32));
+        self.masm.branch_test32(
+            Condition::NonZero,
+            scratch,
+            u32::from(layout.array_flag_length_not_writable),
+            exit,
+        );
         // Packed indexed storage, or none yet.
         let known_kind = self.masm.new_label();
         self.masm
@@ -68,8 +100,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .branch32_imm(Condition::NotEqual, scratch, i32::from(flags), fail);
         self.masm
-            .load8(scratch, &Address::new(array, layout.array_is_proxy_target as i32));
-        self.masm.branch_test32(Condition::NonZero, scratch, 0xFF, fail);
+            .load8(scratch, &Address::new(array, layout.array_flags as i32));
+        self.masm.branch_test32(
+            Condition::NonZero,
+            scratch,
+            u32::from(layout.array_flag_is_proxy_target),
+            fail,
+        );
 
         // NB: %Object.prototype% is an immutable prototype exotic object,
         //     so the chain ends there.
@@ -135,14 +172,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             u32::from(layout.object_flag_has_magical_length),
             fail,
         );
-        self.masm
-            .load64(shape, &Address::new(object, offsets.object_shape as i32));
-        self.masm
-            .load64(scratch, &Address::new(shape, layout.shape_prototype as i32));
-        self.masm.branch64_imm(
+        self.emit_load_compressed_cell(shape, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch32_memory_imm(
             Condition::NotEqual,
-            scratch,
-            self.runtime.array_prototype.0 as i64,
+            &Address::new(shape, layout.shape_prototype as i32),
+            self.runtime.array_prototype.compressed() as i32,
             fail,
         );
         self.masm
@@ -200,12 +234,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let scratch = self.pinned.scratch;
         let offsets = self.runtime.offsets;
         let layout = self.runtime.layout;
-        self.masm
-            .load64(scratch, &Address::new(object, offsets.object_shape as i32));
-        self.masm
-            .load64(scratch, &Address::new(scratch, layout.shape_prototype as i32));
+        self.emit_load_compressed_cell(scratch, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch32_memory_imm(
+            Condition::NotEqual,
+            &Address::new(scratch, layout.shape_prototype as i32),
+            CellId(expected).compressed() as i32,
+            fail,
+        );
         self.masm.move_imm64(dst, expected);
-        self.masm.branch64(Condition::NotEqual, scratch, dst, fail);
         self.masm.load32(
             scratch,
             &Address::new(dst, layout.object_indexed_array_like_size as i32),
@@ -229,7 +265,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let saved = slow_path_saved_registers::<M>()
             .without(output)
             .iter()
-            .collect::<Vec<_>>();
+            .collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
         // NB: Either may be in the other's argument register.
         let arguments: [Gpr; 2] = [M::ARGUMENT_GPRS[0], M::ARGUMENT_GPRS[1]];
@@ -244,7 +280,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// `CallStoreHoleyElement`: calls `RuntimeInfo::store_holey_element`,
     /// saving the registers the call clobbers.
     pub(in crate::codegen) fn emit_call_store_holey_element(&mut self, node: NodeId) {
-        let saved = slow_path_saved_registers::<M>().iter().collect::<Vec<_>>();
+        let saved = slow_path_saved_registers::<M>().iter().collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
         // NB: The inputs may be in each other's argument registers, which the saves area holds the values of.
         for (input, argument) in M::ARGUMENT_GPRS.iter().take(3).enumerate() {

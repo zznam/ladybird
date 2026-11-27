@@ -19,6 +19,7 @@
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Member.h>
 #include <LibGC/NanBoxedValue.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
@@ -289,6 +290,24 @@ public:
     requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Ref<T>) = delete;
 
     template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Member<T> const& member)
+        : Value(member.ptr())
+    {
+    }
+
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Member<T> const&) = delete;
+
+    template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::NonnullMember<T> const& member)
+        : Value(member.ptr())
+    {
+    }
+
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::NonnullMember<T> const&) = delete;
+
+    template<typename T>
     requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const& ptr)
         : Value(ptr.ptr())
     {
@@ -402,7 +421,6 @@ public:
     ThrowCompletionOr<double> to_double(VM&) const;
     ThrowCompletionOr<i32> to_i32(VM&) const;
     ThrowCompletionOr<u32> to_u32(VM&) const;
-    ThrowCompletionOr<u16> to_u16(VM&) const;
     ThrowCompletionOr<u8> to_u8(VM&) const;
     ThrowCompletionOr<size_t> to_length(VM&) const;
     bool to_boolean() const;

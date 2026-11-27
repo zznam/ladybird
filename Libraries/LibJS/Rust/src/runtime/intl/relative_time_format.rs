@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Finalize, GcCell, define_cell};
-use crate::gc::gc_ref_cell::GcRefCell;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
@@ -24,6 +23,7 @@ use crate::runtime::intl::intl_object::{IntlObject, ResolutionOptionDescriptor};
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_key::PropertyKey;
+use crate::runtime::realm::Realm;
 use crate::unicode::intl::{self as unicode, Style};
 use crate::unicode::relative_time_format::{
     self as unicode_relative_time_format, NumericDisplay, RelativeTimeFormatPartition, TimeUnit,
@@ -36,9 +36,9 @@ use crate::utf16::Utf16View;
 pub struct RelativeTimeFormat {
     base: Object,
     #[gc(untraced)]
-    locale: GcRefCell<Utf16String>, // [[Locale]]
+    locale: RefCell<Utf16String>, // [[Locale]]
     #[gc(untraced)]
-    numbering_system: GcRefCell<Utf16String>, // [[NumberingSystem]]
+    numbering_system: RefCell<Utf16String>, // [[NumberingSystem]]
     #[gc(untraced)]
     style: Cell<Style>, // [[Style]]
     #[gc(untraced)]
@@ -46,7 +46,7 @@ pub struct RelativeTimeFormat {
 
     // Non-standard. Stores the ICU relative-time formatter for the Intl object's formatting options.
     #[gc(untraced)]
-    formatter: GcRefCell<Option<unicode_relative_time_format::RelativeTimeFormat>>,
+    formatter: RefCell<Option<unicode_relative_time_format::RelativeTimeFormat>>,
 }
 
 define_cell!(RelativeTimeFormat, Object, extends: [Object], finalize: finalize);
@@ -66,14 +66,20 @@ impl Finalize for RelativeTimeFormat {
 }
 
 impl RelativeTimeFormat {
-    pub fn new(vm: &Vm, prototype: Gc<Object>) -> RelativeTimeFormat {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> RelativeTimeFormat {
         RelativeTimeFormat {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-            locale: GcRefCell::default(),
-            numbering_system: GcRefCell::default(),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            locale: RefCell::default(),
+            numbering_system: RefCell::default(),
             style: Cell::new(Style::Long),
             numeric: Cell::new(NumericDisplay::Always),
-            formatter: GcRefCell::new(None),
+            formatter: RefCell::new(None),
         }
     }
 

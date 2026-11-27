@@ -17,7 +17,7 @@ use crate::layout::value::Value;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
-use crate::runtime::property_key::PropertyKey;
+use crate::runtime::property_key::NonSymbolPropertyKey;
 use crate::runtime::temporal::abstract_operations::{
     DateType, Overflow, ShowCalendar, Unit, ascii_view, epoch_days_to_epoch_ms, iso_date_to_epoch_days,
     parse_temporal_calendar_string, to_integer_with_truncation, to_offset_string, to_positive_integer_with_truncation,
@@ -103,16 +103,16 @@ const CALENDAR_FIELDS: [CalendarField; 14] = [
 pub struct CalendarFields {
     pub era: Option<Utf16String>,
     pub era_year: Option<i32>,
-    pub year: Option<i32>,
+    pub year: Option<f64>,
     pub month: Option<u32>,
     pub month_code: Option<Utf16String>,
     pub day: Option<u32>,
-    pub hour: Option<u8>,
-    pub minute: Option<u8>,
-    pub second: Option<u8>,
-    pub millisecond: Option<u16>,
-    pub microsecond: Option<u16>,
-    pub nanosecond: Option<u16>,
+    pub hour: Option<f64>,
+    pub minute: Option<f64>,
+    pub second: Option<f64>,
+    pub millisecond: Option<f64>,
+    pub microsecond: Option<f64>,
+    pub nanosecond: Option<f64>,
     pub offset_string: Option<Utf16String>,
     pub time_zone: Option<Utf16String>,
 }
@@ -121,12 +121,12 @@ pub struct CalendarFields {
 impl Default for CalendarFields {
     fn default() -> Self {
         Self {
-            hour: Some(0),
-            minute: Some(0),
-            second: Some(0),
-            millisecond: Some(0),
-            microsecond: Some(0),
-            nanosecond: Some(0),
+            hour: Some(0.0),
+            minute: Some(0.0),
+            second: Some(0.0),
+            millisecond: Some(0.0),
+            microsecond: Some(0.0),
+            nanosecond: Some(0.0),
             ..Self::unset()
         }
     }
@@ -191,20 +191,20 @@ impl CalendarFields {
         }
     }
 
-    /// Sets a field to a double, converted to the integer type of the field: to an i32 or a u32 saturating, and to the
-    /// u8 and u16 time fields through an i32, wrapping.
+    /// Sets a field to a double. The era year, month, and day convert to their integer type, saturating so that a value
+    /// out of range stays out of it. The year and time fields keep the double.
     fn set_number_field(&mut self, field: CalendarField, value: f64) {
         match field {
             CalendarField::EraYear => self.era_year = Some(value as i32),
-            CalendarField::Year => self.year = Some(value as i32),
+            CalendarField::Year => self.year = Some(value),
             CalendarField::Month => self.month = Some(value as u32),
             CalendarField::Day => self.day = Some(value as u32),
-            CalendarField::Hour => self.hour = Some(value as i32 as u8),
-            CalendarField::Minute => self.minute = Some(value as i32 as u8),
-            CalendarField::Second => self.second = Some(value as i32 as u8),
-            CalendarField::Millisecond => self.millisecond = Some(value as i32 as u16),
-            CalendarField::Microsecond => self.microsecond = Some(value as i32 as u16),
-            CalendarField::Nanosecond => self.nanosecond = Some(value as i32 as u16),
+            CalendarField::Hour => self.hour = Some(value),
+            CalendarField::Minute => self.minute = Some(value),
+            CalendarField::Second => self.second = Some(value),
+            CalendarField::Millisecond => self.millisecond = Some(value),
+            CalendarField::Microsecond => self.microsecond = Some(value),
+            CalendarField::Nanosecond => self.nanosecond = Some(value),
             CalendarField::Era | CalendarField::MonthCode | CalendarField::Offset | CalendarField::TimeZone => {}
         }
     }
@@ -236,7 +236,7 @@ pub struct BalancedDate {
 
 struct CalendarFieldData {
     key: CalendarField,
-    property: PropertyKey,
+    property: NonSymbolPropertyKey,
     conversion: CalendarFieldConversion,
 }
 
@@ -261,7 +261,7 @@ fn calendar_field_data(vm: &Vm, field: CalendarField) -> CalendarFieldData {
     };
     CalendarFieldData {
         key: field,
-        property: property.clone(),
+        property: NonSymbolPropertyKey::from(property.as_string().clone()),
         conversion,
     }
 }
@@ -984,16 +984,20 @@ pub fn non_iso_date_until(
 
         // OPTIMIZATION: Skip ahead by estimating the month difference from calendar dates to avoid a large number of
         //               iterations in the NonISODateSurpasses loop below.
+        //               The estimate counts the months of each year in between, as a year of a lunisolar calendar has
+        //               twelve or thirteen, and starts two months short, as constraining the day or a leap month can
+        //               make the difference one month shorter than the month numbers say.
         if largest_unit == Unit::Month {
-            let mut estimated_months = (calendar_two.year.wrapping_sub(calendar_one.year))
-                .wrapping_mul(12)
-                .wrapping_add(i32::from(calendar_two.month) - i32::from(calendar_one.month));
-            if estimated_months != 0 {
-                estimated_months -= i32::from(sign);
-            }
-
-            if estimated_months != 0 {
-                candidate_months = f64::from(estimated_months);
+            let first_year = calendar_one.year.min(calendar_two.year);
+            let last_year = calendar_one.year.max(calendar_two.year);
+            let months_in_years: i64 = (first_year..last_year)
+                .map(|year| i64::from(calendar_months_in_year(calendar, year)))
+                .sum();
+            let estimated_months = i64::from(sign) * months_in_years + i64::from(calendar_two.month)
+                - i64::from(calendar_one.month)
+                - 2 * i64::from(sign);
+            if estimated_months.signum() == i64::from(sign) {
+                candidate_months = estimated_months as f64;
             }
         }
 
@@ -1474,7 +1478,7 @@ pub fn non_iso_calendar_date_to_iso(
     overflow: Overflow,
 ) -> ThrowCompletionOr<ISODate> {
     // 1. Assert: fields.[[Year]], fields.[[Month]], and fields.[[Day]] are not UNSET.
-    let fields_year = fields.year.expect("the year is resolved");
+    let fields_year = fields.year.expect("the year is resolved") as i32;
     let fields_month = fields.month.expect("the month is resolved");
     let fields_day = fields.day.expect("the day is resolved");
 
@@ -1545,7 +1549,7 @@ pub fn calendar_date_to_iso(
     // 1. If calendar is "iso8601", then
     if calendar == ISO8601_CALENDAR {
         // a. Assert: fields.[[Year]], fields.[[Month]], and fields.[[Day]] are not UNSET.
-        let year = fields.year.expect("the year is resolved");
+        let year = fields.year.expect("the year is resolved") as i32;
         let month = fields.month.expect("the month is resolved");
         let day = fields.day.expect("the day is resolved");
 
@@ -1573,6 +1577,8 @@ pub fn non_iso_month_day_to_iso_reference_date(
 
     // 2. If fields.[[Year]] is not UNSET, then
     if let Some(fields_year) = fields.year {
+        let fields_year = fields_year as i32;
+
         // a. Assert: fields.[[Month]] is not UNSET.
         let fields_month = fields.month.expect("the month is resolved");
 
@@ -1746,10 +1752,14 @@ pub fn calendar_month_day_to_iso_reference_date(
         const REFERENCE_ISO_YEAR: i32 = 1972;
 
         // c. If fields.[[Year]] is UNSET, let year be referenceISOYear; else let year be fields.[[Year]].
-        let year = fields.year.unwrap_or(REFERENCE_ISO_YEAR);
+        let year = fields.year.unwrap_or(f64::from(REFERENCE_ISO_YEAR));
+
+        // AD-HOC: Only the leap-year status matters here. ISO years repeat every 400 years, so reduce the year before
+        //         regulating it to avoid losing precision or exceeding the range of ISODate.year.
+        let year = year % 400.0;
 
         // d. Let result be ? RegulateISODate(year, fields.[[Month]], fields.[[Day]], overflow).
-        let result = regulate_iso_date(vm, f64::from(year), f64::from(month), f64::from(day), overflow)?;
+        let result = regulate_iso_date(vm, year, f64::from(month), f64::from(day), overflow)?;
 
         // e. Return CreateISODateRecord(referenceISOYear, result.[[Month]], result.[[Day]]).
         return Ok(create_iso_date_record(
@@ -2014,7 +2024,7 @@ pub fn non_iso_resolve_fields(
             calendar_date_arithmetic_year_for_era_year(calendar, Utf16View::of_string(&era), era_year);
 
         // d. If fields.[[Year]] is not UNSET, and fields.[[Year]] ≠ arithmeticYear, throw a RangeError exception.
-        if fields.year.is_some_and(|year| year != arithmetic_year) {
+        if fields.year.is_some_and(|year| year != f64::from(arithmetic_year)) {
             return vm.throw_completion(
                 ErrorKind::RangeError,
                 ErrorType::TemporalInvalidCalendarFieldName,
@@ -2023,7 +2033,7 @@ pub fn non_iso_resolve_fields(
         }
 
         // e. Set fields.[[Year]] to arithmeticYear.
-        fields.year = Some(arithmetic_year);
+        fields.year = Some(f64::from(arithmetic_year));
     }
 
     // 15. Set fields.[[Era]] to UNSET.
@@ -2049,6 +2059,8 @@ pub fn non_iso_resolve_fields(
 
         // b. If fields.[[Year]] is not UNSET, then
         if let Some(year) = fields.year {
+            let year = year as i32;
+
             // i. If YearContainsMonthCode(calendar, fields.[[Year]], fields.[[MonthCode]]) is true, let constrainedMonthCode be fields.[[MonthCode]];
             //    else let constrainedMonthCode be ! ConstrainMonthCode(calendar, fields.[[Year]], fields.[[MonthCode]], CONSTRAIN).
             let constrained_month_code = if year_contains_month_code(calendar, year, Utf16View::of_string(&month_code))
@@ -2470,6 +2482,9 @@ pub fn calendar_months_in_year(calendar: Utf16View<'_>, arithmetic_year: i32) ->
     unicode_calendar::calendar_months_in_year(&calendar_for_unicode(calendar), arithmetic_year)
 }
 
+/// Further from year 0 than the arithmetic year of any date within the limits of Temporal, in any calendar.
+const BALANCED_YEAR_LIMIT: i64 = 300_000;
+
 // 4.1.16 BalanceNonISODate ( calendar, arithmeticYear, ordinalMonth, day ), https://tc39.es/proposal-intl-era-monthcode/#sec-temporal-balancenonisodate
 pub fn balance_non_iso_date(
     calendar: Utf16View<'_>,
@@ -2485,6 +2500,22 @@ pub fn balance_non_iso_date(
 
     // 2. Let resolvedMonth be ordinalMonth.
     let mut resolved_month = ordinal_month;
+
+    // AD-HOC: A year has at most 13 months and 385 days in every calendar, so once the months or the days alone move the
+    //         year past any year of a date within the limits of Temporal, the result is out of range whatever it
+    //         balances to, and walking there month by month can take very long.
+    let years_moved_by_months = i64::from(resolved_month) / 13;
+    let years_moved_by_days = i64::from(day) / 385;
+    if years_moved_by_months.signum() * years_moved_by_days.signum() >= 0 {
+        let year_at_least = i64::from(resolved_year) + years_moved_by_months + years_moved_by_days;
+        if year_at_least.abs() > BALANCED_YEAR_LIMIT {
+            return BalancedDate {
+                year: ((BALANCED_YEAR_LIMIT + 1) * year_at_least.signum()) as i32,
+                month: 1,
+                day: 1,
+            };
+        }
+    }
 
     // 3. Let monthsInYear be CalendarMonthsInYear(calendar, resolvedYear).
     let mut months_in_year = months_in_year_of(resolved_year);
@@ -2518,6 +2549,24 @@ pub fn balance_non_iso_date(
 
     // 7. Let daysInMonth be CalendarDaysInMonth(calendar, resolvedYear, resolvedMonth).
     let mut days_in_month = days_in_month_of(resolved_year, resolved_month);
+
+    // OPTIMIZATION: Steps 8 and 9 move resolvedDay - 1 days on from the first day of the month one month at a time,
+    //               which takes very long for a count of many years of days. Adding them to the ISO date of the first
+    //               day of the month finds the same date directly.
+    if resolved_day.unsigned_abs() > 400 {
+        let unicode_calendar_name = calendar_for_unicode(calendar);
+        if let Some(first_day_of_month) =
+            unicode_calendar::calendar_date_to_iso_date(&unicode_calendar_name, resolved_year, resolved_month as u8, 1)
+        {
+            let iso_date = add_days_to_iso_date(first_day_of_month, f64::from(resolved_day) - 1.0);
+            let date = unicode_calendar::iso_date_to_calendar_date(&unicode_calendar_name, iso_date);
+            return BalancedDate {
+                year: date.year,
+                month: date.month,
+                day: date.day,
+            };
+        }
+    }
 
     // 8. Repeat, while resolvedDay ≤ 0,
     while resolved_day <= 0 {

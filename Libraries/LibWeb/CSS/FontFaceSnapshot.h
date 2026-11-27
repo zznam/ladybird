@@ -59,10 +59,13 @@ public:
         // Where a pending face is on its font-display timeline, which a frozen cascade records.
         Gfx::PendingFontState rendering_state { Gfx::PendingFontState::Visible };
         Vector<Gfx::UnicodeRange> unicode_ranges;
+        double size_adjust { 1 };
         bool has_urls { false };
         // Its font-display period failed or its load errored, so it contributes nothing.
         bool is_unusable { false };
         bool has_non_default_unicode_range { false };
+        // Its font-weight descriptor is auto, so the weights it renders with are those of its font file.
+        bool weight_descriptor_is_auto { true };
     };
 
     // Each key of the table and the faces registered under it, in order.

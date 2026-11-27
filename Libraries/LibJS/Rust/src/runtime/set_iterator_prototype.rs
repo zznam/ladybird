@@ -38,17 +38,15 @@ define_object_class!(SetIteratorPrototype, extends: [Object], methods: {
 
 impl SetIteratorPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<SetIteratorPrototype> {
-        realm.create_object(
-            vm,
-            SetIteratorPrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.intrinsics().iterator_prototype(vm),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| SetIteratorPrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.intrinsics().iterator_prototype(vm)),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {

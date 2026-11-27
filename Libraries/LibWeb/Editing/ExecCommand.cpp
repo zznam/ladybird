@@ -7,9 +7,12 @@
 #include <AK/AnyOf.h>
 #include <AK/ScopeGuard.h>
 #include <AK/TemporaryChange.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/EditingHostManager.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/StaticRange.h>
 #include <LibWeb/DOM/Text.h>
@@ -19,14 +22,21 @@
 #include <LibWeb/Editing/Internal/Algorithms.h>
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/VisiblePosition.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLIElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Page/EventHandler.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
+#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/UIEvents/InputEvent.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 
@@ -121,9 +131,86 @@ static bool exec_command_in_text_control(HTML::FormAssociatedTextControlElement&
     return true;
 }
 
-// https://w3c.github.io/editing/docs/execCommand/#execcommand()
-WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value)
+static bool is_clipboard_command(Utf16FlyString const& command)
 {
+    return command.is_one_of_ignoring_ascii_case(Editing::CommandNames::copy, Editing::CommandNames::cut);
+}
+
+// Whether the copy or cut command has selected content to act on.
+static bool clipboard_command_is_enabled(Document& document, Utf16FlyString const& command)
+{
+    if (auto* control = focused_text_control(document)) {
+        if (auto* input = as_if<HTML::HTMLInputElement>(control->text_control_to_html_element());
+            input && input->type_state() == HTML::HTMLInputElement::TypeAttributeState::Password)
+            return false;
+        if (control->selection_start() == control->selection_end())
+            return false;
+        return !command.equals_ignoring_ascii_case(Editing::CommandNames::cut)
+            || as<HTML::FormAssociatedElement>(control->text_control_to_html_element()).is_mutable();
+    }
+    auto range = Editing::active_range(document);
+    if (!range || range->collapsed())
+        return false;
+    return !command.equals_ignoring_ascii_case(Editing::CommandNames::cut)
+        || (range->start_container()->is_editable_or_editing_host() && range->end_container()->is_editable_or_editing_host());
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#execcommand()
+WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, TrustedTypes::TrustedHTMLOrString const& trusted_value)
+{
+    // NB: Clipboard actions can delete through the internal editing entry point, but their script callbacks must
+    //     not recursively execute public commands, including input listeners on text controls.
+    if (m_inside_clipboard_exec_command)
+        return false;
+
+    // NB: An edit a script makes on its own is not one the user would lose. Whether it edits for the user is decided
+    //     here, as an input listener may consume the window's transient activation while the command runs.
+    TemporaryChange inside_script_edit_on_its_own { m_inside_script_edit_on_its_own, !script_edits_for_the_user() };
+
+    // AD-HOC: The spec gets the Trusted Types compliant string for an insertHTML value in step 1 of the insertHTML
+    //         command's action. Get it here instead, where only a script's value arrives: The action also inserts the
+    //         HTML a user pastes, which isn't an injection sink. And so a script's string is rejected even when the
+    //         command isn't enabled, before any beforeinput event fires.
+    Utf16String compliant_value;
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::insertHTML)) {
+        // NB: See the AD-HOC note about recursive calls in exec_command_internal(). A default policy's createHTML
+        //     callback runs the page's script, so that script mustn't run a command while this one gets its value.
+        if (m_inside_exec_command)
+            return false;
+        TemporaryChange guard_recursion { m_inside_exec_command, true };
+        compliant_value = TRY(TrustedTypes::get_trusted_type_compliant_string(
+            TrustedTypes::TrustedTypeName::TrustedHTML,
+            HTML::relevant_global_object(*this),
+            trusted_value,
+            TrustedTypes::InjectionSink::Document_execCommand,
+            TrustedTypes::Script.view()));
+    } else {
+        compliant_value = trusted_value.visit(
+            [](GC::Ref<TrustedTypes::TrustedHTML> const& html) { return html->to_string(); },
+            [](Utf16String const& string) { return string; });
+    }
+    Utf16View value = compliant_value;
+
+    // https://w3c.github.io/clipboard-apis/#integration-with-rich-text-editing
+    // These are the steps to follow when triggering copy, cut or paste actions through a scripting API:
+    // 1. Execute the corresponding action synchronously.
+    // 2. Use the action's return value as the return value for the API call.
+    // NB: The actions also run when the command is not enabled, since they fire their clipboard event in any case.
+    if (is_clipboard_command(command) && is_html_document()) {
+        // NB: See the AD-HOC note about recursive calls in exec_command_internal().
+        if (m_inside_exec_command)
+            return false;
+        TemporaryChange guard_recursion { m_inside_clipboard_exec_command, true };
+
+        auto navigable = this->navigable();
+        if (!navigable || navigable->active_document().ptr() != this)
+            return false;
+        auto trigger = Web::EventHandler::ClipboardActionTrigger::Script;
+        if (command.equals_ignoring_ascii_case(Editing::CommandNames::copy))
+            return navigable->event_handler().perform_copy_action(trigger);
+        return navigable->event_handler().perform_cut_action(trigger);
+    }
+
     // NB: See the INTEROP note at focused_text_control(). exec_command_internal() checks whether the command is
     //     enabled for the active range only, so check whether it is enabled for the text control here.
     if (auto* control = focused_text_control(*this); control && is_html_document() && !m_inside_exec_command) {
@@ -138,10 +225,35 @@ WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, 
         }
     }
 
-    return exec_command_internal(command, show_ui, value, DispatchInputEvent::Yes);
+    auto content_versions_before = EditingHostManager::content_versions(*this);
+    auto result = exec_command_internal(command, show_ui, value, DispatchInputEvent::Yes);
+    // NB: A page that edits for the user in an editing host, such as from a keydown or paste handler or a toolbar
+    //     button's click handler, makes the user's edit.
+    EditingHostManager::did_run_user_edit(*this, result, content_versions_before);
+    return result;
 }
 
-WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event, Optional<Utf16FlyString> const& user_input_type, GC::Ptr<StaticRange> deletion_range)
+// NB: A page may edit for the user, such as with execCommand("insertText") from a keydown handler, or from the click
+//     handler of a toolbar button, which gives the window transient activation. That edit is the user's, unlike one a
+//     script makes on its own.
+bool Document::script_edits_for_the_user() const
+{
+    if (Web::EventHandler::is_handling_user_key_press_or_paste())
+        return true;
+    auto window = this->window();
+    return window && window->has_transient_activation();
+}
+
+void Document::did_make_user_edit()
+{
+    if (m_had_user_edits || m_inside_script_edit_on_its_own)
+        return;
+    m_had_user_edits = true;
+    if (auto navigable = this->navigable())
+        navigable->page().update_had_user_edits();
+}
+
+WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event, Optional<Utf16FlyString> const& user_input_type, GC::Ptr<StaticRange> deletion_range, GC::Ptr<DocumentFragment> pasted_fragment)
 {
     // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
     if (!is_html_document())
@@ -158,8 +270,9 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
 
     // 3. If command is not supported or not enabled, return false.
     // NB: This does not use query_command_enabled(), which reports whether a command is enabled in a focused text
-    //     control. The commands below act on the active range, and rely on it being checked here.
-    if (!MUST(query_command_supported(command)) || !command_is_enabled(*this, command))
+    //     control. The commands below act on the active range, and rely on it being checked here. The clipboard
+    //     commands are handled by exec_command().
+    if (is_clipboard_command(command) || !MUST(query_command_supported(command)) || !command_is_enabled(*this, command))
         return false;
 
     // 4. If command is not in the Miscellaneous commands section:
@@ -229,7 +342,8 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
         && range_before_command && is<DOM::Text>(*range_before_command->start_container())
         // INTEROP: An Apple-interchange-newline represents an intentional paragraph boundary, not a fragment-ending
         //          placeholder. Blink and WebKit preserve the destination paragraph's trailing break in this case.
-        && !value.contains(u"Apple-interchange-newline"sv);
+        && !(pasted_fragment ? pasted_fragment->get_elements_by_class_name(u"Apple-interchange-newline"sv)->length() > 0
+                             : value.contains(u"Apple-interchange-newline"sv));
     GC::Root<DOM::Node> paste_start_block;
     if (paste_started_in_text_node)
         paste_start_block = Editing::block_node_of_node(*range_before_command->start_container());
@@ -311,6 +425,10 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     // 5. Take the action for command, passing value to the instructions as an argument.
     auto command_result = [&] {
         TemporaryChange running_action { m_running_editing_command_action, true };
+        if (pasted_fragment) {
+            VERIFY(command_definition.command == Editing::CommandNames::insertHTML);
+            return Editing::insert_pasted_fragment(*this, *pasted_fragment);
+        }
         return command_definition.action(*this, value);
     }();
 
@@ -363,9 +481,12 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     if (!command_result)
         return false;
 
-    // A command the user ran by editing, rather than one a script called, is a user edit for spellchecking.
-    if (user_input_type.has_value() && tree_was_modified && affected_editing_host)
+    // A command the user ran by editing, rather than one a script called, is a user edit for spellchecking and writing
+    // suggestions.
+    if (user_input_type.has_value() && tree_was_modified && affected_editing_host) {
         spell_check_controller().did_user_edit(*affected_editing_host);
+        writing_suggestion_controller().did_user_edit(*affected_editing_host);
+    }
 
     // 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
     //    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
@@ -388,7 +509,6 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
         event_init.is_composing = is_input_method_composing();
 
         auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init, {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this)));
-        event->set_is_trusted(true);
 
         TemporaryChange preserve_selection_offsets { m_preserve_selection_offsets_during_identical_character_data_replacement, true };
         affected_editing_host->dispatch_event(event);
@@ -412,6 +532,9 @@ WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& 
     // 2. Return true if command is both supported and enabled, false otherwise.
     if (!MUST(query_command_supported(command)))
         return false;
+
+    if (is_clipboard_command(command))
+        return clipboard_command_is_enabled(*this, command);
 
     // NB: See the INTEROP note at focused_text_control().
     if (auto command_definition = Editing::find_command_definition(command); command_definition.has_value()) {
@@ -628,7 +751,8 @@ WebIDL::ExceptionOr<bool> Document::query_command_supported(Utf16FlyString const
 
     // When the queryCommandSupported(command) method on the Document interface is invoked, the user agent must return
     // true if command is supported and available within the current script on the current site, and false otherwise.
-    return Editing::find_command_definition(command).has_value();
+    // NB: The copy and cut commands are defined by the clipboard API, and execCommand() triggers their actions.
+    return Editing::find_command_definition(command).has_value() || is_clipboard_command(command);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#querycommandvalue()
@@ -650,8 +774,11 @@ WebIDL::ExceptionOr<Utf16String> Document::query_command_value(Utf16FlyString co
     // 2. If command is "fontSize" and its value override is set, convert the value override to an
     //    integer number of pixels and return the legacy font size for the result.
     if (command_definition.command == Editing::CommandNames::fontSize && value_override.has_value()) {
-        auto pixel_size = Editing::font_size_to_pixel_size(value_override.release_value());
-        return Editing::legacy_font_size(pixel_size.to_int());
+        // NB: The sizes are taken where the active range starts, as the effective command value is read there.
+        auto range = Editing::active_range(*this);
+        auto medium_font_size = range ? Editing::medium_font_size_at(*range->start_container()) : CSS::StyleComputer::default_user_font_size();
+        auto pixel_size = Editing::font_size_to_pixel_size(value_override.release_value(), medium_font_size);
+        return Editing::legacy_font_size(pixel_size.to_int(), medium_font_size);
     }
 
     // 3. If the value override for command is set, return it.

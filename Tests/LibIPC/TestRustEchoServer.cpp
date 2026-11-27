@@ -9,6 +9,7 @@
 
 #include <AK/Function.h>
 #include <AK/MemoryStream.h>
+#include <LibCore/File.h>
 #include <LibCore/System.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
@@ -17,7 +18,9 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
-#include <sys/resource.h>
+#if !defined(AK_OS_WINDOWS)
+#    include <sys/resource.h>
+#endif
 
 // NB: Starts the Rust endpoint, which the IPC compiler generated Rust code for from the same definition as the C++ code
 //     this test uses, and returns this end of a transport to it.
@@ -30,9 +33,18 @@ static NonnullOwnPtr<IPC::Transport> start_server()
     auto server_send_right = MUST(our_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
     auto server_receive_right = MUST(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto our_send_right = MUST(server_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
-    IPC::TransportMachPort::raise_receive_queue_limit(server_receive_right);
+    IPC::Transport::raise_receive_queue_limit(server_receive_right);
     rust_echo_server_serve(server_receive_right.release(), server_send_right.release());
-    return make<IPC::TransportMachPort>(move(our_receive_right), move(our_send_right));
+    return MUST(IPC::Transport::create(move(our_receive_right), move(our_send_right)));
+}
+#elif defined(AK_OS_WINDOWS)
+extern "C" void rust_echo_server_serve(int descriptor);
+
+static NonnullOwnPtr<IPC::Transport> start_server()
+{
+    auto handles = MUST(Core::System::duplex_pipe());
+    rust_echo_server_serve(handles[1]);
+    return MUST(IPC::Transport::adopt_fd(handles[0]));
 }
 #else
 extern "C" void rust_echo_server_serve(int socket_fd);
@@ -42,9 +54,7 @@ static NonnullOwnPtr<IPC::Transport> start_server()
     int fds[2] {};
     MUST(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
     rust_echo_server_serve(fds[1]);
-    auto socket = MUST(Core::LocalSocket::adopt_fd(fds[0]));
-    MUST(socket->set_blocking(false));
-    return make<IPC::TransportSocket>(move(socket));
+    return MUST(IPC::Transport::adopt_fd(fds[0]));
 }
 #endif
 
@@ -87,6 +97,19 @@ TEST_CASE(values_make_a_round_trip_through_rust)
     EXPECT_EQ(response->bytes(), bytes);
 }
 
+TEST_CASE(latin1_strings_make_a_round_trip_through_rust)
+{
+    auto transport = start_server();
+    // "crème brûlée", with each code unit as one byte.
+    static constexpr u8 code_units[] = { 'c', 'r', 0xE8, 'm', 'e', ' ', 'b', 'r', 0xFB, 'l', 0xE9, 'e' };
+    auto latin1_text = Utf16String::from_utf16(Utf16View::from_latin1(code_units, false));
+    send(*transport, Messages::RustEchoServer::Echo::static_encode(1, ""sv, latin1_text.utf16_view(), {}, {}));
+
+    auto response = receive<Messages::RustEchoServer::EchoResponse>(*transport);
+    EXPECT_EQ(response->utf16_text(), latin1_text);
+    EXPECT(response->utf16_text().utf16_view().has_latin1_storage());
+}
+
 TEST_CASE(strings_with_lone_surrogates_make_a_round_trip_through_rust)
 {
     auto transport = start_server();
@@ -99,7 +122,7 @@ TEST_CASE(strings_with_lone_surrogates_make_a_round_trip_through_rust)
 TEST_CASE(large_payloads_make_a_round_trip_through_rust)
 {
     auto transport = start_server();
-    auto bytes = MUST(ByteBuffer::create_uninitialized(100'000));
+    auto bytes = MUST(ByteBuffer::create_uninitialized(2 * MiB));
     for (size_t i = 0; i < bytes.size(); ++i)
         bytes[i] = static_cast<u8>(i * 7);
     Vector<Optional<i64>> values;
@@ -116,24 +139,26 @@ TEST_CASE(files_go_to_rust_as_attachments)
     send(*transport, Messages::RustEchoServer::WriteToFile::static_encode(IPC::File::adopt_fd(pipe[1]), "from rust"sv));
     (void)receive<Messages::RustEchoServer::WriteToFileResponse>(*transport);
 
-    char buffer[32] = {};
-    auto read = MUST(Core::System::read(pipe[0], { buffer, sizeof(buffer) }));
-    EXPECT_EQ(StringView(buffer, read), "from rust"sv);
-    MUST(Core::System::close(pipe[0]));
+    auto reader = MUST(Core::File::adopt_fd(pipe[0], Core::File::OpenMode::Read));
+    u8 buffer[32] = {};
+    auto read = MUST(reader->read_some(buffer));
+    EXPECT_EQ(StringView(read), "from rust"sv);
 }
 
 // NB: Linux fails sending descriptors once all those the user has in flight exceed the sender's limit, which other
 //     processes running at the same time count towards, so raise it as LibMain does for every process.
 static void raise_descriptor_limit()
 {
+#if !defined(AK_OS_WINDOWS)
     rlimit limit {};
     VERIFY(getrlimit(RLIMIT_NOFILE, &limit) == 0);
     limit.rlim_cur = min<rlim_t>(limit.rlim_max, 65536);
-#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+#    if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     // NB: macOS rejects a descriptor limit above OPEN_MAX, but still needs one above its default of 256.
     limit.rlim_cur = min<rlim_t>(limit.rlim_cur, OPEN_MAX);
-#endif
+#    endif
     VERIFY(setrlimit(RLIMIT_NOFILE, &limit) == 0);
+#endif
 }
 
 TEST_CASE(many_files_make_a_round_trip_through_rust)
@@ -142,11 +167,11 @@ TEST_CASE(many_files_make_a_round_trip_through_rust)
     static constexpr size_t file_count = 200;
     raise_descriptor_limit();
     auto transport = start_server();
-    Vector<int> readers;
+    Vector<NonnullOwnPtr<Core::File>> readers;
     Vector<IPC::File> files;
     for (size_t i = 0; i < file_count; ++i) {
         auto pipe = MUST(Core::System::pipe2(O_CLOEXEC));
-        readers.append(pipe[0]);
+        readers.append(MUST(Core::File::adopt_fd(pipe[0], Core::File::OpenMode::Read)));
         files.append(IPC::File::adopt_fd(pipe[1]));
     }
     send(*transport, Messages::RustEchoServer::EchoFiles::static_encode(files));
@@ -154,15 +179,13 @@ TEST_CASE(many_files_make_a_round_trip_through_rust)
     auto returned_files = receive<Messages::RustEchoServer::EchoFilesResponse>(*transport)->take_files();
     EXPECT_EQ(returned_files.size(), file_count);
     for (size_t i = 0; i < min(returned_files.size(), file_count); ++i) {
-        auto fd = returned_files[i].take_fd();
-        MUST(Core::System::write(fd, "!"sv.bytes()));
-        MUST(Core::System::close(fd));
-        char buffer = 0;
-        EXPECT_EQ(MUST(Core::System::read(readers[i], { &buffer, 1 })), 1uz);
+        auto writer = MUST(Core::File::adopt_fd(returned_files[i].take_fd(), Core::File::OpenMode::Write));
+        MUST(writer->write_until_depleted("!"sv.bytes()));
+        writer->close();
+        u8 buffer = 0;
+        EXPECT_EQ(MUST(readers[i]->read_some({ &buffer, 1 })).size(), 1uz);
         EXPECT_EQ(buffer, '!');
     }
-    for (auto reader : readers)
-        MUST(Core::System::close(reader));
 }
 
 TEST_CASE(the_rust_end_closing_ends_the_connection)
@@ -255,8 +278,12 @@ static void expect_refused_by_cpp_and_rust(ReadonlyBytes message)
     bytes.append(message.data(), message.size());
     MUST(transport->post_message(move(bytes), outgoing_attachments));
     // NB: A valid message follows, so the Rust end either closes the connection or answers it, and never leaves this
-    //     waiting.
-    send(*transport, Messages::RustEchoServer::EchoValue::static_encode(RustEcho::Value { 1u }));
+    //     waiting. Having refused the first message, it may have closed the connection before this one is sent, and
+    //     then the send itself fails.
+    auto valid_message = MUST(Messages::RustEchoServer::EchoValue::static_encode(RustEcho::Value { 1u }));
+    auto valid_message_attachments = valid_message.take_attachments();
+    if (transport->post_message(valid_message.take_data(), valid_message_attachments).is_error())
+        return;
     auto answered = false;
     auto should_shutdown = IPC::Transport::ShouldShutdown::No;
     while (!answered && should_shutdown == IPC::Transport::ShouldShutdown::No) {

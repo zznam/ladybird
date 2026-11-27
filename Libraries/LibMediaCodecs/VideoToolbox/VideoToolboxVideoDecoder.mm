@@ -7,12 +7,15 @@
 #include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
+#include <LibGfx/VideoSurfaceImage.h>
 #include <LibMediaCodecs/Codecs/AV1.h>
 #include <LibMediaCodecs/Codecs/H264.h>
 #include <LibMediaCodecs/Codecs/H265.h>
+#include <LibMediaCodecs/Codecs/HighDynamicRangeMetadataTracker.h>
 #include <LibMediaCodecs/Codecs/NALUnit.h>
 #include <LibMediaCodecs/Codecs/VP9.h>
 #include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/Limits.h>
 #include <LibMediaCodecs/VideoFrame.h>
 #include <LibMediaCodecs/VideoToolbox/VideoToolboxVideoDecoder.h>
 
@@ -97,13 +100,6 @@ private:
 // How many frames the media engine may be decoding before it has to hand one back.
 constexpr size_t MAXIMUM_FRAMES_IN_FLIGHT = 4;
 
-AK::Duration duration_from_cm_time(CMTime time)
-{
-    if (!CMTIME_IS_NUMERIC(time))
-        return AK::Duration::zero();
-    return AK::Duration::from_time_units(time.value, 1, static_cast<u32>(time.timescale));
-}
-
 CMTime cm_time_from_duration(AK::Duration duration)
 {
     return CMTimeMake(duration.to_nanoseconds(), 1'000'000'000);
@@ -172,20 +168,72 @@ struct DecoderFormat {
     RetainedRef<CFMutableDictionaryRef> destination_attributes;
     CodingIndependentCodePoints cicp;
     u8 reorder_frame_count { 0 };
+    // Set where VideoToolbox has no software decoder for the format, or has one that accepts the format but then fails
+    // every frame of it.
+    bool requires_hardware_decoder { false };
 };
+
+// The parameter sets of H.264 and H.265 describe the stream's colours in their video usability information, which the
+// format description made from them carries as extensions.
+CodingIndependentCodePoints cicp_of_format_description(CMVideoFormatDescriptionRef description)
+{
+    auto string_extension = [&](CFStringRef key) -> CFStringRef {
+        auto value = CMFormatDescriptionGetExtension(description, key);
+        if (value == nullptr || CFGetTypeID(value) != CFStringGetTypeID())
+            return nullptr;
+        return static_cast<CFStringRef>(value);
+    };
+    auto full_range_flag = VideoFullRangeFlag::Unspecified;
+    if (auto value = CMFormatDescriptionGetExtension(description, kCMFormatDescriptionExtension_FullRangeVideo); value != nullptr && CFGetTypeID(value) == CFBooleanGetTypeID())
+        full_range_flag = CFBooleanGetValue(static_cast<CFBooleanRef>(value)) ? VideoFullRangeFlag::Full : VideoFullRangeFlag::Studio;
+    return {
+        static_cast<ColorPrimaries>(CVColorPrimariesGetIntegerCodePointForString(string_extension(kCMFormatDescriptionExtension_ColorPrimaries))),
+        static_cast<TransferCharacteristics>(CVTransferFunctionGetIntegerCodePointForString(string_extension(kCMFormatDescriptionExtension_TransferFunction))),
+        static_cast<MatrixCoefficients>(CVYCbCrMatrixGetIntegerCodePointForString(string_extension(kCMFormatDescriptionExtension_YCbCrMatrix))),
+        full_range_flag,
+    };
+}
+
+// H.264 and H.265 number their chroma formats alike.
+Subsampling subsampling_of_chroma_format(u8 chroma_format_idc)
+{
+    switch (chroma_format_idc) {
+    case 2:
+        return Subsampling::yuv422();
+    case 3:
+        return Subsampling::yuv444();
+    default:
+        return Subsampling::yuv420();
+    }
+}
+
+// A format description cannot express an identity matrix, so the colour description of the sequence parameter set is
+// taken over it.
+CodingIndependentCodePoints cicp_of_parameter_sets(CMVideoFormatDescriptionRef description, CodingIndependentCodePoints const& sequence_cicp)
+{
+    auto cicp = cicp_of_format_description(description);
+    cicp.adopt_specified_values(sequence_cicp);
+    return cicp;
+}
 
 // Left to choose for itself, a decoder hands back layouts that pack samples across element boundaries, which nothing
 // downstream can sample or read. Asking for the documented biplanar formats keeps the output to one sample per
 // component, in whichever range the stream is in.
-RetainedRef<CFMutableDictionaryRef> destination_attributes_for_bit_depth(u8 bit_depth)
+// An RGB picture comes back with green, blue and red in place of luma and chroma. The decoder converts between ranges
+// as if they were luma and chroma, so they are only asked for in the range the stream is in.
+RetainedRef<CFMutableDictionaryRef> destination_attributes(u8 bit_depth, Subsampling subsampling, CodingIndependentCodePoints const& cicp)
 {
-    Array<OSType, 2> pixel_formats { kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange };
-    if (bit_depth > 8)
-        pixel_formats = { kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange };
+    auto formats = Gfx::biplanar_pixel_formats_holding(bit_depth, subsampling);
+    if (formats.is_empty()) {
+        formats = Gfx::biplanar_pixel_formats_holding(bit_depth, Subsampling::yuv420());
+    } else if (cicp.matrix_coefficients() == MatrixCoefficients::Identity && subsampling == Subsampling::yuv444()) {
+        auto range = cicp.video_full_range_flag() == VideoFullRangeFlag::Studio ? VideoFullRangeFlag::Studio : VideoFullRangeFlag::Full;
+        formats.remove_all_matching([&](auto const& format) { return format.range != range; });
+    }
 
-    RetainedRef<CFMutableArrayRef> pixel_format_numbers { CFArrayCreateMutable(kCFAllocatorDefault, pixel_formats.size(), &kCFTypeArrayCallBacks) };
-    for (auto pixel_format : pixel_formats) {
-        RetainedRef<CFNumberRef> number { CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format) };
+    RetainedRef<CFMutableArrayRef> pixel_format_numbers { CFArrayCreateMutable(kCFAllocatorDefault, formats.size(), &kCFTypeArrayCallBacks) };
+    for (auto const& format : formats) {
+        RetainedRef<CFNumberRef> number { CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &format.pixel_format) };
         CFArrayAppendValue(pixel_format_numbers.ref(), number.ref());
     }
 
@@ -197,15 +245,15 @@ RetainedRef<CFMutableDictionaryRef> destination_attributes_for_bit_depth(u8 bit_
     return attributes;
 }
 
-bool hardware_decoding_is_required(CodecID codec_id)
+// The software H.264 decoder accepts a session for any profile, but fails every frame of a stream outside 8-bit 4:2:0 at
+// High profile or below. Nothing short of decoding a frame reveals this.
+bool software_decoder_can_decode(Codecs::H264::SequenceParameterSet const& sequence_parameter_set)
 {
-    switch (codec_id) {
-    case CodecID::H264:
-    case CodecID::H265:
-        return false;
-    default:
-        return true;
-    }
+    constexpr u8 high_profile_idc = 100;
+    constexpr u8 chroma_format_420 = 1;
+    return sequence_parameter_set.profile_idc <= high_profile_idc
+        && sequence_parameter_set.chroma_format_idc == chroma_format_420
+        && sequence_parameter_set.bit_depth_luma == 8;
 }
 
 bool is_running_in_virtual_machine()
@@ -224,13 +272,17 @@ DecoderErrorOr<VTDecompressionSessionRef> create_decompression_session(CodecID c
 {
     // A virtual machine's hardware decoding goes through paravirtualization, which leaks a connection per process.
     auto hardware_is_usable = !is_running_in_virtual_machine();
-    if (hardware_decoding_is_required(codec_id) && !hardware_is_usable)
+    if (format.requires_hardware_decoder && !hardware_is_usable)
         return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "VideoToolbox has no decoder for this format"sv);
+
+    auto dimensions = CMVideoFormatDescriptionGetDimensions(format.description.ref());
+    if (dimensions.width < 1 || dimensions.height < 1 || video_frame_exceeds_limits(dimensions.width, dimensions.height))
+        return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Video frame size is outside the supported limits"sv);
 
     VTRegisterSupplementalVideoDecoderIfAvailable(codec_type_from_codec_id(codec_id));
 
     RetainedRef<CFMutableDictionaryRef> specification { CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) };
-    if (hardware_decoding_is_required(codec_id))
+    if (format.requires_hardware_decoder)
         CFDictionarySetValue(specification.ref(), kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder, kCFBooleanTrue);
     else
         CFDictionarySetValue(specification.ref(), kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder, hardware_is_usable ? kCFBooleanTrue : kCFBooleanFalse);
@@ -252,6 +304,10 @@ bool session_uses_hardware_decoder(VTDecompressionSessionRef session)
 }
 
 struct FormatState {
+    explicit FormatState(CodecID codec_id)
+        : high_dynamic_range_metadata_tracker(codec_id, {})
+    {
+    }
     virtual ~FormatState() = default;
 
     // Takes whatever the frame says about the stream's format.
@@ -266,10 +322,16 @@ struct FormatState {
     bool access_unit_begins_open_gop { false };
     // Whether the last frame's picture is such a leading picture.
     bool access_unit_is_open_gop_leading_picture { false };
+    Codecs::HighDynamicRangeMetadataTracker high_dynamic_range_metadata_tracker;
 };
 
 struct H264State final : FormatState {
     AK_ALLOC_WITH_KMALLOC;
+
+    H264State()
+        : FormatState(CodecID::H264)
+    {
+    }
 
     Codecs::H264::ParameterSetStore parameter_sets;
     u8 nal_unit_length_size { 4 };
@@ -292,9 +354,12 @@ struct H264State final : FormatState {
         if (auto configuration = coded_frame.new_codec_configuration(); configuration.has_value())
             TRY(apply_configuration(*configuration));
 
+        high_dynamic_range_metadata_tracker.begin_frame(coded_frame);
         Codecs::NALUnitIterator iterator { coded_frame.data(), nal_unit_length_size };
-        for (auto nal_unit = iterator.next(); nal_unit.has_value(); nal_unit = iterator.next())
+        for (auto nal_unit = iterator.next(); nal_unit.has_value(); nal_unit = iterator.next()) {
             TRY(apply_nal_unit(*nal_unit));
+            high_dynamic_range_metadata_tracker.apply_nal_unit(*nal_unit);
+        }
         if (iterator.has_error())
             return DecoderError::corrupted("Invalid H.264 NAL unit length"sv);
         return {};
@@ -310,6 +375,7 @@ struct H264State final : FormatState {
 
         parameter_sets = {};
         nal_unit_length_size = sets->nal_unit_length_size;
+        high_dynamic_range_metadata_tracker.forget_stream();
         dirty = true;
 
         for (auto nal_unit : sets->sequence)
@@ -325,11 +391,22 @@ struct H264State final : FormatState {
         Vector<u8 const*, 288> set_pointers;
         Vector<size_t, 288> set_sizes;
         u8 reorder_frame_count = 0;
+        u8 bit_depth = 8;
+        // Only one sequence parameter set can describe the layout that frames are asked for in, so the first one does.
+        Optional<Subsampling> subsampling;
+        CodingIndependentCodePoints sequence_cicp;
+        auto requires_hardware_decoder = false;
         for (auto const& set : parameter_sets.sequence_parameter_sets()) {
             set_pointers.append(set.nal_unit.data());
             set_sizes.append(set.nal_unit.size());
             // Bound every SPS a slice could select, without parsing slice headers to track activation.
             reorder_frame_count = max(reorder_frame_count, set.parameters.max_num_reorder_frames);
+            bit_depth = max(bit_depth, set.parameters.bit_depth_luma);
+            requires_hardware_decoder |= !software_decoder_can_decode(set.parameters);
+            if (!subsampling.has_value()) {
+                subsampling = subsampling_of_chroma_format(set.parameters.chroma_format_idc);
+                sequence_cicp = set.parameters.cicp;
+            }
         }
         if (set_pointers.is_empty())
             return {};
@@ -348,12 +425,18 @@ struct H264State final : FormatState {
         if (CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, set_pointers.size(), set_pointers.data(), set_sizes.data(), nal_unit_length_size, &description) != noErr)
             return {};
 
-        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes_for_bit_depth(8), CodingIndependentCodePoints {}, reorder_frame_count };
+        auto cicp = cicp_of_parameter_sets(description, sequence_cicp);
+        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes(bit_depth, subsampling.value(), cicp), cicp, reorder_frame_count, requires_hardware_decoder };
     }
 };
 
 struct H265State final : FormatState {
     AK_ALLOC_WITH_KMALLOC;
+
+    H265State()
+        : FormatState(CodecID::H265)
+    {
+    }
 
     Codecs::H265::ParameterSetStore parameter_sets;
     u8 nal_unit_length_size { 4 };
@@ -379,9 +462,11 @@ struct H265State final : FormatState {
         auto saw_random_access_point = false;
         auto saw_open_gop_start = false;
         auto saw_open_gop_leading_picture = false;
+        high_dynamic_range_metadata_tracker.begin_frame(coded_frame);
         Codecs::NALUnitIterator iterator { coded_frame.data(), nal_unit_length_size };
         for (auto nal_unit = iterator.next(); nal_unit.has_value(); nal_unit = iterator.next()) {
             TRY(apply_nal_unit(*nal_unit));
+            high_dynamic_range_metadata_tracker.apply_nal_unit(*nal_unit);
             auto header = Codecs::H265::parse_nal_unit_header(*nal_unit);
             if (!header.has_value() || !Codecs::H265::is_coded_slice(*header))
                 continue;
@@ -410,6 +495,7 @@ struct H265State final : FormatState {
 
         parameter_sets = {};
         nal_unit_length_size = sets->nal_unit_length_size;
+        high_dynamic_range_metadata_tracker.forget_stream();
         dirty = true;
 
         for (auto nal_unit : sets->video)
@@ -435,6 +521,9 @@ struct H265State final : FormatState {
         // and takes them in this order.
         u8 reorder_frame_count = 0;
         u8 bit_depth = 8;
+        // Only one sequence parameter set can describe the layout that frames are asked for in, so the first one does.
+        Optional<Subsampling> subsampling;
+        CodingIndependentCodePoints sequence_cicp;
         for (auto const& set : parameter_sets.video_parameter_sets()) {
             auto is_referenced = false;
             for (auto const& sequence_set : parameter_sets.sequence_parameter_sets())
@@ -453,6 +542,10 @@ struct H265State final : FormatState {
             // Bound every sequence set a slice could select, without parsing slice headers to track activation.
             reorder_frame_count = max(reorder_frame_count, set.parameters.sps_max_num_reorder_pics);
             bit_depth = max(bit_depth, set.parameters.bit_depth_luma);
+            if (!subsampling.has_value()) {
+                subsampling = subsampling_of_chroma_format(set.parameters.chroma_format_idc);
+                sequence_cicp = set.parameters.cicp;
+            }
         }
         if (set_pointers.size() == video_count)
             return {};
@@ -472,12 +565,18 @@ struct H265State final : FormatState {
         if (CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, set_pointers.size(), set_pointers.data(), set_sizes.data(), nal_unit_length_size, nullptr, &description) != noErr)
             return {};
 
-        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes_for_bit_depth(bit_depth), CodingIndependentCodePoints {}, reorder_frame_count };
+        auto cicp = cicp_of_parameter_sets(description, sequence_cicp);
+        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes(bit_depth, subsampling.value(), cicp), cicp, reorder_frame_count };
     }
 };
 
 struct VP9State final : FormatState {
     AK_ALLOC_WITH_KMALLOC;
+
+    VP9State()
+        : FormatState(CodecID::VP9)
+    {
+    }
 
     Optional<Codecs::VP9::FrameHeader> header;
 
@@ -488,6 +587,7 @@ struct VP9State final : FormatState {
             header = frame_header;
             dirty = true;
         }
+        high_dynamic_range_metadata_tracker.apply_coded_frame(coded_frame);
         return {};
     }
 
@@ -508,12 +608,22 @@ struct VP9State final : FormatState {
         if (CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_VP9, header->size.width(), header->size.height(), extensions.ref(), &description) != noErr)
             return {};
 
-        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes_for_bit_depth(header->bit_depth), header->color_parameters.cicp };
+        return DecoderFormat {
+            .description = RetainedRef<CMVideoFormatDescriptionRef> { description },
+            .destination_attributes = destination_attributes(header->bit_depth, Subsampling::yuv420(), header->color_parameters.cicp),
+            .cicp = header->color_parameters.cicp,
+            .requires_hardware_decoder = true,
+        };
     }
 };
 
 struct AV1State final : FormatState {
     AK_ALLOC_WITH_KMALLOC;
+
+    AV1State()
+        : FormatState(CodecID::AV1)
+    {
+    }
 
     Optional<Codecs::AV1::SequenceHeader> sequence_header;
 
@@ -524,6 +634,7 @@ struct AV1State final : FormatState {
             sequence_header = frame_sequence_header;
             dirty = true;
         }
+        high_dynamic_range_metadata_tracker.apply_coded_frame(coded_frame);
         return {};
     }
 
@@ -546,7 +657,12 @@ struct AV1State final : FormatState {
         if (CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AV1, size.width(), size.height(), extensions.ref(), &description) != noErr)
             return {};
 
-        return DecoderFormat { RetainedRef<CMVideoFormatDescriptionRef> { description }, destination_attributes_for_bit_depth(parameters.bit_depth), parameters.optional_fields.cicp };
+        return DecoderFormat {
+            .description = RetainedRef<CMVideoFormatDescriptionRef> { description },
+            .destination_attributes = destination_attributes(parameters.bit_depth, Subsampling::yuv420(), parameters.optional_fields.cicp),
+            .cicp = parameters.optional_fields.cicp,
+            .requires_hardware_decoder = true,
+        };
     }
 };
 
@@ -635,7 +751,7 @@ static Optional<DecoderCapabilities> probe_decoder_capabilities(ParsedCodec cons
         return {};
     auto* session = session_or_error.release_value();
 
-    auto uses_hardware = hardware_decoding_is_required(codec.codec_id()) || session_uses_hardware_decoder(session);
+    auto uses_hardware = format->requires_hardware_decoder || session_uses_hardware_decoder(session);
     VTDecompressionSessionInvalidate(session);
     CFRelease(session);
     return DecoderCapabilities { .smooth = true, .power_efficient = uses_hardware };
@@ -667,17 +783,12 @@ DecoderErrorOr<NonnullOwnPtr<VideoToolboxVideoDecoder>> VideoToolboxVideoDecoder
     if (codec_type_from_codec_id(codec_id) == 0)
         return DecoderError::format(DecoderErrorCategory::NotImplemented, "VideoToolbox has no decoder for codec {}", codec_id);
 
-    auto surface_pool_result = VideoFrameSurfacePool::create();
-    if (surface_pool_result.is_error())
-        return DecoderError::format(DecoderErrorCategory::Memory, "Failed to create a video surface pool: {}", surface_pool_result.release_error());
-
     auto format_state = TRY(create_format_state(codec_id, codec_initialization_data));
-    return DECODER_TRY_ALLOC(adopt_nonnull_own_or_enomem(new (nothrow) VideoToolboxVideoDecoder(codec_id, surface_pool_result.release_value(), move(format_state))));
+    return DECODER_TRY_ALLOC(adopt_nonnull_own_or_enomem(new (nothrow) VideoToolboxVideoDecoder(codec_id, move(format_state))));
 }
 
-VideoToolboxVideoDecoder::VideoToolboxVideoDecoder(CodecID codec_id, NonnullRefPtr<VideoFrameSurfacePool> surface_pool, NonnullOwnPtr<FormatState> format_state)
+VideoToolboxVideoDecoder::VideoToolboxVideoDecoder(CodecID codec_id, NonnullOwnPtr<FormatState> format_state)
     : m_codec_id(codec_id)
-    , m_surface_pool(move(surface_pool))
     , m_format_state(move(format_state))
 {
 }
@@ -687,8 +798,6 @@ VideoToolboxVideoDecoder::~VideoToolboxVideoDecoder()
     // Tearing down the session hands the media engine's remaining frames to the output callback, which touches
     // members that would otherwise already be gone by the time the session is destroyed.
     m_session.clear();
-
-    m_surface_pool->shed_storage();
 }
 
 DecoderErrorOr<void> VideoToolboxVideoDecoder::ensure_session_for_frame(CodedFrame const& coded_frame)
@@ -717,11 +826,9 @@ DecoderErrorOr<void> VideoToolboxVideoDecoder::ensure_session_for_frame(CodedFra
     session->format_description = static_cast<CMVideoFormatDescriptionRef>(CFRetain(format->description.ref()));
 
     VTDecompressionOutputCallbackRecord callback {
-        [](void* session_reference, void* frame_reference, OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image_buffer, CMTime presentation_timestamp, CMTime presentation_duration) {
+        [](void* session_reference, void* frame_reference, OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image_buffer, CMTime, CMTime) {
             auto& session = *static_cast<Session*>(session_reference);
-            auto timestamp = duration_from_cm_time(presentation_timestamp);
-            auto duration = duration_from_cm_time(presentation_duration);
-            session.decoder.note_decode_completed(session.cicp, static_cast<u64>(reinterpret_cast<uintptr_t>(frame_reference)), status, image_buffer, timestamp, duration);
+            session.decoder.note_decode_completed(session.cicp, static_cast<u64>(reinterpret_cast<uintptr_t>(frame_reference)), status, image_buffer);
         },
         session.ptr()
     };
@@ -737,26 +844,41 @@ DecoderErrorOr<void> VideoToolboxVideoDecoder::ensure_session_for_frame(CodedFra
     return {};
 }
 
-void VideoToolboxVideoDecoder::note_decode_completed(CodingIndependentCodePoints const& cicp, u64 generation, i32 status, void* image_buffer, AK::Duration timestamp, AK::Duration duration)
+void VideoToolboxVideoDecoder::note_decode_completed(CodingIndependentCodePoints const& cicp, u64 submission_id, i32 status, void* image_buffer)
 {
+    auto completion = DecodeCompletion::ProducedNothing;
     auto caller_needs_waking = false;
     {
         MutexLocker locker { m_output_mutex };
 
-        if (generation == m_generation.load(AK::MemoryOrder::memory_order_relaxed)) {
+        if (auto frame = take_in_flight_frame_while_locked(submission_id); frame.has_value()) {
+            auto color_metadata = frame->high_dynamic_range_metadata;
+            color_metadata.cicp = cicp;
             if (status != noErr)
                 note_decode_failure_while_locked(status);
             else if (image_buffer != nullptr)
-                enqueue_decoded_output_while_locked(cicp, image_buffer, timestamp, duration);
+                enqueue_decoded_output_while_locked(color_metadata, image_buffer, frame->timestamp, frame->duration);
             auto frame_was_decoded_for_reference_only = status == noErr && image_buffer == nullptr;
-            caller_needs_waking = !frame_was_decoded_for_reference_only && !m_caller_is_waiting_for_output;
+            if (!frame_was_decoded_for_reference_only)
+                completion = DecodeCompletion::ProducedOutput;
         }
 
         note_frame_left_the_media_engine_while_locked();
+        auto decodes_finished = m_frames_in_flight.load(AK::MemoryOrder::memory_order_relaxed) == 0;
+        caller_needs_waking = (completion == DecodeCompletion::ProducedOutput || decodes_finished) && !m_caller_is_waiting_for_output;
     }
 
-    if (caller_needs_waking && m_output_arrived_callback)
-        m_output_arrived_callback();
+    if (caller_needs_waking && m_decode_completed_callback)
+        m_decode_completed_callback(completion);
+}
+
+Optional<VideoToolboxVideoDecoder::InFlightFrame> VideoToolboxVideoDecoder::take_in_flight_frame_while_locked(u64 submission_id)
+{
+    for (size_t index = 0; index < m_in_flight_frames.size(); index++) {
+        if (m_in_flight_frames[index].submission_id == submission_id)
+            return m_in_flight_frames.take(index);
+    }
+    return {};
 }
 
 void VideoToolboxVideoDecoder::note_frame_left_the_media_engine_while_locked()
@@ -781,7 +903,7 @@ void VideoToolboxVideoDecoder::insert_output_in_presentation_order_while_locked(
     m_outputs.insert(insertion_index, move(output));
 }
 
-void VideoToolboxVideoDecoder::enqueue_decoded_output_while_locked(CodingIndependentCodePoints const& cicp, void* image_buffer, AK::Duration timestamp, AK::Duration duration)
+void VideoToolboxVideoDecoder::enqueue_decoded_output_while_locked(ColorMetadata const& color_metadata, void* image_buffer, AK::Duration timestamp, AK::Duration duration)
 {
     auto* pixel_buffer = static_cast<CVPixelBufferRef>(image_buffer);
     auto* io_surface = CVPixelBufferGetIOSurface(pixel_buffer);
@@ -792,8 +914,9 @@ void VideoToolboxVideoDecoder::enqueue_decoded_output_while_locked(CodingIndepen
     if (surface_or_error.is_error())
         return;
 
-    auto pixel_format = CVPixelBufferGetPixelFormatType(pixel_buffer);
-    auto is_ten_bit = pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+    auto pixel_format = Gfx::biplanar_pixel_format(CVPixelBufferGetPixelFormatType(pixel_buffer));
+    if (!pixel_format.has_value())
+        return;
 
     if (m_decode_failure.has_value())
         return;
@@ -808,11 +931,20 @@ void VideoToolboxVideoDecoder::enqueue_decoded_output_while_locked(CodingIndepen
         .timestamp = timestamp,
         .duration = duration,
         .size = { static_cast<int>(CVPixelBufferGetWidth(pixel_buffer)), static_cast<int>(CVPixelBufferGetHeight(pixel_buffer)) },
-        .bit_depth = static_cast<u8>(is_ten_bit ? 10 : 8),
-        .subsampling = Subsampling::yuv420(),
-        .cicp = cicp,
+        .bit_depth = pixel_format->bit_depth,
+        .subsampling = pixel_format->subsampling,
+        .color_metadata = color_metadata,
     };
     insert_output_in_presentation_order_while_locked(move(output));
+}
+
+bool VideoToolboxVideoDecoder::has_any_decode_in_progress() const
+{
+    MutexLocker locker { m_output_mutex };
+    if (m_frames_in_flight.load(AK::MemoryOrder::memory_order_relaxed) > 0)
+        return true;
+    // Output held back for reordering waits for more coded data, so only output that can be taken now counts.
+    return may_pull_frame_from_reorder_queue_while_locked() || m_decode_failure.has_value();
 }
 
 DecoderErrorOr<void> VideoToolboxVideoDecoder::receive_coded_data(CodedFrame const& coded_frame, DecodeIntent intent)
@@ -839,6 +971,7 @@ DecoderErrorOr<void> VideoToolboxVideoDecoder::receive_coded_data(CodedFrame con
     block_source.refCon = &block_was_released;
 
     OSStatus status = noErr;
+    auto submission_id = m_next_submission_id++;
     {
         RetainedRef<CMBlockBufferRef> block_buffer;
         if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, const_cast<u8*>(data.data()), data.size(), nullptr, &block_source, 0, data.size(), 0, block_buffer.out()) != noErr)
@@ -868,11 +1001,11 @@ DecoderErrorOr<void> VideoToolboxVideoDecoder::receive_coded_data(CodedFrame con
                 m_caller_is_waiting_for_output = false;
             }
             m_frames_in_flight.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
+            m_in_flight_frames.append({ submission_id, coded_frame.presentation_timestamp(), coded_frame.duration(), m_format_state->high_dynamic_range_metadata_tracker.metadata() });
         }
-        auto generation = m_generation.load(AK::MemoryOrder::memory_order_relaxed);
 
         VTDecodeInfoFlags info_flags = 0;
-        auto* frame_reference = reinterpret_cast<void*>(static_cast<uintptr_t>(generation));
+        auto* frame_reference = reinterpret_cast<void*>(static_cast<uintptr_t>(submission_id));
         status = VTDecompressionSessionDecodeFrame(m_session->session, sample_buffer.ref(), flags, frame_reference, &info_flags);
     }
 
@@ -880,6 +1013,7 @@ DecoderErrorOr<void> VideoToolboxVideoDecoder::receive_coded_data(CodedFrame con
 
     if (status != noErr) {
         MutexLocker locker { m_output_mutex };
+        (void)take_in_flight_frame_while_locked(submission_id);
         note_frame_left_the_media_engine_while_locked();
         return DecoderError::format(DecoderErrorCategory::Corrupted, "VideoToolbox rejected a frame with status {}", status);
     }
@@ -902,7 +1036,7 @@ bool VideoToolboxVideoDecoder::may_pull_frame_from_reorder_queue_while_locked() 
     return m_outputs.size() > frames_that_may_still_be_preceded;
 }
 
-DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target)
 {
     MutexLocker locker { m_output_mutex };
     while (true) {
@@ -913,7 +1047,7 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::take_next_ou
                 auto const& output = m_outputs[index];
                 if (*target < output.timestamp || *target >= output.timestamp + output.duration)
                     continue;
-                auto frame = TRY(adopt_output_while_locked(container_cicp, index));
+                auto frame = TRY(adopt_output_while_locked(container_color_metadata, index));
                 // Everything the covering frame was queued behind precedes the target.
                 m_outputs.remove(0, index + 1);
                 return frame;
@@ -935,38 +1069,36 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::take_next_ou
         m_caller_is_waiting_for_output = false;
     }
 
-    auto frame = TRY(adopt_output_while_locked(container_cicp, 0));
+    auto frame = TRY(adopt_output_while_locked(container_color_metadata, 0));
     m_outputs.remove(0);
     return frame;
 }
 
-DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::adopt_output_while_locked(CodingIndependentCodePoints const& container_cicp, size_t index)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> VideoToolboxVideoDecoder::adopt_output_while_locked(ColorMetadata const& container_color_metadata, size_t index)
 {
     auto const& output = m_outputs[index];
 
-    auto acquired_slot = m_surface_pool->try_acquire(output.surface, output.contents);
-    if (!acquired_slot.has_value())
-        return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every video frame slot is held elsewhere"sv);
+    auto storage = m_surface_budget->try_hold(output.surface, output.contents);
+    if (!storage)
+        return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every video surface the decoder may hand out is held elsewhere"sv);
 
-    auto pool_slot_result = m_surface_pool->try_adopt_acquired_slot(*acquired_slot);
-    if (pool_slot_result.is_error())
-        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate a pooled frame slot reference"sv);
-
-    auto cicp = container_cicp;
-    cicp.adopt_specified_values(output.cicp);
+    auto color_metadata = container_color_metadata;
+    color_metadata.adopt_specified_values(output.color_metadata);
 
     return DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(
         output.timestamp, output.duration, output.size.to_type<u32>(),
-        output.bit_depth, output.subsampling, cicp, pool_slot_result.release_value()));
+        output.bit_depth, output.subsampling, move(color_metadata), storage.release_nonnull()));
 }
 
 void VideoToolboxVideoDecoder::flush()
 {
     m_reached_end_of_stream = false;
     m_awaiting_first_submitted_frame = true;
+    m_format_state->high_dynamic_range_metadata_tracker.forget_stream();
 
     MutexLocker locker { m_output_mutex };
-    m_generation.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
+    // The media engine still hands back the frames it was decoding, which are discarded once nothing awaits them.
+    m_in_flight_frames.clear();
     m_outputs.clear();
     m_decode_failure.clear();
 }

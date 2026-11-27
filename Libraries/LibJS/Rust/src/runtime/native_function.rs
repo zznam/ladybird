@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, OnceCell};
+use core::cell::Cell;
 use core::ops::Deref;
 use core::ptr::NonNull;
 
@@ -17,9 +17,11 @@ use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
+use crate::layout::function_object::FUNCTION_LENGTH_AND_NAME_SLOTS;
 pub use crate::layout::function_object::{
     DirectGetterFunction, NativeFunction, NativeFunctionTableEntry, NativeFunctionType, RawNativeFunction,
 };
+use crate::layout::member::Member;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::layout_forward::FlyStringSlot;
@@ -27,6 +29,8 @@ pub use crate::layout_forward::{RawNativeFunctionPointer, RawNativeFunctionResul
 use crate::runtime::abstract_operations::new_function_environment_for_native_javascript_backed_function;
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Throw, ThrowCompletionOr};
+use crate::runtime::error::ErrorKind;
+use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ObjectMethods, allocate_object};
@@ -40,6 +44,8 @@ pub struct NativeFunctionMethods {
     pub construct: fn(&NativeFunction, &Vm, Gc<FunctionObject>) -> ThrowCompletionOr<Gc<Object>>,
     pub function_environment_needed: fn(&NativeFunction) -> bool,
     pub function_environment_bindings_count: fn(&NativeFunction) -> usize,
+    /// For a function that the embedder calls as a step that cannot fail. Its own steps must have a bounded stack use.
+    pub ignores_stack_space_limit: bool,
 }
 
 pub static NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
@@ -48,6 +54,7 @@ pub static NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFuncti
     construct: |_, _, _| unreachable!("NativeFunction::construct has to be overridden"),
     function_environment_needed: |_| false,
     function_environment_bindings_count: |_| 0,
+    ignores_stack_space_limit: false,
 };
 
 pub static NATIVE_FUNCTION_METHODS: ObjectMethods = ObjectMethods {
@@ -100,42 +107,43 @@ impl NativeFunction {
         realm: Gc<Realm>,
         builtin: Option<Builtin>,
     ) -> NativeFunction {
-        let base = FunctionObject::new_with_realm_and_prototype(
-            vm,
-            class,
-            realm,
-            prototype,
-            MayInterfereWithIndexedPropertyAccess::No,
-        );
+        let base =
+            FunctionObject::new_with_prototype(vm, class, realm, prototype, MayInterfereWithIndexedPropertyAccess::No);
         base.set_builtin(builtin);
         Self::from_function_object(base, None, realm)
     }
 
-    // FIXME: m_realm is supposed to be the realm argument of CreateBuiltinFunction, or the current
-    //        Realm Record. The former is not something that's commonly used or we support, the
-    //        latter is impossible as no ExecutionContext exists when most NativeFunctions are created...
-
-    pub fn new_with_prototype(vm: &Vm, class: &'static Class, prototype: Gc<Object>) -> NativeFunction {
-        let base = FunctionObject::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No);
-        Self::from_function_object(base, None, prototype.shape().realm())
-    }
-
-    pub fn new_with_name(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
-        name: Utf16FlyString,
+        realm: Gc<Realm>,
         prototype: Gc<Object>,
+        name: Option<Utf16FlyString>,
     ) -> NativeFunction {
-        let base = FunctionObject::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No);
-        Self::from_function_object(base, Some(name), prototype.shape().realm())
+        let base = FunctionObject::new_with_prototype(
+            vm,
+            class,
+            realm,
+            Some(prototype),
+            MayInterfereWithIndexedPropertyAccess::No,
+        );
+        Self::from_function_object(base, name, realm)
     }
 
     fn from_function_object(base: FunctionObject, name: Option<Utf16FlyString>, realm: Gc<Realm>) -> NativeFunction {
+        // NB: The fast paths of calls make the realm of the function's shape current.
+        debug_assert!(
+            base.shape().realm() == realm,
+            "a native function's shape is of its realm"
+        );
+        base.inline_named_capacity.set(FUNCTION_LENGTH_AND_NAME_SLOTS as u8);
         NativeFunction {
             base,
+            inline_named_storage: [const { Cell::new(Value::UNDEFINED) }; FUNCTION_LENGTH_AND_NAME_SLOTS],
             name: FlyStringSlot::new(name),
             initial_name: FlyStringSlot::new(None),
-            realm: Cell::new(realm),
+            realm: Member::new(realm),
+            raw_native_function_index: Cell::new(0),
         }
     }
 
@@ -227,15 +235,33 @@ impl NativeFunction {
     {
         CapturingNativeFunction::create(
             vm,
-            NativeFunction::new_with_name(
+            NativeFunction::new_with_prototype(
                 vm,
                 CapturingNativeFunction::CLASS,
-                name.clone(),
+                realm,
                 realm.function_prototype(),
+                Some(name.clone()),
             ),
             captures,
             behaviour,
         )
+    }
+
+    /// The captures of the object, if it is a native function that create() or create_with_name() made with captures
+    /// of type C, which tell such a function from all others, as an internal slot of its own would.
+    pub fn captures_if<C: 'static>(object: &Object) -> Option<&C> {
+        let function = crate::gc::class::downcast_ref::<Object, CapturingNativeFunction>(object)?;
+        function.native_function.captures().downcast_ref::<C>()
+    }
+
+    /// The entry JIT code can call in an already initialized native frame, if this is a capturing native function.
+    #[cfg(feature = "jit")]
+    pub(crate) fn capturing_call_entry(&self) -> RawNativeFunctionPointer {
+        self.as_native_function_gc().downcast::<CapturingNativeFunction>()?;
+        crate::raw_native!(|vm| {
+            let function = vm.active_function_object().expect("the native frame has its function");
+            CapturingNativeFunction::call(cast_ref(&*function), vm)
+        })
     }
 
     pub fn as_native_function_gc(&self) -> Gc<NativeFunction> {
@@ -269,7 +295,7 @@ impl NativeFunction {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
         // Note: This is already the default value.
@@ -297,28 +323,21 @@ impl NativeFunction {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
             callee_context
                 .lexical_environment
                 .set(caller_context.lexical_environment.get());
-            callee_context
-                .variable_environment
-                .set(caller_context.variable_environment.get());
         }
-
-        // Note: Keeping the private environment is probably only needed because of async methods in classes
-        //       calling async_block_start which goes through a NativeFunction here.
-        callee_context
-            .private_environment
-            .set(caller_context.private_environment.get());
 
         // </8.> --------------------------------------------------------------------------
 
         // 9. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
-        vm.push_execution_context_checking_stack_space(NonNull::from(callee_context))?;
+        if vm.did_reach_stack_space_limit() && !function.methods().ignores_stack_space_limit {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
+        // NB: The realm of the context is F.[[Realm]] (see step 6).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(function.realm()));
 
         // 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. thisArgument is the this value, argumentsList provides the named parameters, and the NewTarget value is undefined.
         let result = function.call(vm);
@@ -352,7 +371,7 @@ impl NativeFunction {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
         // Note: This is already the default value.
@@ -377,22 +396,21 @@ impl NativeFunction {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
             callee_context
                 .lexical_environment
                 .set(caller_context.lexical_environment.get());
-            callee_context
-                .variable_environment
-                .set(caller_context.variable_environment.get());
         }
 
         // </8.> --------------------------------------------------------------------------
 
         // 9. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
-        vm.push_execution_context_checking_stack_space(NonNull::from(callee_context))?;
+        if vm.did_reach_stack_space_limit() {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
+        // NB: The realm of the context is F.[[Realm]] (see step 6).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(function.realm()));
 
         // 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. The this value is uninitialized, argumentsList provides the named parameters, and newTarget provides the NewTarget value.
         let result = function.construct(vm, new_target);
@@ -450,6 +468,9 @@ impl FunctionObject {
 /// The behaviour of a native function that captures state, which a CapturingNativeFunction calls.
 pub trait NativeFunctionBehaviour: Trace + 'static {
     fn call(&self, vm: &Vm) -> ThrowCompletionOr<Value>;
+
+    /// The state the behaviour captures.
+    fn captures(&self) -> &dyn core::any::Any;
 }
 
 /// A behaviour together with the state it captures. The behaviour is zero-sized, so the captures are all the state
@@ -474,6 +495,10 @@ where
     fn call(&self, vm: &Vm) -> ThrowCompletionOr<Value> {
         (self.behaviour)(vm, &self.captures)
     }
+
+    fn captures(&self) -> &dyn core::any::Any {
+        &self.captures
+    }
 }
 
 /// A native function whose behaviour captures state.
@@ -481,7 +506,7 @@ where
 #[derive(Trace)]
 struct CapturingNativeFunction {
     base: NativeFunction,
-    native_function: OnceCell<Box<dyn NativeFunctionBehaviour>>,
+    native_function: Box<dyn NativeFunctionBehaviour>,
 }
 
 static CAPTURING_NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
@@ -513,19 +538,10 @@ impl CapturingNativeFunction {
                 "a native function captures its state through its captures, not its behaviour"
             );
         };
-        let function = allocate_object(
-            vm,
-            CapturingNativeFunction {
-                base,
-                native_function: OnceCell::new(),
-            },
-        );
-        // The captures stay on the stack, where the collector finds them, until the function that keeps them alive
-        // exists. Nothing allocates from the heap between allocating the function and storing them in it.
-        let behaviour: Box<dyn NativeFunctionBehaviour> = Box::new(CapturingBehaviour { captures, behaviour });
-        if function.native_function.set(behaviour).is_err() {
-            unreachable!("the behaviour is stored once");
-        }
+        let function = allocate_object(vm, |_| CapturingNativeFunction {
+            base,
+            native_function: Box::new(CapturingBehaviour { captures, behaviour }),
+        });
         function.upcast()
     }
 
@@ -533,11 +549,7 @@ impl CapturingNativeFunction {
         let function: &CapturingNativeFunction = cast_ref(function);
         // NB: The behaviour is borrowed for the whole call. That is sound: the function is the [[Function]] of the
         //     running execution context, which keeps it and its behaviour alive, and the behaviour is never replaced.
-        function
-            .native_function
-            .get()
-            .expect("a capturing native function has its behaviour")
-            .call(vm)
+        function.native_function.call(vm)
     }
 }
 
@@ -602,8 +614,8 @@ impl RawNativeFunctionResult {
 
     pub fn into_completion(self) -> ThrowCompletionOr<Value> {
         match self.variant {
-            0 => Ok(Value(self.payload)),
-            1 => Err(Throw::new(Value(self.payload))),
+            0 => Ok(Value::from_bits(self.payload)),
+            1 => Err(Throw::new(Value::from_bits(self.payload))),
             variant => unreachable!("{variant} is not a ThrowCompletionOr variant"),
         }
     }
@@ -714,31 +726,30 @@ impl RawNativeFunction {
     ) -> RawNativeFunction {
         let base = NativeFunction::new_with_realm(vm, class, prototype, realm, builtin);
         base.set_is_raw_native_function();
-        RawNativeFunction {
-            base,
-            native_function_index: Cell::new(vm.register_native_function(NativeFunctionTableEntry {
+        base.raw_native_function_index
+            .set(vm.register_native_function(NativeFunctionTableEntry {
                 function: native_function,
                 function_type: NativeFunctionType::RawNativeFunction,
-            })),
-        }
+            }));
+        RawNativeFunction { base }
     }
 
-    pub fn new_with_name(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
+        realm: Gc<Realm>,
+        prototype: Gc<Object>,
         name: Utf16FlyString,
         native_function: RawNativeFunctionPointer,
-        prototype: Gc<Object>,
     ) -> RawNativeFunction {
-        let base = NativeFunction::new_with_name(vm, class, name, prototype);
+        let base = NativeFunction::new_with_prototype(vm, class, realm, prototype, Some(name));
         base.set_is_raw_native_function();
-        RawNativeFunction {
-            base,
-            native_function_index: Cell::new(vm.register_native_function(NativeFunctionTableEntry {
+        base.raw_native_function_index
+            .set(vm.register_native_function(NativeFunctionTableEntry {
                 function: native_function,
                 function_type: NativeFunctionType::RawNativeFunction,
-            })),
-        }
+            }));
+        RawNativeFunction { base }
     }
 
     // 10.3.3 CreateBuiltinFunction ( behaviour, length, name, additionalInternalSlotsList [ , realm [ , prototype [ , prefix ] ] ] ), https://tc39.es/ecma262/#sec-createbuiltinfunction
@@ -754,10 +765,9 @@ impl RawNativeFunction {
         let realm = realm.unwrap_or_else(|| vm.current_realm().expect("there is a current realm"));
 
         let prototype = realm.function_prototype();
-        let function = allocate_object(
-            vm,
-            Self::new_with_realm(vm, Self::CLASS, behaviour, Some(prototype), realm, builtin),
-        );
+        let function = allocate_object(vm, |_| {
+            Self::new_with_realm(vm, Self::CLASS, behaviour, Some(prototype), realm, builtin)
+        });
         function.unsafe_set_shape(realm.native_function_shape());
         function.initialize_direct(realm.native_function_length_offset(), Value::from_i32(length));
         let function_name = function.make_function_name(vm, &ClassElementName::PropertyKey(name.clone()), prefix);
@@ -771,10 +781,16 @@ impl RawNativeFunction {
         name: &Utf16FlyString,
         function: RawNativeFunctionPointer,
     ) -> Gc<RawNativeFunction> {
-        allocate_object(
-            vm,
-            Self::new_with_name(vm, Self::CLASS, name.clone(), function, realm.function_prototype()),
-        )
+        allocate_object(vm, |_| {
+            Self::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                name.clone(),
+                function,
+            )
+        })
     }
 
     fn call(function: &NativeFunction, vm: &Vm) -> ThrowCompletionOr<Value> {
@@ -783,22 +799,26 @@ impl RawNativeFunction {
     }
 
     pub fn native_function(&self, vm: &Vm) -> RawNativeFunctionPointer {
-        vm.native_function(self.native_function_index.get(), NativeFunctionType::RawNativeFunction)
+        vm.native_function(
+            self.raw_native_function_index.get(),
+            NativeFunctionType::RawNativeFunction,
+        )
     }
 }
 
 /// Where a DirectGetterFunction finds the value it returns in a platform object.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectGetterConfiguration {
-    // These are byte offsets to pointer-sized fields read directly by the interpreter. The bindings
-    // generator obtains them from PlatformObject::wrapped_implementation_offset(), the implementation
-    // field's generated offset helper, Wrappable::main_world_wrapper_offset(), and
-    // GC::WeakImpl::value_offset(), respectively. DirectGetterFunction validates their alignment and
-    // converts them to word offsets.
+    // These are byte offsets to fields read directly by the interpreter. The bindings generator obtains them from
+    // PlatformObject::wrapped_implementation_offset(), the implementation field's generated offset helper,
+    // Wrappable::main_world_wrapper_offset(), and GC::WeakImpl::value_offset(), respectively. They are pointer-sized,
+    // but for the implementation value, which is a compressed cell pointer if implementation_value_is_compressed is set.
+    // DirectGetterFunction validates their alignment and converts all but the implementation value to word offsets.
     pub wrapper_implementation_offset: usize,
     pub implementation_value_offset: usize,
     pub main_world_wrapper_offset: usize,
     pub weak_impl_value_offset: usize,
+    pub implementation_value_is_compressed: bool,
 }
 
 define_cell!(
@@ -832,10 +852,9 @@ impl DirectGetterFunction {
         configuration: DirectGetterConfiguration,
         prefix: Option<&str>,
     ) -> Gc<DirectGetterFunction> {
-        let function = allocate_object(
-            vm,
-            Self::new(vm, behaviour, realm.function_prototype(), realm, configuration),
-        );
+        let function = allocate_object(vm, |_| {
+            Self::new(vm, behaviour, realm.function_prototype(), realm, configuration)
+        });
         function.unsafe_set_shape(realm.native_function_shape());
         function.initialize_direct(realm.native_function_length_offset(), Value::from_i32(length));
         let function_name = function.make_function_name(vm, &ClassElementName::PropertyKey(name.clone()), prefix);
@@ -852,8 +871,13 @@ impl DirectGetterFunction {
     ) -> DirectGetterFunction {
         let base = RawNativeFunction::new_with_realm(vm, Self::CLASS, native_function, Some(prototype), realm, None);
         let word_size = size_of::<usize>();
+        let value_size = if configuration.implementation_value_is_compressed {
+            size_of::<u32>()
+        } else {
+            word_size
+        };
         assert!(configuration.wrapper_implementation_offset.is_multiple_of(word_size));
-        assert!(configuration.implementation_value_offset.is_multiple_of(word_size));
+        assert!(configuration.implementation_value_offset.is_multiple_of(value_size));
         assert!(configuration.main_world_wrapper_offset.is_multiple_of(word_size));
         assert!(configuration.weak_impl_value_offset.is_multiple_of(word_size));
         let word_offset =
@@ -861,9 +885,12 @@ impl DirectGetterFunction {
         let function = DirectGetterFunction {
             base,
             wrapper_implementation_word_offset: Cell::new(word_offset(configuration.wrapper_implementation_offset)),
-            implementation_value_word_offset: Cell::new(word_offset(configuration.implementation_value_offset)),
+            implementation_value_offset: Cell::new(
+                u32::try_from(configuration.implementation_value_offset).expect("the offset of a field fits in u32"),
+            ),
             main_world_wrapper_word_offset: Cell::new(word_offset(configuration.main_world_wrapper_offset)),
             weak_impl_value_word_offset: Cell::new(word_offset(configuration.weak_impl_value_offset)),
+            implementation_value_is_compressed: Cell::new(u32::from(configuration.implementation_value_is_compressed)),
         };
         function.set_is_direct_getter_function();
         function

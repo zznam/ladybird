@@ -4,22 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
-#include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
@@ -30,12 +25,12 @@
 
 namespace {
 
-class TestApplication : public WebView::Application {
+class TestApplication : public Test::HeadlessApplication {
     WEB_VIEW_APPLICATION(TestApplication)
 
 public:
     explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
+        : Test::HeadlessApplication(move(ladybird_binary_path))
     {
     }
 
@@ -45,8 +40,6 @@ public:
         browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
         web_content_options.is_test_mode = WebView::IsTestMode::Yes;
     }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
 
     virtual OwnPtr<WebView::PictureInPictureWindow> create_picture_in_picture_window(WebView::WebContentPage& requesting_page, WebView::CanonicalTraversable& traversable, Gfx::IntSize video_size) override
     {
@@ -134,23 +127,14 @@ bool is_cursor(Gfx::Cursor const& cursor, Gfx::StandardCursor standard_cursor)
 // and show their own cursor and tooltip in place of the page's while hovered. They work while the page's renderer is
 // stopped.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(picture_in_picture_window_controls)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestPictureInPictureWindowControls-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+    Test::HeadlessTestEnvironment environment { "TestPictureInPictureWindowControls"sv };
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     auto view = WebView::HeadlessWebView::create(move(theme), { 800, 600 });
 
@@ -170,12 +154,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     view->enable_picture_in_picture_controls();
 
-    // The page logs where it is pressed, released and dragged, and its top-right corner has a cursor and tooltip of its
+    // The page logs where it is pressed, released and dragged, and its top-left corner has a cursor and tooltip of its
     // own.
     view->load_html(R"~~~(<!DOCTYPE html>
 <title>page saw</title>
 <body style="margin:0">
-<div title="Page tooltip" style="position:fixed;top:0;right:0;width:100px;height:100px;cursor:crosshair"></div>
+<div title="Page tooltip" style="position:fixed;top:0;left:0;width:100px;height:100px;cursor:crosshair"></div>
 <script>
 function log(name, event) { document.title += " " + name + " " + event.clientX; }
 addEventListener("pointerdown", event => log("down", event));
@@ -186,11 +170,11 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     Core::EventLoop::current().spin_until([&]() { return loads_finished >= 2; });
     VERIFY(last_title == "page saw"sv);
 
-    // The Close button is centred at (778, 22) and Back to tab at (22, 22). (790, 10) is in the corner of Close's bounds,
+    // The Close button is centred at (24, 24) and Back to tab at (776, 24). (11, 11) is in the corner of Close's bounds,
     // over the page's corner but outside the round button.
-    Web::DevicePixelPoint close_button { 778, 22 };
-    Web::DevicePixelPoint back_to_tab_button { 22, 22 };
-    Web::DevicePixelPoint corner_beside_close_button { 790, 10 };
+    Web::DevicePixelPoint close_button { 24, 24 };
+    Web::DevicePixelPoint back_to_tab_button { 776, 24 };
+    Web::DevicePixelPoint corner_beside_close_button { 11, 11 };
     Web::DevicePixelPoint middle_of_page { 400, 300 };
 
     move_mouse_to(*view, close_button);
@@ -230,7 +214,7 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
 
     click_at(*view, middle_of_page);
     Core::EventLoop::current().spin_until([&]() { return last_title.ends_with(" up 400"sv); });
-    VERIFY(last_title == "page saw down 790 up 790 down 778 up 778 down 400 up 400"sv);
+    VERIFY(last_title == "page saw down 11 up 11 down 24 up 24 down 400 up 400"sv);
     outln("the page sees only the presses off the shown controls");
 
     signal_renderers(SIGSTOP);
@@ -266,9 +250,11 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     auto& window_view = WebView::ViewImplementation::find_view_by_handle(app->picture_in_picture_window_handle).value();
     window_view.enable_picture_in_picture_controls();
     auto window_size = app->picture_in_picture_window_size;
-    Web::DevicePixelPoint player_control_bar { window_size.width() / 2, window_size.height() - 10 };
-    Web::DevicePixelPoint window_close_button { window_size.width() - 22, 22 };
-    Web::DevicePixelPoint middle_of_window { window_size.width() / 2, window_size.height() / 2 };
+    // The player's timeline is in the middle of the row along its bottom, inside 12 px of padding.
+    Web::DevicePixelPoint player_control_bar { window_size.width() / 2, window_size.height() - 23 };
+    Web::DevicePixelPoint window_close_button { 24, 24 };
+    // The player's play button is in the middle of the window, so the page is pressed and rested on beside it.
+    Web::DevicePixelPoint beside_play_button { window_size.width() / 4, window_size.height() / 2 };
 
     // The player's control bar shows on the first move and is hovered from the next.
     move_mouse_to(window_view, player_control_bar);
@@ -284,7 +270,7 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     VERIFY(window_view.picture_in_picture_player_controls_are_shown_for_testing());
     outln("the player's controls stay shown while a window control is hovered");
 
-    move_mouse_to(window_view, middle_of_window);
+    move_mouse_to(window_view, beside_play_button);
     Core::EventLoop::current().spin_until([&]() { return !window_view.picture_in_picture_controls_are_shown_for_testing(); });
     VERIFY(!window_view.picture_in_picture_player_controls_are_shown_for_testing());
     outln("both fade once the pointer rests away from them");
@@ -295,8 +281,8 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     Optional<ByteString> window_tooltip;
     window_view.on_enter_tooltip_area = [&](auto const& text) { window_tooltip = text; };
     window_view.on_leave_tooltip_area = [&]() { window_tooltip.clear(); };
-    move_mouse_to(window_view, middle_of_window);
-    press_mouse_at(window_view, middle_of_window);
+    move_mouse_to(window_view, beside_play_button);
+    press_mouse_at(window_view, beside_play_button);
     move_mouse_to(window_view, window_close_button, Web::UIEvents::MouseButton::Primary);
     VERIFY(is_cursor(window_cursor, Gfx::StandardCursor::Hand));
     VERIFY(window_tooltip == "Close"sv);
@@ -311,21 +297,21 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     // The page sees none of a press on a control, even once the press moves off it.
     move_mouse_to(window_view, window_close_button);
     press_mouse_at(window_view, window_close_button);
-    move_mouse_to(window_view, middle_of_window, Web::UIEvents::MouseButton::Primary);
+    move_mouse_to(window_view, beside_play_button, Web::UIEvents::MouseButton::Primary);
     wait_for(1500);
     VERIFY(window_view.picture_in_picture_player_controls_are_shown_for_testing());
-    release_mouse_at(window_view, middle_of_window);
+    release_mouse_at(window_view, beside_play_button);
     Core::EventLoop::current().spin_until([&]() {
         return !window_view.picture_in_picture_controls_are_shown_for_testing() && !window_view.picture_in_picture_player_controls_are_shown_for_testing();
     });
     outln("the player's controls stay shown for the rest of a press on a window control");
 
     // The controls are where the displayed frame shows them, at the pixel ratio it was painted at, until a frame at a new
-    // ratio replaces it. (W - 18, 18) is inside Close at 1x but outside it at 2x, and (W - 44, 44) is the reverse.
+    // ratio replaces it. (16, 16) is inside Close at 1x but outside it at 2x, and (48, 48) is the reverse.
     Vector<Compositing::PictureInPictureControl> window_activated_controls;
     window_view.on_picture_in_picture_control_activated = [&](auto control) { window_activated_controls.append(control); };
-    Web::DevicePixelPoint close_button_at_1x { window_size.width() - 18, 18 };
-    Web::DevicePixelPoint close_button_at_2x { window_size.width() - 44, 44 };
+    Web::DevicePixelPoint close_button_at_1x { 16, 16 };
+    Web::DevicePixelPoint close_button_at_2x { 48, 48 };
 
     signal_renderers(SIGSTOP);
     window_view.set_device_pixel_ratio_for_testing(window_view.page(), 2.0);
@@ -343,6 +329,4 @@ addEventListener("pointermove", event => { if (event.buttons) log("drag", event)
     click_at(window_view, close_button_at_1x);
     VERIFY(window_activated_controls.size() == 2);
     outln("a control follows the frame at the new pixel ratio once it is displayed");
-
-    return 0;
 }

@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! Vectors: v128 loads, constants, lanes and SIMD arithmetic, as AVX2 instructions on xmm registers.
+//! Vectors: v128 loads, constants, lanes and SIMD arithmetic on xmm registers. The assembler selects AVX2 or
+//! equivalent SSE sequences for the host CPU.
 //!
 //! The allocator gives a vector node an output register apart from its inputs and temps, so a lowering may write
 //! its output before it has read all inputs. Inputs may share a register (`i32x4.add x x`), and are never written.
@@ -552,7 +553,7 @@ impl CodeGenerator<'_> {
         let func = self.func;
         let node = *func.node(value);
         let record = *self.allocation.node(value);
-        let [a, b, c] = record.inputs;
+        let [a, b, c, _] = record.inputs;
         let output = record.output;
         let temp = record.temps[0];
         match node.op {

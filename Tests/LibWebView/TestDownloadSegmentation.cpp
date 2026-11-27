@@ -7,8 +7,8 @@
 #include <LibHTTP/HeaderList.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/URL.h>
-#include <LibWebView/DownloadPresentation.h>
 #include <LibWebView/DownloadSegmentation.h>
+#include <LibWebView/FileDownloader.h>
 
 static NonnullRefPtr<HTTP::HeaderList> headers(Vector<HTTP::Header> headers)
 {
@@ -237,31 +237,4 @@ TEST_CASE(estimated_time_remaining)
     download.total_size = 1000;
     download.bytes_per_second = 0;
     EXPECT(!download.estimated_time_remaining().has_value());
-}
-
-TEST_CASE(time_remaining_text)
-{
-    auto text = [](i64 seconds) {
-        return WebView::download_time_remaining_text(AK::Duration::from_seconds(seconds));
-    };
-
-    EXPECT_EQ(text(0), "1 sec left"_string);
-    EXPECT_EQ(text(45), "45 sec left"_string);
-    EXPECT_EQ(text(59), "59 sec left"_string);
-
-    EXPECT_EQ(text(60), "1 min left"_string);
-    EXPECT_EQ(text(61), "2 min left"_string);
-    EXPECT_EQ(text(59 * 60), "59 min left"_string);
-
-    EXPECT_EQ(text(60 * 60), "1 hr 0 min left"_string);
-    EXPECT_EQ(text(90 * 60), "1 hr 30 min left"_string);
-    EXPECT_EQ(text(7199), "2 hr 0 min left"_string);
-    EXPECT_EQ(text(25 * 60 * 60), "25 hr 0 min left"_string);
-}
-
-TEST_CASE(rate_text)
-{
-    EXPECT_EQ(WebView::download_rate_text(512), "512 B/s"_string);
-    EXPECT_EQ(WebView::download_rate_text(1536), "1.5 KiB/s"_string);
-    EXPECT_EQ(WebView::download_rate_text(3 * MiB), "3.0 MiB/s"_string);
 }

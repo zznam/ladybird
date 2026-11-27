@@ -22,6 +22,11 @@
 
 namespace Web::Editing {
 
+void SpellCheckController::ParagraphPiece::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    visitor.visit(text);
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#spelling-and-grammar-checking
 static bool is_checkable_text_control(HTML::HTMLElement& element)
 {
@@ -68,6 +73,19 @@ static bool text_is_checkable(DOM::Text& text)
     // immediate parent of the first character of the word, sentence, or other piece of text.
     auto* parent = as_if<HTML::HTMLElement>(text.parent());
     return parent && parent->is_editable_or_editing_host() && parent->spellcheck();
+}
+
+// INTEROP: The value of an input is checked only while the input has focus, and its markers come off when focus leaves
+//          it. A one-line field mostly holds names, addresses and such, so its errors only show while the user types.
+static bool is_checked_now(DOM::Text& text)
+{
+    if (!text_is_checkable(text))
+        return false;
+    auto editable = checkable_editable_for(text);
+    if (!is<HTML::HTMLInputElement>(*editable))
+        return true;
+    auto focused_area = text.document().focused_area();
+    return focused_area && checkable_editable_for(*focused_area) == editable;
 }
 
 // A check only ever runs on the user's behalf. A check a page could start at will would let it test any words it likes
@@ -135,24 +153,6 @@ bool SpellCheckController::owns(DOM::Text const& text) const
     return text.is_connected() && &text.document() == m_document.ptr();
 }
 
-Optional<SpellCheckController::TextPosition> SpellCheckController::caret_position() const
-{
-    auto focused = m_document->focused_area();
-    if (auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(focused.ptr())) {
-        auto text = text_control->form_associated_element_to_text_node();
-        if (!text)
-            return {};
-        return TextPosition { *text, min<size_t>(text_control->selection_end(), text->length_in_utf16_code_units()) };
-    }
-    auto selection = m_document->get_selection();
-    if (!selection)
-        return {};
-    auto* text = as_if<DOM::Text>(selection->focus_node().ptr());
-    if (!text)
-        return {};
-    return TextPosition { *text, selection->focus_offset() };
-}
-
 void SpellCheckController::send_window_around(DOM::Text& text, size_t offset, RequestKind kind)
 {
     if (!owns(text))
@@ -197,7 +197,7 @@ void SpellCheckController::schedule_typing_check()
     if (m_typing_check_scheduled)
         return;
     m_typing_check_scheduled = true;
-    HTML::queue_global_task(HTML::Task::Source::UserInteraction, HTML::relevant_global_object(m_document), GC::create_function(m_document->heap(), [document = GC::Weak<DOM::Document> { m_document }] {
+    HTML::queue_global_task(HTML::Task::Source::UserInteraction, HTML::relevant_global_object(m_document), GC::create_function(m_document->heap(), GC::captures(GC::Weak<DOM::Document> { m_document }), [](auto& document) {
         if (auto strong_document = document.ptr()) {
             strong_document->spell_check_controller().run_typing_check();
             strong_document->page().notify_spell_check_progress();
@@ -213,7 +213,7 @@ void SpellCheckController::run_typing_check()
         m_typing_check_wanted = true;
         return;
     }
-    auto caret = caret_position();
+    auto caret = caret_text_position(m_document);
     if (!caret.has_value() || !owns(*caret->text) || !checkable_editable_for(*caret->text))
         return;
     // Right after an edit, the word touching the caret is still being typed. Its markers come off, and no answer flags
@@ -235,7 +235,7 @@ void SpellCheckController::schedule_exempt_word_check()
     if (m_exempt_word_check_scheduled)
         return;
     m_exempt_word_check_scheduled = true;
-    HTML::queue_global_task(HTML::Task::Source::UserInteraction, HTML::relevant_global_object(m_document), GC::create_function(m_document->heap(), [document = GC::Weak<DOM::Document> { m_document }] {
+    HTML::queue_global_task(HTML::Task::Source::UserInteraction, HTML::relevant_global_object(m_document), GC::create_function(m_document->heap(), GC::captures(GC::Weak<DOM::Document> { m_document }), [](auto& document) {
         if (auto strong_document = document.ptr()) {
             strong_document->spell_check_controller().run_exempt_word_check();
             strong_document->page().notify_spell_check_progress();
@@ -256,7 +256,7 @@ void SpellCheckController::run_exempt_word_check()
         return;
     }
     // A caret still inside the same word, which typing may have lengthened, keeps it exempt.
-    if (auto caret = caret_position(); caret.has_value() && caret->text.ptr() == text.ptr()) {
+    if (auto caret = caret_text_position(m_document); caret.has_value() && caret->text.ptr() == text.ptr()) {
         if (auto word = word_touching(*text, caret->offset); word.has_value() && word->start <= exempt.start && exempt.start <= word->end) {
             m_exempt_word = word;
             return;
@@ -380,7 +380,7 @@ void SpellCheckController::send(Request request)
     ++m_requests_in_flight;
     if (request.kind == RequestKind::Typing)
         m_typing_check_in_flight = true;
-    m_document->page().request_spell_check(text, GC::create_function(m_document->heap(), [document = GC::Weak<DOM::Document> { m_document }, request = move(request)](Vector<SpellingError> errors) {
+    m_document->page().request_spell_check(text, GC::create_function(m_document->heap(), GC::captures(GC::Weak<DOM::Document> { m_document }, move(request)), [](auto& document, auto& request, Vector<SpellingError> errors) {
         auto strong_document = document.ptr();
         if (!strong_document)
             return;
@@ -498,7 +498,7 @@ void SpellCheckController::apply(Request const& request, Vector<SpellingError> c
         auto text = piece.text.ptr();
         // Text that left the document, or whose checking turned off, since the text was sent takes nothing from the
         // answer.
-        if (!text || !piece.checked || !owns(*text) || !text_is_checkable(*text))
+        if (!text || !piece.checked || !owns(*text) || !is_checked_now(*text))
             continue;
         // A node edited since the text was sent is dirty again, and the next check takes it.
         auto data = text->data().utf16_view();
@@ -524,12 +524,22 @@ void SpellCheckController::apply(Request const& request, Vector<SpellingError> c
 void SpellCheckController::did_focus(GC::Ptr<DOM::Node> node)
 {
     // Focus moving ends the typing that came before. The word the user was typing is no longer being typed, so it gets
-    // checked now. And a typing check queued for an earlier edit no longer runs, since it would read a caret that edit
-    // didn't put there.
+    // checked now, unless it is in an input that focus left. And a typing check queued for an earlier edit no longer
+    // runs, since it would read a caret that edit didn't put there.
     if (auto exempt = exchange(m_exempt_word, {}); exempt.has_value()) {
-        if (auto text = exempt->text.ptr(); text && owns(*text) && text_is_checkable(*text) && m_document->page().spell_checking_available())
+        if (auto text = exempt->text.ptr(); text && owns(*text) && is_checked_now(*text) && m_document->page().spell_checking_available())
             send_window_around(*text, min<size_t>(exempt->start, text->length_in_utf16_code_units()), RequestKind::Other);
     }
+
+    // An input that focus left takes its markers with it.
+    GC::RootVector<GC::Ref<DOM::Text>> unfocused;
+    m_document->spelling_markers().for_each_marked_text([&](DOM::Text& text, auto) {
+        if (auto editable = checkable_editable_for(text); editable && is<HTML::HTMLInputElement>(*editable) && !is_checked_now(text))
+            unfocused.append(text);
+    });
+    for (auto& text : unfocused)
+        m_document->spelling_markers().remove_all(text);
+
     m_typing_check_scheduled = false;
     m_typing_check_wanted = false;
     m_exempt_word_check_scheduled = false;

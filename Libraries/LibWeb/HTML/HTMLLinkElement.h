@@ -32,6 +32,8 @@ class WEB_API HTMLLinkElement final : public HTMLElement {
 public:
     virtual ~HTMLLinkElement() override;
 
+    GC::Ref<DOM::DOMTokenList> blocking();
+
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
     virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
@@ -90,7 +92,7 @@ private:
             URL::URL base_url,
             URL::Origin origin,
             GC::Ref<HTML::EnvironmentSettingsObject> environment,
-            GC::Ref<HTML::PolicyContainer> policy_container,
+            NonnullRefPtr<HTML::PolicyContainer> policy_container,
             GC::Ptr<Web::DOM::Document> document,
             Utf16String cryptographic_nonce_metadata,
             Fetch::Infrastructure::Request::Priority fetch_priority);
@@ -143,7 +145,7 @@ private:
 
         // policy container
         //     A policy container
-        GC::Ref<HTML::PolicyContainer> policy_container;
+        NonnullRefPtr<HTML::PolicyContainer> policy_container;
 
         // document (default null)
         //     Null or a Document
@@ -159,6 +161,8 @@ private:
     };
 
     HTMLLinkElement(DOM::Document&, DOM::QualifiedName);
+
+    GC::Ptr<DOM::DOMTokenList> m_blocking;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
@@ -171,7 +175,7 @@ private:
     virtual bool is_implicitly_potentially_render_blocking() const override;
 
     GC::Ref<LinkProcessingOptions> create_link_options();
-    static GC::Ptr<Fetch::Infrastructure::Request> create_link_request(LinkProcessingOptions const&);
+    static RefPtr<Fetch::Infrastructure::Request> create_link_request(LinkProcessingOptions const&);
     static bool apply_link_options_from_parsed_header_attributes(LinkProcessingOptions&, HTTP::Link const&);
 
     void fetch_and_process_linked_resource();
@@ -187,17 +191,21 @@ private:
     bool stylesheet_linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
 
     static void preconnect(LinkProcessingOptions const&);
-    static void preload(LinkProcessingOptions&, Function<void(Fetch::Infrastructure::Response&)> process_response = {});
+    static void preload(LinkProcessingOptions&, GC::Ptr<GC::Function<void(Fetch::Infrastructure::Response&)>> process_response = {});
     static void modulepreload(LinkProcessingOptions const&);
 
-    void process_linked_resource(bool success, Fetch::Infrastructure::Response const&, CSS::StyleScope::OriginClean, Core::ImmutableBytes const*);
-    void process_icon_resource(bool success, Fetch::Infrastructure::Response const&, ByteBuffer);
-    void process_stylesheet_resource(bool success, Fetch::Infrastructure::Response const&, CSS::StyleScope::OriginClean, ReadonlyBytes);
+    void process_linked_resource(bool success, Fetch::Infrastructure::ResponseView const&, CSS::StyleScope::OriginClean, Core::ImmutableBytes const*);
+    void process_icon_resource(bool success, Fetch::Infrastructure::ResponseView const&, ByteBuffer);
+    void process_stylesheet_resource(bool success, Fetch::Infrastructure::ResponseView const&, CSS::StyleScope::OriginClean, ReadonlyBytes);
     void associate_style_sheet(CSS::StyleSheetState&, CSS::StyleScope::OriginClean);
-    void associate_empty_style_sheet(Fetch::Infrastructure::Response const&, CSS::StyleScope::OriginClean);
+    void associate_empty_style_sheet(Fetch::Infrastructure::ResponseView const&, CSS::StyleScope::OriginClean);
     void finish_processing_stylesheet_resource(u64 fetch_generation);
-    void cancel_pending_stylesheet_processing();
-    void stop_blocking_on_style_sheet();
+    enum class UnblockRendering : u8 {
+        No,
+        Yes,
+    };
+    void cancel_pending_stylesheet_processing(UnblockRendering = UnblockRendering::Yes);
+    void stop_blocking_on_style_sheet(UnblockRendering = UnblockRendering::Yes);
 
     bool should_fetch_and_process_resource_type() const;
 
@@ -219,6 +227,10 @@ private:
 
     RefPtr<Gfx::Bitmap const> m_loaded_icon;
     RefPtr<CSS::StyleSheetState> m_loaded_style_sheet;
+    // The style sheet the link had when it was disabled, and the fetch generation then: enabling the link again before
+    // it starts another fetch puts the sheet back.
+    RefPtr<CSS::StyleSheetState> m_style_sheet_kept_while_disabled;
+    u64 m_style_sheet_kept_while_disabled_fetch_generation { 0 };
 
     GC::Ptr<DOM::DOMTokenList> m_rel_list;
     GC::Ptr<DOM::DOMTokenList> m_sizes;
@@ -232,8 +244,6 @@ private:
     bool m_explicitly_enabled { false };
 
     bool m_was_enabled_when_created_by_parser { false };
-
-    Optional<Utf16String> m_mime_type;
 
     SourceSet m_source_set;
 

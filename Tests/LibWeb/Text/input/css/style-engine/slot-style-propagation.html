@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <div id="host"></div>
 <script>
     test(() => {
@@ -24,19 +25,12 @@
         }
         const childShadow = host.firstElementChild.attachShadow({ mode: "open" });
         childShadow.innerHTML = "<span>shadow child</span>";
-        internals.updateStyle();
-        let before = internals.styleEngineCounters();
-        slot.style.backgroundColor = "red";
-        internals.updateStyle();
-        let after = internals.styleEngineCounters();
-        println(`background change only reaches slot: ${after.reachedStyleNodes - before.reachedStyleNodes === 1}`);
+        const backgroundWork = styleWork(() => slot.style.backgroundColor = "red");
+        println(`background change restyled: [${backgroundWork.restyled().map(shortStyleName).join(", ")}]`);
         println(`child background: ${getComputedStyle(host.firstElementChild).backgroundColor}`);
 
-        before = internals.styleEngineCounters();
-        slot.style.color = "green";
-        internals.updateStyle();
-        after = internals.styleEngineCounters();
-        println(`inherited color avoids full drives: ${after.engineFullDrivesStarted === before.engineFullDrivesStarted}`);
+        const colorWork = styleWork(() => slot.style.color = "green");
+        println(`inherited color passes: [${colorWork.passes().join(", ")}]`);
         println(`inherited color: ${getComputedStyle(host.firstElementChild).color}`);
         println(`last child color: ${getComputedStyle(host.lastElementChild).color}`);
         println(`shadow descendant color: ${getComputedStyle(childShadow.firstElementChild).color}`);

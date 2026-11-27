@@ -4,6 +4,7 @@ set(SOURCES
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
     AudioDiscardIntervals.cpp
+    Codecs/AudioPacketDurationParser.cpp
     Codecs/FLAC.cpp
     Codecs/Opus.cpp
     Codecs/Vorbis.cpp
@@ -66,7 +67,6 @@ set(SOURCES
     Sinks/RemoteVideoSink.cpp
     TimeRanges.cpp
     Track.cpp
-    VideoEdgeQueue.cpp
     VideoPresentation/VideoPresentationClientConnection.cpp
     VideoPresentation/VideoPresentationServerConnection.cpp
 )
@@ -82,6 +82,12 @@ if (APPLE)
     )
 endif()
 
+if (WIN32)
+    list(APPEND SOURCES
+        WindowsMediaFoundation/WindowsMediaFoundationAudioDecoder.cpp
+    )
+endif()
+
 compile_ipc(VideoPresentation/VideoPresentationClient.ipc VideoPresentation/VideoPresentationClientEndpoint.h)
 compile_ipc(VideoPresentation/VideoPresentationServer.ipc VideoPresentation/VideoPresentationServerEndpoint.h)
 
@@ -93,13 +99,21 @@ if (APPLE)
     target_link_libraries(LibMedia PRIVATE "-framework AudioToolbox")
 endif()
 
+if (WIN32)
+    target_link_libraries(LibMedia PRIVATE mfplat mfuuid)
+endif()
+
 target_sources(LibMedia PRIVATE
         FFmpeg/FFmpegAudioConverter.cpp
         FFmpeg/FFmpegAudioDecoder.cpp
+        FFmpeg/FFmpegAudioEncoder.cpp
         FFmpeg/FFmpegChannelLayout.cpp
 )
 
-if (NOT ANDROID)
+if (LINUX AND NOT ANDROID)
+    # LibMediaCodecs loads the bundled FFmpeg, and every call goes through its functions.
+    ladybird_use_bundled_ffmpeg_headers(LibMedia)
+elseif (NOT ANDROID)
     target_link_libraries(LibMedia PRIVATE PkgConfig::AVCODEC PkgConfig::AVUTIL PkgConfig::LIBSWRESAMPLE)
 else()
     target_include_directories(LibMedia PRIVATE ${FFMPEG_INCLUDE_DIRS})

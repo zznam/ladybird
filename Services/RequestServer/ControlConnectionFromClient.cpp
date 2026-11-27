@@ -8,6 +8,7 @@
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/TransportHandle.h>
 #include <RequestServer/AlternativeServices.h>
+#include <RequestServer/CertificateExceptions.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
@@ -15,6 +16,8 @@
 namespace RequestServer {
 
 static ControlConnectionFromClient* s_control_connection = nullptr;
+
+static constexpr auto disk_cache_size_report_delay = AK::Duration::from_seconds(2);
 
 ControlConnectionFromClient::ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RequestServer::ConnectionFromClient::ConnectionMap& connections, RequestServer::ConnectionFromClient::RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache)
     : IPC::ConnectionFromClient<RequestServerControlClientEndpoint, RequestServerControlEndpoint>(*this, move(transport), 0)
@@ -25,10 +28,30 @@ ControlConnectionFromClient::ControlConnectionFromClient(NonnullOwnPtr<IPC::Tran
 {
     VERIFY(s_control_connection == nullptr);
     s_control_connection = this;
+#if defined(AK_OS_LINUX)
+    // The Linux sandbox denies RequestServer the files that the system resolver reads, like /etc/resolv.conf.
+    Resolver::resolve_system_names_remotely();
+#endif
+
+    if (m_disk_cache.has_value()) {
+        // Coalesce the size changes of a burst of cache writes into one report.
+        m_disk_cache_size_report_timer = Core::Timer::create_single_shot(disk_cache_size_report_delay, [this] {
+            async_disk_cache_size_changed(m_disk_cache->estimated_size());
+        });
+        m_disk_cache->set_on_estimated_size_change([this] {
+            if (!m_disk_cache_size_report_timer->is_active())
+                m_disk_cache_size_report_timer->start();
+        });
+
+        // The cache may have been on disk before this process started.
+        m_disk_cache_size_report_timer->start();
+    }
 }
 
 ControlConnectionFromClient::~ControlConnectionFromClient()
 {
+    if (m_disk_cache.has_value())
+        m_disk_cache->set_on_estimated_size_change(nullptr);
     if (s_control_connection == this)
         s_control_connection = nullptr;
 }
@@ -45,8 +68,17 @@ void ControlConnectionFromClient::die()
     m_performance_timer = nullptr;
     Request::set_performance_monitor_enabled(false);
 
+    if (m_disk_cache.has_value())
+        m_disk_cache->set_on_estimated_size_change(nullptr);
+    m_disk_cache_size_report_timer = nullptr;
+
     if (s_control_connection == this)
         s_control_connection = nullptr;
+
+    // No answer comes for a lookup that's still waiting on the process that launched RequestServer.
+    auto pending_system_resolutions = move(m_pending_system_resolutions);
+    for (auto& [resolution_id, on_resolved] : pending_system_resolutions)
+        on_resolved(Error::from_string_literal("The system resolver's process is gone"));
 
     if (m_connections.is_empty())
         Core::EventLoop::current().quit(0);
@@ -118,6 +150,14 @@ void ControlConnectionFromClient::bind_client_to_site(int client_id, Utf16String
         connection.value()->bind_to_site({}, top_level_site, frame_site);
 }
 
+void ControlConnectionFromClient::designate_request_adopter(u64 designation_id, int source_client_id, u64 source_request_id, int adopter_client_id)
+{
+    auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
+    if (auto lease = m_request_transfer_leases.get(lease_key); lease.has_value() && m_connections.contains(adopter_client_id))
+        lease->adopter_client_id = adopter_client_id;
+    async_request_adopter_designated(designation_id);
+}
+
 void ControlConnectionFromClient::set_disk_cache_settings(HTTP::DiskCacheSettings disk_cache_settings)
 {
     if (m_disk_cache.has_value())
@@ -131,13 +171,6 @@ void ControlConnectionFromClient::set_dns_server(ByteString host_or_address, u16
     if (host_or_address == dns_info.server_hostname && port == dns_info.port && use_tls == dns_info.use_dns_over_tls && validate_dnssec_locally == dns_info.validate_dnssec_locally)
         return;
 
-    if (auto v4 = IPv4Address::from_string(host_or_address); v4.has_value())
-        dns_info.server_address = Core::SocketAddress { v4.value(), port };
-    else if (auto v6 = IPv6Address::from_string(host_or_address); v6.has_value())
-        dns_info.server_address = Core::SocketAddress { v6.value(), port };
-    else
-        dns_info.server_address = {};
-
     dns_info.server_hostname = host_or_address;
     dns_info.port = port;
     dns_info.use_dns_over_tls = use_tls;
@@ -150,7 +183,6 @@ void ControlConnectionFromClient::set_use_system_dns()
 {
     auto& dns_info = DNSInfo::the();
     dns_info.server_hostname = {};
-    dns_info.server_address = {};
 
     Resolver::reset_connections();
 }
@@ -158,6 +190,11 @@ void ControlConnectionFromClient::set_use_system_dns()
 void ControlConnectionFromClient::set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration)
 {
     RequestServer::set_proxy_configuration(move(proxy_configuration));
+}
+
+void ControlConnectionFromClient::trust_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString error_details)
+{
+    add_certificate_exception(host, port, move(fingerprint), errors, move(error_details));
 }
 
 void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)
@@ -207,6 +244,65 @@ void ControlConnectionFromClient::remove_cache_entries_accessed_since(u64 clear_
     AlternativeServiceCache::the().remove_entries_received_since(since);
 
     async_removed_cache_entries(clear_cache_request_id);
+}
+
+void ControlConnectionFromClient::retrieve_cache_access_profile(u64 access_profile_request_id, AK::Duration granularity)
+{
+    Vector<Requests::CacheAccessBucket> buckets;
+
+    if (m_disk_cache.has_value())
+        buckets = m_disk_cache->access_profile(granularity);
+
+    async_retrieved_cache_access_profile(access_profile_request_id, move(buckets));
+}
+
+void ControlConnectionFromClient::remove_cache_entries_accessed_before(UnixDateTime before)
+{
+    if (m_disk_cache.has_value())
+        m_disk_cache->remove_entries_accessed_before(before);
+}
+
+DNS::Resolver::CancelRemoteSystemResolution ControlConnectionFromClient::resolve_host_with_system_resolver(ByteString const& host, Core::Socket::AddressFamily family, Function<void(DNS::Resolver::SystemResolution)> on_resolved)
+{
+    VERIFY(family != Core::Socket::AddressFamily::Unspecified);
+
+    auto resolution_id = m_next_system_resolution_id++;
+    m_pending_system_resolutions.set(resolution_id, move(on_resolved));
+    async_resolve_host_with_system_resolver(resolution_id, host, family == Core::Socket::AddressFamily::IPv6Only);
+
+    return [weak_this = make_weak_ptr<ControlConnectionFromClient>(), resolution_id] {
+        auto self = weak_this.strong_ref();
+        if (self && self->m_pending_system_resolutions.remove(resolution_id))
+            self->m_cancelled_system_resolutions.set(resolution_id);
+    };
+}
+
+void ControlConnectionFromClient::resolved_host_with_system_resolver(u64 resolution_id, Optional<Vector<ByteString>> addresses)
+{
+    auto on_resolved = m_pending_system_resolutions.take(resolution_id);
+    if (!on_resolved.has_value()) {
+        // The answer to a lookup the resolver gave up on still comes, and is dropped.
+        if (m_cancelled_system_resolutions.remove(resolution_id))
+            return;
+        did_misbehave("Unexpected system resolver answer");
+        return;
+    }
+
+    if (!addresses.has_value()) {
+        (*on_resolved)(Error::from_string_literal("The system resolver could not resolve the name"));
+        return;
+    }
+
+    Vector<Variant<IPv4Address, IPv6Address>> parsed_addresses;
+    for (auto const& address : *addresses) {
+        if (auto ipv4_address = IPv4Address::from_string(address); ipv4_address.has_value())
+            parsed_addresses.append(*ipv4_address);
+        else if (auto ipv6_address = IPv6Address::from_string(address); ipv6_address.has_value())
+            parsed_addresses.append(*ipv6_address);
+        else
+            dbgln("RequestServer: Ignoring an address the system resolver returned that does not parse: {}", address);
+    }
+    (*on_resolved)(move(parsed_addresses));
 }
 
 void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 request_id, RequestType request_type, u64 cookie_request_id, String cookie)

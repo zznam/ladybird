@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
-
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Class, GcCell, cast_ref, define_cell};
 use crate::gc::root::MarkedVec;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
+use crate::layout::object::array_flags;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::call_function_object;
 use crate::runtime::array_prototype::array_merge_sort;
@@ -37,14 +36,9 @@ use crate::utf16::Utf16View;
 #[derive(Trace)]
 pub struct Array {
     base: Object,
-    realm: Cell<Gc<Realm>>,
-    length_writable: Cell<bool>,
-    is_proxy_target: Cell<bool>,
 }
 
-/// The offsets of the flags JIT code checks before writing elements of an array.
-pub const ARRAY_LENGTH_WRITABLE_OFFSET: usize = core::mem::offset_of!(Array, length_writable);
-pub const ARRAY_IS_PROXY_TARGET_OFFSET: usize = core::mem::offset_of!(Array, is_proxy_target);
+const _: () = assert!(size_of::<Array>() == 32);
 
 pub static ARRAY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     internal_get_own_property: Array::internal_get_own_property,
@@ -95,14 +89,15 @@ impl Array {
                 shape.create_prototype_transition(vm, Some(prototype)),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
-            None => Object::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            None => Object::new_with_prototype(
+                vm,
+                class,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
         };
-        let array = Self {
-            base,
-            realm: Cell::new(realm),
-            length_writable: Cell::new(true),
-            is_proxy_target: Cell::new(false),
-        };
+        let array = Self { base };
         array.base.set_has_magical_length_property();
         array
     }
@@ -125,7 +120,7 @@ impl Array {
         // 3. Let A be MakeBasicObject(« [[Prototype]], [[Extensible]] »).
         // 4. Set A.[[Prototype]] to proto.
         // 5. Set A.[[DefineOwnProperty]] as specified in 10.4.2.1.
-        let array = allocate_object(vm, Self::new(vm, realm, prototype));
+        let array = allocate_object(vm, |_| Self::new(vm, realm, prototype));
 
         // 6. Perform ! OrdinaryDefineOwnProperty(A, "length", PropertyDescriptor { [[Value]]: 𝔽(length), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: false }).
         // OPTIMIZATION: The length of an array is the size of its indexed storage, and a new array's length is already
@@ -156,20 +151,25 @@ impl Array {
     /// CreateArrayFromList for a list that is kept alive while the array is allocated.
     pub fn create_from_list(vm: &Vm, realm: Gc<Realm>, elements: &MarkedVec<'_, Value>) -> Gc<Array> {
         let array = Self::create(vm, realm, 0, None).must();
-        elements.with_values(|elements| array.set_indexed_property_elements(elements));
+        array.set_indexed_property_elements(&elements.values());
         array
     }
 
     pub fn length_is_writable(&self) -> bool {
-        self.length_writable.get()
+        self.class_bits.get() & array_flags::LENGTH_NOT_WRITABLE == 0
     }
 
     pub fn is_proxy_target(&self) -> bool {
-        self.is_proxy_target.get()
+        self.class_bits.get() & array_flags::IS_PROXY_TARGET != 0
     }
 
     pub fn set_is_proxy_target(&self, is_proxy_target: bool) {
-        self.is_proxy_target.set(is_proxy_target);
+        let flags = self.class_bits.get();
+        self.class_bits.set(if is_proxy_target {
+            flags | array_flags::IS_PROXY_TARGET
+        } else {
+            flags & !array_flags::IS_PROXY_TARGET
+        });
     }
 
     // Packed arrays have no holes, so the prototype chain is irrelevant:
@@ -238,7 +238,7 @@ impl Array {
         }
         // NOTE: Step d. doesn't apply here.
         // e. Else if current.[[Writable]] is false, then
-        if !self.length_writable.get() {
+        if !self.length_is_writable() {
             // i. If Desc has a [[Writable]] field and Desc.[[Writable]] is true, return false.
             if property_descriptor.writable == Some(true) {
                 return Ok(false);
@@ -263,7 +263,8 @@ impl Array {
         // a. Set succeeded to ! OrdinaryDefineOwnProperty(A, "length", PropertyDescriptor { [[Writable]]: false }).
         // b. Assert: succeeded is true.
         if !new_writable {
-            self.length_writable.set(false);
+            self.class_bits
+                .set(self.class_bits.get() | array_flags::LENGTH_NOT_WRITABLE);
         }
 
         // NOTE: Continuation of step #17
@@ -278,11 +279,11 @@ impl Array {
 
     /// The realm whose intrinsics default_prototype_chain_intact() compares the prototype chain with.
     pub fn realm(&self) -> Gc<Realm> {
-        self.realm.get()
+        self.shape().realm()
     }
 
     pub fn default_prototype_chain_intact(&self) -> bool {
-        let realm = self.realm.get();
+        let realm = self.realm();
         let Some(array_prototype) = self.shape().prototype() else {
             return false;
         };
@@ -335,7 +336,7 @@ impl Array {
         if property_key.is_string() && property_key.as_string() == vm.names.length.as_string() {
             return Ok(Some(PropertyDescriptor {
                 value: Some(Value::from_f64(f64::from(array.indexed_array_like_size()))),
-                writable: Some(array.length_writable.get()),
+                writable: Some(array.length_is_writable()),
                 enumerable: Some(false),
                 configurable: Some(false),
                 ..Default::default()
@@ -370,7 +371,7 @@ impl Array {
                         if !array.is_extensible(vm)? {
                             return Ok(false);
                         }
-                        if index >= array.indexed_array_like_size() && !array.length_writable.get() {
+                        if index >= array.indexed_array_like_size() && !array.length_is_writable() {
                             return Ok(false);
                         }
                         array.indexed_put(index, value, DEFAULT_ATTRIBUTES);
@@ -426,7 +427,7 @@ impl Array {
             // f. Let index be ! ToUint32(P).
 
             // g. If index ≥ oldLen and oldLenDesc.[[Writable]] is false, return false.
-            if property_key.as_number() >= array.indexed_array_like_size() && !array.length_writable.get() {
+            if property_key.as_number() >= array.indexed_array_like_size() && !array.length_is_writable() {
                 return Ok(false);
             }
 

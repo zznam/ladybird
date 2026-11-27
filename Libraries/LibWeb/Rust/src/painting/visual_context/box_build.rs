@@ -20,41 +20,48 @@ pub(crate) struct BoxBuildEnvironment<'a, Arena> {
 
 pub(crate) trait AnchorScrollShiftResolver {
     fn default_scroll_shift_anchor(&self, slot: NodeSlotId) -> NodeSlotId;
-    fn enclosing_scroll_node_index(&self, slot: NodeSlotId) -> SpatialNodeIndex;
+    fn spatial_node_index(&self, slot: NodeSlotId) -> SpatialNodeIndex;
 }
 
 #[derive(Clone)]
 pub(crate) struct PaintableVisualContextAssignment {
     pub slot: NodeSlotId,
-    pub enclosing_scroll_node_index: SpatialNodeIndex,
     pub own_scroll_node_index: SpatialNodeIndex,
     pub node_identity: i64,
     pub has_accumulated_visual_context: bool,
     pub accumulated_visual_context: ContextRef,
     pub accumulated_visual_context_for_descendants: ContextRef,
     pub has_non_invertible_css_transform: bool,
+    pub hidden_by_empty_svg_mask_or_clip: bool,
     pub record: PaintableVisualContextRecord,
     pub node_handles: BoxVisualContextNodeHandles,
+    /// The bounds of the SVG filter the box references, as the build gathered them, which the row takes as the
+    /// assignment applies. None for an assignment no build gathered.
+    pub gathered_svg_filter_bounds: Option<Option<crate::layout::used_values::FfiCssPixelRect>>,
 }
 
 impl PaintableVisualContextAssignment {
     pub(crate) fn from_data(slot: NodeSlotId, data: &PaintableData, record: PaintableVisualContextRecord) -> Self {
         Self {
             slot,
-            enclosing_scroll_node_index: data.enclosing_scroll_node_index,
             own_scroll_node_index: data.own_scroll_node_index,
             node_identity: data.node_identity,
             has_accumulated_visual_context: data.has_accumulated_visual_context,
             accumulated_visual_context: data.accumulated_visual_context,
             accumulated_visual_context_for_descendants: data.accumulated_visual_context_for_descendants,
             has_non_invertible_css_transform: data.has_flag(PaintableFlag::HasNonInvertibleCssTransform),
+            hidden_by_empty_svg_mask_or_clip: data.has_flag(PaintableFlag::HiddenByEmptySvgMaskOrClip),
             record,
             node_handles: BoxVisualContextNodeHandles::default(),
+            gathered_svg_filter_bounds: None,
         }
     }
 
     pub(crate) fn apply(self, layout_arena: &mut impl PaintableRowsWrite) {
-        use crate::painting::record::damage::PaintDamage;
+        use crate::painting::record::change_ticks::RowPaintChange;
+        if let Some(svg_filter_bounds) = self.gathered_svg_filter_bounds {
+            super::node_values::set_svg_filter_bounds(layout_arena, self.slot, svg_filter_bounds);
+        }
         // Commands and hit-test items name the row's own nodes; the scroll metadata of every
         // descendant names the nearest scroll node above it.
         let (scroll_nodes_changed, non_invertible_transform_flipped) = match layout_arena
@@ -63,8 +70,7 @@ impl PaintableVisualContextAssignment {
             Some(_) => {
                 let data = layout_arena.paintable_data(self.slot);
                 (
-                    data.enclosing_scroll_node_index != self.enclosing_scroll_node_index
-                        || data.own_scroll_node_index != self.own_scroll_node_index
+                    data.own_scroll_node_index != self.own_scroll_node_index
                         || data.node_identity != self.node_identity,
                     data.has_flag(PaintableFlag::HasNonInvertibleCssTransform) != self.has_non_invertible_css_transform,
                 )
@@ -74,7 +80,6 @@ impl PaintableVisualContextAssignment {
         {
             let mut data = layout_arena.paintable_data_mut(self.slot);
             data.establishes_stacking_context = self.record.stacking_context.establishes_stacking_context;
-            data.enclosing_scroll_node_index = self.enclosing_scroll_node_index;
             data.own_scroll_node_index = self.own_scroll_node_index;
             data.node_identity = self.node_identity;
             data.has_accumulated_visual_context = self.has_accumulated_visual_context;
@@ -84,48 +89,42 @@ impl PaintableVisualContextAssignment {
                 PaintableFlag::HasNonInvertibleCssTransform,
                 self.has_non_invertible_css_transform,
             );
+            data.set_flag(
+                PaintableFlag::HiddenByEmptySvgMaskOrClip,
+                self.hidden_by_empty_svg_mask_or_clip,
+            );
         }
         layout_arena.set_paintable_visual_context_record(self.slot, self.record, self.node_handles);
         if scroll_nodes_changed {
-            layout_arena.push_paint_damage(self.slot, PaintDamage::ALL_PRODUCERS);
-            layout_arena.push_paint_damage_to_paint_subtree(self.slot, PaintDamage::SCROLL_METADATA);
+            layout_arena.note_paint_change(self.slot, RowPaintChange::EVERYTHING_IT_PAINTS);
+            layout_arena.note_paint_change_in_paint_subtree(self.slot, RowPaintChange::SCROLL_METADATA);
         }
         if non_invertible_transform_flipped {
-            layout_arena.push_paint_damage(self.slot, PaintDamage::ELIGIBILITY | PaintDamage::ALL_PRODUCERS);
+            layout_arena.note_paint_change(self.slot, RowPaintChange::ORDER | RowPaintChange::EVERYTHING_IT_PAINTS);
         }
     }
 }
 
-// A scroll-like node's registry parent follows containing blocks up to the viewport. A node
-// that is not scroll-like ends the chain: a committed index can name a node an earlier box of
-// this pass retired, and such a box contributes no scroll shift instead of a stale lookup.
-fn scroll_registry_parent_node(sink: &impl VisualContextNodeSink, index: SpatialNodeIndex) -> Option<SpatialNodeIndex> {
-    if index == VISUAL_VIEWPORT_NODE_INDEX {
-        return None;
-    }
-    match &sink.spatial_node_at(index).data {
-        SpatialData::Scroll(scroll) => Some(scroll.registry_parent_node),
-        SpatialData::Sticky(sticky) => Some(sticky.registry_parent_node),
-        _ => None,
-    }
-}
-
-fn scroll_registry_chain_to_viewport(
+// The scroll-like nodes that move content of the space of `index`, nearest first. A committed index
+// can name a node an earlier box of this pass retired; the walk stops there, so such a box
+// contributes no scroll shift instead of a stale lookup.
+fn scroll_like_nodes_up_to_viewport(
     sink: &impl VisualContextNodeSink,
     index: SpatialNodeIndex,
 ) -> Vec<SpatialNodeIndex> {
-    const MAX_SCROLL_REGISTRY_CHAIN_LENGTH: usize = 1024;
-    let mut chain = Vec::new();
-    let mut node = index;
-    while let Some(parent) = scroll_registry_parent_node(sink, node) {
-        debug_assert!(!chain.contains(&node), "scroll registry parents form a cycle");
-        if chain.len() >= MAX_SCROLL_REGISTRY_CHAIN_LENGTH {
+    let mut scroll_like_nodes = Vec::new();
+    let mut current = index;
+    while current != VISUAL_VIEWPORT_NODE_INDEX {
+        let node = sink.spatial_node_at(current);
+        if !node.data.is_live() {
             break;
         }
-        chain.push(node);
-        node = parent;
+        if node.data.is_scroll_like() {
+            scroll_like_nodes.push(current);
+        }
+        current = node.parent;
     }
-    chain
+    scroll_like_nodes
 }
 
 // https://drafts.csswg.org/css-anchor-position-1/#default-scroll-shift
@@ -140,15 +139,15 @@ fn append_anchor_scroll_shift_nodes<Arena: PaintableRowsRead, Sink: VisualContex
     sink: &mut Sink,
     resolver: &dyn AnchorScrollShiftResolver,
     layout_node: NodeSlotId,
-    own_enclosing_scroll_node_index: SpatialNodeIndex,
     first_anchor_node: NodeSlotId,
     mut own_state: ContextRef,
 ) -> ContextRef {
-    let enclosing_scroll_node_index = |node: NodeSlotId| {
+    let own_spatial_node_before_shifts = own_state.spatial;
+    let spatial_node_index = |node: NodeSlotId| {
         if node == layout_node {
-            own_enclosing_scroll_node_index
+            own_spatial_node_before_shifts
         } else {
-            resolver.enclosing_scroll_node_index(node)
+            resolver.spatial_node_index(node)
         }
     };
     let mut box_node = layout_node;
@@ -172,8 +171,8 @@ fn append_anchor_scroll_shift_nodes<Arena: PaintableRowsRead, Sink: VisualContex
             compensate_horizontal_scroll && box_flags & NodeFlag::CompensatesForHorizontalScroll as u32 != 0;
         compensate_vertical_scroll =
             compensate_vertical_scroll && box_flags & NodeFlag::CompensatesForVerticalScroll as u32 != 0;
-        let anchor_scroll_chain = scroll_registry_chain_to_viewport(sink, enclosing_scroll_node_index(anchor_node));
-        let base_scroll_chain = scroll_registry_chain_to_viewport(sink, enclosing_scroll_node_index(box_node));
+        let anchor_scroll_chain = scroll_like_nodes_up_to_viewport(sink, spatial_node_index(anchor_node));
+        let base_scroll_chain = scroll_like_nodes_up_to_viewport(sink, spatial_node_index(box_node));
         let shared_scroll_node = base_scroll_chain
             .iter()
             .copied()
@@ -213,8 +212,10 @@ fn append_anchor_scroll_shift_nodes<Arena: PaintableRowsRead, Sink: VisualContex
     own_state
 }
 
-// Positioned descendants skip intermediate overflow clips. Share the new clip when
-// their spatial and clip chains coincide; otherwise append it under their own chain.
+// Positioned descendants skip intermediate overflow clips. Share the new clip when their spatial and
+// clip chains coincide; otherwise append it under their own clip chain.
+// NB: The clip geometry is in the clipping box's own space, which differs from the chain's space when the
+//     chain skips a scroll node (e.g. fixed position descendants of a box in a scrolled document).
 fn append_clip_to_positioned_chain<Sink: VisualContextNodeSink>(
     sink: &mut Sink,
     chain: PositioningContext,
@@ -225,7 +226,7 @@ fn append_clip_to_positioned_chain<Sink: VisualContextNodeSink>(
     let clip = if chain.spatial == normal_before.spatial && chain.clip == normal_before.clip {
         normal_after.clip
     } else {
-        sink.append_clip_node(data, chain.clip, chain.spatial)
+        sink.append_clip_node(data, chain.clip, normal_before.spatial)
     };
     PositioningContext { clip, ..chain }
 }
@@ -238,7 +239,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     anchor_scroll_shift_resolver: &dyn AnchorScrollShiftResolver,
 ) -> PaintableVisualContextAssignment {
     let layout_arena = env.layout_arena;
-    let facts = super::build::BoxFacts::gather(layout_arena, slot, env.pixel_ratio, true);
+    let (facts, svg_filter_bounds) = super::build::BoxFacts::gather(layout_arena, slot, env.pixel_ratio, true);
     let position = crate::painting::style_queries::position(layout_arena, slot);
     let is_fixed = position == crate::css::css_enums::positioning::FIXED;
     let is_absolute = position == crate::css::css_enums::positioning::ABSOLUTE;
@@ -260,33 +261,9 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
             stacking_context: stacking_context_facts,
         },
     );
-    assignment.enclosing_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.own_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.node_identity = 0;
-
-    let mut nearest_scroll_nodes_for_descendants = if is_fixed {
-        NearestScrollNodeIndices {
-            stopping_at_fixed_position_ancestors: VISUAL_VIEWPORT_NODE_INDEX,
-            continuing_through_fixed_position_ancestors: inherited
-                .fixed_position
-                .nearest_scroll_nodes
-                .continuing_through_fixed_position_ancestors,
-        }
-    } else if is_absolute {
-        inherited.absolute_position.nearest_scroll_nodes
-    } else {
-        inherited.normal.nearest_scroll_nodes
-    };
-    let nearest_ancestor_scroll_node_index = if is_sticky {
-        nearest_scroll_nodes_for_descendants.continuing_through_fixed_position_ancestors
-    } else {
-        nearest_scroll_nodes_for_descendants.stopping_at_fixed_position_ancestors
-    };
-    if !is_fixed && !is_sticky {
-        assignment.enclosing_scroll_node_index = nearest_ancestor_scroll_node_index;
-    }
-
-    let creates_sticky_scroll_node = is_sticky;
+    assignment.gathered_svg_filter_bounds = Some(svg_filter_bounds);
 
     let inherited_chain = if is_fixed {
         inherited.fixed_position
@@ -297,6 +274,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         // their visual parent.
         inherited.normal
     };
+    let mut nearest_scroll_like_node_for_descendants = inherited_chain.nearest_scroll_like_node;
     // Build this element's own state from inherited state.
     let mut own_state = inherited_chain.with_effect(inherited.effect);
 
@@ -305,7 +283,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         sink,
         anchor_scroll_shift_resolver,
         layout_node,
-        assignment.enclosing_scroll_node_index,
         facts.default_scroll_shift_anchor,
         own_state,
     );
@@ -342,6 +319,12 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         }};
     }
 
+    // NB: Layout decides the clip in the parent's space, so the box's own sticky offset, effects and transform go
+    //     under it.
+    if let Some(clip_decided_by_parent) = facts.clip_decided_by_parent {
+        append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Rect(clip_decided_by_parent));
+    }
+
     macro_rules! append_shared_effect {
         ($make:expr) => {{
             let effect = sink.append_effect_node($make, own_state.effect, own_state.spatial, own_state.clip);
@@ -349,13 +332,13 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         }};
     }
 
-    let mut sticky_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
-    if creates_sticky_scroll_node {
+    if is_sticky {
         // The scroll state fills in the geometry once the tree is built. The scroller is the nearest scroll node
         // above any enclosing sticky boxes, as the scroll state resolves it.
-        let (scroller, parent_sticky) = match &sink.spatial_node_at(nearest_ancestor_scroll_node_index).data {
-            SpatialData::Sticky(parent) => (parent.scroller, Some(nearest_ancestor_scroll_node_index)),
-            _ => (nearest_ancestor_scroll_node_index, None),
+        let nearest_scroll_like_node = inherited_chain.nearest_scroll_like_node;
+        let (scroller, parent_sticky) = match &sink.spatial_node_at(nearest_scroll_like_node).data {
+            SpatialData::Sticky(parent) => (parent.scroller, Some(nearest_scroll_like_node)),
+            _ => (nearest_scroll_like_node, None),
         };
         own_state = sink.append_spatial_node_under(
             own_state,
@@ -364,15 +347,9 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
                 parent_sticky,
                 NO_SCROLL_STATE_SLOT,
                 slot,
-                nearest_ancestor_scroll_node_index,
             )),
         );
-        sticky_scroll_node_index = own_state.spatial;
-        assignment.enclosing_scroll_node_index = sticky_scroll_node_index;
-        nearest_scroll_nodes_for_descendants = NearestScrollNodeIndices {
-            stopping_at_fixed_position_ancestors: sticky_scroll_node_index,
-            continuing_through_fixed_position_ancestors: sticky_scroll_node_index,
-        };
+        nearest_scroll_like_node_for_descendants = own_state.spatial;
     }
 
     let transform_data = facts.transform;
@@ -421,6 +398,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
                 role: TransformDataRole::CssTransform,
                 synthetic_plane: true,
                 establishes_sorting_context: inherited.sorting_context_root.is_none(),
+                bounds: libgfx_rust::FloatRect::default(),
             }),
         );
         appended_synthetic_plane = true;
@@ -493,10 +471,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Rect(css_clip));
     }
 
-    if let Some(line_clamp_float_clip) = facts.line_clamp_float_clip {
-        append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Rect(line_clamp_float_clip));
-    }
-
     if facts.clip_path.is_some() {
         append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Path(facts.clip_path_data().unwrap()));
     }
@@ -504,6 +478,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     for mask_layer in &facts.mask_layers {
         append_shared_effect!(EffectNodeData::Mask(*mask_layer));
     }
+    assignment.hidden_by_empty_svg_mask_or_clip = facts.is_hidden_by_empty_svg_mask_or_clip();
 
     // https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation
     // A backdrop filter is limited to the box's rounded border box in the box's own space, and a clip
@@ -541,27 +516,20 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         }
     }
 
-    if paintable_geometry::has_scrollable_overflow(layout_arena, slot) {
-        let parent_index = if creates_sticky_scroll_node {
-            sticky_scroll_node_index
-        } else {
-            nearest_ancestor_scroll_node_index
-        };
+    if paintable_geometry::has_scrollable_overflow(layout_arena, slot)
+        || crate::painting::chrome_geometry::keeps_scrolls_along_some_axis(layout_arena, slot)
+    {
         state_for_descendants = sink.append_spatial_node_under(
             state_for_descendants,
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: slot,
-                registry_parent_node: parent_index,
             }),
         );
         let scroll_node_index = state_for_descendants.spatial;
         assignment.own_scroll_node_index = scroll_node_index;
         assignment.node_identity = layout_arena.unique_node_ids().id(slot);
-        nearest_scroll_nodes_for_descendants = NearestScrollNodeIndices {
-            stopping_at_fixed_position_ancestors: scroll_node_index,
-            continuing_through_fixed_position_ancestors: scroll_node_index,
-        };
+        nearest_scroll_like_node_for_descendants = scroll_node_index;
     }
 
     // A snap area is identified across relayouts and processes by its element, like a scroll node.
@@ -579,7 +547,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     let state_for_positioned_descendants = PositioningContext {
         spatial: state_for_descendants.spatial,
         clip: state_for_descendants.clip,
-        nearest_scroll_nodes: nearest_scroll_nodes_for_descendants,
+        nearest_scroll_like_node: nearest_scroll_like_node_for_descendants,
         plane_root: plane_root_for_descendants,
     };
     if let Some(svg_viewport_transform) = super::build::svg_viewport_transform_of(layout_arena, slot) {
@@ -608,7 +576,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         normal: PositioningContext {
             spatial: state_for_descendants.spatial,
             clip: state_for_descendants.clip,
-            nearest_scroll_nodes: nearest_scroll_nodes_for_descendants,
+            nearest_scroll_like_node: nearest_scroll_like_node_for_descendants,
             plane_root: plane_root_for_descendants,
         },
         absolute_position: state_for_absolute_position_descendants,

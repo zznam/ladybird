@@ -14,7 +14,7 @@ use crate::bytecode::{BytecodeFieldId, HandlerLayout as BytecodeHandlerLayout};
 use crate::frontend::layout::{KnownLayoutConstant, LayoutConstantCategory, LayoutConstants};
 use crate::hash::{HashMap, HashSet};
 use crate::intrinsic::{
-    AddressOperation, AggregateOperation, BranchOperation, BytecodeOperation, CallOperation, CheckedIntegerOperation,
+    AddressOperation, BranchOperation, BytecodeOperation, CallOperation, CheckedIntegerOperation,
     ClassificationOperation, ComparisonDomain, ComparisonRelation, ControlOperation, FieldWidth, FloatConversion,
     FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, IntegerSignedness, Intrinsic,
     LowLevelOperation, MemoryOperation, OperandLoad, OperandOperation, OperandStore, ValueOperation,
@@ -2132,6 +2132,19 @@ fn lower_memory_operation(
             return Err("'load_cell_ptr' requires one result and one address".to_string());
         };
         emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [destination.clone(), address.clone()];);
+    } else if matches!(
+        operation,
+        MemoryOperation::LoadCompressedCellPointer | MemoryOperation::LoadNonnullCompressedCellPointer
+    ) {
+        let ([destination], [address]) = (results, inputs) else {
+            return Err("'load_compressed_cell_ptr' requires one result and one address".to_string());
+        };
+        let nullable = operation == MemoryOperation::LoadCompressedCellPointer;
+        emit!(output; MachineOperation::load(MemoryWidth::Word, false) => [destination.clone(), address.clone()];);
+        if !nullable {
+            emit!(output; MachineOperation::AssertNonzero => [destination.clone()];);
+        }
+        emit!(output; MachineOperation::DecompressCellPointer { nullable } => [destination.clone(), destination.clone()];);
     } else {
         output.push(machine_instruction(
             MachineOperation::Memory(operation),
@@ -2267,7 +2280,8 @@ fn lower_instruction(
             let destination_index = Operand::VirtualRegister(destination_index_register.clone());
             let source_index = Operand::VirtualRegister(source_index_register.clone());
             let value = Operand::VirtualRegister(format!("ssa_move_operand_{}_value", instruction_id.0).into());
-            emit!(output; MachineOperation::load_pair(PairWidth::Word) => [destination_index.clone(), source_index.clone(), bytecode_field_memory(destination), bytecode_field_memory(source)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [destination_index.clone(), bytecode_field_memory(destination)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [source_index.clone(), bytecode_field_memory(source)];);
             emit!(output;
                 MachineOperation::load(MemoryWidth::DoubleWord, false) => [value.clone(), Operand::Address(MemoryAddress {
                         base: AddressRegister::Interpreter(InterpreterRegister::Values),
@@ -2291,7 +2305,7 @@ fn lower_instruction(
                 return Err("'load' requires one bytecode operand field".to_string());
             };
             let index = operand_load_index(instruction_id, 0);
-            emit!(output; MachineOperation::load(MemoryWidth::Word, false) => [index.clone(), bytecode_field_memory(field)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [index.clone(), bytecode_field_memory(field)];);
             emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [destination.clone(), indexed_value_memory(&index)?];);
         }
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Decode)) => {
@@ -2299,7 +2313,7 @@ fn lower_instruction(
             let [Operand::BytecodeField(field)] = inputs.as_slice() else {
                 return Err("'decode_operand' requires one bytecode field".to_string());
             };
-            emit!(output; MachineOperation::load(MemoryWidth::Word, false) => [destination.clone(), bytecode_field_memory(field)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [destination.clone(), bytecode_field_memory(field)];);
         }
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(
             OperandLoad::Index | OperandLoad::RematerializedIndex,
@@ -2569,7 +2583,8 @@ fn lower_instruction(
             };
             let lhs_index = operand_load_index(instruction_id, 0);
             let rhs_index = operand_load_index(instruction_id, 1);
-            emit!(output; MachineOperation::load_pair(PairWidth::Word) => [lhs_index.clone(), rhs_index.clone(), bytecode_field_memory(lhs_field), bytecode_field_memory(rhs_field)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [lhs_index.clone(), bytecode_field_memory(lhs_field)];);
+            emit!(output; MachineOperation::load(OPERAND_FIELD_WIDTH, false) => [rhs_index.clone(), bytecode_field_memory(rhs_field)];);
             emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [lhs.clone(), indexed_value_memory(&lhs_index)?];);
             emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [rhs.clone(), indexed_value_memory(&rhs_index)?];);
         }
@@ -2587,27 +2602,6 @@ fn lower_instruction(
                 temporary
             };
             emit!(output; MachineOperation::Control(ControlOperation::GotoHandler) => [target];);
-        }
-        Operation::Intrinsic(Intrinsic::Aggregate(AggregateOperation::Copy16)) => {
-            let [destination, source] = require_inputs(&inputs, "copy16_field")?;
-            let suffix = output.len();
-            let destination_address = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_destination").into());
-            let source_address = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_source").into());
-            let low = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_low").into());
-            let high = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_high").into());
-            emit!(output; MachineOperation::LoadEffectiveAddress => [destination_address.clone(), destination.clone()];);
-            emit!(output; MachineOperation::LoadEffectiveAddress => [source_address.clone(), source.clone()];);
-            emit!(output; MachineOperation::load_pair(PairWidth::DoubleWord) => [low.clone(), high.clone(), offset_memory(&source_address, 0)?, offset_memory(&source_address, 8)?];);
-            emit!(output; MachineOperation::store_pair(PairWidth::DoubleWord) => [offset_memory(&destination_address, 0)?, offset_memory(&destination_address, 8)?, low, high];);
-        }
-        Operation::Intrinsic(Intrinsic::Aggregate(AggregateOperation::Zero16)) => {
-            let [destination] = require_inputs(&inputs, "zero16_field")?;
-            let suffix = output.len();
-            let destination_address = Operand::VirtualRegister(format!("ssa_zero16_{suffix}_destination").into());
-            let zero = Operand::VirtualRegister(format!("ssa_zero16_{suffix}_zero").into());
-            emit!(output; MachineOperation::IntegerBinary { operation: IntegerBinaryOperation::Binary(BinaryOperation::Xor), width: IntegerWidth::U64 } => [zero.clone(), zero.clone()];);
-            emit!(output; MachineOperation::LoadEffectiveAddress => [destination_address.clone(), destination.clone()];);
-            emit!(output; MachineOperation::store_pair(PairWidth::DoubleWord) => [offset_memory(&destination_address, 0)?, offset_memory(&destination_address, 8)?, zero.clone(), zero];);
         }
         Operation::Intrinsic(Intrinsic::Bytecode(operation @ BytecodeOperation::Load(field_width))) => {
             let [destination] = require_results(&results, operation.name())?;
@@ -3053,16 +3047,6 @@ fn value_operand(function: &FunctionUses<'_>, value: ValueId) -> Result<Operand,
         },
         ValueDefinition::Dead => return Err(format!("cannot select dead SSA value {value:?}")),
     })
-}
-
-fn offset_memory(base: &Operand, offset: i64) -> Result<Operand, String> {
-    let base = address_register(base).ok_or_else(|| "indexed memory requires a register base".to_string())?;
-    Ok(Operand::Address(MemoryAddress {
-        base,
-        index: None,
-        scale: None,
-        displacement: (offset != 0).then_some(AddressDisplacement::Immediate(offset)),
-    }))
 }
 
 fn address_register(operand: &Operand) -> Option<AddressRegister> {
@@ -3607,6 +3591,9 @@ fn machine_instruction(operation: MachineOperation, operands: Vec<Operand>) -> I
         operands,
     }
 }
+
+/// How wide the loads of operand fields are, which `metadata::OPERAND_SIZE` lays out.
+const OPERAND_FIELD_WIDTH: MemoryWidth = MemoryWidth::Byte;
 
 fn bytecode_field_memory(field: &BytecodeFieldId) -> Operand {
     Operand::Address(MemoryAddress {

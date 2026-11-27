@@ -7,6 +7,7 @@
 #include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/ScopeGuard.h>
 #include <LibCore/Environment.h>
@@ -52,7 +53,7 @@ static DecoderErrorOr<void> verify_library_layout(FFmpegFunctions const& functio
 static void resolve_codec_ids(FFmpegFunctions& functions)
 {
     for (auto codec_id : all_codec_ids) {
-        auto const* bundled_descriptor = avcodec_descriptor_get(ffmpeg_codec_id_from_media_codec_id(codec_id));
+        auto const* bundled_descriptor = FFmpegFunctions::bundled().avcodec_descriptor_get(ffmpeg_codec_id_from_media_codec_id(codec_id));
         VERIFY(bundled_descriptor != nullptr);
         auto const* descriptor = functions.avcodec_descriptor_get_by_name(bundled_descriptor->name);
         functions.codec_ids[to_underlying(codec_id)] = descriptor != nullptr ? descriptor->id : AV_CODEC_ID_NONE;
@@ -111,10 +112,19 @@ static OwnPtr<SystemFFmpeg> load_preferred_library()
     return {};
 }
 
+static NeverDestroyed<Optional<OwnPtr<SystemFFmpeg>>> s_library;
+
+void SystemFFmpeg::load()
+{
+    if (!s_library->has_value())
+        *s_library = load_preferred_library();
+}
+
 SystemFFmpeg const* SystemFFmpeg::the()
 {
-    static NeverDestroyed<OwnPtr<SystemFFmpeg> const> library { load_preferred_library() };
-    return library->ptr();
+    if (!s_library->has_value())
+        return nullptr;
+    return s_library->value().ptr();
 }
 
 SystemFFmpeg::SystemFFmpeg(void* library_handle, NonnullOwnPtr<FFmpegFunctions> functions, unsigned major)
@@ -140,11 +150,6 @@ bool SystemFFmpeg::provides_decoder_missing_from_bundle() const
     return any_of(all_codec_ids, [&](CodecID codec_id) {
         return bundled.avcodec_find_decoder(bundled.ffmpeg_codec_id(codec_id)) == nullptr && has_decoder(codec_id);
     });
-}
-
-bool SystemFFmpeg::shares_bundled_struct_layouts() const
-{
-    return m_functions->avcodec_version() >> 16 == LIBAVCODEC_VERSION_MAJOR && m_functions->avutil_version() >> 16 == LIBAVUTIL_VERSION_MAJOR;
 }
 
 }

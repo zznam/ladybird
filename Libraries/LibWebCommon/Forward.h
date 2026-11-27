@@ -21,6 +21,8 @@ enum class WheelDeltaPrecision : u8;
 
 struct InitiatorSourceSnapshot;
 struct KeyEvent;
+struct LoaderConfig;
+struct LoaderConfigSnapshot;
 struct MouseEvent;
 struct PinchEvent;
 
@@ -75,6 +77,7 @@ struct EmbedderPolicy;
 class EnvironmentId;
 struct HistoryNavigationPopulation;
 enum class HistoryStepResult;
+struct MessageDescriptor;
 struct NavigationPopulationRequest;
 struct NavigationPopulationResult;
 struct NavigationStartRequest;
@@ -116,6 +119,7 @@ struct StorageEndpoint;
 namespace WebView {
 
 struct AccessibilityNodeData;
+struct AccessibilityTreeDelta;
 struct Attribute;
 struct ConsoleOutput;
 struct DOMNodeProperties;

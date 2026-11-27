@@ -8,6 +8,7 @@
 //! the paused frames and evaluate code in them.
 
 use core::cell::{Cell, RefCell};
+use core::marker::PhantomData;
 use core::ops::ControlFlow;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,11 +18,11 @@ use indexmap::IndexMap;
 use libjs_runtime_macros::Trace;
 
 use crate::breakpoint::{Breakpoint, BreakpointID};
-use crate::bytecode::basic_block::SourceMapEntry;
-use crate::bytecode::executable::{Executable, LocalVariableMetadata};
+use crate::bytecode::executable::{Executable, LocalVariableScopeRange};
+use crate::bytecode::source_map::SourceMapEntry;
 use crate::gc::foreign::ForeignCellSlot;
-use crate::gc::heap::cell_is_dead;
 use crate::gc::root::MarkedVec;
+use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak::GcWeak;
 use crate::interpreter::vm::{EvalMode, StackTraceElement, Vm};
@@ -68,16 +69,26 @@ pub enum ResumeMode {
 
 /// What the debugger tells its pause callback about where execution paused. It only lives on the stack while the
 /// callback runs, where the collector finds the cells it holds.
-pub struct PauseInfo {
+pub struct PauseInfo<'a> {
     pub executable: Gc<Executable>,
     pub bytecode_offset: u32,
     pub source_range: Option<SourceRange>,
     /// The frames from the paused one down, the first of which is where execution paused.
-    pub stack_trace: Vec<StackTraceElement>,
+    pub stack_trace: &'a [StackTraceElement],
     pub breakpoint_ids: Vec<BreakpointID>,
     pub exception: Option<Value>,
     pub exception_will_be_caught: bool,
     pub reason: PauseReason,
+    /// Only the debugger makes these, while execution is paused and the frames are on the stack.
+    _frames: PhantomData<&'a ExecutionContext>,
+}
+
+impl<'a> PauseInfo<'a> {
+    pub fn execution_context(&self, index: usize) -> &'a ExecutionContext {
+        // SAFETY: The frames of the stack trace stay on the stack while execution is paused, which it is while the
+        //         debugger lends this.
+        unsafe { self.stack_trace[index].execution_context.as_ref() }
+    }
 }
 
 #[derive(Clone, Trace)]
@@ -89,7 +100,7 @@ pub struct FrameBinding {
 
 /// The callback must call continue_execution() before it returns. It may evaluate JavaScript, in which case any pause
 /// triggered by that evaluation is ignored.
-pub type PauseCallback = Rc<dyn Fn(&Vm, &PauseInfo)>;
+pub type PauseCallback = Rc<dyn Fn(&Vm, &PauseInfo<'_>)>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BindingStorage {
@@ -158,7 +169,7 @@ impl Debugger {
         }
     }
 
-    pub fn set_pause_callback(&self, callback: impl Fn(&Vm, &PauseInfo) + 'static) {
+    pub fn set_pause_callback(&self, callback: impl Fn(&Vm, &PauseInfo<'_>) + 'static) {
         *self.pause_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
@@ -195,16 +206,22 @@ impl Debugger {
         }
         self.is_paused.set(true);
 
-        let mut stack_trace = vm.stack_trace();
-        assert!(!stack_trace.is_empty());
+        let stack_trace = vm.stack_trace();
+        let paused_frame = stack_trace.get(0).expect("execution pauses in a frame");
         let source_range = executable.source_range_at(bytecode_offset);
-        stack_trace[0].source_range = source_range.clone();
+        stack_trace.set(
+            0,
+            StackTraceElement {
+                source_range: source_range.clone(),
+                ..paused_frame
+            },
+        );
         // NB: Frames that JIT code creates get their ids when the debugger first needs them, which is when it steps
         //     from a paused frame.
         // SAFETY: The frames of the stack trace are live while execution is paused.
-        vm.frame_id_of(unsafe { stack_trace[0].execution_context.as_ref() });
+        vm.frame_id_of(unsafe { paused_frame.execution_context.as_ref() });
         self.paused_execution_context
-            .set(stack_trace[0].execution_context.as_ptr().cast_const());
+            .set(paused_frame.execution_context.as_ptr().cast_const());
         *self.paused_source_range.borrow_mut() = source_range.clone();
         pause_callback(
             vm,
@@ -212,11 +229,12 @@ impl Debugger {
                 executable,
                 bytecode_offset,
                 source_range,
-                stack_trace,
+                stack_trace: &stack_trace.values(),
                 breakpoint_ids: executable.debugger_breakpoints_at(bytecode_offset),
                 exception,
                 exception_will_be_caught,
                 reason,
+                _frames: PhantomData,
             },
         );
         assert!(!self.is_paused.get(), "the pause callback continues execution");
@@ -271,6 +289,13 @@ impl Debugger {
         // NB: The copy must hold the objects that a frame of an inlined call has markers for.
         crate::jit::translate::resolve_deferred_arguments(vm, execution_context);
         let context = execution_context.copy();
+        // NB: The copy runs as a context without a function, which keeps its own environments: the evaluated code
+        //     declares its variables in the local environment, and the variable environment of a frame of a function
+        //     without a function environment would be the function's [[Environment]].
+        context.function.set(None);
+        context.set_realm(execution_context.realm());
+        context.set_script_or_module(execution_context.script_or_module());
+        context.set_private_environment(execution_context.private_environment());
         let local_environment = new_declarative_environment(
             vm,
             context
@@ -296,13 +321,13 @@ impl Debugger {
             }
         }
         context.lexical_environment.set(Some(local_environment.upcast()));
-        context.variable_environment.set(Some(local_environment.upcast()));
+        context.set_variable_environment(Some(local_environment.upcast()));
         vm.push_execution_context_checking_stack_space(context.as_non_null())?;
         let _pop_context = ScopeGuard::new(|| {
             vm.pop_execution_context();
         });
 
-        let strict_caller = if executable.is_strict_mode {
+        let strict_caller = if executable.is_strict_mode() {
             CallerMode::Strict
         } else {
             CallerMode::NonStrict
@@ -338,7 +363,7 @@ impl Debugger {
         let executable = Executable::from_head(context.executable.get().expect("a frame runs an executable"));
 
         let mut binding_locations = IndexMap::new();
-        for (index, name) in executable.argument_variable_names.iter().enumerate() {
+        for (index, name) in executable.argument_variable_names().iter().enumerate() {
             if !name.is_empty() {
                 binding_locations.insert(
                     name.clone(),
@@ -357,27 +382,27 @@ impl Debugger {
         } else {
             executable.source_range_at(context.program_counter.get())
         };
-        let scope_is_active = |metadata: &LocalVariableMetadata| {
-            let (Some(scope_range), Some(paused_source_range)) = (metadata.scope_range, &paused_source_range) else {
+        let scope_is_active = |scope_range: Option<LocalVariableScopeRange>| {
+            let (Some(scope_range), Some(paused_source_range)) = (scope_range, &paused_source_range) else {
                 return true;
             };
             let position = paused_source_range.start;
             scope_range.start <= position && position < scope_range.end
         };
 
-        for (index, name) in executable.local_variable_names.iter().enumerate() {
+        for (index, name) in executable.local_variable_names().iter().enumerate() {
             if name.is_empty() {
                 continue;
             }
-            let metadata = executable.local_variable_metadata[index];
-            if !scope_is_active(&metadata) {
+            let scope_range = executable.local_variable_scope_range(index);
+            if !scope_is_active(scope_range) {
                 continue;
             }
 
             if let Some(existing) = binding_locations.get(name)
                 && existing.storage == BindingStorage::Local
             {
-                let Some(scope_range) = metadata.scope_range else {
+                let Some(scope_range) = scope_range else {
                     continue;
                 };
                 if existing
@@ -392,8 +417,8 @@ impl Debugger {
                 BindingLocation {
                     storage: BindingStorage::Local,
                     index,
-                    is_mutable: metadata.is_mutable,
-                    scope_start: metadata.scope_range.map(|range| range.start),
+                    is_mutable: executable.local_variable_metadata()[index].is_mutable,
+                    scope_start: scope_range.map(|range| range.start),
                 },
             );
         }
@@ -625,10 +650,10 @@ impl Debugger {
     }
 
     /// Forgets the executables that died in this collection, as LibGC prunes a WeakHashSet.
-    pub fn remove_dead_executables(&self) {
+    pub fn remove_dead_executables(&self, sweep: &Sweep<'_>) {
         self.executables
             .borrow_mut()
-            .retain(|_, executable| executable.get().is_some_and(|executable| !cell_is_dead(executable)));
+            .retain(|_, executable| executable.get().is_some_and(|executable| !sweep.is_dead(executable)));
     }
 
     fn resolve_breakpoint(&self, breakpoint: &Breakpoint) {
@@ -721,7 +746,7 @@ impl Debugger {
             return true;
         }
 
-        for entry in &executable.source_map {
+        for entry in executable.source_positions() {
             if entry.bytecode_offset > bytecode_offset && entry.line > 0 {
                 return false;
             }
@@ -748,7 +773,7 @@ unsafe impl Trace for Debugger {
 /// ExecutionContext::local_variables()
 fn local_variables<'context>(context: &'context ExecutionContext, executable: &Executable) -> &'context [Cell<Value>] {
     let local_index_base = executable.local_index_base() as usize;
-    &context.slots()[local_index_base..local_index_base + executable.local_variable_names.len()]
+    &context.slots()[local_index_base..local_index_base + executable.local_variable_names().len()]
 }
 
 fn source_code_pointer(executable: &Executable) -> *const SourceCode {
@@ -778,7 +803,7 @@ fn breakpoint_candidate_for_executable(breakpoint: &Breakpoint, executable: &Exe
     }
 
     let mut matching_entry: Option<SourceMapEntry> = None;
-    for entry in &executable.source_map {
+    for entry in executable.source_positions() {
         if entry.line == 0 || entry.line < breakpoint.line {
             continue;
         }
@@ -789,7 +814,7 @@ fn breakpoint_candidate_for_executable(breakpoint: &Breakpoint, executable: &Exe
             entry.line < matching_entry.line
                 || (entry.line == matching_entry.line && entry.column < matching_entry.column)
         }) {
-            matching_entry = Some(*entry);
+            matching_entry = Some(entry);
         }
     }
     matching_entry

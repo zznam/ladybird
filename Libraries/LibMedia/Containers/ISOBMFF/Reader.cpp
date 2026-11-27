@@ -17,6 +17,7 @@
 #include <LibMediaCodecs/Codecs/H265.h>
 #include <LibMediaCodecs/Codecs/MPEG4Audio.h>
 #include <LibMediaCodecs/Codecs/VP9.h>
+#include <LibMediaCodecs/Limits.h>
 
 #include "Reader.h"
 #include "Streamer.h"
@@ -147,6 +148,15 @@ DecoderErrorOr<void> Reader::parse_child_boxes(Streamer& streamer, BoxHeader con
         return DecoderError::format(DecoderErrorCategory::Corrupted, "Read past the end of the {} box", parent.type);
 
     while (!parent_end.has_value() || streamer.position() < parent_end.value()) {
+        // A box header takes at least a 32-bit size and a four-character type, so fewer bytes than that at the end of
+        // the parent can't start another box. Skip them, leaving the streamer at the parent's end: QuickTime files may
+        // end a sample entry's child boxes with a 32-bit zero as a terminator.
+        static constexpr size_t MINIMUM_BOX_HEADER_SIZE = sizeof(u32) + sizeof(FourCC);
+        if (parent_end.has_value() && parent_end.value() - streamer.position() < MINIMUM_BOX_HEADER_SIZE) {
+            TRY(streamer.seek_to_position(parent_end.value()));
+            break;
+        }
+
         auto child_or_error = read_box_header(streamer);
         if (child_or_error.is_error()) {
             if (!parent_end.has_value() && child_or_error.error().category() == DecoderErrorCategory::EndOfStream)
@@ -650,8 +660,10 @@ DecoderErrorOr<SampleEntry> Reader::parse_sample_entry(Streamer& streamer, BoxHe
 
     Optional<CodingIndependentCodePoints> color_from_colour_information_box;
     TRY(parse_child_boxes(streamer, header, IsTopLevel::No, [&](BoxHeader const& child) -> DecoderErrorOr<IterationDecision> {
-        auto read_configuration = [&] -> DecoderErrorOr<FixedArray<u8>> {
-            return streamer.read_bytes(child.content_size.value());
+        auto read_configuration = [&](size_t size) -> DecoderErrorOr<FixedArray<u8>> {
+            if (size > MAX_CODEC_CONFIGURATION_SIZE)
+                return DecoderError::corrupted("Codec configuration box is too large"sv);
+            return streamer.read_bytes(size);
         };
 
         auto require_sample_entry_codec = [&](auto... codec_ids) -> DecoderErrorOr<void> {
@@ -666,15 +678,15 @@ DecoderErrorOr<SampleEntry> Reader::parse_sample_entry(Streamer& streamer, BoxHe
 
         if (child.type == AVC_CONFIGURATION_BOX) {
             TRY(require_sample_entry_codec(CodecID::H264));
-            entry.codec_initialization_data = TRY(read_configuration());
+            entry.codec_initialization_data = TRY(read_configuration(child.content_size.value()));
             adopt_parameters(Codecs::H264::parse_configuration_record(entry.codec_initialization_data.span()));
         } else if (child.type == HEVC_CONFIGURATION_BOX) {
             TRY(require_sample_entry_codec(CodecID::H265));
-            entry.codec_initialization_data = TRY(read_configuration());
+            entry.codec_initialization_data = TRY(read_configuration(child.content_size.value()));
             adopt_parameters(Codecs::H265::parse_configuration_record(entry.codec_initialization_data.span()));
         } else if (child.type == AV1_CONFIGURATION_BOX) {
             TRY(require_sample_entry_codec(CodecID::AV1));
-            entry.codec_initialization_data = TRY(read_configuration());
+            entry.codec_initialization_data = TRY(read_configuration(child.content_size.value()));
             adopt_parameters(Codecs::AV1::parse_configuration_record(entry.codec_initialization_data.span()));
         } else if (child.type == VP_CONFIGURATION_BOX) {
             TRY(require_sample_entry_codec(CodecID::VP8, CodecID::VP9));
@@ -683,20 +695,47 @@ DecoderErrorOr<SampleEntry> Reader::parse_sample_entry(Streamer& streamer, BoxHe
                 return DecoderError::corrupted("VP codec configuration box is too small"sv);
             auto full_box = TRY(read_full_box_header(streamer));
             if (entry.codec_id == CodecID::VP9 && full_box.version == 1) {
-                auto record = TRY(streamer.read_bytes(child.content_size.value() - FULL_BOX_HEADER_SIZE));
+                auto record = TRY(read_configuration(child.content_size.value() - FULL_BOX_HEADER_SIZE));
                 adopt_parameters(Codecs::VP9::parse_configuration_record(record.span()));
             }
         } else if (child.type == OPUS_CONFIGURATION_BOX) {
-            auto configuration = TRY(read_configuration());
+            auto configuration = TRY(read_configuration(child.content_size.value()));
             entry.codec_initialization_data = TRY(Codecs::Opus::codec_initialization_data_from_isobmff_configuration(configuration.span()));
         } else if (child.type == FLAC_CONFIGURATION_BOX) {
-            auto configuration = TRY(read_configuration());
+            auto configuration = TRY(read_configuration(child.content_size.value()));
             entry.codec_initialization_data = TRY(Codecs::FLAC::codec_initialization_data_from_isobmff_configuration(configuration.span()));
         } else if (child.type == ELEMENTARY_STREAM_DESCRIPTOR_BOX) {
             u8 object_type_indication = 0;
             entry.codec_initialization_data = TRY(parse_elementary_stream_descriptor_box(streamer, child, entry.codec_id, object_type_indication));
             if (entry.codec_id == CodecID::AAC)
                 adopt_parameters(Codecs::AAC::parse_configuration_record(entry.codec_initialization_data.span(), object_type_indication));
+        } else if (child.type == MASTERING_DISPLAY_COLOUR_VOLUME_BOX && entry.video.has_value()) {
+            // The box holds the fields of the H.265 mastering display colour volume SEI message, whose primaries are
+            // in the order green, blue, red, with chromaticities in units of 0.00002 and luminances of 0.0001 cd/m².
+            static constexpr size_t MASTERING_DISPLAY_COLOUR_VOLUME_BOX_SIZE = 24;
+            if (child.content_size.value() < MASTERING_DISPLAY_COLOUR_VOLUME_BOX_SIZE)
+                return IterationDecision::Continue;
+            auto read_chromaticity = [&] -> DecoderErrorOr<Chromaticity> {
+                auto x = TRY(streamer.read<u16>());
+                auto y = TRY(streamer.read<u16>());
+                return Chromaticity { x * 0.00002f, y * 0.00002f };
+            };
+            MasteringDisplayColorVolume volume;
+            volume.green = TRY(read_chromaticity());
+            volume.blue = TRY(read_chromaticity());
+            volume.red = TRY(read_chromaticity());
+            volume.white_point = TRY(read_chromaticity());
+            volume.maximum_luminance = TRY(streamer.read<u32>()) * 0.0001f;
+            volume.minimum_luminance = TRY(streamer.read<u32>()) * 0.0001f;
+            entry.video->mastering_display_color_volume = volume;
+        } else if (child.type == CONTENT_LIGHT_LEVEL_BOX && entry.video.has_value()) {
+            static constexpr size_t CONTENT_LIGHT_LEVEL_BOX_SIZE = 4;
+            if (child.content_size.value() < CONTENT_LIGHT_LEVEL_BOX_SIZE)
+                return IterationDecision::Continue;
+            entry.video->content_light_level_information = ContentLightLevelInformation {
+                .maximum_content_light_level = TRY(streamer.read<u16>()),
+                .maximum_frame_average_light_level = TRY(streamer.read<u16>()),
+            };
         } else if (child.type == COLOUR_INFORMATION_BOX && entry.video.has_value()) {
             if (TRY(streamer.read_four_cc()) == NCLX_COLOUR_TYPE) {
                 auto colour_primaries = TRY(streamer.read<u16>());
@@ -772,6 +811,8 @@ DecoderErrorOr<FixedArray<u8>> Reader::parse_elementary_stream_descriptor_box(St
     auto size = TRY(read_descriptor_size(streamer));
     if (streamer.position() > end || size > end - streamer.position())
         return DecoderError::corrupted("DecoderSpecificInfo extends past the end of its box"sv);
+    if (size > MAX_CODEC_CONFIGURATION_SIZE)
+        return DecoderError::corrupted("DecoderSpecificInfo is too large"sv);
     return streamer.read_bytes(size);
 }
 

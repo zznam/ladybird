@@ -15,33 +15,13 @@ use crate::embedding::abi_types::{
     owned_utf16_string_from_abi, owned_utf16_string_into_abi, value_from_abi, vm_from_abi,
 };
 use crate::embedding::source_code::source_code_into_abi;
-use crate::gc::class::{Class, GcCell};
+use crate::gc::class::GcCell;
 use crate::layout::cell::Gc;
 use crate::layout::host_class::{JSCompletion, JSObject, JSVM, JSValue};
 use crate::layout::object::Object;
 use crate::runtime::error::Error;
 use crate::runtime::error_data::{CompactTraceback, ErrorData, ErrorDataCell};
 use crate::utf16::Utf16View;
-
-/// The error data that the embedder passes as a JSErrorData: an address js_error_data_of gave it, or a JSErrorDataCell
-/// itself, which is where a pointer to the C++ ErrorDataCell points as a pointer to the ErrorData it derives from.
-///
-/// # Safety
-///
-/// `error_data` must be the error data or the error data cell of a live cell.
-unsafe fn error_data_or_error_data_cell_from_abi<'cell>(error_data: *const JSErrorData) -> &'cell ErrorData {
-    assert!(!error_data.is_null(), "the embedder passes error data");
-    // A cell starts with its class. Error data starts with a part of its traceback's Vec or a cell pointer, neither
-    // of which is ever the address of a class.
-    // SAFETY: Both start with an initialized word.
-    let first_word = unsafe { error_data.cast::<*const Class>().read_unaligned() };
-    if core::ptr::eq(first_word, ErrorDataCell::CLASS) {
-        // SAFETY: The pointer is the address of a live error data cell.
-        return unsafe { &*error_data.cast::<ErrorDataCell>() }.error_data();
-    }
-    // SAFETY: The caller passes error data of a live cell.
-    unsafe { error_data_from_abi(error_data) }
-}
 
 /// The error data that the error_data hook of a host class returned for `object`: error data or an error data cell
 /// as js_error_data_stack_string takes it, or null for none.
@@ -51,7 +31,7 @@ unsafe fn error_data_or_error_data_cell_from_abi<'cell>(error_data: *const JSErr
 /// `error_data` must be null or the error data or error data cell of a cell that `object` keeps alive.
 pub unsafe fn error_data_from_host_hook(_object: &Object, error_data: *mut c_void) -> Option<&ErrorData> {
     // SAFETY: The caller guarantees that the object keeps the error data alive, as long as the object itself.
-    (!error_data.is_null()).then(|| unsafe { error_data_or_error_data_cell_from_abi(error_data.cast_const().cast()) })
+    (!error_data.is_null()).then(|| unsafe { error_data_from_abi(error_data.cast_const().cast()) })
 }
 
 /// Throws a new error of `kind` whose message is a copy of the code units `message` views, created the way the
@@ -122,7 +102,7 @@ pub unsafe extern "C" fn js_error_create_with_prototype(
     let vm = unsafe { vm_from_abi(vm) };
     // SAFETY: The caller passes a realm and an object of the VM.
     let (realm, prototype) = unsafe { (cell_from_abi(realm), cell_from_abi(prototype)) };
-    let error = realm.create_object(vm, Error::new(vm, Error::CLASS, prototype));
+    let error = realm.create_object(vm, |_| Error::new(vm, realm, Error::CLASS, prototype));
     cell_into_abi(error.upcast())
 }
 
@@ -213,7 +193,7 @@ pub unsafe extern "C" fn js_error_data_stack_string(
     compact: bool,
 ) -> JSOwnedUtf16String {
     // SAFETY: The caller passes error data of a live cell.
-    let error_data = unsafe { error_data_or_error_data_cell_from_abi(error_data) };
+    let error_data = unsafe { error_data_from_abi(error_data) };
     let compact = if compact {
         CompactTraceback::Yes
     } else {
@@ -222,8 +202,8 @@ pub unsafe extern "C" fn js_error_data_stack_string(
     owned_utf16_string_into_abi(error_data.stack_string(compact))
 }
 
-/// How many frames the call stack of `error_data` has, the outermost execution context included. Call on the VM's
-/// thread.
+/// How many frames the call stack of `error_data` has, the outermost execution context included when the stack was not
+/// cut at Error.stackTraceLimit. Call on the VM's thread.
 ///
 /// # Safety
 ///
@@ -231,8 +211,22 @@ pub unsafe extern "C" fn js_error_data_stack_string(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_error_data_traceback_length(error_data: *const JSErrorData) -> usize {
     // SAFETY: The caller passes error data of a live cell.
-    unsafe { error_data_or_error_data_cell_from_abi(error_data) }
-        .traceback()
+    unsafe { error_data_from_abi(error_data) }.traceback().len()
+}
+
+/// How many frames of the call stack of `error_data`, from the innermost, script can observe: those the error would
+/// keep if the VM kept no long stack traces, which js_error_data_traceback_frame writes as it writes the others. The
+/// embedder reads only these for what script can observe, so that does not change while a debugger is attached. Call
+/// on the VM's thread.
+///
+/// # Safety
+///
+/// `error_data` must be error data, or an error data cell, of a live cell of the embedder's VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_error_data_script_visible_traceback_length(error_data: *const JSErrorData) -> usize {
+    // SAFETY: The caller passes error data of a live cell.
+    unsafe { error_data_from_abi(error_data) }
+        .script_visible_traceback()
         .len()
 }
 
@@ -264,7 +258,7 @@ pub unsafe extern "C" fn js_error_data_traceback_frame(
     out: *mut JSTracebackFrame,
 ) {
     // SAFETY: The caller passes error data of a live cell.
-    let error_data = unsafe { error_data_or_error_data_cell_from_abi(error_data) };
+    let error_data = unsafe { error_data_from_abi(error_data) };
     let frame = &error_data.traceback()[index];
     let (filename, line, column) = frame.source_position();
     assert!(!out.is_null(), "the embedder passes an out parameter");
@@ -297,4 +291,17 @@ pub unsafe extern "C" fn js_error_data_cell_capture(vm: *mut JSVM) -> *mut JSErr
     // SAFETY: The caller passes its VM.
     let vm = unsafe { vm_from_abi(vm) };
     cell_into_abi(ErrorDataCell::capture(vm))
+}
+
+/// ErrorDataCell::capture_whole_stack(vm): error data with every frame of the current call stack, whatever
+/// Error.stackTraceLimit is, for a trace of the running code that is not the stack of an error. Call on the VM's thread.
+///
+/// # Safety
+///
+/// `vm` must be the embedder's VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_error_data_cell_capture_whole_stack(vm: *mut JSVM) -> *mut JSErrorDataCell {
+    // SAFETY: The caller passes its VM.
+    let vm = unsafe { vm_from_abi(vm) };
+    cell_into_abi(ErrorDataCell::capture_whole_stack(vm))
 }

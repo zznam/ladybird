@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/HashTable.h>
 #include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
@@ -35,6 +36,8 @@ public:
     virtual void form_associated_element_was_removed(DOM::Node*) override;
 
     Utf16String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+
+    bool shows_fallback_content() const { return m_representation == Representation::Children; }
 
     bool represents_its_content_navigable() const { return m_representation == Representation::ContentNavigable; }
 
@@ -74,15 +77,15 @@ private:
     bool has_ancestor_media_element_or_object_element_not_showing_fallback_content() const;
 
     void queue_element_task_to_run_object_representation_steps();
-    void run_object_representation_handler_steps(Fetch::Infrastructure::Response const&, MimeSniff::MimeType const&, ReadonlyBytes);
+    void run_object_representation_handler_steps(Fetch::Infrastructure::ResponseView const&, MimeSniff::MimeType const&, ReadonlyBytes);
     void run_object_representation_completed_steps(Representation);
     void run_object_representation_fallback_steps();
 
     void load_image();
     void update_layout_and_child_objects(Representation);
 
-    void resource_did_load(Fetch::Infrastructure::Response const&, ReadonlyBytes);
-    void resource_did_fail();
+    void resource_did_load(u64 fetch_id, Fetch::Infrastructure::ResponseView const&, ReadonlyBytes);
+    void resource_did_fail(u64 fetch_id);
 
     // ^DOM::Element
     virtual i32 default_tab_index_value() const override;
@@ -99,8 +102,16 @@ private:
 
     GC::Ptr<DOM::DocumentObserver> m_document_observer;
 
+    // The document of the last object representation task queued, while that task has not started yet.
+    GC::Ptr<DOM::Document> m_document_of_queued_object_representation_task;
+    u64 m_object_representation_task_count { 0 };
+
     Vector<DOM::DocumentLoadEventDelayer> m_document_load_event_delayer_for_object_representation_task;
     Vector<DOM::DocumentLoadEventDelayer> m_document_load_event_delayer_for_resource_load;
+
+    // The resource fetches that still delay the load event, until their response is handled or they're stopped.
+    HashTable<u64> m_pending_resource_fetches;
+    u64 m_last_resource_fetch_id { 0 };
 };
 
 }

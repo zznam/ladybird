@@ -40,7 +40,7 @@ static NonnullOwnPtr<icu::Locale> apply_usage_to_locale(icu::Locale const& local
 
     switch (usage) {
     case Usage::Sort:
-        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.bytes() }), status);
+        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.ascii_bytes() }), status);
         break;
     case Usage::Search:
         result->setUnicodeKeywordValue("co", "search", status);
@@ -170,7 +170,7 @@ public:
     SubstringSearcherImpl(icu::RuleBasedCollator const& collator, Utf16View const& haystack, Utf16View const& needle)
     {
         auto to_unicode_string = [](Utf16View const& string) {
-            if (string.has_ascii_storage()) {
+            if (string.has_latin1_storage()) {
                 auto utf8 = MUST(string.to_utf8());
                 return icu::UnicodeString::fromUTF8(icu_string_piece(utf8.bytes_as_string_view()));
             }
@@ -193,19 +193,28 @@ public:
         if (m_pattern.isEmpty() || start_offset > static_cast<size_t>(m_text.length()))
             return {};
 
-        UErrorCode status = U_ZERO_ERROR;
-        m_search->setOffset(static_cast<i32>(start_offset), status);
-        verify_icu_success(status);
+        // ICU snaps offsets inside a surrogate pair or contraction backwards, so step forward until a match doesn't.
+        auto search_offset = static_cast<i32>(start_offset);
+        while (search_offset < m_text.length()) {
+            UErrorCode status = U_ZERO_ERROR;
+            m_search->setOffset(search_offset, status);
+            verify_icu_success(status);
 
-        auto const match_start = m_search->next(status);
-        verify_icu_success(status);
-        if (match_start == USEARCH_DONE)
-            return {};
+            auto const match_start = m_search->next(status);
+            verify_icu_success(status);
+            if (match_start == USEARCH_DONE)
+                return {};
 
-        return Collator::Match {
-            .start = static_cast<size_t>(match_start),
-            .end = static_cast<size_t>(match_start + m_search->getMatchedLength()),
-        };
+            if (static_cast<size_t>(match_start) >= start_offset) {
+                return Collator::Match {
+                    .start = static_cast<size_t>(match_start),
+                    .end = static_cast<size_t>(match_start + m_search->getMatchedLength()),
+                };
+            }
+
+            search_offset = m_text.moveIndex32(search_offset, 1);
+        }
+        return {};
     }
 
 private:
@@ -225,11 +234,17 @@ public:
     virtual Collator::Order compare(Utf16View const& lhs, Utf16View const& rhs) const override
     {
         UErrorCode status = U_ZERO_ERROR;
+        UCollationResult result;
 
-        auto lhs_it = icu_string_iterator(lhs);
-        auto rhs_it = icu_string_iterator(rhs);
-
-        auto result = m_collator->compare(lhs_it, rhs_it, status);
+        // NB: ICU has no iterator over Latin-1, so a string with Latin-1 storage that is not ASCII is compared as UTF-16.
+        auto has_non_ascii_latin1_storage = [](Utf16View const& string) { return string.has_latin1_storage() && !string.has_ascii_storage(); };
+        if (has_non_ascii_latin1_storage(lhs) || has_non_ascii_latin1_storage(rhs)) {
+            result = m_collator->compare(icu_string(lhs), icu_string(rhs), status);
+        } else {
+            auto lhs_it = icu_string_iterator(lhs);
+            auto rhs_it = icu_string_iterator(rhs);
+            result = m_collator->compare(lhs_it, rhs_it, status);
+        }
         verify_icu_success(status);
 
         switch (result) {
@@ -276,10 +291,9 @@ NonnullOwnPtr<Collator> Collator::create(
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.bytes());
-    VERIFY(locale_data.has_value());
+    auto& locale_data = LocaleData::for_locale_or_default(locale);
 
-    auto locale_with_usage = apply_usage_to_locale(locale_data->locale(), usage, collation);
+    auto locale_with_usage = apply_usage_to_locale(locale_data.locale(), usage, collation);
 
     auto collator = adopt_own(*icu::Collator::createInstance(*locale_with_usage, status));
     verify_icu_success(status);

@@ -5,8 +5,10 @@
  */
 
 #include <AK/NonnullOwnPtr.h>
+#include <AK/RefCounted.h>
 #include <LibCore/EventLoop.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Function.h>
 #include <LibGC/Weak.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
@@ -27,22 +29,18 @@
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/HTML/BarProp.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
-#include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/Platform/Timer.h>
-#include <LibWeb/ResizeObserver/ResizeObserver.h>
-#include <LibWeb/WebAssembly/BindingsGlue.h>
-#include <LibWeb/WebAssembly/Instance.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace {
-
-bool s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = false;
 
 void ensure_font_plugin_installed()
 {
@@ -278,7 +276,7 @@ GC::Ref<JS::Realm> create_test_principal_realm(JS::VM& vm)
             return global_this.as_nonnull();
         });
 
-    auto realm = execution_context->realm;
+    auto realm = execution_context->realm();
     URL::Origin::OpaqueData::Nonce nonce {};
     auto origin = URL::Origin { URL::Origin::OpaqueData { nonce, URL::Origin::OpaqueData::Type::Standard } };
     Web::HTML::WindowEnvironmentSettingsObject::setup(
@@ -328,7 +326,7 @@ struct TestRealm {
         realm().vm().pop_execution_context();
     }
 
-    JS::Realm& realm() { return *execution_context->realm; }
+    JS::Realm& realm() { return *execution_context->realm(); }
 
     GC::Root<JS::Realm> principal_realm;
     NonnullOwnPtr<JS::ExecutionContext> execution_context;
@@ -475,7 +473,7 @@ TEST_CASE(global_wrapper_uses_requested_realm)
     TestRealm allocation_realm { *vm };
     auto wrappable = allocation_realm.realm().create<TestWrappable>(allocation_realm.realm());
     auto extension_execution_context = MUST(JS::Realm::initialize_host_defined_realm(*vm, nullptr, nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
 
     auto wrapper = Web::Bindings::create_global_object_wrapper(extension_realm, wrappable);
 
@@ -541,7 +539,7 @@ TEST_CASE(global_wrapper_cache_uses_realm_wrapper_world)
             return Web::Bindings::create_global_object_wrapper(realm, wrappable);
         },
         nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
     install_test_host_defined(extension_realm, Web::Bindings::WrapperWorld::Type::Extension, *main_world.principal_realm);
     Web::Bindings::cache_global_object_wrapper(extension_realm);
 
@@ -808,7 +806,7 @@ TEST_CASE(custom_element_prototype_helper_denies_realm_without_host_defined)
     auto original_prototype = main_wrapper->shape().prototype();
 
     auto bare_execution_context = MUST(JS::Realm::initialize_host_defined_realm(*vm, nullptr, nullptr));
-    auto& bare_realm = *bare_execution_context->realm;
+    auto& bare_realm = *bare_execution_context->realm();
     auto bare_prototype = JS::Object::create(bare_realm, nullptr);
 
     auto result = Web::Bindings::set_prototype_of_cached_main_world_wrapper(*wrappable, *bare_prototype);
@@ -827,7 +825,7 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     auto window = Web::HTML::Window::create();
     auto wrapper = Web::Bindings::wrap(wrapper_world, extension_realm.realm(), window);
     auto key = Web::HTML::CrossOriginKey {
-        .current_settings_object = 1,
+        .current_settings_object = Web::HTML::principal_realm_settings_object(extension_realm.realm()),
         .relevant_settings_object = 2,
         .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
     };
@@ -835,10 +833,10 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     EXPECT(!wrapper->host_data());
     JS::PropertyDescriptor descriptor;
     descriptor.value = JS::Value(false);
-    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
 
     EXPECT(wrapper->host_data());
-    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).contains(key));
+    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).get(key).has_value());
     EXPECT(wrapper_world.wrapper_for(*window, extension_realm.realm()) == wrapper);
     wrapper_world.detach();
     EXPECT(!wrapper_world.wrapper_for(*window, extension_realm.realm()));
@@ -854,16 +852,16 @@ TEST_CASE(cross_origin_descriptor_cache_does_not_root_realm_after_wrapper_dies)
         auto& wrapper_world = Web::Bindings::host_defined_wrapper_world(realm.realm());
         auto window = Web::HTML::Window::create();
         auto wrapper = Web::Bindings::wrap(wrapper_world, realm.realm(), window);
-        auto accessor = JS::NativeFunction::create(realm.realm(), [](JS::VM&) { return JS::js_undefined(); }, 0);
+        auto accessor = JS::NativeFunction::create(realm.realm(), [](JS::VM&) -> JS::ThrowCompletionOr<JS::Value> { return JS::js_undefined(); }, 0);
         auto key = Web::HTML::CrossOriginKey {
-            .current_settings_object = 1,
+            .current_settings_object = Web::HTML::principal_realm_settings_object(realm.realm()),
             .relevant_settings_object = 2,
             .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
         };
 
         JS::PropertyDescriptor descriptor;
         descriptor.get = accessor;
-        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
         weak_realm = GC::Weak<JS::Realm> { realm.realm() };
     }
 
@@ -875,23 +873,38 @@ TEST_CASE(cross_origin_descriptor_cache_does_not_root_realm_after_wrapper_dies)
     EXPECT(!weak_realm);
 }
 
-TEST_CASE(single_shot_timer_restarted_from_callback_keeps_activity_root)
+struct TimerFired : RefCounted<TimerFired> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    bool value { false };
+};
+
+// An active timer lives only as long as its owner reaches it. One that nothing reaches is collected, and must be
+// stopped then rather than fire into a callback that was collected with it.
+TEST_CASE(unreachable_active_timer_is_stopped_when_collected)
 {
     IGNORE_USE_IN_ESCAPING_LAMBDA Core::EventLoop event_loop;
     auto vm = JS::VM::create();
-    IGNORE_USE_IN_ESCAPING_LAMBDA GC::Root<Web::Platform::Timer> timer;
-    timer = Web::Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), nullptr);
-    timer->on_timeout = GC::create_function(GC::Heap::the(), [&] {
-        timer->restart(AK::Duration::from_milliseconds(1000));
+    auto fired = make_ref_counted<TimerFired>();
+    GC::Weak<Web::Platform::Timer> weak_timer;
+    [&] {
+        auto timer = Web::Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), GC::captures(fired), [](auto& fired) {
+            fired->value = true;
+        }));
+        timer->start();
+        weak_timer = *timer;
+    }();
+
+    vm->heap().collect_garbage(GC::Heap::CollectionType::CollectEverything);
+    EXPECT(!weak_timer);
+
+    auto quit_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(10), [&] {
         event_loop.quit(0);
     });
-
-    timer->start();
+    quit_timer->start();
     event_loop.exec();
 
-    EXPECT(timer->is_active());
-    EXPECT(timer->has_activity_root());
-    timer->stop();
+    EXPECT(!fired->value);
 }
 
 TEST_CASE(extension_world_hash_cache_scales)
@@ -1033,22 +1046,21 @@ TEST_CASE(relevant_global_main_world_wrapper_ignores_preferred_realm)
     auto window = GC::Ref { *traversable->active_document()->window() };
 
     auto preferred_execution_context = MUST(JS::Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
-    auto& preferred_realm = *preferred_execution_context->realm;
+    auto& preferred_realm = *preferred_execution_context->realm();
     install_test_host_defined(preferred_realm, static_cast<Web::HTML::Agent&>(*vm.agent()).main_world(), window->principal_realm());
 
-    auto bar_prop = GC::Ref { const_cast<Web::HTML::BarProp&>(*window->locationbar()) };
+    auto bar_prop = window->locationbar();
     auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(preferred_realm), preferred_realm, bar_prop);
 
     EXPECT(&wrapper_realm(*wrapper) == &window->principal_realm());
     EXPECT(&wrapper_realm(*wrapper) != &preferred_realm);
-    EXPECT(wrapper.ptr() == cached_wrapper_for(preferred_realm, *bar_prop).ptr());
+    EXPECT(wrapper.ptr() == Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(preferred_realm), preferred_realm, bar_prop).ptr());
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
 }
 
-TEST_CASE(wasm_instance_exports_are_not_shared_with_another_world)
+TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
 {
     ensure_font_plugin_installed();
 
@@ -1065,64 +1077,25 @@ TEST_CASE(wasm_instance_exports_are_not_shared_with_another_world)
     auto& window_realm = traversable->active_document()->window()->principal_realm();
 
     auto extension_execution_context = MUST(JS::Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
     install_test_host_defined(extension_realm, Web::Bindings::WrapperWorld::Type::Extension, window_realm);
 
-    static constexpr u8 empty_module_bytes[] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-    auto bytes = JS::ArrayBuffer::create(window_realm, MUST(ByteBuffer::copy(empty_module_bytes, sizeof(empty_module_bytes))));
-    auto& module_constructor = Web::Bindings::ensure_web_constructor<Web::Bindings::ModulePrototype>(window_realm, "WebAssembly.Module"_utf16_fly_string);
-    auto module_wrapper = MUST(JS::construct(vm, module_constructor, bytes.ptr()));
-    auto instance = MUST(Web::Bindings::construct_instance(window_realm, *Web::Bindings::module_from_value(module_wrapper.ptr()), nullptr));
+    // An Instance made in the window realm, whose exports object belongs to that realm.
+    GC::Ptr<JS::Object> instance_wrapper;
+    {
+        Web::HTML::TemporaryExecutionContext execution_context { window_realm };
+        static constexpr u8 empty_module_bytes[] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+        auto bytes = JS::ArrayBuffer::create(window_realm, MUST(ByteBuffer::copy(empty_module_bytes, sizeof(empty_module_bytes))));
+        auto& web_assembly = MUST(window_realm.global_object().get("WebAssembly"_utf16_fly_string)).as_object();
+        auto module = MUST(JS::construct(vm, MUST(web_assembly.get("Module"_utf16_fly_string)).as_function(), bytes.ptr()));
+        instance_wrapper = MUST(JS::construct(vm, MUST(web_assembly.get("Instance"_utf16_fly_string)).as_function(), module.ptr()));
+    }
 
-    auto exports = Web::Bindings::exports(window_realm, instance);
-    EXPECT(&exports->shape().realm() == &window_realm);
-    EXPECT_DEATH("Reading a WebAssembly instance's exports from another world", Web::Bindings::exports(extension_realm, instance));
+    // Read through the window realm's wrapper while the extension realm is the current realm.
+    EXPECT(vm.current_realm() == &extension_realm);
+    auto exports = MUST(instance_wrapper->get("exports"_utf16_fly_string));
+    EXPECT(&exports.as_object().shape().realm() == &window_realm);
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
-}
-
-// This exercises the collected-document finalization path. It does not claim
-// coverage of the ResizeObserver sweep callback: the document's destruction
-// path releases the activity root before that callback would be relevant.
-TEST_CASE(resize_observer_releases_activity_root_when_registration_document_is_collected_via_finalization)
-{
-    // The rest of this suite deliberately creates and retains unrelated VMs.
-    // Run this fixture in isolation to exercise the main-thread initialization
-    // path; avoid corrupting the shared suite state when run without a filter.
-    if (s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test)
-        return;
-
-    ensure_font_plugin_installed();
-    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
-    auto& vm = Web::Bindings::main_thread_vm();
-    auto make_document = [&]() {
-        auto client = vm.heap().allocate<TestPageClient>();
-        auto page = Web::Page::create(client);
-        client->m_page = page.ptr();
-        auto traversable = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {});
-        page->set_top_level_traversable(traversable);
-        return GC::Ref { *traversable->active_document() };
-    };
-
-    auto target_document = make_document();
-    auto target = MUST(target_document->create_element("div"_utf16, Web::Bindings::ElementCreationOptions {}));
-    auto observer_client = vm.heap().allocate<TestPageClient>();
-    auto observer_page = Web::Page::create(observer_client);
-    observer_client->m_page = observer_page.ptr();
-    auto observer_page_root = GC::make_root(observer_page);
-    GC::Ptr<Web::DOM::Document> observer_document = Web::HTML::HTMLDocument::create(*observer_page, GC::Ref { *target_document->window() });
-    auto observer = Web::ResizeObserver::ResizeObserver::create(nullptr, *observer_document);
-    auto observer_root = GC::make_root(observer);
-    GC::Weak<Web::DOM::Document> observer_document_weak { observer_document };
-
-    observer->observe(*target, {});
-    EXPECT(observer->has_activity_root());
-
-    observer_document = nullptr;
-    vm.heap().collect_garbage();
-
-    EXPECT(!observer_document_weak);
-    EXPECT(!observer->has_activity_root());
 }

@@ -10,6 +10,7 @@
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
 #include <LibMedia/FFmpeg/FFmpegChannelLayout.h>
 #include <LibMediaCodecs/FFmpeg/FFmpegHelpers.h>
+#include <LibMediaCodecs/Limits.h>
 
 extern "C" {
 #include <libswresample/swresample.h>
@@ -26,21 +27,26 @@ ErrorOr<NonnullOwnPtr<FFmpegAudioConverter>> FFmpegAudioConverter::try_create()
 
 ErrorOr<void> FFmpegAudioConverter::set_output_sample_specification(Audio::SampleSpecification specification)
 {
+    if (audio_sample_rate_is_outside_limits(specification.sample_rate()))
+        return Error::from_string_literal("Audio sample rate is outside the supported range");
     return set_sample_specifications(m_input_sample_specification, specification);
 }
 
 ErrorOr<void> FFmpegAudioConverter::set_input_sample_specification(Audio::SampleSpecification specification)
 {
+    if (audio_sample_rate_is_outside_limits(specification.sample_rate()))
+        return Error::from_string_literal("Audio sample rate is outside the supported range");
     return set_sample_specifications(specification, m_output_sample_specification);
 }
 
 ErrorOr<void> FFmpegAudioConverter::set_sample_specifications(Audio::SampleSpecification input, Audio::SampleSpecification output)
 {
-    if (m_input_sample_specification == input && m_output_sample_specification == output)
+    auto conversion_is_needed = input.is_valid() && output.is_valid() && input != output;
+    if (m_input_sample_specification == input && m_output_sample_specification == output && (!conversion_is_needed || m_context != nullptr))
         return {};
 
     ArmedScopeGuard free_context = { [&] {
-        swr_free(&m_context);
+        FFmpegFunctions::bundled().swr_free(&m_context);
         VERIFY(m_context == nullptr);
     } };
 
@@ -56,22 +62,22 @@ ErrorOr<void> FFmpegAudioConverter::set_sample_specifications(Audio::SampleSpeci
     if (output.sample_rate() > NumericLimits<int>::max())
         return Error::from_string_literal("Output sample rate is too high");
 
-    auto input_channel_layout = TRY(channel_map_to_av_channel_layout(FFmpegFunctions::bundled(), input.channel_map()));
+    auto input_channel_layout = TRY(FFmpegChannelLayout::from_channel_map(FFmpegFunctions::bundled(), input.channel_map()));
     auto input_sample_rate = static_cast<int>(input.sample_rate());
 
-    auto output_channel_layout = TRY(channel_map_to_av_channel_layout(FFmpegFunctions::bundled(), output.channel_map()));
+    auto output_channel_layout = TRY(FFmpegChannelLayout::from_channel_map(FFmpegFunctions::bundled(), output.channel_map()));
     auto output_sample_rate = static_cast<int>(output.sample_rate());
 
-    auto allocation_result = swr_alloc_set_opts2(&m_context,
-        &output_channel_layout, AVSampleFormat::AV_SAMPLE_FMT_FLTP, output_sample_rate,
-        &input_channel_layout, AVSampleFormat::AV_SAMPLE_FMT_FLTP, input_sample_rate,
+    auto allocation_result = FFmpegFunctions::bundled().swr_alloc_set_opts2(&m_context,
+        &output_channel_layout.layout(), AVSampleFormat::AV_SAMPLE_FMT_FLTP, output_sample_rate,
+        &input_channel_layout.layout(), AVSampleFormat::AV_SAMPLE_FMT_FLTP, input_sample_rate,
         0, nullptr);
     if (allocation_result < 0)
         return Error::from_string_view(av_error_code_to_string(allocation_result));
 
-    auto init_result = swr_init(m_context);
+    auto init_result = FFmpegFunctions::bundled().swr_init(m_context);
     if (init_result < 0)
-        return Error::from_string_view(av_error_code_to_string(allocation_result));
+        return Error::from_string_view(av_error_code_to_string(init_result));
 
     free_context.disarm();
     return {};
@@ -82,14 +88,14 @@ ErrorOr<int> FFmpegAudioConverter::get_maximum_output_frames(size_t input_size) 
     Checked<size_t> result = input_size;
     result /= m_input_sample_specification.channel_count();
 
-    auto delay = swr_get_delay(m_context, m_input_sample_specification.sample_rate());
+    auto delay = FFmpegFunctions::bundled().swr_get_delay(m_context, m_input_sample_specification.sample_rate());
     VERIFY(delay >= 0);
     result += delay;
 
     if (result.has_overflow() || result.value_unchecked() > NumericLimits<int>::max())
         return Error::from_string_literal("Input is too large");
 
-    auto rescaled = av_rescale_rnd(static_cast<i64>(result.value_unchecked()), m_output_sample_specification.sample_rate(), m_input_sample_specification.sample_rate(), AV_ROUND_UP);
+    auto rescaled = FFmpegFunctions::bundled().av_rescale_rnd(static_cast<i64>(result.value_unchecked()), m_output_sample_specification.sample_rate(), m_input_sample_specification.sample_rate(), AV_ROUND_UP);
     VERIFY(rescaled > 0);
     if (rescaled > NumericLimits<int>::max())
         return Error::from_string_literal("Input is too large");
@@ -151,11 +157,11 @@ ErrorOr<void> FFmpegAudioConverter::push_block(AudioBlock const& input)
         output_buffers[channel] = buffered_plane(channel).reinterpret<u8>().data();
 
     auto output_sample_rate = m_output_sample_specification.sample_rate();
-    auto delay_in_output_frames = swr_get_delay(m_context, output_sample_rate);
+    auto delay_in_output_frames = FFmpegFunctions::bundled().swr_get_delay(m_context, output_sample_rate);
     VERIFY(delay_in_output_frames >= 0);
     auto output_media_time_start = input.media_time_start() - AK::Duration::from_time_units(delay_in_output_frames, 1, output_sample_rate);
 
-    auto converted_frames_result = swr_convert(m_context, output_buffers.data(), maximum_output_frames, input_buffers.data(), input_frame_count);
+    auto converted_frames_result = FFmpegFunctions::bundled().swr_convert(m_context, output_buffers.data(), maximum_output_frames, input_buffers.data(), input_frame_count);
     if (converted_frames_result < 0)
         return Error::from_string_view(av_error_code_to_string(converted_frames_result));
     VERIFY(converted_frames_result <= maximum_output_frames);
@@ -198,7 +204,7 @@ void FFmpegAudioConverter::signal_end_of_stream()
 
     // swr_get_out_samples() returns an upper bound on the output of the next swr_convert() call, which FFmpeg itself
     // asserts against, so a single flush with this capacity fully drains the resampler.
-    auto flush_capacity = swr_get_out_samples(m_context, 0);
+    auto flush_capacity = FFmpegFunctions::bundled().swr_get_out_samples(m_context, 0);
     if (flush_capacity <= 0)
         return;
     if (ensure_buffer_capacity(static_cast<size_t>(flush_capacity), m_output_sample_specification.channel_count()).is_error()) {
@@ -210,7 +216,7 @@ void FFmpegAudioConverter::signal_end_of_stream()
     for (size_t channel = 0; channel < m_output_sample_specification.channel_count(); channel++)
         output_buffers[channel] = buffered_plane(channel).reinterpret<u8>().data();
 
-    auto flushed_frames_result = swr_convert(m_context, output_buffers.data(), flush_capacity, nullptr, 0);
+    auto flushed_frames_result = FFmpegFunctions::bundled().swr_convert(m_context, output_buffers.data(), flush_capacity, nullptr, 0);
     if (flushed_frames_result <= 0) {
         if (flushed_frames_result < 0)
             dbgln("FFmpegAudioConverter: Failed to flush the resampler at the end of the stream: {}", av_error_code_to_string(flushed_frames_result));
@@ -238,14 +244,14 @@ void FFmpegAudioConverter::flush()
     m_buffered_frame_offset = 0;
     m_end_of_stream = false;
     if (m_context != nullptr) {
-        auto result = swr_init(m_context);
+        auto result = FFmpegFunctions::bundled().swr_init(m_context);
         VERIFY(result >= 0);
     }
 }
 
 FFmpegAudioConverter::~FFmpegAudioConverter()
 {
-    swr_free(&m_context);
+    FFmpegFunctions::bundled().swr_free(&m_context);
 }
 
 }

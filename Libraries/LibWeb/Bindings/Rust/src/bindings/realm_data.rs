@@ -12,9 +12,19 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use libjs_rust::api::{EmbedderCell, EmbedderClass, EmbedderValue, FunctionObject, Gc, Realm, Trace, Vm};
+use libjs_rust::api::{
+    EmbedderCell, EmbedderClass, EmbedderValue, FunctionObject, Gc, GcRefCell, Object, Realm, Trace, Vm,
+};
+
+use crate::bindings::interface::Ref;
 
 use crate::bindings::services::web_bindings_wrapper_world;
+use crate::event_timing::event_timing::WindowEventTimingStateRef;
+use crate::gamepad::navigator_gamepad::NavigatorGamepadRef;
+use crate::html::mime_type::MimeType;
+use crate::html::plugin::Plugin;
+use crate::performance_timeline::performance_timeline::PerformanceTimelineRef;
+use crate::web_assembly::tag::Tag;
 
 /// The wrapper world of a realm, Web::Bindings::WrapperWorld, which the realm keeps alive.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,6 +48,24 @@ pub(crate) struct RealmData {
     pub(crate) count_queuing_strategy_size_function: Cell<Option<Gc<FunctionObject>>>,
     /// https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
     pub(crate) byte_length_queuing_strategy_size_function: Cell<Option<Gc<FunctionObject>>>,
+    /// The NativeError prototypes and constructors of WebAssembly.CompileError, LinkError and RuntimeError,
+    /// https://webassembly.github.io/spec/js-api/#error-objects
+    pub(crate) webassembly_error_prototypes: [Cell<Option<Gc<Object>>>; 3],
+    pub(crate) webassembly_error_constructors: [Cell<Option<Gc<Object>>>; 3],
+    /// The Tag object of the JavaScript exception tag, https://webassembly.github.io/spec/js-api/#javascript-exception-tag
+    pub(crate) webassembly_js_tag: Cell<Option<Ref<Tag>>>,
+    /// https://w3c.github.io/performance-timeline/#performance-timeline
+    pub(crate) performance_timeline: Cell<Option<PerformanceTimelineRef>>,
+    /// https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
+    pub(crate) performance_observer_supported_entry_types: Cell<Option<Gc<Object>>>,
+    /// https://w3c.github.io/event-timing/#sec-modifications-HTML
+    pub(crate) event_timing_state: Cell<Option<WindowEventTimingStateRef>>,
+    /// https://w3c.github.io/gamepad/#internal-slots
+    pub(crate) navigator_gamepad: Cell<Option<NavigatorGamepadRef>>,
+    /// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-plugin-objects
+    pub(crate) pdf_viewer_plugin_objects: GcRefCell<Vec<Ref<Plugin>>>,
+    /// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-mime-type-objects
+    pub(crate) pdf_viewer_mime_type_objects: GcRefCell<Vec<Ref<MimeType>>>,
 }
 
 static REALM_DATA_CLASS: EmbedderClass<RealmData> = EmbedderClass::new("RealmData");
@@ -51,7 +79,7 @@ pub(crate) fn realm_data(vm: &Vm, realm: Gc<Realm>) -> Gc<EmbedderCell<RealmData
     if let Some(data) = realm.embedder_data::<RealmData>() {
         return data;
     }
-    let data = REALM_DATA_CLASS.allocate(vm, RealmData::default());
+    let data = REALM_DATA_CLASS.allocate(vm, |_| RealmData::default());
     realm.set_embedder_data(data);
     data
 }

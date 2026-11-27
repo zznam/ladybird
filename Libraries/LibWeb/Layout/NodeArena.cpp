@@ -8,6 +8,7 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/HTML/HTMLEmbedElement.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -33,6 +34,11 @@ Node* NodeArena::node_if_live(Layout::BegunRead const& read, Compositing::RustFF
     return static_cast<Node*>(RustFFI::render_state_node_shell_if_live(host(), &read, slot));
 }
 
+void NodeArena::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    visitor.visit(m_document);
+}
+
 void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
 {
     RustFFI::render_state_set_box_presence_host(host(), this, [](void* context, u32 style_node, u8 bits) {
@@ -41,8 +47,13 @@ void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
         GC::Ptr<DOM::Node> node = &document;
         if (style_node != 0)
             node = document.style_computer().node_for_style_node(CSS::StyleNodeID { style_node });
-        if (node)
-            node->set_box_presence({}, bits & RustFFI::BOX_PRESENCE_HAS_LAYOUT_BOX, bits & RustFFI::BOX_PRESENCE_HAS_COMMITTED_BOX);
+        if (node) {
+            bool has_layout_box = bits & RustFFI::BOX_PRESENCE_HAS_LAYOUT_BOX;
+            bool changed = node->has_layout_box() != has_layout_box;
+            node->set_box_presence({}, has_layout_box, bits & RustFFI::BOX_PRESENCE_HAS_COMMITTED_BOX);
+            if (changed && is<HTML::HTMLEmbedElement>(*node))
+                as<HTML::HTMLEmbedElement>(*node).rendering_changed();
+        }
     });
 }
 

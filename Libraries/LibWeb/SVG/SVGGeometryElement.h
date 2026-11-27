@@ -7,6 +7,7 @@
 #pragma once
 
 #include <LibWeb/Geometry/DOMPoint.h>
+#include <LibWeb/SVG/Path.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
 namespace Web::SVG {
@@ -20,7 +21,8 @@ public:
 
     virtual CSS::ElementBoxKind box_kind() const override;
 
-    Gfx::Path computed_path();
+    // https://svgwg.org/svg2-draft/paths.html#TermEquivalentPath
+    Vector<PathVertex> equivalent_path_vertices();
 
     WebIDL::ExceptionOr<bool> is_point_in_fill(Bindings::DOMPointInit const&);
     WebIDL::ExceptionOr<bool> is_point_in_stroke(Bindings::DOMPointInit const&);
@@ -29,9 +31,13 @@ public:
 
     GC::Ref<SVGAnimatedNumber> path_length();
 
+    // The pathLength attribute's value, where it parses as a number.
+    Optional<float> author_path_length() const;
+
 protected:
     SVGGeometryElement(DOM::Document& document, DOM::QualifiedName qualified_name);
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
 private:
     bool with_computed_values(Function<void(CSSPixelSize viewport_size, CSS::ComputedValues const&)> const&);

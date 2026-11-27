@@ -21,11 +21,11 @@ pub(crate) mod buffer_source;
 #[cfg(not(test))]
 pub(crate) mod canvas;
 #[cfg(not(test))]
+pub(crate) mod context_loss;
+#[cfg(not(test))]
 pub(crate) mod exports;
 #[cfg(not(test))]
 pub(crate) mod extensions;
-#[cfg(not(test))]
-pub(crate) mod fingerprint;
 #[cfg(not(test))]
 pub(crate) mod gl_string;
 #[cfg(not(test))]
@@ -50,6 +50,8 @@ pub(crate) mod web_gl2_rendering_context_overloads;
 pub(crate) mod web_gl_active_info;
 #[cfg(not(test))]
 pub(crate) mod web_gl_buffer;
+#[cfg(not(test))]
+pub(crate) mod web_gl_context_event;
 #[cfg(not(test))]
 pub(crate) mod web_gl_draw_buffers;
 #[cfg(not(test))]
@@ -99,6 +101,7 @@ extensions::modules_of_extension_interfaces_without_operations! {
     oes_element_index_uint::OESElementIndexUint,
     /// https://registry.khronos.org/webgl/extensions/OES_standard_derivatives/
     oes_standard_derivatives::OESStandardDerivatives,
+    oes_texture_float::OESTextureFloat,
     /// https://registry.khronos.org/webgl/extensions/WEBGL_compressed_texture_s3tc/
     web_gl_compressed_texture_s3tc::WebGLCompressedTextureS3tc {
         compressed_texture_formats_enabled_when_created: [

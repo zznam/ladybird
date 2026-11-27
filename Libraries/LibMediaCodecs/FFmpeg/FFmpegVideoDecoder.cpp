@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <LibCore/System.h>
 #include <LibGfx/YUVData.h>
 #include <LibMediaCodecs/CodedFrame.h>
@@ -12,6 +13,7 @@
 #include "FFmpegVideoDecoder.h"
 #include <LibMediaCodecs/FFmpeg/FFmpegFunctions.h>
 #include <LibMediaCodecs/FFmpeg/FFmpegHelpers.h>
+#include <LibMediaCodecs/Limits.h>
 
 namespace Media::FFmpeg {
 
@@ -47,6 +49,7 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create
 
     TRY(set_codec_initialization_data(functions, *codec_context, codec_id, codec_initialization_data));
     VERIFY(functions.av_opt_set_int(codec_context, "threads", min(Core::System::hardware_concurrency(), 4u), 0) == 0);
+    VERIFY(functions.av_opt_set_int(codec_context, "max_pixels", MAX_VIDEO_FRAME_AREA, 0) == 0);
 
     if (functions.avcodec_open2(codec_context, codec, nullptr) < 0)
         return DecoderError::format(DecoderErrorCategory::Unknown, "Unknown error occurred when opening FFmpeg codec {}", codec_id);
@@ -64,7 +67,7 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create
         return DecoderError::format(DecoderErrorCategory::Memory, "Failed to create a video frame pool: {}", frame_pool_result.release_error());
 
     memory_guard.disarm();
-    return DECODER_TRY_ALLOC(try_make<FFmpegVideoDecoder>(functions, codec_context, packet, frame, frame_pool_result.release_value()));
+    return DECODER_TRY_ALLOC(try_make<FFmpegVideoDecoder>(functions, codec_id, codec_initialization_data, codec_context, packet, frame, frame_pool_result.release_value()));
 }
 
 Optional<DecoderCapabilities> FFmpegVideoDecoder::capabilities(ParsedCodec const& codec)
@@ -77,12 +80,13 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create
     return try_create(FFmpegFunctions::bundled(), codec_id, codec_initialization_data);
 }
 
-FFmpegVideoDecoder::FFmpegVideoDecoder(FFmpegFunctions const& functions, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool)
+FFmpegVideoDecoder::FFmpegVideoDecoder(FFmpegFunctions const& functions, CodecID codec_id, ReadonlyBytes codec_initialization_data, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool)
     : m_functions(functions)
     , m_codec_context(codec_context)
     , m_packet(packet)
     , m_frame(frame)
     , m_frame_pool(move(frame_pool))
+    , m_frames_awaiting_output(codec_id, codec_initialization_data)
 {
 }
 
@@ -111,7 +115,7 @@ void FFmpegVideoDecoder::signal_end_of_stream()
     VERIFY(result == 0 || result == AVERROR_EOF);
 }
 
-DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(CodingIndependentCodePoints const& container_cicp, [[maybe_unused]] Optional<AK::Duration> target)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(ColorMetadata const& container_color_metadata, [[maybe_unused]] Optional<AK::Duration> target)
 {
     while (!m_pending_frame.has_value()) {
         auto result = m_functions.avcodec_receive_frame(m_codec_context, m_frame);
@@ -139,7 +143,9 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(C
         }
     }
 
-    auto cicp = coding_independent_code_points_of(m_functions, *m_codec_context, container_cicp);
+    auto color_metadata = container_color_metadata;
+    color_metadata.adopt_specified_values(m_pending_frame->high_dynamic_range_metadata);
+    color_metadata.cicp = coding_independent_code_points_of(m_functions, *m_codec_context, container_color_metadata.cicp);
 
     auto pixel_format = static_cast<AVPixelFormat>(m_frame->format);
     auto bit_depth = [&]() -> Optional<u8> {
@@ -150,14 +156,20 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(C
         case AV_PIX_FMT_YUVJ420P:
         case AV_PIX_FMT_YUVJ422P:
         case AV_PIX_FMT_YUVJ444P:
+        case AV_PIX_FMT_GBRP:
+        case AV_PIX_FMT_GRAY8:
             return 8;
         case AV_PIX_FMT_YUV420P10:
         case AV_PIX_FMT_YUV422P10:
         case AV_PIX_FMT_YUV444P10:
+        case AV_PIX_FMT_GBRP10:
+        case AV_PIX_FMT_GRAY10:
             return 10;
         case AV_PIX_FMT_YUV420P12:
         case AV_PIX_FMT_YUV422P12:
         case AV_PIX_FMT_YUV444P12:
+        case AV_PIX_FMT_GBRP12:
+        case AV_PIX_FMT_GRAY12:
             return 12;
         default:
             return {};
@@ -172,6 +184,10 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(C
         case AV_PIX_FMT_YUV420P10:
         case AV_PIX_FMT_YUV420P12:
         case AV_PIX_FMT_YUVJ420P:
+        // A picture with no chroma is given the smallest chroma planes there are.
+        case AV_PIX_FMT_GRAY8:
+        case AV_PIX_FMT_GRAY10:
+        case AV_PIX_FMT_GRAY12:
             return Subsampling::yuv420();
         case AV_PIX_FMT_YUV422P:
         case AV_PIX_FMT_YUV422P10:
@@ -193,18 +209,13 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(C
     if (!acquired_slot.has_value())
         return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every video frame slot is held elsewhere"sv);
 
-    auto pool_slot_result = m_frame_pool->try_adopt_acquired_slot(*acquired_slot);
-    if (pool_slot_result.is_error())
-        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate a pooled frame slot reference"sv);
-    auto pool_slot = pool_slot_result.release_value();
-
-    auto yuv_data = DECODER_TRY_ALLOC(Gfx::YUVData::create(size, *bit_depth, subsampling, cicp,
+    auto yuv_data = DECODER_TRY_ALLOC(Gfx::YUVData::create(size, *bit_depth, subsampling, color_metadata.cicp,
         acquired_slot->bytes.slice(0, layout.y_size),
         acquired_slot->bytes.slice(layout.u_offset, layout.u_size),
         acquired_slot->bytes.slice(layout.v_offset, layout.v_size)));
     TRY(copy_pending_frame_into(yuv_data));
 
-    auto frame = DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(m_pending_frame->timestamp, m_pending_frame->duration, size.to_type<u32>(), *bit_depth, subsampling, cicp, move(pool_slot)));
+    auto frame = DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(m_pending_frame->timestamp, m_pending_frame->duration, size.to_type<u32>(), *bit_depth, subsampling, move(color_metadata), acquired_slot->storage));
     m_pending_frame.clear();
     return frame;
 }
@@ -220,7 +231,20 @@ DecoderErrorOr<void> FFmpegVideoDecoder::copy_pending_frame_into(Gfx::YUVData& y
 
     auto component_size = yuv_data.bit_depth() <= 8 ? 1 : 2;
 
+    auto pixel_format = static_cast<AVPixelFormat>(m_frame->format);
+    auto has_chroma = !first_is_one_of(pixel_format, AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12);
+
     for (u32 plane = 0; plane < 3; plane++) {
+        if (plane > 0 && !has_chroma) {
+            // The chroma planes of a picture without chroma are filled with the level that adds no color.
+            auto neutral_chroma = 1u << (yuv_data.bit_depth() - 1);
+            if (component_size == 1)
+                buffers[plane].fill(static_cast<u8>(neutral_chroma));
+            else
+                buffers[plane].reinterpret<u16>().fill(static_cast<u16>(neutral_chroma));
+            continue;
+        }
+
         VERIFY(m_frame->linesize[plane] != 0);
         if (m_frame->linesize[plane] < 0)
             return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "Reversed scanlines are not supported"sv);
@@ -249,7 +273,7 @@ void FFmpegVideoDecoder::flush()
 {
     m_functions.avcodec_flush_buffers(m_codec_context);
     m_pending_frame.clear();
-    m_frames_awaiting_output.clear();
+    m_frames_awaiting_output.flush();
 }
 
 }

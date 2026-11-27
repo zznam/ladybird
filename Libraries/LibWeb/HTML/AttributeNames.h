@@ -36,6 +36,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(background, "background")                                           \
     __ENUMERATE_HTML_ATTRIBUTE(behavior, "behavior")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(bgcolor, "bgcolor")                                                 \
+    __ENUMERATE_HTML_ATTRIBUTE(blocking, "blocking")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(border, "border")                                                   \
     __ENUMERATE_HTML_ATTRIBUTE(bordercolor, "bordercolor")                                         \
     __ENUMERATE_HTML_ATTRIBUTE(bottommargin, "bottommargin")                                       \
@@ -245,6 +246,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(onseeking, "onseeking")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(onselect, "onselect")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(onselectionchange, "onselectionchange")                             \
+    __ENUMERATE_HTML_ATTRIBUTE(onselectstart, "onselectstart")                                     \
     __ENUMERATE_HTML_ATTRIBUTE(onslotchange, "onslotchange")                                       \
     __ENUMERATE_HTML_ATTRIBUTE(onstalled, "onstalled")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(onstorage, "onstorage")                                             \

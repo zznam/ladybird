@@ -1,4 +1,7 @@
+ladybird_test_suite(AudioServer)
+
 set(TEST_SOURCES
+    TestCaptureActivity.cpp
     TestCaptureDevices.cpp
     TestPlatformPlaybackStream.cpp
     TestPlaybackStreamMixer.cpp
@@ -6,6 +9,5 @@ set(TEST_SOURCES
     TestRemoteRecordStream.cpp
 )
 
-foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" AudioServer LIBS audioserverservice LibAudio LibCore LibIPC LibMedia LibThreading)
-endforeach()
+target_sources(TestAudioServer PRIVATE ${TEST_SOURCES})
+target_link_libraries(TestAudioServer PRIVATE audioserverservice LibAudio LibCore LibIPC LibMedia LibThreading)

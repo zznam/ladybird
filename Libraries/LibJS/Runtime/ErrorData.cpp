@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
 #include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/ErrorData.h>
 #include <LibJS/Runtime/VM.h>
@@ -19,16 +18,10 @@ static JSErrorData const* error_data_to_abi(ErrorData const& error_data)
     return reinterpret_cast<JSErrorData const*>(&error_data);
 }
 
-static SourceRange const& source_range_of_a_frame_without_one()
-{
-    static NeverDestroyed<SourceRange> source_range { SourceRange { SourceCode::create({}, Utf16String {}), {} } };
-    return *source_range;
-}
-
-SourceRange const& TracebackFrame::source_range() const
+SourceRange TracebackFrame::source_range() const
 {
     if (!cached_source_range.has_value())
-        return source_range_of_a_frame_without_one();
+        return SourceRange { SourceCode::create({}, Utf16String {}), {} };
     return *cached_source_range;
 }
 
@@ -37,11 +30,8 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
     return owned_utf16_string_from_abi(js_error_data_stack_string(error_data_to_abi(*this), compact == CompactTraceback::Yes));
 }
 
-Vector<TracebackFrame, 32> ErrorData::traceback() const
+static Vector<TracebackFrame, 32> innermost_traceback_frames(JSErrorData const* error_data, size_t frame_count)
 {
-    auto const* error_data = error_data_to_abi(*this);
-    auto frame_count = js_error_data_traceback_length(error_data);
-
     Vector<TracebackFrame, 32> traceback;
     traceback.ensure_capacity(frame_count);
     for (size_t index = 0; index < frame_count; ++index) {
@@ -56,9 +46,28 @@ Vector<TracebackFrame, 32> ErrorData::traceback() const
     return traceback;
 }
 
+Vector<TracebackFrame, 32> ErrorData::traceback() const
+{
+    auto const* error_data = error_data_to_abi(*this);
+    return innermost_traceback_frames(error_data, js_error_data_traceback_length(error_data));
+}
+
+Vector<TracebackFrame, 32> ErrorData::script_visible_traceback() const
+{
+    auto const* error_data = error_data_to_abi(*this);
+    return innermost_traceback_frames(error_data, js_error_data_script_visible_traceback_length(error_data));
+}
+
 GC::Ref<ErrorDataCell> ErrorDataCell::capture(VM& vm)
 {
     auto* cell = js_error_data_cell_capture(vm_to_abi(vm));
+    VERIFY(cell);
+    return cell_ref_from_abi<ErrorDataCell>(cell);
+}
+
+GC::Ref<ErrorDataCell> ErrorDataCell::capture_whole_stack(VM& vm)
+{
+    auto* cell = js_error_data_cell_capture_whole_stack(vm_to_abi(vm));
     VERIFY(cell);
     return cell_ref_from_abi<ErrorDataCell>(cell);
 }

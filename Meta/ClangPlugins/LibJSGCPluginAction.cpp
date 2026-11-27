@@ -7,6 +7,7 @@
 
 #include "LibJSGCPluginAction.h"
 #include <array>
+#include <clang/AST/IgnoreExpr.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/SourceManager.h>
@@ -98,6 +99,72 @@ static bool type_has_visit_edges_method(clang::CXXRecordDecl const* record)
     return false;
 }
 
+// The definition of the record a type names, or for a dependent specialization, of the template it specializes.
+static clang::CXXRecordDecl const* record_named_by_type(clang::QualType type)
+{
+    if (auto const* record = type->getAsCXXRecordDecl())
+        return record->getDefinition();
+    if (auto const* specialization = type->getAs<clang::TemplateSpecializationType>()) {
+        if (auto const* class_template = llvm::dyn_cast_or_null<clang::ClassTemplateDecl>(specialization->getTemplateName().getAsTemplateDecl()))
+            return class_template->getTemplatedDecl()->getDefinition();
+    }
+    return nullptr;
+}
+
+static bool record_inherits_from_weak_container(clang::CXXRecordDecl const& record)
+{
+    for (auto const& base : record.bases()) {
+        auto const* base_record = record_named_by_type(base.getType());
+        if (!base_record)
+            continue;
+        if (base_record->getQualifiedNameAsString() == "GC::WeakContainer" || record_inherits_from_weak_container(*base_record))
+            return true;
+    }
+    return false;
+}
+
+static bool type_names_weak_vector(clang::QualType type)
+{
+    if (auto const* specialization = type->getAs<clang::TemplateSpecializationType>()) {
+        auto const* template_decl = specialization->getTemplateName().getAsTemplateDecl();
+        return template_decl && template_decl->getQualifiedNameAsString() == "GC::WeakVector";
+    }
+    auto const* specialization = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(type->getAsCXXRecordDecl());
+    return specialization && specialization->getSpecializedTemplate()->getQualifiedNameAsString() == "GC::WeakVector";
+}
+
+// Whether a value of the type holds a GC::WeakVector, itself or in an array element, template argument, base or field
+// of a type it holds.
+static bool type_holds_weak_vector(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited)
+{
+    while (auto const* array = type->getAsArrayTypeUnsafe())
+        type = array->getElementType();
+
+    if (type_names_weak_vector(type))
+        return true;
+
+    auto const* record = record_named_by_type(type);
+    if (!record || record_inherits_from_cell(*record) || !visited.insert(record).second)
+        return false;
+
+    if (auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+        for (auto const& argument : specialization->getTemplateArgs().asArray()) {
+            if (argument.getKind() == clang::TemplateArgument::Type && type_holds_weak_vector(argument.getAsType(), visited))
+                return true;
+        }
+    }
+
+    for (auto const& base : record->bases()) {
+        if (type_holds_weak_vector(base.getType(), visited))
+            return true;
+    }
+    for (auto const* field : record->fields()) {
+        if (type_holds_weak_vector(field->getType(), visited))
+            return true;
+    }
+    return false;
+}
+
 enum class ContainsGCPtrResult {
     No,
     Yes,
@@ -143,11 +210,8 @@ static ContainsGCPtrResult record_contains_gc_ptr(clang::CXXRecordDecl const* re
         "GC::RootHashTableBase",
         "GC::Heap",
         "GC::MarkedVector",
-        "GC::ConservativeVector",
-        "GC::ConservativeHashMap",
-        "GC::ConservativeHashMapBase",
-        "GC::ConservativeHashTable",
-        "GC::ConservativeHashTableBase",
+        "GC::RootHashMap",
+        "GC::RootHashMapBase",
     };
     if (gc_infrastructure_types.contains(qualified_name)) {
         s_contains_gc_ptr_cache[record] = ContainsGCPtrResult::No;
@@ -209,12 +273,12 @@ static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std
         if (template_name == "GC::Ptr" || template_name == "GC::Ref")
             return ContainsGCPtrResult::Yes;
 
-        // Raw pointers don't need visiting
-        if (template_name == "GC::RawPtr" || template_name == "GC::RawRef")
+        // A weak vector's owner prunes it of dead cells instead of visiting it
+        if (template_name == "GC::WeakVector")
             return ContainsGCPtrResult::No;
 
         // Root types handle their own visiting
-        if (template_name == "GC::Root" || template_name == "GC::RootVector" || template_name == "GC::ConservativeHashMap" || template_name == "GC::ConservativeHashTable" || template_name == "GC::RootHashTable")
+        if (template_name == "GC::Root" || template_name == "GC::RootVector" || template_name == "GC::RootHashMap" || template_name == "GC::RootHashTable")
             return ContainsGCPtrResult::No;
 
         // Check template arguments recursively for containers
@@ -251,11 +315,8 @@ static std::vector<clang::QualType> get_all_qualified_types(clang::QualType cons
         static std::unordered_set<std::string> gc_relevant_type_names {
             "GC::Ptr",
             "GC::Ref",
-            "GC::RawPtr",
-            "GC::RawRef",
             "GC::RootVector",
-            "GC::ConservativeHashMap",
-            "GC::ConservativeHashTable",
+            "GC::RootHashMap",
             "GC::RootHashTable",
             "GC::Root",
         };
@@ -280,7 +341,6 @@ static std::vector<clang::QualType> get_all_qualified_types(clang::QualType cons
 }
 enum class OuterType {
     GCPtr,
-    RawPtr,
     Root,
     Ptr,
     Ref,
@@ -306,8 +366,6 @@ static std::optional<QualTypeGCInfo> validate_qualified_type(clang::QualType con
         OuterType outer_type;
         if (template_type_name == "GC::Ptr" || template_type_name == "GC::Ref") {
             outer_type = OuterType::GCPtr;
-        } else if (template_type_name == "GC::RawPtr" || template_type_name == "GC::RawRef") {
-            outer_type = OuterType::RawPtr;
         } else if (template_type_name == "GC::Root") {
             outer_type = OuterType::Root;
         } else {
@@ -377,6 +435,9 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
 
     validate_engine_subclass_is_in_libjs(*record);
 
+    remember_polymorphic_subclass(*record);
+    remember_claim_of_no_cell_edges(*record);
+
     auto& diag_engine = m_context.getDiagnostics();
     std::vector<clang::FieldDecl const*> fields_that_need_visiting;
     std::vector<clang::FieldDecl const*> substruct_fields_that_need_visiting;
@@ -417,11 +478,11 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
                                 << "GC::Ptr";
                     }
                 }
-            } else if (outer_type == OuterType::GCPtr || outer_type == OuterType::RawPtr || outer_type == OuterType::Value) {
+            } else if (outer_type == OuterType::GCPtr || outer_type == OuterType::Value) {
                 if (!base_type_inherits_from_cell) {
                     auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "Specialization type must inherit from GC::Cell");
                     diag_engine.Report(field->getLocation(), diag_id);
-                } else if (outer_type != OuterType::RawPtr) {
+                } else {
                     fields_that_need_visiting.push_back(field);
                 }
             } else if (outer_type == OuterType::Root) {
@@ -443,10 +504,29 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         }
     }
 
+    if (record_is_cell && !record_inherits_from_weak_container(*record)) {
+        auto member_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
+            "Member %0 holds a GC::WeakVector, but %1 is not a GC::WeakContainer that removes its dead cells");
+        auto base_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
+            "Base %0 holds a GC::WeakVector, but %1 is not a GC::WeakContainer that removes its dead cells");
+        for (auto const& base : record->bases()) {
+            std::set<clang::CXXRecordDecl const*> visited;
+            if (type_holds_weak_vector(base.getType(), visited))
+                diag_engine.Report(base.getBeginLoc(), base_diag_id) << base.getType() << record;
+        }
+        for (auto const* field : record->fields()) {
+            std::set<clang::CXXRecordDecl const*> visited;
+            if (type_holds_weak_vector(field->getType(), visited))
+                diag_engine.Report(field->getLocation(), member_diag_id) << field << record;
+        }
+    }
+
     // Non-Cell types don't need visit_edges just for existing - they only need it
     // when used as a member of a Cell (checked below for Cell types).
     // However, if they DO have visit_edges, verify it visits all GC members.
     if (!record_is_cell) {
+        validate_gc_members_of_polymorphic_record(*record);
+
         // Check if this non-Cell type has a visit_edges method
         clang::DeclarationName name = &m_context.Idents.get("visit_edges");
         auto const* visit_edges_method = record->lookup(name).find_first<clang::CXXMethodDecl>();
@@ -1069,8 +1149,12 @@ bool LibJSGCVisitor::VisitClassTemplateDecl(clang::ClassTemplateDecl* class_temp
         return true;
 
     for (auto const* specialization : class_template->specializations()) {
-        if (specialization->getSpecializationKind() == clang::TSK_ImplicitInstantiation && specialization->isCompleteDefinition())
-            validate_engine_subclass_is_in_libjs(*specialization);
+        if (specialization->getSpecializationKind() != clang::TSK_ImplicitInstantiation || !specialization->isCompleteDefinition())
+            continue;
+        validate_engine_subclass_is_in_libjs(*specialization);
+        remember_polymorphic_subclass(*specialization);
+        if (!record_inherits_from_cell(*specialization))
+            validate_gc_members_of_polymorphic_record(*specialization);
     }
     return true;
 }
@@ -1100,11 +1184,6 @@ static bool is_type_that_does_not_store_gc_pointers_by_value(std::string const& 
         "AK::RefPtr",
         "AK::Span",
         "AK::WeakPtr",
-        "GC::ConservativeHashMap",
-        "GC::ConservativeHashTable",
-        "GC::ConservativeVector",
-        "GC::RawPtr",
-        "GC::RawRef",
         "GC::Root",
         "GC::RootHashMap",
         "GC::RootHashTable",
@@ -1112,12 +1191,12 @@ static bool is_type_that_does_not_store_gc_pointers_by_value(std::string const& 
         "GC::Weak",
         "GC::WeakHashMap",
         "GC::WeakHashSet",
+        "GC::WeakVector",
     };
     return template_names.contains(template_name);
 }
 
-// The template arguments as written keep alias templates such as GC::RawPtr, which the canonical arguments of a
-// specialization resolve to the template they alias. A dependent type such as Vector<GC::Ref<T>> only has those.
+// A dependent type such as Vector<GC::Ref<T>> only has the template arguments as written.
 static std::optional<TemplateInstance> template_instance_of_type(clang::QualType type)
 {
     if (auto const* specialization_type = type->getAs<clang::TemplateSpecializationType>()) {
@@ -1125,7 +1204,7 @@ static std::optional<TemplateInstance> template_instance_of_type(clang::QualType
         if (!template_decl)
             return {};
         auto template_name = template_decl->getQualifiedNameAsString();
-        if (specialization_type->isTypeAlias() && !is_type_that_does_not_store_gc_pointers_by_value(template_name))
+        if (specialization_type->isTypeAlias())
             return template_instance_of_type(specialization_type->getAliasedType());
 
         TemplateInstance instance { std::move(template_name), {} };
@@ -1197,6 +1276,258 @@ static bool type_holds_gc_pointer(clang::QualType type, std::set<clang::CXXRecor
     return false;
 }
 
+// Whether a type declares with GC_HOLDS_NO_CELL_EDGES, or inherits from one that declares, that it holds no cell edges.
+static bool record_declares_no_cell_edges(clang::CXXRecordDecl const& record)
+{
+    auto declares = [](clang::CXXRecordDecl const* candidate) {
+        for (auto const* declaration : candidate->decls()) {
+            if (auto const* alias = llvm::dyn_cast<clang::TypedefNameDecl>(declaration); alias && alias->getName() == "HoldsNoCellEdges")
+                return true;
+        }
+        return false;
+    };
+    if (declares(&record))
+        return true;
+    // NB: forallBases() gives up on a dependent base, so the bases are walked here, skipping those not known yet.
+    for (auto const& base : record.bases()) {
+        auto const* base_record = base.getType()->getAsCXXRecordDecl();
+        base_record = base_record ? base_record->getDefinition() : nullptr;
+        if (base_record && record_declares_no_cell_edges(*base_record))
+            return true;
+    }
+    return false;
+}
+
+enum class ClaimViolation {
+    GCPointer,
+    OpaqueFunction,
+};
+
+static bool is_owning_pointer(std::string const& template_name)
+{
+    return template_name == "AK::NonnullOwnPtr" || template_name == "AK::NonnullRefPtr" || template_name == "AK::OwnPtr" || template_name == "AK::RefPtr";
+}
+
+// Whether a value of this type holds what a type declared to hold no cell edges must not: a GC pointer, which nothing
+// would trace, or an AK::Function, whose captures no check can see. Roots and weak pointers need no tracing. A GC pointer
+// is looked for in what the value owns too, unless the pointee declares the claim itself and is checked on its own.
+// NB: An owned object's callbacks are its own API, such as those of libraries below LibGC, which can't keep a
+//     GC::Function. As with every AK::Function, what they capture must be rooted or weak.
+static bool record_violates_claim_of_no_cell_edges(clang::CXXRecordDecl const&, ClaimViolation, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const&);
+
+static bool type_violates_claim_of_no_cell_edges(clang::QualType type, ClaimViolation violation, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const& polymorphic_subclasses)
+{
+    if (auto const* array = type->getAsArrayTypeUnsafe())
+        return type_violates_claim_of_no_cell_edges(array->getElementType(), violation, visited, polymorphic_subclasses);
+
+    // NB: A raw pointer to a cell, or to something with cell edges such as the mixin of a cell, is an edge that nothing
+    //     traces. Whether a pointee that is only declared is one can't be seen.
+    if (type->isPointerType() || type->isReferenceType()) {
+        if (violation != ClaimViolation::GCPointer)
+            return false;
+        auto const* pointee = type->getPointeeCXXRecordDecl();
+        auto const* definition = pointee ? pointee->getDefinition() : nullptr;
+        return definition && (record_inherits_from_cell(*definition) || (!record_is_in_ak_or_gc(*definition) && type_has_visit_edges_method(definition)));
+    }
+
+    if (auto instance = template_instance_of_type(type)) {
+        if (instance->name == "AK::Function")
+            return violation == ClaimViolation::OpaqueFunction;
+        if (instance->name == "GC::Ptr" || instance->name == "GC::Ref" || instance->name == "GC::Member" || instance->name == "GC::NonnullMember")
+            return violation == ClaimViolation::GCPointer;
+        if (is_owning_pointer(instance->name)) {
+            if (violation != ClaimViolation::GCPointer || instance->type_arguments.empty())
+                return false;
+            auto const* pointee = instance->type_arguments.front()->getAsCXXRecordDecl();
+            pointee = pointee ? pointee->getDefinition() : nullptr;
+            if (pointee && record_declares_no_cell_edges(*pointee))
+                return false;
+            if (type_violates_claim_of_no_cell_edges(instance->type_arguments.front(), violation, visited, polymorphic_subclasses))
+                return true;
+            // NB: The pointer may own a subclass of its pointee.
+            if (!pointee)
+                return false;
+            auto subclasses = polymorphic_subclasses.find(pointee->getCanonicalDecl());
+            if (subclasses == polymorphic_subclasses.end())
+                return false;
+            for (auto const* subclass : subclasses->second) {
+                if (record_declares_no_cell_edges(*subclass))
+                    continue;
+                if (record_violates_claim_of_no_cell_edges(*subclass, violation, visited, polymorphic_subclasses))
+                    return true;
+            }
+            return false;
+        }
+        if (is_type_that_does_not_store_gc_pointers_by_value(instance->name))
+            return false;
+        for (auto const& type_argument : instance->type_arguments) {
+            if (type_violates_claim_of_no_cell_edges(type_argument, violation, visited, polymorphic_subclasses))
+                return true;
+        }
+    }
+
+    auto const* record = type->getAsCXXRecordDecl();
+    return record && record_violates_claim_of_no_cell_edges(*record, violation, visited, polymorphic_subclasses);
+}
+
+static bool record_violates_claim_of_no_cell_edges(clang::CXXRecordDecl const& record, ClaimViolation violation, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const& polymorphic_subclasses)
+{
+    if (!record.isCompleteDefinition() || !visited.insert(&record).second)
+        return false;
+    if (record_is_nan_boxed_value(record))
+        return violation == ClaimViolation::GCPointer;
+    if (record_is_in_ak_or_gc(record) || record_inherits_from_cell(record))
+        return false;
+    for (auto const& base : record.bases()) {
+        if (type_violates_claim_of_no_cell_edges(base.getType(), violation, visited, polymorphic_subclasses))
+            return true;
+    }
+    for (auto const* field : record.fields()) {
+        if (type_violates_claim_of_no_cell_edges(field->getType(), violation, visited, polymorphic_subclasses))
+            return true;
+    }
+    return false;
+}
+
+// A GC::Function captures a type that declares that it holds no cell edges without tracing it, so the type must not hold
+// a GC pointer, which nothing would keep alive. Roots and weak pointers are fine, as they need no tracing. Nor may it hold
+// an AK::Function, whose captures could hold anything.
+// NB: Claims are checked once the translation unit is complete, when every instantiation of a class template that makes
+//     the claim, and every subclass of what a claimed type owns, is known.
+void LibJSGCVisitor::remember_claim_of_no_cell_edges(clang::CXXRecordDecl const& record)
+{
+    clang::CXXRecordDecl const* claimed_record = nullptr;
+    bool callbacks_hold_roots = false;
+    bool claim_covers_subclasses = false;
+    if (auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record)) {
+        if (specialization->getSpecializationKind() != clang::TSK_ExplicitSpecialization || specialization->getSpecializedTemplate()->getQualifiedNameAsString() != "GC::IsUntracedCapture")
+            return;
+        // NB: GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS() declares that the type's callbacks hold roots, which no check
+        //     can see, so only its other members are checked.
+        for (auto const* declaration : specialization->decls()) {
+            if (auto const* variable = llvm::dyn_cast<clang::VarDecl>(declaration); variable && variable->getName() == "callbacks_hold_roots")
+                callbacks_hold_roots = true;
+        }
+        // NB: A partial specialization declares the claim for whatever its arguments hold, which is checked where they
+        //     make claims of their own.
+        auto const& arguments = specialization->getTemplateArgs();
+        if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(specialization) || arguments.size() != 1 || arguments[0].getKind() != clang::TemplateArgument::Type || arguments[0].getAsType()->isDependentType())
+            return;
+        claimed_record = arguments[0].getAsType()->getAsCXXRecordDecl();
+        // NB: Unlike a claim made in the class, which its subclasses inherit and make themselves, this one covers a
+        //     counted or owned pointer to the class, which may point to a subclass.
+        claim_covers_subclasses = true;
+    } else if (record_declares_no_cell_edges(record)) {
+        claimed_record = &record;
+    }
+    if (claimed_record)
+        m_claims_of_no_cell_edges.push_back({ claimed_record, callbacks_hold_roots, claim_covers_subclasses });
+}
+
+void LibJSGCVisitor::validate_claims_of_no_cell_edges()
+{
+    std::set<clang::CXXRecordDecl const*> validated;
+    auto validate = [&](clang::CXXRecordDecl const* record, bool callbacks_hold_roots, clang::CXXRecordDecl const* claiming_base = nullptr) {
+        if (record && record->isCompleteDefinition() && !record->isDependentContext() && validated.insert(record).second)
+            validate_claim_of_no_cell_edges(*record, callbacks_hold_roots, claiming_base);
+    };
+    for (auto const& claim : m_claims_of_no_cell_edges) {
+        if (auto const* class_template = claim.record->getDescribedClassTemplate()) {
+            for (auto const* specialization : class_template->specializations())
+                validate(specialization, claim.callbacks_hold_roots);
+            continue;
+        }
+        auto const* definition = claim.record->getDefinition();
+        validate(definition, claim.callbacks_hold_roots);
+        if (!claim.covers_subclasses || !definition)
+            continue;
+        // NB: A subclass that makes the claim itself is checked on its own.
+        auto subclasses = m_polymorphic_subclasses.find(definition->getCanonicalDecl());
+        if (subclasses == m_polymorphic_subclasses.end())
+            continue;
+        for (auto const* subclass : subclasses->second) {
+            if (!record_declares_no_cell_edges(*subclass))
+                validate(subclass, claim.callbacks_hold_roots, definition);
+        }
+    }
+}
+
+// NB: A subclass of a class whose counted or owned pointers are declared to hold no cell edges is checked with the claiming
+//     base, which is checked on its own.
+void LibJSGCVisitor::validate_claim_of_no_cell_edges(clang::CXXRecordDecl const& record, bool callbacks_hold_roots, clang::CXXRecordDecl const* claiming_base)
+{
+    auto const* claimed_record = &record;
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 is declared to hold no cell edges, but its member %1 holds a GC pointer");
+    auto record_name = name_for_diagnostic(m_context, *claimed_record);
+    if (claiming_base)
+        record_name += " (through its base " + name_for_diagnostic(m_context, *claiming_base) + ")";
+    auto function_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 is declared to hold no cell edges, but its member %1 holds an AK::Function, whose captures can't be checked");
+    auto violates = [&](clang::QualType type, ClaimViolation violation) {
+        if (violation == ClaimViolation::OpaqueFunction && callbacks_hold_roots)
+            return false;
+        // NB: The claimed type is checked here already, wherever its members lead back to it, such as through the
+        //     template arguments of RefCounted<T>.
+        std::set<clang::CXXRecordDecl const*> visited { claimed_record };
+        if (claiming_base)
+            visited.insert(claiming_base);
+        return type_violates_claim_of_no_cell_edges(type, violation, visited, m_polymorphic_subclasses);
+    };
+    for (auto const* field : claimed_record->fields()) {
+        if (violates(field->getType(), ClaimViolation::GCPointer))
+            diag_engine.Report(field->getLocation(), diag_id) << record_name << field->getName();
+        if (violates(field->getType(), ClaimViolation::OpaqueFunction))
+            diag_engine.Report(field->getLocation(), function_diag_id) << record_name << field->getName();
+    }
+
+    // NB: A base that declares the claim itself is checked on its own.
+    auto base_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 is declared to hold no cell edges, but its base %1 holds a GC pointer");
+    auto base_function_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 is declared to hold no cell edges, but its base %1 holds an AK::Function, whose captures can't be checked");
+    for (auto const& base : claimed_record->bases()) {
+        auto const* base_record = base.getType()->getAsCXXRecordDecl();
+        if (base_record && record_declares_no_cell_edges(*base_record))
+            continue;
+        if (violates(base.getType(), ClaimViolation::GCPointer))
+            diag_engine.Report(base.getBeginLoc(), base_diag_id) << record_name << base.getType();
+        if (violates(base.getType(), ClaimViolation::OpaqueFunction))
+            diag_engine.Report(base.getBeginLoc(), base_function_diag_id) << record_name << base.getType();
+    }
+}
+
+void LibJSGCVisitor::validate_gc_members_of_polymorphic_record(clang::CXXRecordDecl const& record)
+{
+    if (record.isDependentContext() || !record.isPolymorphic() || type_has_visit_edges_method(&record))
+        return;
+
+    bool has_polymorphic_base = false;
+    record.forallBases([&](clang::CXXRecordDecl const* base) {
+        has_polymorphic_base |= base->isPolymorphic();
+        return !has_polymorphic_base;
+    });
+    if (!has_polymorphic_base)
+        return;
+
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "Member %0 of polymorphic class %1 contains GC pointers but %1 has no visit_edges method");
+    auto record_name = name_for_diagnostic(m_context, record);
+    for (auto const* field : record.fields()) {
+        std::set<clang::CXXRecordDecl const*> visited;
+        if (type_holds_gc_pointer(field->getType(), visited))
+            diag_engine.Report(field->getLocation(), diag_id) << field->getName() << record_name;
+    }
+}
+
+void LibJSGCVisitor::remember_polymorphic_subclass(clang::CXXRecordDecl const& record)
+{
+    if (record.isDependentContext() || !record.isPolymorphic())
+        return;
+    record.forallBases([&](clang::CXXRecordDecl const* base) {
+        if (base->isPolymorphic())
+            m_polymorphic_subclasses[base->getCanonicalDecl()].push_back(&record);
+        return true;
+    });
+}
+
 static bool is_container_with_heap_storage(std::string const& template_name)
 {
     static std::unordered_set<std::string> const template_names {
@@ -1215,14 +1546,16 @@ static bool is_container_with_heap_storage(std::string const& template_name)
 static bool is_container_scanned_by_gc(std::string const& template_name)
 {
     static std::unordered_set<std::string> const template_names {
-        "GC::ConservativeHashMap",
-        "GC::ConservativeHashTable",
-        "GC::ConservativeVector",
         "GC::RootHashMap",
         "GC::RootHashTable",
         "GC::RootVector",
     };
     return template_names.contains(template_name);
+}
+
+static bool is_root_container(std::string const& template_name)
+{
+    return template_name == "GC::RootHashMap" || template_name == "GC::RootHashTable" || template_name == "GC::RootVector";
 }
 
 static bool is_value_wrapper(std::string const& template_name)
@@ -1237,11 +1570,40 @@ static bool is_value_wrapper(std::string const& template_name)
     return template_names.contains(template_name);
 }
 
+static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(clang::QualType, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const* subclasses_of_owned_types = nullptr);
+
+static clang::FieldDecl const* find_owned_member_with_gc_pointers(clang::QualType owned_type, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const& subclasses_of_owned_types)
+{
+    auto const* record = owned_type->getAsCXXRecordDecl();
+    if (!record || !record->getDefinition())
+        return nullptr;
+    record = record->getDefinition();
+    if (record_is_in_ak_or_gc(*record) || record_inherits_from_cell(*record) || !visited.insert(record).second)
+        return nullptr;
+
+    std::vector<clang::CXXRecordDecl const*> records { record };
+    record->forallBases([&](clang::CXXRecordDecl const* base) {
+        records.push_back(base);
+        return true;
+    });
+    if (auto subclasses = subclasses_of_owned_types.find(record->getCanonicalDecl()); subclasses != subclasses_of_owned_types.end())
+        records.insert(records.end(), subclasses->second.begin(), subclasses->second.end());
+
+    for (auto const* candidate : records) {
+        for (auto const* field : candidate->fields()) {
+            std::set<clang::CXXRecordDecl const*> visited_by_field;
+            if (type_holds_gc_pointer(field->getType(), visited_by_field) || find_container_with_unscanned_gc_pointers(field->getType(), visited, &subclasses_of_owned_types))
+                return field;
+        }
+    }
+    return nullptr;
+}
+
 // Conservative stack scanning sees the values stored in a stack object, but not the heap storage of a container in it.
-static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited)
+static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const* subclasses_of_owned_types)
 {
     if (auto const* array = type->getAsArrayTypeUnsafe())
-        return find_container_with_unscanned_gc_pointers(array->getElementType(), visited);
+        return find_container_with_unscanned_gc_pointers(array->getElementType(), visited, subclasses_of_owned_types);
 
     if (type->isPointerType() || type->isReferenceType())
         return {};
@@ -1252,12 +1614,27 @@ static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(
                 std::set<clang::CXXRecordDecl const*> visited_by_element;
                 if (type_holds_gc_pointer(type_argument, visited_by_element))
                     return type;
+                if (subclasses_of_owned_types && find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
+                    return type;
+            }
+            return {};
+        }
+        if (subclasses_of_owned_types && is_owning_pointer(instance->name)) {
+            for (auto const& type_argument : instance->type_arguments) {
+                std::set<clang::CXXRecordDecl const*> visited_by_object;
+                if (type_holds_gc_pointer(type_argument, visited_by_object) || find_owned_member_with_gc_pointers(type_argument, visited, *subclasses_of_owned_types))
+                    return type;
+                if (find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
+                    return type;
             }
             return {};
         }
         if (is_value_wrapper(instance->name) || is_container_scanned_by_gc(instance->name)) {
             for (auto const& type_argument : instance->type_arguments) {
-                if (auto container = find_container_with_unscanned_gc_pointers(type_argument, visited))
+                // NB: A root container traces a value with a visit_edges(), which visits what the value keeps on the heap.
+                if (is_root_container(instance->name) && type_has_visit_edges_method(type_argument->getAsCXXRecordDecl()))
+                    continue;
+                if (auto container = find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
                     return container;
             }
             return {};
@@ -1272,11 +1649,11 @@ static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(
     if (record_is_in_ak_or_gc(*record) || record_inherits_from_cell(*record))
         return {};
     for (auto const& base : record->bases()) {
-        if (auto container = find_container_with_unscanned_gc_pointers(base.getType(), visited))
+        if (auto container = find_container_with_unscanned_gc_pointers(base.getType(), visited, subclasses_of_owned_types))
             return container;
     }
     for (auto const* field : record->fields()) {
-        if (auto container = find_container_with_unscanned_gc_pointers(field->getType(), visited))
+        if (auto container = find_container_with_unscanned_gc_pointers(field->getType(), visited, subclasses_of_owned_types))
             return container;
     }
     return {};
@@ -1314,7 +1691,7 @@ void LibJSGCVisitor::validate_type_on_stack(clang::QualType type, clang::SourceL
         return;
 
     auto& diag_engine = m_context.getDiagnostics();
-    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 keeps GC pointers in heap memory that is not scanned for roots; use GC::RootVector, GC::RootHashMap, GC::RootHashTable or a GC::Conservative container instead");
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 keeps GC pointers in heap memory that is not scanned for roots; use GC::RootVector, GC::RootHashMap or GC::RootHashTable instead");
     diag_engine.Report(location, diag_id) << *container;
 }
 
@@ -1375,6 +1752,7 @@ void LibJSGCASTConsumer::HandleTranslationUnit(clang::ASTContext& context)
 {
     LibJSGCVisitor visitor { context, m_macro_map, m_detect_invalid_function_members };
     visitor.TraverseDecl(context.getTranslationUnitDecl());
+    visitor.validate_claims_of_no_cell_edges();
 }
 
 char const* LibJSCellMacro::type_name(Type type)

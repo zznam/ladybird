@@ -1,4 +1,7 @@
 {
+  "-moz-color-swatch": {
+    "alias-for": "color-swatch"
+  },
   "-moz-meter-bar": {
     "alias-for": "slider-fill"
   },
@@ -17,6 +20,13 @@
   "-moz-range-thumb": {
     "alias-for": "slider-thumb"
   },
+  "-webkit-color-swatch": {
+    "alias-for": "color-swatch"
+  },
+  "-webkit-color-swatch-wrapper": {
+    "spec": "https://drafts.csswg.org/css-forms-1/#vendor-pseudo-element-compatibility",
+    "implementation": "element-reference"
+  },
   "-webkit-input-placeholder": {
     "alias-for": "placeholder"
   },
@@ -28,6 +38,10 @@
   },
   "-webkit-progress-value": {
     "alias-for": "slider-fill"
+  },
+  "-webkit-search-cancel-button": {
+    "spec": "https://drafts.csswg.org/css-forms-1/#selectordef-clear-icon",
+    "implementation": "element-reference"
   },
   "-webkit-slider-runnable-track": {
     "alias-for": "slider-track"
@@ -48,6 +62,10 @@
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-before",
     "is-tree-abiding": true,
     "implementation": "synthetic"
+  },
+  "color-swatch": {
+    "spec": "https://drafts.csswg.org/css-forms-1/#selectordef-color-swatch",
+    "implementation": "element-reference"
   },
   "details-content": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-details-content",
@@ -76,6 +94,7 @@
       "float",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "first-line": {
@@ -91,12 +110,24 @@
       "FIXME: ruby-position",
       "#inline-layout-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "highlight": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-highlight",
     "type": "function",
-    "function-syntax": "<highlight-name-selector>"
+    "function-syntax": "<highlight-name-selector>",
+    "is-highlight": true,
+    "property-whitelist": [
+      "color",
+      "background-color",
+      "#text-decoration-properties",
+      "FIXME: stroke-color",
+      "FIXME: fill-color",
+      "stroke-width",
+      "#custom-properties"
+    ],
+    "accepts-animations": false
   },
   "marker": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-marker",
@@ -136,6 +167,7 @@
       "stroke-width",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "search-text-current": {
@@ -151,6 +183,7 @@
       "stroke-width",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "selection": {
@@ -165,6 +198,7 @@
       "stroke-width",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "slider-fill": {
@@ -198,6 +232,7 @@
       "stroke-width",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "view-transition": {

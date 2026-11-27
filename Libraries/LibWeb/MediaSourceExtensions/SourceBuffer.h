@@ -56,6 +56,8 @@ public:
     double append_window_end() const { return m_append_window_end; }
     WebIDL::ExceptionOr<void> set_append_window_end(double);
 
+    GC::Ref<MediaSource> media_source() const { return m_media_source; }
+
     // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
     bool updating() const;
     bool first_initialization_segment_received() const { return m_first_initialization_segment_received; }
@@ -71,6 +73,8 @@ public:
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-texttracks
     GC::Ref<HTML::TextTrackList> text_tracks() const { return m_text_tracks; }
+
+    bool is_associated_with_an_enabled_or_selected_track() const;
 
     AK::Duration highest_presentation_timestamp() const;
     AK::Duration highest_end_time() const;
@@ -112,6 +116,7 @@ private:
     void finish_range_removal();
     void update_ready_state_and_duration_after_coded_frame_processing(AK::Duration group_end_timestamp);
     void finish_buffer_append();
+    void set_updating(bool);
 
     GC::Ref<MediaSource> m_media_source;
     NonnullRefPtr<MediaClient::RemoteSourceBuffer> m_remote_source_buffer;

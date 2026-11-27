@@ -157,6 +157,15 @@ fn discard_whitespace(values: &[ComponentValue], position: &mut usize) {
     }
 }
 
+// https://drafts.css-houdini.org/css-properties-values-api/#consume-data-type-name
+// NB: Data type names are consumed as literal code points, unlike custom identifiers, which allow escapes.
+fn data_type_name(value: &ComponentValue) -> Option<&[u16]> {
+    if value.original_source_text.iter().any(|unit| unit == u16::from(b'\\')) {
+        return None;
+    }
+    value.ident()
+}
+
 fn parse_single_component(
     values: &[ComponentValue],
     position: &mut usize,
@@ -179,7 +188,7 @@ fn parse_single_component(
 
     if values.get(*position).is_some_and(|value| value.is_delim(b'<')) {
         *position += 1;
-        let name = values.get(*position).and_then(ComponentValue::ident);
+        let name = values.get(*position).and_then(data_type_name);
         *position += usize::from(name.is_some());
         if let Some(name) = name
             && values.get(*position).is_some_and(|value| value.is_delim(b'>'))
@@ -205,7 +214,7 @@ fn parse_component(
     if values.get(*position).is_some_and(|value| value.is_delim(b'<'))
         && values
             .get(*position + 1)
-            .and_then(ComponentValue::ident)
+            .and_then(data_type_name)
             .is_some_and(|name| equals_ascii(name, b"transform-list"))
         && values.get(*position + 2).is_some_and(|value| value.is_delim(b'>'))
     {
@@ -401,7 +410,7 @@ pub(crate) fn parse_with_syntax_component_values(
     original_source: Option<&[u16]>,
 ) -> Option<StyleValueData> {
     if matches!(syntax, SyntaxNode::Universal) {
-        if !declaration_value_is_valid(values) {
+        if !values.is_empty() && !declaration_value_is_valid(values) {
             return None;
         }
 
@@ -409,7 +418,7 @@ pub(crate) fn parse_with_syntax_component_values(
         collect_arbitrary_substitution_function_presence(values, &mut presence).ok()?;
 
         return Some(match original_source {
-            Some(source) => unresolved_value(source, &[], values.to_vec(), presence),
+            Some(source) => unresolved_value(source, values, presence),
             None => unresolved_value_from_component_values(values.to_vec(), presence),
         });
     }
@@ -442,20 +451,27 @@ pub extern "C" fn rust_syntax_release(syntax: OwnedArc<SyntaxNode>) {
     drop(syntax);
 }
 
-/// # Safety
-/// `syntax` must be null or a live parsed-syntax handle.
-pub(crate) unsafe fn clone_syntax_handle(syntax: *const c_void) -> Option<SyntaxNode> {
-    unsafe { syntax.cast::<SyntaxNode>().as_ref() }.cloned()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_syntax_is_universal(syntax: &SyntaxNode) -> bool {
     matches!(syntax, SyntaxNode::Universal)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_syntax_is_single_component(syntax: &SyntaxNode) -> bool {
-    is_single_syntax_component(syntax)
+pub extern "C" fn rust_syntax_value_is_list(syntax: &SyntaxNode, value: &StyleValueData) -> bool {
+    match syntax {
+        SyntaxNode::Multiplier { .. } => true,
+        SyntaxNode::Alternatives(alternatives) => {
+            // NB: Select the same first matching alternative as parsing. A transform-list is one Typed OM value,
+            //     whereas a multiplier on transform-function produces multiple values.
+            let source = crate::css::serialize::serialize_style_value_to_utf16(value);
+            let context = ParseContext::default();
+            alternatives
+                .iter()
+                .find(|alternative| parse_with_syntax(&context, &source, alternative).is_some())
+                .is_some_and(|alternative| matches!(alternative, SyntaxNode::Multiplier { .. }))
+        }
+        _ => false,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -494,13 +510,28 @@ pub unsafe extern "C" fn rust_parse_with_syntax(
         return std::ptr::null();
     };
     *out_status = FfiParseStatus::Parsed;
-    Arc::into_raw(Arc::new(parsed)).cast()
+    crate::css::style_value_arc::StyleValueArc::into_raw(crate::css::style_value_arc::StyleValueArc::new(parsed)).cast()
+}
+
+impl SyntaxNode {
+    pub(crate) fn is_universal(&self) -> bool {
+        rust_syntax_is_universal(self)
+    }
+
+    pub(crate) fn is_single_component(&self) -> bool {
+        is_single_syntax_component(self)
+    }
+
+    pub(crate) fn serialize_to(&self, sink: &mut TextSink) {
+        serialize_syntax(self, sink);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::css::parser::value_parser::RandomFunctionIndex;
+    use crate::css::style_value::UnresolvedPayload;
 
     fn context(random_function_index: &RandomFunctionIndex) -> ParseContext<'_> {
         ParseContext {
@@ -599,12 +630,21 @@ mod tests {
             crate::css::css_tokenizer::tokenize_for_parser_without_source(b"1.00px").into_vec(),
         )
         .unwrap();
-        let Some(StyleValueData::Unresolved { source_text, .. }) =
+        let Some(StyleValueData::Unresolved(unresolved_payload)) =
             parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, Some(&source))
         else {
             panic!("expected an unresolved value");
         };
-        assert_eq!(source_text.units(), source);
+        let unresolved_payload: &UnresolvedPayload = &unresolved_payload;
+        let source_text = unresolved_payload.source_text();
+        assert_eq!(
+            {
+                let mut units = Vec::new();
+                source_text.append_to(&mut units);
+                units
+            },
+            source
+        );
     }
 
     #[test]
@@ -613,16 +653,24 @@ mod tests {
         let context = context(&random_function_index);
         let mut values = consume_a_list_of_component_values(tokenize_for_parser(b"a b".as_slice())).unwrap();
         values.remove(1);
-        let Some(StyleValueData::Unresolved {
-            source_text,
-            components,
-            ..
-        }) = parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, None)
+        let Some(StyleValueData::Unresolved(unresolved_payload)) =
+            parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, None)
         else {
             panic!("expected an unresolved value");
         };
-        assert_eq!(source_text.units(), utf16("a/**/b"));
-        assert_eq!(components.as_slice(), values.as_slice());
+        let source_text = unresolved_payload.source_text();
+        assert_eq!(
+            {
+                let mut units = Vec::new();
+                source_text.append_to(&mut units);
+                units
+            },
+            utf16("a/**/b")
+        );
+        assert!(crate::css::style_value::components_equal(
+            &unresolved_payload.components(),
+            &values
+        ));
     }
 
     #[test]

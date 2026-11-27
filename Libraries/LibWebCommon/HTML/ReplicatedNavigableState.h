@@ -9,9 +9,12 @@
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibHTTP/Cache/CacheMode.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/ContentSecurityPolicy/SerializedPolicy.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
@@ -28,6 +31,7 @@ struct ReplicatedContainerState {
     // Whether the container is in its node document's tree rather than a shadow tree, which makes the navigable a
     // document-tree child navigable of that document.
     bool is_in_document_tree { false };
+    bool suppresses_viewport_scrolling { false };
 
     // https://html.spec.whatwg.org/multipage/browsers.html#iframe-sandboxing-flag-set
     SandboxingFlagSet iframe_sandboxing_flag_set {};
@@ -46,6 +50,10 @@ struct ReplicatedContainerState {
     // The container's local name, which navigate makes its request's destination and initiator type.
     Optional<Utf16FlyString> local_name;
 
+    // The container's name content attribute, which lets a cross-origin child whose target name matches it be found by
+    // that name on its parent's window.
+    Optional<Utf16FlyString> name {};
+
     // https://html.spec.whatwg.org/multipage/browsers.html#determining-the-iframe-element-referrer-policy
     ReferrerPolicy::ReferrerPolicy iframe_referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
 
@@ -54,13 +62,24 @@ struct ReplicatedContainerState {
     PermissionsPolicy::PolicyDirective container_policy {};
 
     // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy, of the container's node
-    // document's relevant settings object, which a browsing context created for the navigable in another process
-    // inherits.
+    // document's policy container, which a document created in the navigable inherits.
     UpgradeInsecureRequests::InsecureRequestsPolicy document_insecure_requests_policy { UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade };
 
     // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set, of the container's
-    // node document's relevant settings object.
+    // node document's policy container.
     UpgradeInsecureRequests::UpgradeInsecureNavigationsSet document_upgrade_insecure_navigations_set {};
+
+    // https://html.spec.whatwg.org/multipage/browsers.html#policy-container-csp-list, of the container's node
+    // document's policy container, whose frame-src governs where the navigable can be navigated to.
+    Vector<ContentSecurityPolicy::SerializedPolicy> document_csp_list {};
+
+    // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
+    // The container's used color scheme, which decides whether the canvas of the navigable's document is opaque.
+    CSS::PreferredColorScheme used_color_scheme { CSS::PreferredColorScheme::Light };
+
+    // The cache mode that the container's node document loads with, which the navigations of the navigable use while
+    // that document loads.
+    HTTP::CacheMode document_cache_mode_while_loading { HTTP::CacheMode::Default };
 };
 
 // What the process hosting a navigable's active document reports of it to the UI process, which composes the
@@ -77,7 +96,9 @@ struct ReplicatedNavigableState {
     Utf16String target_name;
     URL::URL active_document_url;
     URL::Origin active_document_origin;
+    SandboxingFlagSet active_document_sandboxing_flag_set {};
     bool active_document_is_fully_active { false };
+    bool active_window_has_sticky_activation { false };
     URL::URL top_level_creation_url;
     URL::Origin top_level_origin;
     bool top_level_is_created_by_web_content { false };
@@ -88,6 +109,7 @@ struct ReplicatedNavigableState {
     OpenerPolicy opener_policy;
     bool active_browsing_context_is_auxiliary { false };
     Optional<CrossProcessId> opener_navigable_id {};
+    Optional<CrossProcessId> one_permitted_sandboxed_navigator_navigable_id {};
 
     bool active_document_is_completely_loaded { false };
     bool is_closing { false };

@@ -13,6 +13,7 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
+#include <LibAudio/OutputSession.h>
 #include <LibMedia/MediaSourceExtensions/SourceBufferProcessor.h>
 #include <LibMedia/PlaybackManager.h>
 #include <LibMedia/Track.h>
@@ -30,14 +31,16 @@ class PlaybackSession {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    PlaybackSession(ConnectionFromClient&, u64 id);
+    PlaybackSession(ConnectionFromClient&, u64 id, Audio::PlaybackGroupId audio_group);
     ~PlaybackSession();
 
     u64 id() const { return m_id; }
     Media::PlaybackManager& manager() { return *m_manager; }
+    void set_audio_group(Audio::PlaybackGroupId audio_group) { m_audio_output_session->set_group(audio_group); }
 
     void add_media_stream_source(u64 stream_id, NonnullRefPtr<Media::MediaStream> const&);
 
+    void start(u64 seek_request_id);
     void seek(u64 seek_request_id, AK::Duration timestamp, Media::SeekMode);
     void set_audio_track_enabled(u64 seek_request_id, Media::Track const&, bool enabled, bool resume_ended_playback);
     void reserve_video_sink(u64 seek_request_id, Media::Track const&, Media::VideoSinkHandle, bool resume_ended_playback);
@@ -73,6 +76,9 @@ private:
 
     struct SourceBuffer {
         NonnullRefPtr<Media::MediaSourceExtensions::SourceBufferProcessor> processor;
+        // The renderer chooses the ID and can use it again for a new source buffer after it destroys this one. Work
+        // that finishes later uses this to check that the source buffer it finds is still the one it started for.
+        u64 instance_id { 0 };
         // The data of the next append, which arrives in pieces small enough for one message each.
         ByteBuffer pending_append_data;
         AppendOutcome append_outcome { AppendOutcome::Pending };
@@ -95,18 +101,21 @@ private:
 
     SourceBuffer* find_source_buffer(u64 source_buffer_id);
     Media::MediaSourceExtensions::PublishedState published_state_for_renderer(SourceBuffer const&) const;
-    void add_source_buffer_demuxer(u64 source_buffer_id, NonnullRefPtr<Media::Demuxer> const&);
-    void finish_source_buffer_track_addition(u64 source_buffer_id, TrackAdditionOutcome);
+    void add_source_buffer_demuxer(u64 source_buffer_id, u64 instance_id, NonnullRefPtr<Media::Demuxer> const&);
+    void finish_source_buffer_track_addition(u64 source_buffer_id, u64 instance_id, TrackAdditionOutcome);
     static void send_or_hold(SourceBuffer&, Optional<u64> append_generation, Function<void()>);
     void report_playback_state();
 
     ConnectionFromClient& m_connection;
     u64 m_id { 0 };
+    NonnullRefPtr<Audio::OutputSession> m_audio_output_session;
     NonnullOwnPtr<Media::PlaybackManager> m_manager;
     u64 m_applied_seek_request_id { 0 };
+    bool m_reported_playback_state_is_settled { true };
 
     HashMap<u64, MediaStreamSource> m_media_stream_sources;
     HashMap<u64, SourceBuffer> m_source_buffers;
+    u64 m_next_source_buffer_instance_id { 1 };
 };
 
 }

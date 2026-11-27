@@ -12,25 +12,31 @@
 
 namespace WebView {
 
-NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalSimilarOriginWindowAgent::create(Web::HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode)
+NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalSimilarOriginWindowAgent::create(Web::HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode, bool agent_cluster_is_origin_keyed)
 {
-    return adopt_ref(*new CanonicalSimilarOriginWindowAgent(agent_cluster_cross_origin_isolation_mode));
+    return adopt_ref(*new CanonicalSimilarOriginWindowAgent(agent_cluster_cross_origin_isolation_mode, agent_cluster_is_origin_keyed));
 }
 
 // Random, so that it cannot collide with the id a WebContent process gives a shared worker's agent cluster.
-CanonicalSimilarOriginWindowAgent::CanonicalSimilarOriginWindowAgent(Web::HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode)
+CanonicalSimilarOriginWindowAgent::CanonicalSimilarOriginWindowAgent(Web::HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode, bool agent_cluster_is_origin_keyed)
     : m_agent_cluster_id(get_random<u64>())
+    , m_agent_cluster_is_origin_keyed(agent_cluster_is_origin_keyed)
     , m_agent_cluster_cross_origin_isolation_mode(agent_cluster_cross_origin_isolation_mode)
 {
 }
 
-RefPtr<WebContentClient> CanonicalSimilarOriginWindowAgent::hosting_process() const
+// A process that has exited, or has been asked to, hosts nothing.
+static RefPtr<WebContentClient> process_able_to_host(WeakPtr<WebContentClient> const& weak_process)
 {
-    // A process that has exited, or has been asked to, hosts nothing.
-    auto process = m_hosting_process.strong_ref();
+    auto process = weak_process.strong_ref();
     if (!process || !process->is_open() || process->has_requested_close())
         return nullptr;
     return process;
+}
+
+RefPtr<WebContentClient> CanonicalSimilarOriginWindowAgent::hosting_process() const
+{
+    return process_able_to_host(m_hosting_process);
 }
 
 void CanonicalSimilarOriginWindowAgent::set_hosting_process_if_unset(WebContentClient& process)
@@ -139,13 +145,13 @@ NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalBrowsingContextGroup::
     if (!m_agent_cluster_map.contains(key)) {
         // 1. Let agentCluster be a new agent cluster.
         // 2. Set agentCluster's cross-origin isolation mode to group's cross-origin isolation mode.
-        // FIXME: 3. If key is an origin:
-        //           1. Assert: key is origin.
-        //           2. Set agentCluster's is origin-keyed to true.
+        // 3. If key is an origin:
+        //    1. Assert: key is origin.
+        //    2. Set agentCluster's is origin-keyed to true.
         // 4. Add the result of creating an agent, given false, to agentCluster.
         // NB: The agent cluster's single similar-origin window agent holds the agent cluster's id and cross-origin
         //     isolation mode.
-        AgentCluster agent_cluster { CanonicalSimilarOriginWindowAgent::create(m_cross_origin_isolation_mode) };
+        AgentCluster agent_cluster { CanonicalSimilarOriginWindowAgent::create(m_cross_origin_isolation_mode, key.value.has<URL::Origin>()) };
 
         // 5. Set group's agent cluster map[key] to agentCluster.
         m_agent_cluster_map.set(key, move(agent_cluster));
@@ -166,6 +172,20 @@ RefPtr<CanonicalSimilarOriginWindowAgent> CanonicalBrowsingContextGroup::similar
     if (!agent_cluster.has_value())
         return nullptr;
     return agent_cluster->similar_origin_window_agent;
+}
+
+RefPtr<WebContentClient> CanonicalBrowsingContextGroup::process_hosting_sandboxed_documents_of_origin(String const& origin) const
+{
+    auto process = m_processes_hosting_sandboxed_documents.get(origin);
+    if (!process.has_value())
+        return nullptr;
+    return process_able_to_host(*process);
+}
+
+void CanonicalBrowsingContextGroup::set_process_hosting_sandboxed_documents_of_origin(String const& origin, WebContentClient& process)
+{
+    m_processes_hosting_sandboxed_documents.remove_all_matching([](auto const&, auto const& hosting_process) { return hosting_process.is_null(); });
+    m_processes_hosting_sandboxed_documents.set(origin, process.make_weak_ptr<WebContentClient>());
 }
 
 }

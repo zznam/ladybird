@@ -12,10 +12,12 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/AbortSignal.h>
 #include <LibWeb/Fetch/FetchMethod.h>
+#include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Fetching/RefCountedFlag.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Request.h>
@@ -58,7 +60,7 @@ static JS::Value deserialize_serialized_abort_reason(JS::Realm& realm, Infrastru
     // 3. If abortReason is non-null, then set deserializedError to StructuredDeserialize(abortReason, realm).
     //    If that threw an exception or returned undefined, then set deserializedError to fallbackError.
     if (controller.serialized_abort_reason().has_value()) {
-        auto deserialized_error_or_exception = HTML::structured_deserialize(realm.vm(), controller.serialized_abort_reason().value(), realm, {});
+        auto deserialized_error_or_exception = HTML::structured_deserialize(realm.vm(), controller.serialized_abort_reason().value(), realm);
         if (!deserialized_error_or_exception.is_exception() && !deserialized_error_or_exception.value().is_undefined())
             deserialized_error = deserialized_error_or_exception.value();
     }
@@ -90,14 +92,14 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
     // 4. If requestObject’s signal is aborted, then:
     if (request_object->signal()->aborted()) {
         // 1. Abort the fetch() call with p, request, null, and requestObject’s signal’s abort reason.
-        abort_fetch(*promise_capability, request, nullptr, request_object->signal()->reason());
+        abort_fetch(*promise_capability, request_object, nullptr, request_object->signal()->reason());
 
         // 2. Return p.
         return promise_capability;
     }
 
     // 5. Let globalObject be request’s client’s global object.
-    auto& global_object = request->client()->global_object();
+    auto& global_object = Fetching::resolve_client(request)->global_object();
 
     // FIXME: 6. If globalObject is a ServiceWorkerGlobalScope object, then set request’s service-workers mode to "none".
     (void)global_object;
@@ -122,13 +124,13 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
 
     // 12. Set controller to the result of calling fetch given request and processResponse given response being these
     //     steps:
-    auto process_response = [locally_aborted, promise_capability, request, response_object_holder, controller_holder, &relevant_realm](GC::Ref<Infrastructure::Response> response) {
+    auto process_response = GC::create_function(GC::Heap::the(), GC::captures(locally_aborted, promise_capability, request_object, response_object_holder, controller_holder, relevant_realm), [](auto& locally_aborted, auto& promise_capability, auto& request_object, auto& response_object_holder, auto& controller_holder, auto& relevant_realm, GC::Ref<Infrastructure::ResponseView> response) {
         // 1. If locallyAborted is true, then abort these steps.
         if (locally_aborted->value())
             return;
 
-        // AD-HOC: An execution context is required for Promise functions.
-        HTML::TemporaryExecutionContext execution_context { relevant_realm };
+        // AD-HOC: Promise reactions need an execution context and incumbent callback settings.
+        HTML::TemporaryExecutionContext execution_context { relevant_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 2. If response’s aborted flag is set, then:
         if (response->aborted()) {
@@ -137,7 +139,7 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
             auto deserialized_error = deserialize_serialized_abort_reason(relevant_realm, *controller_holder->controller());
 
             // 2. Abort the fetch() call with p, request, responseObject, and deserializedError.
-            abort_fetch(*promise_capability, request, response_object_holder->response_object, deserialized_error);
+            abort_fetch(*promise_capability, request_object, response_object_holder->response_object, deserialized_error);
 
             // 3. Abort these steps.
             return;
@@ -160,22 +162,17 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
             relevant_realm,
             GC::Ref { *response_object_holder->response_object });
         WebIDL::resolve_promise(relevant_realm, promise_capability, response_value);
-    };
-    controller_holder->set_controller(Fetching::fetch(
-        realm,
-        request,
-        Infrastructure::FetchAlgorithms::create(
-            {
-                .process_request_body_chunk_length = {},
-                .process_request_end_of_body = {},
-                .process_early_hints_response = {},
-                .process_response = move(process_response),
-                .process_response_end_of_body = {},
-                .process_response_consume_body = {},
-            })));
+    });
+    Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Engine::BodyIntent::DeliverStreamToConsumerAgent };
+    fetch_algorithms_input.process_response = process_response;
+    // AD-HOC: Request holds its body's source and length, and requestObject its stream, which fetching reads. Its
+    //         reader is acquired here, not when fetching reads the stream, so that script cannot lock the stream first.
+    if (auto body = request_object->body_impl())
+        fetch_algorithms_input.request_body_reader = Infrastructure::FetchAlgorithms::RequestBodyReader { *body, MUST(body->stream()->get_a_reader()) };
+    controller_holder->set_controller(Fetching::fetch(realm, request, Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input))));
 
     // 11. Add the following abort steps to requestObject’s signal:
-    (void)request_object->signal()->add_abort_algorithm([locally_aborted, request, controller_holder, promise_capability, request_object, response_object_holder, &relevant_realm] {
+    (void)request_object->signal()->add_abort_algorithm(GC::create_function(GC::Heap::the(), GC::captures(locally_aborted, controller_holder, promise_capability, request_object, response_object_holder, relevant_realm), [](auto& locally_aborted, auto& controller_holder, auto& promise_capability, auto& request_object, auto& response_object_holder, auto& relevant_realm) {
         dbgln_if(WEB_FETCH_DEBUG, "Fetch: Request object signal's abort algorithm called");
 
         // 1. Set locallyAborted to true.
@@ -191,26 +188,27 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
         HTML::TemporaryExecutionContext execution_context { relevant_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 4. Abort the fetch() call with p, request, responseObject, and requestObject’s signal’s abort reason.
-        abort_fetch(*promise_capability, request, response_object_holder->response_object, request_object->signal()->reason());
-    });
+        abort_fetch(*promise_capability, request_object, response_object_holder->response_object, request_object->signal()->reason());
+    }));
 
     // 13. Return p.
     return promise_capability;
 }
 
 // https://fetch.spec.whatwg.org/#abort-fetch
-void abort_fetch(WebIDL::Promise const& promise, GC::Ref<Infrastructure::Request> request, GC::Ptr<Response> response_object, JS::Value error)
+// NB: request is given as the Request object holding its body's stream.
+void abort_fetch(WebIDL::Promise const& promise, GC::Ref<Request> request_object, GC::Ptr<Response> response_object, JS::Value error)
 {
-    dbgln_if(WEB_FETCH_DEBUG, "Fetch: Aborting fetch with: request @ {}, error = {}", request.ptr(), error);
+    dbgln_if(WEB_FETCH_DEBUG, "Fetch: Aborting fetch with: request @ {}, error = {}", request_object->request().ptr(), error);
 
     // 1. Reject promise with error.
     // NOTE: This is a no-op if promise has already fulfilled.
     WebIDL::reject_promise(promise, error);
 
     // 2. If request’s body is non-null and is readable, then cancel request’s body with error.
-    if (auto* body = request->body().get_pointer<GC::Ref<Infrastructure::Body>>(); body != nullptr && (*body)->stream()->is_readable()) {
+    if (auto body = request_object->body_impl(); body && body->stream()->is_readable()) {
         // NOTE: Cancel here is different than the cancel method of stream and refers to https://streams.spec.whatwg.org/#readablestream-cancel
-        (*body)->stream()->cancel(error);
+        body->stream()->cancel(error);
     }
 
     // 3. If responseObject is null, then return.

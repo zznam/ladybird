@@ -6,7 +6,8 @@
 
 use ak::Utf16String;
 use libjs_rust::api::{
-    Array, ArrayBuffer, ArrayBufferShared, PrimitiveString, TypedArrayKind, Value, create_typed_array_on_buffer,
+    Array, ArrayBuffer, ArrayBufferShared, MarkedVec, PrimitiveString, TypedArrayKind, Value,
+    create_typed_array_on_buffer,
 };
 
 use super::proxy::recorder::bytes_of;
@@ -17,7 +18,6 @@ use crate::bindings::interface::{Interface, Ref, wrap};
 impl ContextState {
     fn typed_array(&self, cx: &CallContext, kind: TypedArrayKind, bytes: &[u8], length: usize) -> Value {
         let array_buffer = ArrayBuffer::create_from_bytes(cx.vm(), self.realm(), bytes, ArrayBufferShared::No);
-        let length = u32::try_from(length).expect("a typed array of a few numbers");
         Value::from_object(create_typed_array_on_buffer(
             cx.vm(),
             self.realm(),
@@ -41,8 +41,11 @@ impl ContextState {
 
     /// A `sequence<GLboolean>` returned as `any` is a JS array.
     pub(crate) fn boolean_array(&self, cx: &CallContext, booleans: &[bool]) -> Value {
-        let elements: Vec<Value> = booleans.iter().map(|&boolean| Value::from_bool(boolean)).collect();
-        Value::from_object(Array::create_from(cx.vm(), self.realm(), &elements))
+        let elements = MarkedVec::with_capacity(cx.vm(), booleans.len());
+        for &boolean in booleans {
+            elements.push(Value::from_bool(boolean));
+        }
+        Value::from_object(Array::create_from_list(cx.vm(), self.realm(), &elements))
     }
 }
 

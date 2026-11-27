@@ -20,12 +20,17 @@
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::HTML {
 
 void report_exception_to_console(JS::Value value, JS::Realm& realm, ErrorInPromise error_in_promise)
 {
+    // NB: Whatever comes out of an aborted script is no error of its own.
+    if (realm.vm().interrupt_requested())
+        return;
+
     auto& console = realm.intrinsics().console_object()->console();
 
     if (value.is_object()) {
@@ -36,12 +41,12 @@ void report_exception_to_console(JS::Value value, JS::Realm& realm, ErrorInPromi
         if (name.is_accessor() || message.is_accessor()) {
             // The result is not going to be useful, let's just print the value. This affects DOMExceptions, for example.
             if (auto exception = Bindings::dom_exception_report_details(object); exception.has_value()) {
-                dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}: {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", exception->name, exception->message);
+                dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", JS::Console::escape_for_terminal(ByteString::formatted("{}: {}", exception->name, exception->message)));
             } else {
-                dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", JS::Value(&object));
+                dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", JS::Console::escape_for_terminal(ByteString::formatted("{}", JS::Value(&object))));
             }
         } else {
-            dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m [{}] {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", name, message);
+            dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", JS::Console::escape_for_terminal(ByteString::formatted("[{}] {}", name, message)));
         }
         if (auto const* error_data = object.error_data()) {
             Utf16String exception_name;
@@ -53,12 +58,13 @@ void report_exception_to_console(JS::Value value, JS::Realm& realm, ErrorInPromi
                 exception_name = name.to_utf16_string_without_side_effects();
                 exception_message = message.to_utf16_string_without_side_effects();
             }
-            dbgln("{}", error_data->stack_string(JS::CompactTraceback::Yes));
+            auto stack = error_data->stack_string(JS::CompactTraceback::Yes);
+            dbgln("{}", JS::Console::escape_for_terminal(stack.utf16_view()));
             console.report_exception(exception_name, exception_message, *error_data, error_in_promise == ErrorInPromise::Yes);
             return;
         }
     } else {
-        dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", value);
+        dbgln("\033[31;1mUnhandled JavaScript exception{}:\033[0m {}", error_in_promise == ErrorInPromise::Yes ? " (in promise)" : "", JS::Console::escape_for_terminal(ByteString::formatted("{}", value)));
     }
 
     auto utf16_message = value.to_utf16_string_without_side_effects();
@@ -69,14 +75,26 @@ void report_exception_to_console(JS::Value value, JS::Realm& realm, ErrorInPromi
 // https://html.spec.whatwg.org/multipage/webappapis.html#report-an-exception
 void report_an_exception(JS::Object& global, JS::Value exception, OmitError omit_error, GC::Ptr<Script> script)
 {
+    report_an_exception(global, exception, {}, omit_error, script);
+}
+
+void report_an_exception(JS::Object& global, JS::Value exception, Optional<ErrorInformation> precomputed_error_info, OmitError omit_error, GC::Ptr<Script> script)
+{
     auto& realm = relevant_realm(global);
     auto& vm = realm.vm();
+
+    // NB: Whatever comes out of an aborted script is no error of its own.
+    if (vm.interrupt_requested())
+        return;
 
     // 1. Let notHandled be true.
     bool not_handled = true;
 
     // 2. Let errorInfo be the result of extracting error information from exception.
-    auto error_info = extract_error_information(vm, exception);
+    // NB: An exception from a dedicated worker stays in the worker, so its Worker object's relevant global object
+    //     reports it with the information the worker sent along with it.
+    bool has_precomputed_error_info = precomputed_error_info.has_value();
+    auto error_info = has_precomputed_error_info ? precomputed_error_info.release_value() : extract_error_information(vm, exception);
 
     // 3. Let script be a script found in an implementation-defined way, or null. This should usually be the
     //    running script (most notably during run a classic script).
@@ -128,15 +146,7 @@ void report_an_exception(JS::Object& global, JS::Value exception, OmitError omit
         // 2. If global implements EventTarget, then set notHandled to the result of firing an event named
         //    error at global, using ErrorEvent, with the cancelable attribute initialized to true, and
         //    additional attributes initialized according to errorInfo.
-        ErrorEventInit event_init = {};
-        event_init.cancelable = true;
-        event_init.message = error_info.message;
-        event_init.filename = error_info.filename;
-        event_init.lineno = error_info.lineno;
-        event_init.colno = error_info.colno;
-        event_init.error = error_info.error;
-
-        not_handled = window_or_worker->this_impl().dispatch_event(ErrorEvent::create(EventNames::error, event_init, HighResolutionTime::current_high_resolution_time(global)));
+        not_handled = window_or_worker->this_impl().dispatch_event(create_error_event(realm, EventNames::error, { .cancelable = true }, error_info));
 
         // 3. Set global's in error reporting mode to false.
         window_or_worker->set_in_error_reporting_mode(false);
@@ -144,6 +154,11 @@ void report_an_exception(JS::Object& global, JS::Value exception, OmitError omit
 
     // 7. If notHandled is true, then:
     if (not_handled) {
+        // https://w3c.github.io/webdriver-bidi/#event-log-entryAdded
+        // NB: WebDriver BiDi defines error reporting steps for an error that is not handled.
+        if (WebDriver::BiDi::is_active())
+            WebDriver::BiDi::error_reporting_steps(principal_realm_settings_object(realm), exception);
+
         // 1. Set errorInfo[error] to null.
         error_info.error = JS::js_null();
 
@@ -159,7 +174,11 @@ void report_an_exception(JS::Object& global, JS::Value exception, OmitError omit
             }
         }
         // 3. Otherwise, the user agent may report exception to a developer console.
-        else {
+        else if (has_precomputed_error_info) {
+            dbgln("\033[31;1mUnhandled JavaScript exception:\033[0m {}", JS::Console::escape_for_terminal(error_info.message.utf16_view()));
+            dbgln("    at {}:{}:{}", JS::Console::escape_for_terminal(error_info.filename.utf16_view()), error_info.lineno, error_info.colno);
+            realm.intrinsics().console_object()->console().report_exception("Error"_utf16, error_info.message, error_info.filename, error_info.lineno, error_info.colno, false);
+        } else {
             report_exception_to_console(exception, realm, ErrorInPromise::No);
         }
     }

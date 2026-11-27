@@ -45,6 +45,7 @@ struct LegacyPlatformObjectInfo {
     using IndexedPropertySetter = WebIDL::ExceptionOr<void> (*)(JS::HostObject& wrapper, JS::Realm&, u32 index, JS::Value);
     using NamedPropertySetter = WebIDL::ExceptionOr<void> (*)(JS::HostObject& wrapper, JS::Realm&, Utf16FlyString const& name, JS::Value);
     using NamedPropertyDeleter = WebIDL::ExceptionOr<NamedPropertyDeletionResult> (*)(JS::HostObject& wrapper, Utf16FlyString const& name);
+    using SupportedPropertyNames = Vector<Utf16FlyString> (*)(JS::HostObject const& wrapper);
 
     bool supports_indexed_properties { false };
     bool supports_named_properties { false };
@@ -74,6 +75,8 @@ struct LegacyPlatformObjectInfo {
     NamedPropertySetter set_value_of_named_property { nullptr };
 
     NamedPropertyDeleter delete_value { nullptr };
+
+    SupportedPropertyNames supported_property_names { nullptr };
 };
 
 [[nodiscard]] inline LegacyPlatformObjectInfo const* legacy_platform_object_info_of(JS::HostObject const& wrapper)
@@ -103,6 +106,9 @@ extern JSHostObjectHooks const dom_exception_wrapper_hooks;
 
 // The finalize hook of every wrapper host class calls this to remove the wrapper from its world.
 void finalize_platform_object(JS::HostObject& wrapper);
+// The preserve_identity hook of wrappers: script made the identity of the wrapper outlive the references to it, so the
+// wrapper must not be dropped and recreated anymore.
+void preserve_identity_of_platform_object(JS::HostObject& wrapper);
 
 // https://webidl.spec.whatwg.org/#dfn-platform-object
 // Only host classes give objects the platform object flag, so every platform object is a host object: a wrapper, whose
@@ -122,8 +128,13 @@ void finalize_platform_object(JS::HostObject& wrapper);
 }
 
 // https://webidl.spec.whatwg.org/#dfn-named-property-visibility
-// The wrapper must be a legacy platform object or the wrapper of a [Global] interface.
-WEB_API JS::ThrowCompletionOr<bool> is_named_property_exposed_on_object(JS::HostObject const& wrapper, JS::PropertyKey const&);
+// The wrapper must be a legacy platform object or the wrapper of a [Global] interface. A caller that took the name from
+// the object's supported property names passes NameIsSupported::Yes, which skips checking that again.
+enum class NameIsSupported {
+    No,
+    Yes,
+};
+WEB_API JS::ThrowCompletionOr<bool> is_named_property_exposed_on_object(JS::HostObject const& wrapper, JS::PropertyKey const&, NameIsSupported = NameIsSupported::No);
 
 // Defines the property via OrdinaryDefineOwnProperty and, if that created a new own property,
 // preserves the object's wrapper so the expando stays alive as long as the wrappable does.

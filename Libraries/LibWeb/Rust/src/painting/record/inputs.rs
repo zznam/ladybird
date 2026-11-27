@@ -6,7 +6,6 @@
 
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::display_list::commands::UniqueNodeId;
 use crate::painting::ffi::FfiChromeMetrics;
 use crate::painting::force_dark::ForceDarkSettings;
 use crate::painting::host::{FfiFlexOverlayInput, FfiGridOverlayInput, RootBackgroundSource};
@@ -22,7 +21,6 @@ pub(crate) struct UncapturedContentInputs {
     pub root_background_source: RootBackgroundSource,
     // Scroll commands use a scrollport at the origin. Its position is compositor state.
     pub device_viewport_size: IntSize,
-    pub document_id: UniqueNodeId,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     // The compositor hands a wheel over a nested context to it only where no box painted later covers it, which it can
     // tell only from the wheel hit test targets of every box.
@@ -67,10 +65,24 @@ pub(crate) struct RecordingInputs {
     pub force_dark_enabled: bool,
     pub force_dark_settings: ForceDarkSettings,
     pub should_paint_overlay: bool,
+    /// Cuts the plans a recording walks as finely as they go: every child scope with a bound is walked on its own,
+    /// and a run holds only what starts in one pixel row. Tests ask for it to see which boxes a change records
+    /// again on pages too small to span the rows a recording is otherwise cut along.
+    pub records_in_finest_runs: bool,
+    /// Records everything the document paints, wherever it is, and not just what shows in a window around the
+    /// viewport: what a screenshot of more than the viewport and a dump of the display list read.
+    pub records_whole_document: bool,
+    /// Notes beside the records which box and phase recorded each and the text each glyph run draws, for the display
+    /// list dump.
+    pub notes_record_origins: bool,
     pub canvas_fill_rect: Option<IntRect>,
     pub opaque_canvas: bool,
     pub bitmap_rect: IntRect,
     pub publishes_recording: bool,
+    /// What the compositor clears the surface with below the recording, for a top-level traversable.
+    pub surface_clear_color: Option<Color>,
+    /// What the recording's display list is stamped with for async scrolling, but for the keyboard scroll state.
+    pub async_scrolling_metadata: Option<libcompositing_rust::ipc_types::Compositing_AsyncScrollingMetadata>,
     pub window_is_focused: bool,
     pub outline_auto_color: Color,
     pub selection_background_from_palette: Color,
@@ -80,11 +92,13 @@ pub(crate) struct RecordingInputs {
     pub inactive_selection_background_light: Color,
     pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
-    pub document_has_supported_color_schemes: bool,
     // Whether the document's supported color schemes name `light` or `dark`.
     pub document_supports_light_or_dark: bool,
     // The color scheme an SVG image renders in where neither the box that draws it nor its document opts into one.
     pub image_fallback_color_scheme: u8,
+    // Whether the document is an SVG image's, whose records go into the tapes of the documents that draw the image: the
+    // transforms, clips and effects of its boxes are recorded in the records, which name no visual context.
+    pub records_without_visual_contexts: bool,
     // The paintable the assistive technology's browse-mode focus is on, which paints the AT focus ring.
     pub accessibility_focus_target: Option<NodeSlotId>,
     pub inspector_highlight: Option<InspectorHighlight>,
@@ -131,7 +145,8 @@ pub(crate) struct FocusedTextControlSelection {
 #[derive(Clone)]
 pub(crate) struct FocusedAreaOutline {
     pub image: NodeSlotId,
-    pub path_bytes: Box<[u8]>,
+    /// The style-tree identity of the area.
+    pub area: u32,
 }
 
 #[derive(Clone)]

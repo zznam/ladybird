@@ -27,7 +27,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/Timer.h>
-#include <LibWeb/StorageAPI/StorageAreaMirror.h>
+#include <LibWeb/StorageAPI/StorageAreaMirrorClient.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
@@ -65,18 +65,20 @@ public:
     virtual void die() override;
 
     void request_file(Web::PageId page_id, Web::FileRequest);
+    void request_file_for_webdriver(Web::PageId page_id, u64 command_id, Web::FileRequest);
 
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
     Web::Compositor::CompositorConnection* compositor_process_connection() const;
     void did_destroy_compositor_context(Web::CompositorContextId);
 
-    Function<void(IPC::TransportHandle const&, Optional<int> client_id)> on_request_server_connection;
-    Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
+    Function<void(IPC::TransportHandle const&, Optional<int> client_id, Optional<Utf16String> const& top_level_site)> on_request_server_connection;
 
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_webrtc_client_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_image_decoder_transport();
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -84,7 +86,6 @@ public:
     Queue<Web::QueuedInputEvent>& input_event_queue() { return m_input_event_queue; }
     void update_input_method_state(Web::PageId page_id);
 
-    void notify_started_using_gamepads();
     void pump_and_dispatch_gamepad_events();
 
 private:
@@ -94,28 +95,35 @@ private:
     Optional<PageClient const&> page(Web::PageId index, SourceLocation = SourceLocation::current()) const;
 
     virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;
+    virtual void release_memory() override;
     virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::CrossProcessId initial_document_id, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
-    virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void populate_history_entry_document(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void media_session_action(Web::PageId page_id, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     virtual void insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor) override;
     virtual void remove_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
     virtual void content_navigable_completely_finished_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_local_root_container_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState) override;
     virtual void close_server() override;
+    virtual void start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type) override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(Web::PageId page_id) override;
     virtual void set_window_handle(Web::PageId page_id, String handle) override;
     virtual void run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments) override;
+    virtual void run_webdriver_bidi_command(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id, String method, JsonValue params) override;
+    virtual void set_webdriver_bidi_session_state(Web::WebDriver::BiDiSessionState state) override;
     virtual void set_webdriver_session_config(Web::PageId page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts) override;
     virtual void run_webdriver_user_prompt_handling(Web::PageId page_id, u64 request_id) override;
     virtual void did_handle_webdriver_mouse_event(Web::PageId page_id, u64 request_id) override;
     virtual void connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) override;
-    virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id) override;
+    virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
-    virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void disconnect_from_image_decoder() override;
     virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
+    virtual void set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot) override;
     virtual void compositor_process_reconnected() override;
     virtual void update_system_theme(Web::PageId page_id, Core::AnonymousBuffer) override;
     virtual void update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect>, Vector<Web::DevicePixelRect>, u32) override;
@@ -128,7 +136,8 @@ private:
     virtual void run_navigation_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Web::HTML::UnloadPromptShown) override;
     virtual void create_navigation_params(Web::PageId page_id, Web::HTML::NavigationPopulationRequest) override;
     virtual void cancel_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
-    virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
+    virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::MessageDescriptor) override;
+    virtual void report_violation_of_environment(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, URL::URL resource) override;
     virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
     virtual void focus_window_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -141,10 +150,11 @@ private:
     virtual void run_beforeunload_check(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<Web::HTML::SessionHistoryEntryDescriptor> target_entry, Optional<Web::HTML::UserNavigationInvolvement> user_involvement_for_navigate_event, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void discard_embedded_page(Web::PageId page_id) override;
     virtual void queue_navigation_api_state_clear_task(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params) override;
+    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, bool needs_population) override;
+    virtual void create_history_navigation_params(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::NavigationPopulationRequest request, bool allow_POST) override;
     virtual void clear_ongoing_history_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) override;
-    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) override;
+    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
+    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
     virtual void run_descendant_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Web::HTML::StopHostingAfterUnload) override;
     virtual void continue_child_navigable_destruction(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void abort_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -167,6 +177,7 @@ private:
     virtual void mouse_event_in_hosted_root(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent) override;
     virtual void drag_event(Web::PageId page_id, Web::DragEvent) override;
     virtual void pinch_event(Web::PageId page_id, Web::PinchEvent) override;
+    virtual void pinch_event_in_hosted_root(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::PinchEvent) override;
     virtual void debug_request(Web::PageId page_id, ByteString, ByteString) override;
     virtual void get_source(Web::PageId page_id) override;
     virtual void inspect_dom_tree(Web::PageId page_id) override;
@@ -219,12 +230,15 @@ private:
     virtual void remove_debugger_breakpoint(Web::PageId page_id, u64 request_id, WebView::DebuggerBreakpointLocation) override;
     virtual void get_debugger_environments(Web::PageId page_id, u64 request_id, u64 frame_id) override;
     virtual void evaluate_javascript_in_debugger_frame(Web::PageId page_id, u64 request_id, u64 frame_id, Utf16String source_text) override;
-    virtual void get_debugger_object_properties(Web::PageId page_id, u64 request_id, u64 object_id) override;
+    virtual void get_debugger_object_properties(Web::PageId page_id, u64 request_id, u64 object_id, WebView::DebuggerObjectScope scope) override;
     virtual void get_debugger_source_positions(Web::PageId page_id, u64 request_id, Web::HTML::ScriptRegistry::Identifier) override;
     virtual void resolve_dom_node_url(Web::PageId page_id, u64 request_id, Optional<Web::UniqueNodeID> node_id, String url) override;
+    virtual void complete_js_console_input(Web::PageId page_id, u64 request_id, String input) override;
 
     virtual void set_listen_for_dom_mutations(Web::PageId page_id, bool) override;
     virtual void set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) override;
+    virtual void save_session_history_entry_states(Web::PageId page_id) override;
+    virtual void start_sending_console_output(Web::PageId page_id, bool messages, bool errors) override;
     virtual void get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) override;
@@ -241,7 +255,9 @@ private:
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
-    virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
+    virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
+    virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;
+    virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
     virtual void set_preferred_motion(Web::PageId page_id, Web::CSS::PreferredMotion) override;
@@ -249,16 +265,23 @@ private:
     virtual void set_browsing_behavior(Web::PageId page_id, WebView::BrowsingBehavior) override;
     virtual void set_enable_global_privacy_control(Web::PageId page_id, bool) override;
     virtual void set_spell_checking_available(Web::PageId page_id, bool available) override;
+    virtual void set_writing_suggestions_available(Web::PageId page_id, bool available) override;
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
-    virtual void permission_request_completed(Web::PageId page_id, u64 request_id, bool granted) override;
+    virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
+    virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_closed(Web::PageId page_id, u64 notification_id, bool by_user) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
+    virtual void notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) override;
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
-    virtual void set_viewport_corner_radius(Web::PageId page_id, double) override;
+    virtual void set_screen_shows_high_dynamic_range(Web::PageId page_id, bool) override;
+    virtual void set_frame_rate_capped(Web::PageId page_id, bool) override;
     virtual void set_window_position(Web::PageId page_id, Web::DevicePixelPoint) override;
     virtual void set_window_size(Web::PageId page_id, Web::DevicePixelSize) override;
     virtual void did_complete_window_rect_request(Web::PageId page_id, u64 completion_id) override;
@@ -279,11 +302,17 @@ private:
     virtual void confirm_closed(Web::PageId page_id, bool accepted) override;
     virtual void prompt_closed(Web::PageId page_id, Optional<Utf16String> response) override;
     virtual void color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) override;
+    virtual void date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value) override;
     virtual void file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files) override;
     virtual void select_dropdown_closed(Web::PageId page_id, Optional<u32> selected_item_id) override;
 
     virtual void retrieved_clipboard_entries(Web::PageId page_id, u64 request_id, Vector<Web::Clipboard::SystemClipboardItem>) override;
     virtual void did_check_spelling(Web::PageId page_id, u64 request_id, Vector<Web::SpellingError> errors) override;
+    virtual void did_get_writing_suggestion(Web::PageId page_id, u64 request_id, Optional<Web::WritingSuggestion> suggestion) override;
+    virtual void request_translation_language_sample(Web::PageId page_id, u64 request_id) override;
+    virtual void start_translation(Web::PageId page_id, String source_language, String target_language) override;
+    virtual void stop_translation(Web::PageId page_id) override;
+    virtual void did_translate(Web::PageId page_id, Web::TranslatedUnit unit) override;
     virtual void replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement) override;
     virtual void accept_spelling_word(Web::PageId page_id, Utf16String word) override;
     virtual void forget_accepted_spelling_words(Web::PageId page_id) override;
@@ -296,12 +325,11 @@ private:
     virtual void toggle_media_picture_in_picture_state(Web::PageId page_id) override;
     virtual void toggle_media_controls_state(Web::PageId page_id) override;
 
-    virtual void set_page_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state) override;
-
     virtual void take_document_screenshot(Web::PageId page_id) override;
     virtual void take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id) override;
 
     virtual void request_internal_page_info(Web::PageId page_id, WebView::PageInfoType) override;
+    virtual void describe_owners_of_visual_context_nodes(Web::PageId page_id, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices) override;
 
     virtual void get_selected_text(Web::PageId page_id, u64 request_id) override;
     virtual void generate_text_fragment_url(Web::PageId page_id, u64 request_id, u64 generation_id) override;
@@ -318,7 +346,7 @@ private:
     virtual void find_in_page_end(Web::PageId page_id) override;
 
     virtual void paste(Web::PageId page_id, Utf16String text) override;
-    virtual void paste_from_clipboard(Web::PageId page_id) override;
+    virtual void paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data) override;
     virtual void set_marked_text_from_input_method(Web::PageId page_id, Utf16String text) override;
     virtual void commit_text_from_input_method(Web::PageId page_id, Utf16String text, i32 replacement_start, i32 replacement_length) override;
     virtual void unmark_text_from_input_method(Web::PageId page_id) override;
@@ -338,7 +366,6 @@ private:
     virtual void cookies_changed(Web::PageId page_id, Vector<HTTP::Cookie::Cookie>) override;
     virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
     virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
     virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
@@ -351,6 +378,7 @@ private:
     virtual void exit_fullscreen(Web::PageId page_id) override;
 
     virtual void set_has_picture_in_picture_support(Web::PageId page_id, bool has_support) override;
+    virtual void set_offers_to_trust_certificates(Web::PageId page_id, bool self_signed, bool invalid) override;
     virtual void did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size) override;
     virtual void picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) override;
     virtual void picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) override;
@@ -361,13 +389,12 @@ private:
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
 
-    bool m_did_notify_started_using_gamepads { false };
-
     HashMap<int, Web::FileRequest> m_requested_files {};
     int last_id { 0 };
 
     void enqueue_input_event(Web::QueuedInputEvent);
     void enqueue_mouse_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::MouseEvent);
+    void enqueue_pinch_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::PinchEvent);
 
     Queue<Web::QueuedInputEvent> m_input_event_queue;
     bool m_enable_test_mode { false };

@@ -19,7 +19,6 @@
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -193,23 +192,16 @@ JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString
         this_argument = JS::js_undefined();
 
     // 3. Let O be the ECMAScript object corresponding to value.
-    auto& object = callback.callback;
+    GC::Ref<JS::Object> object = callback.callback;
 
     // 4. Let realm be O’s associated realm.
-    auto& realm = object->shape().realm();
+    auto& realm = callback.associated_realm();
 
     // 5. Let relevant settings be realm’s settings object.
     auto& relevant_settings = HTML::principal_realm_settings_object(realm);
 
     // 6. Let stored settings be value’s callback context.
-    auto& stored_settings = callback.callback_context;
-
-    // AD-HOC: Reject a cross-origin callback object before entering its realm; otherwise the operation lookup below
-    //         throws in that protected realm, exposing it to the caller. See https://github.com/whatwg/webidl/issues/1640.
-    if (HTML::is_cross_origin_platform_object(object)) {
-        auto& caller_realm = *object->vm().current_realm();
-        return throw_completion(caller_realm, WebIDL::SecurityError::create(caller_realm, "Cannot invoke a callback on a cross-origin object"_utf16));
-    }
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callback.callback_context;
 
     // AD-HOC: See is_settings_object_of_inactive_window().
     if (refuse_from_inactive_window == RefuseCallbackFromInactiveWindow::Yes && is_settings_object_of_inactive_window(relevant_settings))
@@ -296,6 +288,16 @@ JS::ThrowCompletionOr<Utf16String> to_utf16_usv_string(JS::VM& vm, JS::Value val
     return TRY(value.to_utf16_string(vm)).to_well_formed();
 }
 
+JS::ThrowCompletionOr<StringArgument> to_usv_string_argument(JS::VM& vm, JS::Value value)
+{
+    if (value.is_string()) {
+        auto const& string = value.as_string().utf16_string();
+        if (string.utf16_view().validate())
+            return StringArgument::borrowed(string);
+    }
+    return StringArgument::owned(TRY(to_utf16_usv_string(vm, value)));
+}
+
 // https://webidl.spec.whatwg.org/#invoke-a-callback-function
 // https://whatpr.org/webidl/1437.html#invoke-a-callback-function
 template<typename ReturnSteps>
@@ -308,7 +310,7 @@ static auto invoke_callback_impl(CallbackType& callback, Optional<JS::Value> thi
         this_argument = JS::js_undefined();
 
     // 3. Let F be the ECMAScript object corresponding to callable.
-    auto& function_object = callback.callback;
+    GC::Ref<JS::Object> function_object = callback.callback;
 
     // 5. Let realm be F’s associated realm.
     auto& realm = function_object->shape().realm();
@@ -325,7 +327,7 @@ static auto invoke_callback_impl(CallbackType& callback, Optional<JS::Value> thi
     }
 
     // 7. Let stored settings be callable’s callback context.
-    auto& stored_settings = callback.callback_context;
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callback.callback_context;
 
     // AD-HOC: See is_settings_object_of_inactive_window().
     if (is_settings_object_of_inactive_window(relevant_settings))
@@ -439,7 +441,7 @@ JS::Completion construct(CallbackType& callable, ReadonlySpan<JS::Value> args)
     JS::Completion completion;
 
     // 2. Let F be the JavaScript object corresponding to callable.
-    auto& function_object = callable.callback;
+    GC::Ref<JS::Object> function_object = callable.callback;
 
     // 3. If IsConstructor(F) is false, throw a TypeError exception.
     // 4. Let realm be F’s associated realm.
@@ -451,7 +453,7 @@ JS::Completion construct(CallbackType& callable, ReadonlySpan<JS::Value> args)
     auto& relevant_settings = HTML::principal_realm_settings_object(realm);
 
     // 6. Let stored settings be callable’s callback context.
-    auto& stored_settings = callable.callback_context;
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callable.callback_context;
 
     // AD-HOC: See is_settings_object_of_inactive_window().
     if (is_settings_object_of_inactive_window(relevant_settings))
@@ -588,6 +590,18 @@ JS::ThrowCompletionOr<T> convert_to_int(JS::VM& vm, JS::Value value, EnforceRang
 
     // 10. Set x to x modulo 2^bitLength.
     auto constexpr two_pow_bitlength = NumericLimits<MakeUnsigned<T>>::max() + 1.0;
+    if constexpr (sizeof(T) == 8) {
+        // NB: fmod() is exact, and leaves an integer of the sign of x whose magnitude is below 2^64, which a u64 holds.
+        //     But a double holds few integers near 2^64, so adding 2^64 to a negative remainder in one would round
+        //     (and -1 would become 2^64). So the wrap around to a non-negative x is done in a u64 instead.
+        auto remainder = fmod(x, two_pow_bitlength);
+        auto modulo = remainder < 0 ? 0 - static_cast<u64>(-remainder) : static_cast<u64>(remainder);
+
+        // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1), then return x − 2^(bitLength).
+        // 12. Otherwise, return x.
+        // NB: Reinterpreting the bits of x as a signed 64-bit integer does just that.
+        return static_cast<T>(modulo);
+    }
     x = JS::modulo(x, two_pow_bitlength);
 
     // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1), then return x − 2^(bitLength).

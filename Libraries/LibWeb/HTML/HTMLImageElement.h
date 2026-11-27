@@ -20,6 +20,7 @@
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/LazyLoadingElement.h>
+#include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/SourceSet.h>
 #include <LibWeb/Layout/ImageProvider.h>
 
@@ -96,6 +97,9 @@ public:
 
     void set_source_set(SourceSet);
 
+    // NB: The next update of the image data presents this resource instead of fetching the image.
+    void set_resource_from_navigation_response(GC::Ref<SharedResourceRequest>);
+
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
     DOM::Element const& dimension_attribute_source() const;
     void set_dimension_attribute_source(DOM::Element const*);
@@ -146,6 +150,7 @@ private:
     virtual void finalize() override;
 
     virtual void adopted_from(DOM::Document&) override;
+    virtual void inserted() override;
     virtual void moved_from(IsSubtreeRoot, GC::Ptr<DOM::Node> old_ancestor) override;
     virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
 
@@ -160,7 +165,15 @@ private:
     virtual void did_set_viewport_rect(CSSPixelRect const&) override;
 
     void handle_failed_fetch();
-    void add_callbacks_to_image_request(GC::Ref<ImageRequest>, bool maybe_omit_events, Utf16View url_string, Utf16View previous_url);
+    enum class LazyLoadOutcome {
+        Resumed,
+        Superseded,
+    };
+    void settle_decodes_waiting_for_lazy_load(LazyLoadOutcome);
+    void retire_lazy_load_continuation();
+    void add_callbacks_to_image_request(GC::Ref<ImageRequest>, GC::Ref<DOM::Document> originating_document, bool maybe_omit_events, Utf16View url_string, Utf16View previous_url, SharedResourceRequest::DelaysLoadEvent);
+    void stop_delaying_the_load_event_for_aborted_requests();
+    void update_image_document_zoom();
 
     void create_alt_text_shadow_tree();
     void remove_alt_text_shadow_tree();
@@ -169,6 +182,7 @@ private:
     void record_box_kind();
 
     virtual void decoded_image_data_did_update() override;
+    virtual bool decoded_image_data_may_be_rendered() const override { return has_layout_box(); }
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 
@@ -185,6 +199,7 @@ private:
     Optional<Utf16String> m_last_selected_source;
 
     // https://html.spec.whatwg.org/multipage/images.html#current-request
+    GC::Ptr<SharedResourceRequest> m_resource_from_navigation_response;
     GC::Ptr<ImageRequest> m_current_request;
 
     // https://html.spec.whatwg.org/multipage/images.html#pending-request
@@ -197,6 +212,9 @@ private:
     SourceSet m_source_set;
 
     CSSPixelSize m_last_seen_viewport_size;
+    Optional<double> m_image_document_zoom_level;
+
+    bool m_is_child_of_picture { false };
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
     // Each img element has a dimension attribute source, which must initially be the img element itself.
@@ -205,6 +223,10 @@ private:
     u64 m_update_the_image_data_count { 0 };
 
     bool m_has_resumed_lazy_loading { false };
+    bool m_is_retiring_lazy_load_continuation { false };
+
+    // NB: decode() calls on a deferred lazy image, which wait until its lazy load resumption steps run.
+    Vector<GC::Ref<GC::Function<void(LazyLoadOutcome)>>> m_decodes_waiting_for_lazy_load;
 
     GC::Ptr<HTMLMapElement> m_cached_associated_map_element;
     Optional<u64> m_cached_associated_map_element_dom_tree_version;

@@ -19,7 +19,6 @@
 //! same entries.
 
 use super::GraphBuilder;
-use super::SlotState;
 use crate::bytecode::Operand;
 use crate::ir::AccessorPart;
 use crate::ir::Block;
@@ -33,6 +32,7 @@ use crate::snapshot::Intrinsic;
 use crate::snapshot::PropertyCacheEntrySnapshot;
 use crate::snapshot::PropertyCacheEntryType;
 use crate::snapshot::PropertyCacheKind;
+use ak::ZoneVec;
 
 /// Where the property an entry describes is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,9 @@ pub(super) enum Action {
         shape: CellId,
         prototype_chain: Option<(CellId, bool)>,
     },
+    /// Reads `undefined`: neither the object nor its prototype chain
+    /// (checked with the validity cell, if there is one) has the property.
+    GetMissing { prototype_chain: Option<(CellId, bool)> },
 }
 
 /// One cache entry: its guards and its action.
@@ -94,6 +97,9 @@ pub(super) struct CacheEntry {
     /// The snapshot executable of the function `prototype_property` holds,
     /// if calls of it may be inlined.
     pub prototype_property_inline_executable: Option<u32>,
+    /// The target through which code may call the function
+    /// `prototype_property` holds directly.
+    pub prototype_property_direct_call: Option<crate::snapshot::DirectCallTarget>,
     /// The watchpoint set that stays valid while the prototype holds
     /// `prototype_property`, if there is one.
     pub prototype_property_watchpoint: Option<CellId>,
@@ -101,8 +107,7 @@ pub(super) struct CacheEntry {
 
 impl CacheEntry {
     /// The entry in its guard and action form, if compiled code can apply
-    /// it: entries of missing properties, and entries without a shape, are
-    /// left to the interpreter's code.
+    /// it: entries without a shape are left to the interpreter's code.
     pub fn of(entry: &PropertyCacheEntrySnapshot) -> Option<CacheEntry> {
         let prototype_holder = || match (entry.prototype, entry.prototype_chain_validity) {
             (Some(prototype), Some(validity)) => Some(Holder::Prototype {
@@ -141,13 +146,19 @@ impl CacheEntry {
                     offset: entry.property_offset,
                 },
             ),
-            // NB: Additions are only speculated for shapes that are no
-            //     dictionaries.
-            PropertyCacheEntryType::AddOwnProperty if !entry.shape_is_dictionary => (
-                entry.from_shape?,
+            PropertyCacheEntryType::GetMissingProperty => (
+                entry.shape?,
+                Action::GetMissing {
+                    prototype_chain: entry
+                        .prototype_chain_validity
+                        .map(|validity| (validity, entry.prototype_chain_valid)),
+                },
+            ),
+            PropertyCacheEntryType::AddOwnProperty => (
+                entry.shape?,
                 Action::Add {
                     offset: entry.property_offset,
-                    shape: entry.shape?,
+                    shape: entry.new_shape?,
                     prototype_chain: entry
                         .prototype_chain_validity
                         .map(|validity| (validity, entry.prototype_chain_valid)),
@@ -160,7 +171,7 @@ impl CacheEntry {
                 shape,
                 dictionary_generation: entry.shape_is_dictionary.then_some(entry.shape_dictionary_generation),
             },
-            // NB: For additions, the stable shape would be the new one.
+            // NB: Additions take objects off the shape.
             stable: entry.shape_is_stable && !matches!(action, Action::Add { .. }),
             key: entry.key.map(|cell| (entry.key_value, cell)),
             action,
@@ -172,6 +183,7 @@ impl CacheEntry {
                 .prototype_property
                 .map(|cell| (cell, entry.prototype_property_intrinsic)),
             prototype_property_inline_executable: entry.prototype_property_inline_executable,
+            prototype_property_direct_call: entry.prototype_property_direct_call,
             prototype_property_watchpoint: entry.prototype_property_watchpoint,
         })
     }
@@ -180,6 +192,7 @@ impl CacheEntry {
     pub fn is_data_access(&self) -> bool {
         match self.action {
             Action::Get { .. } => !self.holds_accessor,
+            Action::GetMissing { .. } => true,
             Action::Set {
                 holder: Holder::Receiver,
                 ..
@@ -219,12 +232,12 @@ impl CacheEntry {
     }
 }
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
     /// The entries of property lookup cache `cache` in their guard and
     /// action form, if the cache is monomorphic or polymorphic and compiled
     /// code can apply every entry.
-    pub(super) fn cache_entries(&self, cache: u32) -> Option<Vec<CacheEntry>> {
-        let cache = self.function.executable.property_caches.get(cache as usize)?;
+    pub(super) fn cache_entries(&self, cache: u32) -> Option<&'a [CacheEntry]> {
+        let cache = self.snapshot[self.function.executable.property_caches].get(cache as usize)?;
         if !matches!(
             cache.kind,
             PropertyCacheKind::Monomorphic | PropertyCacheKind::Polymorphic
@@ -232,27 +245,28 @@ impl GraphBuilder<'_> {
         {
             return None;
         }
-        cache.entries.iter().map(CacheEntry::of).collect()
+        let snapshots = &self.snapshot[cache.entries];
+        let mut entries = ZoneVec::with_capacity_in(snapshots.len(), self.work);
+        for entry in snapshots {
+            entries.push(CacheEntry::of(entry)?);
+        }
+        Some(entries.into_slice())
     }
 
     /// The entry of megamorphic property lookup cache `cache` for the shape
     /// the code knows the object in `object` has (see
     /// `AbstractFrame::fresh_shapes`), if the snapshot captured one.
-    pub(super) fn megamorphic_entries_for_known_shape(&self, cache: u32, object: Operand) -> Option<Vec<CacheEntry>> {
-        let cache = self.function.executable.property_caches.get(cache as usize)?;
+    pub(super) fn megamorphic_entries_for_known_shape(&self, cache: u32, object: Operand) -> Option<&'a [CacheEntry]> {
+        let cache = self.snapshot[self.function.executable.property_caches].get(cache as usize)?;
         if cache.kind != PropertyCacheKind::Megamorphic {
             return None;
         }
-        let SlotState::Value { node, .. } = self.peek(object) else {
-            return None;
-        };
-        let shape = self.fresh_shape(node)?;
-        let entry = cache
-            .entries
+        let shape = self.fresh_shape(self.peek(object)?.node)?;
+        let entry = self.snapshot[cache.entries]
             .iter()
             .filter_map(CacheEntry::of)
             .find(|entry| entry.shape.shape == shape)?;
-        Some(vec![entry])
+        Some(self.work.alloc_slice_copy(&[entry]))
     }
 
     /// The shape guard of an entry. Records whether the shape was stable,
@@ -276,7 +290,8 @@ impl GraphBuilder<'_> {
         apply: impl FnMut(&mut Self, &CacheEntry, NodeId) -> Option<NodeId>,
     ) -> Option<NodeId> {
         let entries = self.entries_for_known_shape(object, entries);
-        let shapes = entries.iter().map(|entry| self.shape_guard(entry)).collect::<Vec<_>>();
+        let work = self.work;
+        let shapes = ZoneVec::from_iter_in(entries.iter().map(|entry| self.shape_guard(entry)), work);
         // NB: The action applies the first entry's, so entries that differ in whether the property holds data do not
         //     share one.
         let one_action = entries.iter().all(|entry| {
@@ -333,43 +348,57 @@ impl GraphBuilder<'_> {
         let source = self.block;
         let frame = self.frame.clone();
         let frame_state = self.eager_frame_state();
-        let mut cases = Vec::with_capacity(shapes.len());
+        let mut cases = ZoneVec::with_capacity_in(shapes.len(), self.work);
         for shape in shapes {
             let block = self.graph.add_block(Block {
-                predecessors: vec![source],
-                ..Block::default()
+                predecessors: self.graph.list(&[source]),
+                ..self.graph.new_block()
             });
             self.order.push(block);
             self.embed(shape.shape);
             cases.push((*shape, block));
         }
         let address = self.cell_address(object);
-        let switch = self.set_control(Op::ShapeSwitch { cases: cases.clone() }, vec![object, address]);
+        let zone = self.graph.zone;
+        let switch = self.set_control(
+            Op::ShapeSwitch {
+                shapes: zone.alloc_slice_from_iter(cases.iter().map(|(shape, _)| *shape)),
+                targets: zone.alloc_slice_from_iter(cases.iter().map(|(_, block)| *block)),
+            },
+            &[object, address],
+        );
         self.graph.nodes[switch.index()].frame_state = Some(frame_state);
 
-        let join = self.graph.add_block(Block::default());
-        let mut results = Vec::new();
-        let mut case_shapes = Vec::with_capacity(cases.len());
+        let join = self.graph.add_block(self.graph.new_block());
+        let mut results = ZoneVec::with_capacity_in(cases.len(), self.work);
+        let mut every_case_has_a_result = true;
+        let mut case_shapes = ZoneVec::with_capacity_in(cases.len(), self.work);
         for (index, (shape, block)) in cases.iter().enumerate() {
             self.block = *block;
-            self.frame = frame.clone();
-            let refined = self.refine(BranchCondition::Shape(*shape), true, vec![object, address]);
-            results.push(case(self, index, refined));
+            self.frame.clone_from(&frame);
+            let refined = self.refine(BranchCondition::Shape(*shape), true, &[object, address]);
+            match case(self, index, refined) {
+                Some(result) => results.push(result),
+                None => every_case_has_a_result = false,
+            }
             debug_assert_eq!(self.frame.slots, frame.slots, "cases do not change frame slots");
-            self.set_control(Op::Jump { target: join }, Vec::new());
+            self.set_control(Op::Jump { target: join }, &[]);
             self.graph.blocks[join.index()].predecessors.push(self.block);
-            case_shapes.push(std::mem::take(&mut self.frame.fresh_shapes));
+            case_shapes.push(self.frame.fresh_shapes.take());
         }
         self.order.push(join);
         self.block = join;
         self.frame = frame;
         // NB: Cases may change shapes, like additions do.
-        self.frame.fresh_shapes = super::AbstractFrame::common_fresh_shapes(case_shapes.iter().map(Vec::as_slice));
+        self.frame
+            .set_common_fresh_shapes(case_shapes.iter().map(|shapes| shapes.as_slice()));
 
-        let results = results.into_iter().collect::<Option<Vec<_>>>()?;
+        if !every_case_has_a_result {
+            return None;
+        }
         if results.iter().all(|result| *result == results[0]) {
             return Some(results[0]);
         }
-        Some(self.add_phi(results))
+        Some(self.add_phi(&results))
     }
 }

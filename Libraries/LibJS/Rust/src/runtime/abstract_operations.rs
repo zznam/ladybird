@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use ak::{ScopeGuard, Utf16FlyString, Utf16String};
+use indexmap::IndexSet;
 use num_bigint::Sign;
 use num_integer::Integer;
 use num_traits::{Signed, Zero};
@@ -18,9 +19,9 @@ use num_traits::{Signed, Zero};
 use crate::bytecode::executable::{Executable, StaticPropertyLookupCacheSite};
 use crate::compile::{CompiledEval, EvalContext, parse_eval};
 use crate::gc::class::{Extends, GcCell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
-use crate::hash_table::Utf16FlyStringHashTable;
 use crate::interpreter::run::should_dump_bytecode;
 use crate::interpreter::runtime_functions::unimplemented_runtime_function;
 use crate::interpreter::vm::{CompilationType, EvalMode, Vm};
@@ -57,7 +58,7 @@ use crate::runtime::private_environment::PrivateEnvironment;
 use crate::runtime::promise_capability::{new_promise_capability, try_or_reject};
 use crate::runtime::property_attributes::PropertyAttributes;
 use crate::runtime::property_descriptor::PropertyDescriptor;
-use crate::runtime::property_key::PropertyKey;
+use crate::runtime::property_key::{NonSymbolPropertyKey, PropertyKey};
 use crate::runtime::proxy_object::ProxyObject;
 use crate::runtime::realm::Realm;
 use crate::runtime::shared_function_instance_data::{
@@ -137,15 +138,24 @@ fn with_callee_context<T>(
         argument_count: u32::try_from(arguments_list.len()).expect("the argument count fits in u32"),
         ..Default::default()
     };
-    function.get_stack_frame_info(vm, &mut stack_frame_info);
+    function.get_stack_frame_info(vm, &mut stack_frame_info)?;
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
-    let Some(callee_context) = stack.allocate(
+    let (registers_and_locals_count, constant_count, argument_count) = (
         stack_frame_info.registers_and_locals_count,
         stack_frame_info.constant_count,
         stack_frame_info.argument_count,
-    ) else {
+    );
+    let callee_context = stack
+        .allocate(registers_and_locals_count, constant_count, argument_count)
+        .or_else(|| {
+            function
+                .ignores_stack_space_limit()
+                .then(|| stack.allocate_past_limit(registers_and_locals_count, constant_count, argument_count))
+                .flatten()
+        });
+    let Some(callee_context) = callee_context else {
         return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
     };
     let _deallocate_guard = ScopeGuard::new(|| stack.deallocate(stack_mark));
@@ -252,8 +262,43 @@ pub fn create_list_from_array_like<'vm>(
     // 3. Let len be ? LengthOfArrayLike(obj).
     let length = length_of_array_like(vm, &array_like)?;
 
+    list_from_array_like(vm, &array_like, length, check_value)
+}
+
+/// CreateListFromArrayLike ( obj ), for the arguments of a call: An array-like longer than any call can take throws
+/// before any of its elements are read.
+pub fn create_argument_list_from_array_like(vm: &Vm, value: Value) -> ThrowCompletionOr<MarkedVec<'_, Value>> {
+    if !value.is_object() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+    }
+    let array_like = value.as_object();
+    let length = length_of_array_like(vm, &array_like)?;
+    throw_if_too_many_arguments(vm, length)?;
+    list_from_array_like(vm, &array_like, length, None)
+}
+
+/// Throws where `argument_count` is more arguments than any call can pass.
+pub fn throw_if_too_many_arguments(vm: &Vm, argument_count: u64) -> ThrowCompletionOr<()> {
+    if argument_count > crate::interpreter::interpreter_stack::MAXIMUM_ARGUMENT_COUNT {
+        return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+    }
+    Ok(())
+}
+
+/// Steps 4 through 7 of CreateListFromArrayLike.
+fn list_from_array_like<'vm>(
+    vm: &'vm Vm,
+    array_like: &Object,
+    length: u64,
+    check_value: Option<&dyn Fn(Value) -> ThrowCompletionOr<()>>,
+) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
     // 4. Let list be a new empty List.
-    let list = MarkedVec::with_capacity(vm, length as usize);
+    // NB: The list grows as its elements are read, past what it reserves: A length no list could hold, such as an
+    //     ownKeys trap's, then fails on the elements it reads rather than on the reservation.
+    let list = MarkedVec::with_capacity(
+        vm,
+        length.min(crate::interpreter::interpreter_stack::MAXIMUM_ARGUMENT_COUNT) as usize,
+    );
 
     // 5. Let index be 0.
     // 6. Repeat, while index < len,
@@ -377,7 +422,7 @@ pub struct PropertyKeyGroups<'vm> {
     keys: MarkedVec<'vm, PropertyKey>,
     elements: Vec<MarkedVec<'vm, Value>>,
     /// Symbol keys are only kept in the marked list of keys and looked up one by one.
-    index_of_string_or_number_key: HashMap<PropertyKey, usize>,
+    index_of_string_or_number_key: HashMap<NonSymbolPropertyKey, usize>,
 }
 
 impl<'vm> PropertyKeyGroups<'vm> {
@@ -443,8 +488,8 @@ impl<'vm> KeyedGroups<'vm> for PropertyKeyGroups<'vm> {
         new_elements.push(value);
 
         // 3. Append group as the last element of groups.
-        if !key.is_symbol() {
-            self.index_of_string_or_number_key.insert(key.clone(), self.keys.len());
+        if let Some(key) = NonSymbolPropertyKey::new(key.clone()) {
+            self.index_of_string_or_number_key.insert(key, self.keys.len());
         }
         self.keys.push(key);
         self.elements.push(new_elements);
@@ -735,23 +780,29 @@ pub fn ordinary_create_from_constructor(
     constructor: Gc<FunctionObject>,
     intrinsic_default_prototype: IntrinsicDefaultPrototype,
 ) -> ThrowCompletionOr<Gc<Object>> {
-    ordinary_create_from_constructor_of(vm, realm, constructor, intrinsic_default_prototype, |prototype| {
-        Object::new_with_prototype(vm, Object::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No)
+    ordinary_create_from_constructor_of(vm, realm, constructor, intrinsic_default_prototype, |_, prototype| {
+        Object::new_with_prototype(
+            vm,
+            Object::CLASS,
+            realm,
+            Some(prototype),
+            MayInterfereWithIndexedPropertyAccess::No,
+        )
     })
 }
 
 // 10.1.13 OrdinaryCreateFromConstructor ( constructor, intrinsicDefaultProto [ , internalSlotsList ] ), https://tc39.es/ecma262/#sec-ordinarycreatefromconstructor
 /// The form of OrdinaryCreateFromConstructor that creates an object with the internal slots of a T, which `create`
-/// makes from the prototype.
+/// builds from the prototype, as Heap::allocate() does.
 pub fn ordinary_create_from_constructor_of<T: GcCell + Extends<Object>>(
     vm: &Vm,
     realm: Gc<Realm>,
     constructor: Gc<FunctionObject>,
     intrinsic_default_prototype: IntrinsicDefaultPrototype,
-    create: impl FnOnce(Gc<Object>) -> T,
+    create: impl FnOnce(&DeferGc<'_>, Gc<Object>) -> T,
 ) -> ThrowCompletionOr<Gc<T>> {
     let prototype = get_prototype_from_constructor(vm, constructor, intrinsic_default_prototype)?;
-    Ok(realm.create_object(vm, create(prototype)))
+    Ok(realm.create_object(vm, |defer_gc| create(defer_gc, prototype)))
 }
 
 // 10.1.14 GetPrototypeFromConstructor ( constructor, intrinsicDefaultProto ), https://tc39.es/ecma262/#sec-getprototypefromconstructor
@@ -820,6 +871,24 @@ pub fn new_object_environment(
             IsWithEnvironment::No
         },
         environment,
+    )
+}
+
+/// The environment of a call of `function`, which needs one: a function environment if the function's code reads
+/// anything of one through its environment, and otherwise the same without the fields it would never read.
+pub fn new_call_environment(
+    vm: &Vm,
+    function: Gc<EcmascriptFunctionObject>,
+    new_target: Option<Gc<Object>>,
+) -> Gc<DeclarativeEnvironment> {
+    let shared_data = function.shared_data();
+    if shared_data.function_environment_has_this_binding() {
+        return new_function_environment(vm, function, new_target).upcast();
+    }
+    DeclarativeEnvironment::create_with_binding_capacity(
+        vm,
+        function.environment(),
+        shared_data.function_environment_bindings_count(),
     )
 }
 
@@ -893,6 +962,19 @@ pub fn new_function_environment_for_native_javascript_backed_function(
     env
 }
 
+/// OPTIMIZATION: The function of the running execution context, if its frame answers for `this`, `super` and
+/// `new.target` in place of the function environment that GetThisEnvironment() would find. That is the case for an
+/// ECMAScript function that is no arrow function and whose calls get no environment with a this binding, because
+/// nothing reads those through the environment (no arrow function or direct eval in it uses them). The frame then has
+/// the this value (empty while a derived constructor has not called super()) and the new target, and the function has
+/// its home object.
+pub fn function_with_frame_as_this_environment(vm: &Vm) -> Option<Gc<EcmascriptFunctionObject>> {
+    let context = vm.running_execution_context_if_any()?;
+    let function = as_ecmascript_function_object(context.function.get()?)?;
+    let shared_data = function.shared_data();
+    (!shared_data.is_arrow_function() && !shared_data.function_environment_has_this_binding()).then_some(function)
+}
+
 // 9.4.3 GetThisEnvironment ( ), https://tc39.es/ecma262/#sec-getthisenvironment
 pub fn get_this_environment(vm: &Vm) -> Gc<Environment> {
     let context = vm
@@ -937,8 +1019,21 @@ pub fn can_be_held_weakly(value: Value) -> bool {
     false
 }
 
+/// NB: Not an operation of the spec. Script is about to hold `value` weakly, which makes the identity of an object
+///     outlive the references to it, so the embedder must keep the object from then on (Object::preserve_identity()).
+pub fn preserve_identity_of_value_held_weakly(value: Value) {
+    if value.is_object() {
+        value.as_object().preserve_identity();
+    }
+}
+
 // 13.3.7.2 GetSuperConstructor ( ), https://tc39.es/ecma262/#sec-getsuperconstructor
 pub fn get_super_constructor(vm: &Vm) -> Option<Gc<Object>> {
+    // OPTIMIZATION: The running function is envRec.[[FunctionObject]] if its frame answers for the environment.
+    if let Some(active_function) = function_with_frame_as_this_environment(vm) {
+        return active_function.internal_get_prototype_of(vm).must();
+    }
+
     // 1. Let envRec be GetThisEnvironment().
     let env = get_this_environment(vm);
 
@@ -1109,12 +1204,11 @@ pub fn perform_eval(vm: &Vm, x: Value, strict_caller: CallerMode, direct: EvalMo
 
         // b. Let varEnv be runningContext's VariableEnvironment.
         variable_environment = running_context
-            .variable_environment
-            .get()
+            .variable_environment()
             .expect("the running execution context has a VariableEnvironment");
 
         // c. Let privateEnv be runningContext's PrivateEnvironment.
-        private_environment = running_context.private_environment.get();
+        private_environment = running_context.private_environment();
     }
     // 19. Else,
     else {
@@ -1173,21 +1267,19 @@ pub fn perform_eval(vm: &Vm, x: Value, strict_caller: CallerMode, direct: EvalMo
     // NOTE: This was done in the construction of eval_context.
 
     // 24. Set evalContext's Realm to evalRealm.
-    eval_context.realm.set(Some(eval_realm));
+    eval_context.set_realm(Some(eval_realm));
 
     // 25. Set evalContext's ScriptOrModule to runningContext's ScriptOrModule.
-    eval_context
-        .script_or_module
-        .set(running_context.script_or_module.get());
+    eval_context.set_script_or_module(running_context.script_or_module());
 
     // 26. Set evalContext's VariableEnvironment to varEnv.
-    eval_context.variable_environment.set(Some(variable_environment));
+    eval_context.set_variable_environment(Some(variable_environment));
 
     // 27. Set evalContext's LexicalEnvironment to lexEnv.
     eval_context.lexical_environment.set(Some(lexical_environment));
 
     // 28. Set evalContext's PrivateEnvironment to privateEnv.
-    eval_context.private_environment.set(private_environment);
+    eval_context.set_private_environment(private_environment);
 
     // 29. Push evalContext onto the execution context stack; evalContext is now the running execution context.
     // NB: A push that fails leaves the context allocated, until the frame that called eval frees the interpreter stack
@@ -1246,11 +1338,11 @@ struct EvalResult<'vm> {
     declaration_data: EvalDeclarationData<'vm>,
 }
 
-fn fly_string_of(name: &crate::ast::Utf16String) -> Utf16FlyString {
-    Utf16FlyString::from_utf16(&name.0)
+fn fly_string_of(name: &Utf16String) -> Utf16FlyString {
+    Utf16View::of_string(name).to_utf16_fly_string()
 }
 
-fn fly_strings_of(names: &[crate::ast::Utf16String]) -> Vec<Utf16FlyString> {
+fn fly_strings_of(names: &[Utf16String]) -> Vec<Utf16FlyString> {
     names.iter().map(fly_string_of).collect()
 }
 
@@ -1270,10 +1362,6 @@ fn compile_eval(
     in_class_field_initializer: bool,
 ) -> Result<EvalResult<'_>, String> {
     let source_code = SourceCode::create(Utf16String::default(), code);
-    let mut code_units = Vec::with_capacity(source_code.length_in_code_units());
-    Utf16View::of_string(source_code.code()).append_to(&mut code_units);
-    let length = code_units.len();
-
     let context = EvalContext {
         starts_in_strict_mode: strict_caller == CallerMode::Strict,
         in_eval_function_context: in_function,
@@ -1281,7 +1369,7 @@ fn compile_eval(
         allow_super_constructor_call: in_derived_constructor,
         in_class_field_initializer,
     };
-    let parsed = parse_eval(&code_units, context).map_err(|errors| {
+    let parsed = parse_eval(&source_code.code(), context).map_err(|errors| {
         errors
             .first()
             .map(|error| format!("{} (line: {}, column: {})", error.message, error.line, error.column))
@@ -1291,17 +1379,17 @@ fn compile_eval(
     let CompiledEval {
         executable,
         declarations,
-    } = crate::compile::compile_eval(parsed, length);
+    } = crate::compile::compile_eval(parsed);
     let executable = Executable::create_with_source_code(vm, executable, Some(&source_code));
     executable.set_name(Utf16FlyString::from_utf8("eval"));
 
     let functions_to_initialize_shared_data = MarkedVec::with_capacity(vm, declarations.functions_to_initialize.len());
     let mut functions_to_initialize = Vec::with_capacity(declarations.functions_to_initialize.len());
     let mut declared_function_names = HashSet::new();
-    for mut function in declarations.functions_to_initialize {
+    for function in &declarations.functions_to_initialize {
         functions_to_initialize_shared_data.push(SharedFunctionInstanceData::create_from_pending_shared_function_data(
             vm,
-            &mut function.shared_function_data,
+            &function.shared_function_data,
             declarations.is_strict,
             Some(&source_code),
         ));
@@ -1336,8 +1424,7 @@ fn compile_eval(
     })
 }
 
-// 19.2.1.3 EvalDeclarationInstantiation ( body, varEnv, lexEnv, privateEnv, strict ), https://tc39.es/ecma262/#sec-evaldeclarationinstantiation
-// 9.1.1.1 EvalDeclarationInstantiation ( body, varEnv, lexEnv, privateEnv, strict ), https://tc39.es/proposal-explicit-resource-management/#sec-evaldeclarationinstantiation
+// 19.2.1.4 EvalDeclarationInstantiation ( body, variableEnv, lexicalEnv, privateEnv, strict ), https://tc39.es/ecma262/#sec-evaldeclarationinstantiation
 pub fn eval_declaration_instantiation(
     vm: &Vm,
     data: &EvalDeclarationData<'_>,
@@ -1349,15 +1436,15 @@ pub fn eval_declaration_instantiation(
     let realm = vm.current_realm().expect("eval runs in a realm");
     let global_var_environment = variable_environment.downcast::<GlobalEnvironment>();
 
-    // 1. Let varNames be the VarDeclaredNames of body.
-    // 2. Let varDeclarations be the VarScopedDeclarations of body.
+    // 1. Let variableNames be the VarDeclaredNames of body.
+    // 2. Let variableDecls be the VarScopedDeclarations of body.
     // 3. If strict is false, then
     if !strict {
-        // a. If varEnv is a global Environment Record, then
+        // a. If variableEnv is a Global Environment Record, then
         if let Some(global_var_environment) = global_var_environment {
-            // i. For each element name of varNames, do
+            // i. For each element name of variableNames, do
             for name in &data.var_names {
-                // 1. If varEnv.HasLexicalDeclaration(name) is true, throw a SyntaxError exception.
+                // 1. If HasLexicalDeclaration(variableEnv, name) is true, throw a SyntaxError exception.
                 if global_var_environment.has_lexical_declaration(name) {
                     return vm.throw_completion(
                         ErrorKind::SyntaxError,
@@ -1366,29 +1453,27 @@ pub fn eval_declaration_instantiation(
                     );
                 }
 
-                // 2. NOTE: eval will not create a global var declaration that would be shadowed by a global lexical declaration.
+                // 2. NOTE: `eval` will not create a global var declaration that would be shadowed by a global lexical declaration.
             }
         }
 
-        // b. Let thisEnv be lexEnv.
+        // b. Let thisEnv be lexicalEnv.
         let mut this_environment = lexical_environment;
         // c. Assert: The following loop will terminate.
 
-        // d. Repeat, while thisEnv is not the same as varEnv,
+        // d. Repeat, while thisEnv and variableEnv are not the same Environment Record,
         while this_environment != variable_environment {
-            // i. If thisEnv is not an object Environment Record, then
+            // i. If thisEnv is not an Object Environment Record, then
             if !this_environment.is_object_environment() {
                 // 1. NOTE: The environment of with statements cannot contain any lexical declaration so it doesn't need to be checked for var/let hoisting conflicts.
-                // 2. For each element name of varNames, do
+                // 2. For each element name of variableNames, do
                 for name in &data.var_names {
                     // a. If ! thisEnv.HasBinding(name) is true, then
                     if this_environment.has_binding(vm, name, None).must() {
-                        // B.3.4 Changes to EvalDeclarationInstantiation, https://tc39.es/ecma262/#sec-evaldeclarationinstantiation
-                        // i. Normative Optional
-                        //     If the host is a web browser or otherwise supports VariableStatements in Catch Blocks, then
-                        //         i. If thisEnv is not the Environment Record for a Catch clause, throw a SyntaxError exception.
+                        // i. If the host is a web browser or otherwise supports VariableStatements in Catch Blocks, then
+                        //     1. If thisEnv is not the Environment Record for a Catch clause, throw a SyntaxError exception.
                         // ii. Else,
-                        //     i. Throw a SyntaxError exception.
+                        //     1. Throw a SyntaxError exception.
                         // AD-HOC: We are a web browser, so we only implement the web browser branch.
                         if !this_environment.is_catch_environment() {
                             return vm.throw_completion(
@@ -1423,16 +1508,22 @@ pub fn eval_declaration_instantiation(
         }
     }
 
-    // 8. Let functionsToInitialize be a new empty List.
-    // 9. Let declaredFunctionNames be a new empty List.
-    // 10. For each element d of varDeclarations, in reverse List order, do
+    // 8. Let funcsToInitialize be a new empty List.
+    // 9. Let declaredFuncNames be a new empty List.
+    // 10. For each element variableDecl of variableDecls, in reverse List order, do
+    //     a. If variableDecl is not either a VariableDeclaration, a ForBinding, or a BindingIdentifier, then
+    //         i. Assert: variableDecl is either a FunctionDeclaration, a GeneratorDeclaration, an AsyncFunctionDeclaration, or an AsyncGeneratorDeclaration.
+    //         ii. NOTE: If there are multiple function declarations for the same name, the last declaration is used.
+    //         iii. Let funcName be the sole element of the BoundNames of variableDecl.
+    //         iv. If declaredFuncNames does not contain funcName, then
+    // NB: funcsToInitialize and declaredFuncNames are worked out when the eval is compiled.
     for function in &data.functions_to_initialize {
-        // 1. If varEnv is a global Environment Record, then
+        // 1. If variableEnv is a Global Environment Record, then
         if let Some(global_var_environment) = global_var_environment {
-            // a. Let fnDefinable be ? varEnv.CanDeclareGlobalFunction(fn).
+            // a. Let funcDefinable be ? CanDeclareGlobalFunction(variableEnv, funcName).
             let function_definable = global_var_environment.can_declare_global_function(vm, &function.name)?;
 
-            // b. If fnDefinable is false, throw a TypeError exception.
+            // b. If funcDefinable is false, throw a TypeError exception.
             if !function_definable {
                 return vm.throw_completion(
                     ErrorKind::TypeError,
@@ -1441,38 +1532,69 @@ pub fn eval_declaration_instantiation(
                 );
             }
         }
+        // 2. Append funcName to declaredFuncNames.
+        // 3. Insert variableDecl as the first element of funcsToInitialize.
     }
 
-    // 11. NOTE: Annex B.3.2.3 adds additional steps at this point.
-    // B.3.2.3 Changes to EvalDeclarationInstantiation, https://tc39.es/ecma262/#sec-web-compat-evaldeclarationinstantiation
-    // 11. If strict is false, then
+    // 11. Let declaredVariableNames be a new empty List.
+    let mut declared_var_names = IndexSet::new();
+
+    // 12. For each element variableDecl of variableDecls, do
+    //     a. If variableDecl is either a VariableDeclaration, a ForBinding, or a BindingIdentifier, then
+    //         i. For each String name of the BoundNames of variableDecl, do
+    for name in &data.var_scoped_names {
+        // 1. If declaredFuncNames does not contain name, then
+        if !data.declared_function_names.contains(name) {
+            // a. If variableEnv is a Global Environment Record, then
+            if let Some(global_var_environment) = global_var_environment {
+                // i. Let variableDefinable be ? CanDeclareGlobalVar(variableEnv, name).
+                let variable_definable = global_var_environment.can_declare_global_var(vm, name)?;
+
+                // ii. If variableDefinable is false, throw a TypeError exception.
+                if !variable_definable {
+                    return vm.throw_completion(ErrorKind::TypeError, ErrorType::CannotDeclareGlobalVariable, &[name]);
+                }
+            }
+
+            // b. If declaredVariableNames does not contain name, then
+            //     i. Append name to declaredVariableNames.
+            declared_var_names.insert(name.clone());
+        }
+    }
+
+    // 13. If strict is false and the host is a web browser or otherwise supports Block-Level Function Declarations Web Legacy Compatibility Semantics, then
     if !strict {
-        // a. Let declaredFunctionOrVarNames be the list-concatenation of declaredFunctionNames and declaredVarNames.
-        // The spec here uses 'declaredVarNames' but that has not been declared yet.
+        // a. Let declaredFuncOrVariableNames be the list-concatenation of declaredFuncNames and declaredVariableNames.
+        // NB: The names that step 13.b.ii.7.a.iii appends to it go into hoisted_functions.
         let mut hoisted_functions = HashSet::new();
 
-        // b. For each FunctionDeclaration f that is directly contained in the StatementList of a Block, CaseClause, or DefaultClause Contained within body, do
+        // b. For each FunctionDeclaration funcDecl that is directly contained in the StatementList of any Block, CaseClause, or DefaultClause x such that body Contains x is true, do
         for function_name in &data.annex_b_candidate_names {
-            // i. Let F be StringValue of the BindingIdentifier of f.
+            // i. Let funcName be the StringValue of the BindingIdentifier of funcDecl.
 
-            // ii. If replacing the FunctionDeclaration f with a VariableStatement that has F as a BindingIdentifier would not produce any Early Errors for body, then
-            // Note: This is checked during parsing and for_each_function_hoistable_with_annexB_extension so it always passes here.
+            // ii. If replacing the FunctionDeclaration funcDecl with a VariableStatement that has funcName as a BindingIdentifier would not produce any Early Errors for body, then
+            // NB: The parser only lists the functions that this holds for.
 
             // 1. Let bindingExists be false.
-            // 2. Let thisEnv be lexEnv.
+            // 2. Set thisEnv to lexicalEnv.
             let mut this_environment = lexical_environment;
 
             // 3. Assert: The following loop will terminate.
 
-            // 4. Repeat, while thisEnv is not the same as varEnv,
+            // 4. Repeat, while thisEnv is not variableEnv,
             let mut binding_exists = false;
             while this_environment != variable_environment {
-                // a. If thisEnv is not an object Environment Record, then
-                //     i. If ! thisEnv.HasBinding(F) is true, then
+                // a. If thisEnv is not an Object Environment Record, then
+                //     i. If ! thisEnv.HasBinding(funcName) is true, then
+                //         1. If the host is a web browser or otherwise supports VariableStatements in Catch Blocks, then
+                //             a. If thisEnv is not the Environment Record for a Catch clause, set bindingExists to true.
+                //         2. Else,
+                //             a. Set bindingExists to true.
+                // AD-HOC: We are a web browser, so we only implement the web browser branch.
                 if !this_environment.is_object_environment()
                     && this_environment.has_binding(vm, function_name, None).must()
+                    && !this_environment.is_catch_environment()
                 {
-                    // i. Let bindingExists be true.
                     binding_exists = true;
                     break;
                 }
@@ -1487,109 +1609,88 @@ pub fn eval_declaration_instantiation(
                 continue;
             }
 
-            // Note: At this point bindingExists is false.
-            // 5. If bindingExists is false and varEnv is a global Environment Record, then
+            // 5. If bindingExists is false and variableEnv is a Global Environment Record, then
             if let Some(global_var_environment) = global_var_environment {
-                // a. If varEnv.HasLexicalDeclaration(F) is false, then
+                // a. If HasLexicalDeclaration(variableEnv, funcName) is false, then
                 if !global_var_environment.has_lexical_declaration(function_name) {
-                    // i. Let fnDefinable be ? varEnv.CanDeclareGlobalVar(F).
+                    // i. Let funcDefinable be ? CanDeclareGlobalVar(variableEnv, funcName).
                     if !global_var_environment.can_declare_global_var(vm, function_name)? {
                         continue;
                     }
                 }
                 // b. Else,
                 else {
-                    // i. Let fnDefinable be false.
+                    // i. Let funcDefinable be false.
                     continue;
                 }
             }
             // 6. Else,
-            //     a. Let fnDefinable be true.
+            //     a. Let funcDefinable be true.
 
-            // Note: At this point fnDefinable is true.
-            // 7. If bindingExists is false and fnDefinable is true, then
-
-            // a. If declaredFunctionOrVarNames does not contain F, then
-            if !data.declared_function_names.contains(function_name) && !hoisted_functions.contains(function_name) {
-                // i. If varEnv is a global Environment Record, then
+            // 7. If bindingExists is false and funcDefinable is true, then
+            // a. If declaredFuncOrVariableNames does not contain funcName, then
+            if !data.declared_function_names.contains(function_name)
+                && !declared_var_names.contains(function_name)
+                && !hoisted_functions.contains(function_name)
+            {
+                // i. If variableEnv is a Global Environment Record, then
                 if let Some(global_var_environment) = global_var_environment {
-                    // i. Perform ? varEnv.CreateGlobalVarBinding(F, true).
+                    // 1. Perform ? CreateGlobalVarBinding(variableEnv, funcName, true).
                     global_var_environment.create_global_var_binding(vm, function_name, true)?;
                 }
                 // ii. Else,
                 else {
-                    // i. Let bindingExists be ! varEnv.HasBinding(F).
-                    // ii. If bindingExists is false, then
+                    // 1. Set bindingExists to ! variableEnv.HasBinding(funcName).
+                    // 2. If bindingExists is false, then
                     if !variable_environment.has_binding(vm, function_name, None).must() {
-                        // i. Perform ! varEnv.CreateMutableBinding(F, true).
+                        // a. Perform ! variableEnv.CreateMutableBinding(funcName, true).
                         variable_environment
                             .create_mutable_binding(vm, function_name, true)
                             .must();
-                        // ii. Perform ! varEnv.InitializeBinding(F, undefined, normal).
+                        // b. Perform ! variableEnv.InitializeBinding(funcName, undefined).
                         variable_environment
                             .initialize_binding(vm, function_name, Value::UNDEFINED, InitializeBindingHint::Normal)
                             .must();
                     }
                 }
+
+                // iii. Append funcName to declaredFuncOrVariableNames.
+                hoisted_functions.insert(function_name.clone());
             }
 
-            // iii. Append F to declaredFunctionOrVarNames.
-            hoisted_functions.insert(function_name.clone());
-
-            // b. When the FunctionDeclaration f is evaluated, perform the following steps in place of the FunctionDeclaration Evaluation algorithm provided in 15.2.6:
-            //     i. Let genv be the running execution context's VariableEnvironment.
-            //     ii. Let benv be the running execution context's LexicalEnvironment.
-            //     iii. Let fobj be ! benv.GetBindingValue(F, false).
-            //     iv. Perform ? genv.SetMutableBinding(F, fobj, false).
+            // b. When the FunctionDeclaration funcDecl is evaluated, perform the following steps in place of the FunctionDeclaration Evaluation algorithm provided in 15.2.6:
+            //     i. Let globalEnv be the running execution context's VariableEnvironment.
+            //     ii. Let blockEnv be the running execution context's LexicalEnvironment.
+            //     iii. Let funcObj be ! blockEnv.GetBindingValue(funcName, false).
+            //     iv. Perform ? globalEnv.SetMutableBinding(funcName, funcObj, false).
             //     v. Return unused.
+            // NB: The bytecode of the function does this with SetVariableBindingOfBlockFunction.
         }
     }
 
-    // 12. Let declaredVarNames be a new empty List.
-    let mut declared_var_names = Utf16FlyStringHashTable::default();
+    // 14. NOTE: No abnormal terminations occur after this algorithm step unless variableEnv is a Global Environment Record and the global object is a Proxy exotic object.
 
-    // 13. For each element d of varDeclarations, do
-    for name in &data.var_scoped_names {
-        // 1. If vn is not an element of declaredFunctionNames, then
-        if !data.declared_function_names.contains(name) {
-            // a. If varEnv is a global Environment Record, then
-            if let Some(global_var_environment) = global_var_environment {
-                // i. Let vnDefinable be ? varEnv.CanDeclareGlobalVar(vn).
-                let variable_definable = global_var_environment.can_declare_global_var(vm, name)?;
-
-                // ii. If vnDefinable is false, throw a TypeError exception.
-                if !variable_definable {
-                    return vm.throw_completion(ErrorKind::TypeError, ErrorType::CannotDeclareGlobalVariable, &[name]);
-                }
-            }
-
-            // b. If vn is not an element of declaredVarNames, then
-            // i. Append vn to declaredVarNames.
-            declared_var_names.set(name.clone());
-        }
-    }
-
-    // 14. NOTE: No abnormal terminations occur after this algorithm step unless varEnv is a global Environment Record and the global object is a Proxy exotic object.
-
-    // 15. Let lexDeclarations be the LexicallyScopedDeclarations of body.
-    // 16. For each element d of lexDeclarations, do
+    // 15. Let lexicalDecls be the LexicallyScopedDeclarations of body.
+    // 16. For each element lexicalDecl of lexicalDecls, do
+    //     a. NOTE: Lexically declared names are only instantiated here but not initialized.
+    //     b. For each element name of the BoundNames of lexicalDecl, do
     for binding in &data.lexical_bindings {
-        // i. If IsConstantDeclaration of d is true, then
+        // i. If IsConstantDeclaration of lexicalDecl is true, then
         if binding.is_constant {
-            // 1. Perform ? lexEnv.CreateImmutableBinding(dn, true).
+            // 1. Perform ! lexicalEnv.CreateImmutableBinding(name, true).
             lexical_environment.create_immutable_binding(vm, &binding.name, true)?;
         }
         // ii. Else,
         else {
-            // 1. Perform ? lexEnv.CreateMutableBinding(dn, false).
+            // 1. Perform ! lexicalEnv.CreateMutableBinding(name, false).
             lexical_environment.create_mutable_binding(vm, &binding.name, false)?;
         }
     }
 
-    // 17. For each Parse Node f of functionsToInitialize, do
+    // 17. For each Parse Node funcDecl of funcsToInitialize, do
     for (function_index, function_to_initialize) in data.functions_to_initialize.iter().enumerate() {
-        // a. Let fn be the sole element of the BoundNames of f.
-        // b. Let fo be InstantiateFunctionObject of f with arguments lexEnv and privateEnv.
+        // a. Let funcName be the sole element of the BoundNames of funcDecl.
+        // b. Let funcObj be InstantiateFunctionDeclaration of funcDecl with arguments lexicalEnv and privateEnv.
         let shared_data = data
             .functions_to_initialize_shared_data
             .get(function_index)
@@ -1602,9 +1703,9 @@ pub fn eval_declaration_instantiation(
             private_environment,
         );
 
-        // c. If varEnv is a global Environment Record, then
+        // c. If variableEnv is a Global Environment Record, then
         if let Some(global_var_environment) = global_var_environment {
-            // i. Perform ? varEnv.CreateGlobalFunctionBinding(fn, fo, true).
+            // i. Perform ? CreateGlobalFunctionBinding(variableEnv, funcName, funcObj, true).
             global_var_environment.create_global_function_binding(
                 vm,
                 &function_to_initialize.name,
@@ -1614,7 +1715,7 @@ pub fn eval_declaration_instantiation(
         }
         // d. Else,
         else {
-            // i. Let bindingExists be ! varEnv.HasBinding(fn).
+            // i. Let bindingExists be ! variableEnv.HasBinding(funcName).
             let binding_exists = variable_environment
                 .has_binding(vm, &function_to_initialize.name, None)
                 .must();
@@ -1622,12 +1723,12 @@ pub fn eval_declaration_instantiation(
             // ii. If bindingExists is false, then
             if !binding_exists {
                 // 1. NOTE: The following invocation cannot return an abrupt completion because of the validation preceding step 14.
-                // 2. Perform ! varEnv.CreateMutableBinding(fn, true).
+                // 2. Perform ! variableEnv.CreateMutableBinding(funcName, true).
                 variable_environment
                     .create_mutable_binding(vm, &function_to_initialize.name, true)
                     .must();
 
-                // 3. Perform ! varEnv.InitializeBinding(fn, fo, normal).
+                // 3. Perform ! variableEnv.InitializeBinding(funcName, funcObj).
                 variable_environment
                     .initialize_binding(
                         vm,
@@ -1639,7 +1740,7 @@ pub fn eval_declaration_instantiation(
             }
             // iii. Else,
             else {
-                // 1. Perform ! varEnv.SetMutableBinding(fn, fo, false).
+                // 1. Perform ! variableEnv.SetMutableBinding(funcName, funcObj, false).
                 variable_environment
                     .set_mutable_binding(vm, &function_to_initialize.name, Value::from_object(function), false)
                     .must();
@@ -1647,25 +1748,25 @@ pub fn eval_declaration_instantiation(
         }
     }
 
-    // 18. For each String vn of declaredVarNames, do
-    for var_name in declared_var_names.iter() {
-        // a. If varEnv is a global Environment Record, then
+    // 18. For each String variableName of declaredVariableNames, do
+    for var_name in &declared_var_names {
+        // a. If variableEnv is a Global Environment Record, then
         if let Some(global_var_environment) = global_var_environment {
-            // i. Perform ? varEnv.CreateGlobalVarBinding(vn, true).
+            // i. Perform ? CreateGlobalVarBinding(variableEnv, variableName, true).
             global_var_environment.create_global_var_binding(vm, var_name, true)?;
         }
         // b. Else,
         else {
-            // i. Let bindingExists be ! varEnv.HasBinding(vn).
+            // i. Let bindingExists be ! variableEnv.HasBinding(variableName).
             let binding_exists = variable_environment.has_binding(vm, var_name, None).must();
 
             // ii. If bindingExists is false, then
             if !binding_exists {
                 // 1. NOTE: The following invocation cannot return an abrupt completion because of the validation preceding step 14.
-                // 2. Perform ! varEnv.CreateMutableBinding(vn, true).
+                // 2. Perform ! variableEnv.CreateMutableBinding(variableName, true).
                 variable_environment.create_mutable_binding(vm, var_name, true).must();
 
-                // 3. Perform ! varEnv.InitializeBinding(vn, undefined, normal).
+                // 3. Perform ! variableEnv.InitializeBinding(variableName, undefined).
                 variable_environment
                     .initialize_binding(vm, var_name, Value::UNDEFINED, InitializeBindingHint::Normal)
                     .must();
@@ -1686,7 +1787,7 @@ pub fn create_unmapped_arguments_object(vm: &Vm, arguments: &[Cell<Value>]) -> G
 
     // 2. Let obj be OrdinaryObjectCreate(%Object.prototype%, « [[ParameterMap]] »).
     // 3. Set obj.[[ParameterMap]] to undefined.
-    let object = Object::create_with_premade_shape(vm, realm.unmapped_arguments_object_shape());
+    let object = Object::create_with_premade_shape_for_indexed_elements(vm, realm.unmapped_arguments_object_shape());
 
     // 4. Perform ! DefinePropertyOrThrow(obj, "length", PropertyDescriptor { [[Value]]: 𝔽(len), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     object.initialize_direct(
@@ -2110,6 +2211,10 @@ pub struct DisposableResource {
 }
 
 // 2.1.3 NewDisposeCapability ( ), https://tc39.es/proposal-explicit-resource-management/#sec-newdisposecapability
+#[cfg_attr(
+    ladybird_gc_lints,
+    expect(gc_container_on_stack, reason = "a new capability holds no resources")
+)]
 pub fn new_dispose_capability() -> DisposeCapability {
     // 1. Let stack be a new empty List.
     // 2. Return the DisposeCapability Record { [[DisposableResourceStack]]: stack }.
@@ -2152,7 +2257,7 @@ pub fn add_disposable_resource(
     // 3. Append resource to disposeCapability.[[DisposableResourceStack]].
     // NB: Creating the resource can run JavaScript, so the capability is only borrowed to append to it.
     dispose_capability
-        .borrow_mut()
+        .borrow_mut(vm)
         .disposable_resource_stack
         .get_or_insert_with(Vec::new)
         .push(resource);
@@ -2417,7 +2522,7 @@ pub fn dispose_resources(
     //    collection, at this point.
 
     // 6. Set disposeCapability.[[DisposableResourceStack]] to a new empty List.
-    dispose_capability.borrow_mut().disposable_resource_stack = None;
+    dispose_capability.borrow_mut(vm).disposable_resource_stack = None;
 
     // 7. Return completion.
     completion
@@ -2495,9 +2600,13 @@ pub fn canonical_numeric_index_string(property_key: &PropertyKey, mode: Canonica
         return CanonicalIndex::new(CanonicalIndexType::Undefined, 0);
     };
 
-    // FIXME: We return 0 instead of n but it might not observable?
     // 3. If SameValue(! ToString(n), argument) is true, return n.
     if Utf16View::Utf16(&number_to_utf16_string(number)) == argument {
+        // NB: Array index keys are numbers, so the only integer a u32 holds that reaches here is 2^32 - 1, the last
+        //     index of a typed array of 2^32 elements. Other numbers are never valid integer indices.
+        if number == f64::from(u32::MAX) {
+            return CanonicalIndex::new(CanonicalIndexType::Index, u32::MAX);
+        }
         return CanonicalIndex::new(CanonicalIndexType::Numeric, 0);
     }
 

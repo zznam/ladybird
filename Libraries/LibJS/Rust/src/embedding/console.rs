@@ -20,7 +20,10 @@ use crate::layout::cell::Gc;
 use crate::layout::host_class::{JSObject, JSVM, JSValue};
 use crate::layout::value::Value;
 use crate::runtime::console_object::ConsoleObject;
+use crate::runtime::error_data::ErrorDataCell;
 use crate::runtime::print::{PrintContext, print};
+use crate::source_code::SourceCode;
+use crate::source_range::{Position, SourceRange};
 
 /// The Console of a realm's console object, which keeps its counters, timers and group stack and hands what it logs
 /// to its client.
@@ -174,6 +177,40 @@ pub unsafe extern "C" fn js_console_report_exception(
     console.report_exception(name, message, error_data, in_promise);
 }
 
+/// Reports an exception whose source location came from another agent. The location becomes its console stack frame.
+///
+/// # Safety
+///
+/// `vm` must point to a live VM, `console` to a live console, and the views must be valid for the call. Call on the
+/// VM's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_console_report_exception_with_location(
+    vm: *mut JSVM,
+    console: *mut JSConsole,
+    name: JSUtf16View,
+    message: JSUtf16View,
+    filename: JSUtf16View,
+    line: u32,
+    column: u32,
+    in_promise: bool,
+) {
+    // SAFETY: The caller passes a live VM.
+    let vm = unsafe { vm_from_abi(vm) };
+    // SAFETY: The caller passes a live console.
+    let console = unsafe { console_from_abi(console) };
+    // SAFETY: The caller guarantees that the views are valid for the call.
+    let (name, message, filename) = unsafe { (name.as_view(), message.as_view(), filename.as_view()) };
+    // Error data has to be in a cell, since error_data_into_abi finds its class through its block.
+    let error_data = ErrorDataCell::from_source_range(
+        vm,
+        SourceRange {
+            code: SourceCode::create(filename.to_utf16_string(), ak::Utf16String::default()),
+            start: Position { line, column },
+        },
+    );
+    console.report_exception(name, message, error_data.error_data(), in_promise);
+}
+
 /// The stream a PrintContext writes to, which hands the bytes to the embedder's sink.
 struct ByteSinkWriter<'a> {
     sink: &'a JSByteSink,
@@ -200,7 +237,8 @@ impl io::Write for ByteSinkWriter<'_> {
 
 /// JS::print(): writes the value to the sink the way the js REPL shows it, as UTF-8 in which lone surrogates are
 /// encoded on their own, in ANSI colors unless `strip_ansi` is set, and with strings quoted and escaped unless
-/// `raw_strings` is set. Returns false if the sink refused bytes, which ends the printing. The sink may run JavaScript,
+/// `raw_strings` is set. With `compact`, writes a bounded preview without looking up properties. Returns false if the
+/// sink refused bytes, which ends the printing. The sink may run JavaScript,
 /// even JavaScript that changes the value being printed. Only on the VM's thread.
 ///
 /// # Safety
@@ -213,6 +251,7 @@ pub unsafe extern "C" fn js_console_print_value(
     sink: *const JSByteSink,
     strip_ansi: bool,
     raw_strings: bool,
+    compact: bool,
 ) -> bool {
     // SAFETY: The caller passes a live VM.
     let vm = unsafe { vm_from_abi(vm) };
@@ -224,6 +263,7 @@ pub unsafe extern "C" fn js_console_print_value(
         stream: &mut writer,
         strip_ansi,
         raw_strings,
+        compact,
     };
-    print(Value(value), &mut print_context).is_ok()
+    print(Value::from_bits(value), &mut print_context).is_ok()
 }

@@ -19,7 +19,7 @@ mod vector;
 pub(crate) use vector::{is_vector_shift, vector_constant_inputs, vector_temps};
 
 use crate::RuntimeInfo;
-use crate::asm::x86_64::{Assembler, BitwiseOp, Cond, Precision, VexOperand};
+use crate::asm::x86_64::{Assembler, BitwiseOp, BranchGroups, Cond, Precision, VexOperand};
 use crate::asm::{Address, Fpr, Gpr, Label, Width};
 use crate::convention::{self, Register};
 use crate::ir::{BlockId, FloatCondition, Func, IntCondition, NONE, Op, Type, Value};
@@ -53,6 +53,10 @@ pub(crate) fn precision(ty: Type) -> Precision {
 }
 
 const SCRATCH: Gpr = Gpr(convention::SCRATCH_GPR);
+
+/// Where loop headers go. How a small loop lies across the windows and lines of code that the CPU fetches decides how
+/// fast it runs, which would otherwise change with anything added in front of it. This is worth 6% of CoreMark's score.
+const LOOP_ALIGNMENT: usize = 64;
 const SCRATCH_FPR: Fpr = Fpr(convention::SCRATCH_FPR - convention::FPR_BASE);
 const FP: Gpr = Gpr(convention::RBP);
 const SP: Gpr = Gpr(convention::RSP);
@@ -92,7 +96,8 @@ pub struct CodeGenerator<'a> {
     func: &'a Func,
     allocation: &'a Allocation,
     runtime: &'a RuntimeInfo,
-    asm: Assembler,
+    stack_limit: u64,
+    asm: Assembler<'a>,
     block_labels: Vec<Label>,
     trap_labels: Vec<Option<Label>>,
     /// The trap with the code in eax, for the runtime's functions that return one.
@@ -106,16 +111,32 @@ pub struct CodeGenerator<'a> {
     /// The block whose code is being generated.
     block: BlockId,
     exception_sites: Vec<u32>,
+    /// The value whose register the last instruction wrote, setting the zero flag for it at its width, and where that
+    /// instruction starts and ends.
+    zero_flag: (Value, Width, usize, usize),
+}
+
+impl<'a> BranchGroups<'a> for CodeGenerator<'a> {
+    fn branch_assembler(&mut self) -> &mut Assembler<'a> {
+        &mut self.asm
+    }
 }
 
 impl<'a> CodeGenerator<'a> {
-    pub fn new(func: &'a Func, allocation: &'a Allocation, runtime: &'a RuntimeInfo) -> Self {
+    pub fn new(
+        func: &'a Func,
+        allocation: &'a Allocation,
+        runtime: &'a RuntimeInfo,
+        stack_limit: u64,
+        memory: &'a mut crate::CodeMemory,
+    ) -> Self {
         let size = convention::FRAME_HEADER_SIZE as u32 + 8 * allocation.slot_count + allocation.outgoing_size;
         Self {
             func,
             allocation,
             runtime,
-            asm: Assembler::new(),
+            stack_limit,
+            asm: Assembler::for_host(&mut memory.code, &memory.work),
             block_labels: Vec::new(),
             trap_labels: vec![None; 32],
             dynamic_trap: None,
@@ -126,6 +147,7 @@ impl<'a> CodeGenerator<'a> {
             frame_size: size.next_multiple_of(16),
             block: 0,
             exception_sites: Vec::new(),
+            zero_flag: (crate::ir::NONE, Width::W32, usize::MAX, usize::MAX),
         }
     }
 
@@ -138,7 +160,12 @@ impl<'a> CodeGenerator<'a> {
         self.prologue();
         for block in 0..func.blocks.len() as BlockId {
             self.block = block;
+            // NB: Other predecessors get here with flags of their own.
+            self.zero_flag = (crate::ir::NONE, Width::W32, usize::MAX, usize::MAX);
             let label = self.block_labels[block as usize];
+            if func.is_loop_header(block) {
+                self.asm.align_code(LOOP_ALIGNMENT);
+            }
             self.asm.bind(label);
             // Phis in registers that have a slot too are stored there where they are defined.
             for phi in func.phis(block) {
@@ -166,7 +193,11 @@ impl<'a> CodeGenerator<'a> {
             }
         }
         self.out_of_line();
-        let code = self.asm.finish().map_err(|_| crate::CompileFailure::CodeGeneration)?;
+        let code = self
+            .asm
+            .finish()
+            .map_err(|_| crate::CompileFailure::CodeGeneration)?
+            .to_vec();
         Ok(Generated {
             code,
             frame_size: self.frame_size,
@@ -207,6 +238,11 @@ impl<'a> CodeGenerator<'a> {
         );
         let overflow = self.trap_label(libwasm_module::abi::TRAP_STACK_EXHAUSTED);
         self.asm.jcc(Cond::Below, overflow);
+        if crate::asm::x86_64::needs_stack_probes(below) {
+            // NB: The frame's pages are touched before anything goes in them (see `Assembler::probe_stack()`).
+            self.asm.mov_rr(Width::W64, context, SP);
+            self.asm.probe_stack(context, SCRATCH, Some(below));
+        }
         self.asm.mov_rr(Width::W64, SP, SCRATCH);
         // Values arriving in registers that have slots.
         let data = func.blocks[0];
@@ -539,18 +575,42 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
-    /// A branch on an integer condition, inverted where the taken successor comes next and needs no moves.
+    /// A branch on an integer condition, inverted where the taken successor comes next and needs no moves, or is a
+    /// loop header the edge needs moves into, so that those moves are inline rather than in a stub that jumps again.
     fn branch_on(&mut self, cond: Cond) {
+        self.compare_and_branch_on(cond, |_| {});
+    }
+
+    /// A `branch_on()` of what `compare` sets the flags for. The compare stays right in front of the branch, which it
+    /// macro-fuses with, so that padding for the branch goes before them both.
+    fn compare_and_branch_on(&mut self, cond: Cond, compare: impl Fn(&mut Self)) {
         let block = self.block;
         let data = self.func.blocks[block as usize];
         let successors = self.func.successors(block);
         let (taken, fallthrough) = (successors[0], successors[1]);
         if taken == block + 1 && self.allocation.edge(data.successors_start).is_empty() {
             let label = self.edge_label(data.successors_start + 1, fallthrough);
-            self.asm.jcc(cond.invert(), label);
+            self.branch_group(|generator| {
+                compare(generator);
+                generator.asm.jcc(cond.invert(), label);
+            });
             return;
         }
-        self.branch(|generator, taken, _| generator.asm.jcc(cond, taken));
+        if self.func.is_loop_header(taken) && !self.allocation.edge(data.successors_start).is_empty() {
+            let label = self.edge_label(data.successors_start + 1, fallthrough);
+            self.branch_group(|generator| {
+                compare(generator);
+                generator.asm.jcc(cond.invert(), label);
+            });
+            self.jump(0);
+            return;
+        }
+        self.branch(|generator, taken, _| {
+            generator.branch_group(|generator| {
+                compare(generator);
+                generator.asm.jcc(cond, taken);
+            });
+        });
     }
 
     fn lower_terminator(&mut self, value: Value) {
@@ -561,13 +621,25 @@ impl<'a> CodeGenerator<'a> {
             Op::Jump => self.jump(0),
             Op::Branch => {
                 let register = gpr(record.inputs[0]);
-                self.asm.test_rr(Width::W32, register, register);
-                self.branch_on(Cond::NotEqual);
+                let flags_hold = self.zero_flag_holds(node.args[0], Width::W32);
+                self.compare_and_branch_on(Cond::NotEqual, |generator| {
+                    if !flags_hold {
+                        generator.asm.test_rr(Width::W32, register, register);
+                    }
+                });
             }
             Op::BranchCompare => {
                 let ty = func.node(node.args[0]).ty;
-                self.compare(ty, record.inputs[0], record.inputs[1], node.args[1]);
-                self.branch_on(condition(IntCondition::from_flags(node.flags)));
+                let condition = IntCondition::from_flags(node.flags);
+                // NB: Only the zero flag says the same after the arithmetic as after a comparison with zero.
+                let flags_hold = matches!(condition, IntCondition::Eq | IntCondition::Ne)
+                    && func.node(node.args[1]).constant() == Some(0)
+                    && self.zero_flag_holds(node.args[0], width(ty));
+                self.compare_and_branch_on(self::condition(condition), |generator| {
+                    if !flags_hold {
+                        generator.compare(ty, record.inputs[0], record.inputs[1], node.args[1]);
+                    }
+                });
             }
             Op::BranchFloatCompare => {
                 let ty = func.node(node.args[0]).ty;
@@ -653,6 +725,24 @@ impl<'a> CodeGenerator<'a> {
         Address::new(FP, slot)
     }
 
+    /// Notes that the instruction just emitted from `start` on wrote `value`, setting the zero flag for it at `width`.
+    fn note_zero_flag(&mut self, value: Value, width: Width, start: usize) {
+        self.zero_flag = (value, width, start, self.asm.offset());
+    }
+
+    /// Whether a branch can test whether `value` is zero at `width` with the flags of the instruction that wrote it:
+    /// nothing was emitted after that instruction, and the two would stay within one 32-byte window, as a compare
+    /// and its branch do. The branch can macro-fuse with the instruction, but its padding would go between the two.
+    fn zero_flag_holds(&self, value: Value, width: Width) -> bool {
+        // NB: The longest conditional branch is 6 bytes.
+        let (start, end) = (self.zero_flag.2, self.asm.offset() + 6);
+        self.zero_flag.0 == value
+            && self.zero_flag.1 == width
+            && self.zero_flag.3 == self.asm.offset()
+            && start / 32 == (end - 1) / 32
+            && !end.is_multiple_of(32)
+    }
+
     fn compare(&mut self, ty: Type, a: Register, b: Register, b_value: Value) {
         if b == crate::regalloc::SLOT_INPUT {
             let address = self.input_slot(b_value);
@@ -687,6 +777,7 @@ impl<'a> CodeGenerator<'a> {
             | Op::TableStore
             | Op::CalleeInstance
             | Op::CheckNull
+            | Op::CheckInterrupt
             | Op::CheckFunction
             | Op::Helper => self.lower_runtime(value),
             Op::VectorLoad => self.lower_memory(value),
@@ -721,7 +812,9 @@ pub fn generate(
     func: &Func,
     allocation: &Allocation,
     runtime: &RuntimeInfo,
+    stack_limit: u64,
+    memory: &mut crate::CodeMemory,
 ) -> Result<Generated, crate::CompileFailure> {
     let _ = NONE;
-    CodeGenerator::new(func, allocation, runtime).generate()
+    CodeGenerator::new(func, allocation, runtime, stack_limit, memory).generate()
 }

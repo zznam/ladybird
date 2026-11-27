@@ -10,12 +10,14 @@ use core::ops::Deref;
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Finalize, GcCell, define_cell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::runtime::abstract_operations::{DisposeCapability, new_dispose_capability};
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
+use crate::runtime::realm::Realm;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Trace)]
 pub enum DisposableState {
@@ -48,11 +50,18 @@ impl Finalize for DisposableStack {
 }
 
 impl DisposableStack {
-    pub fn new(vm: &Vm, dispose_capability: DisposeCapability, prototype: Gc<Object>) -> DisposableStack {
+    /// A pending stack with a new dispose capability.
+    pub fn new(_: &DeferGc<'_>, vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) -> DisposableStack {
         DisposableStack {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             disposable_state: Cell::new(DisposableState::Pending),
-            dispose_capability: GcRefCell::new(dispose_capability),
+            dispose_capability: GcRefCell::new(new_dispose_capability()),
         }
     }
 

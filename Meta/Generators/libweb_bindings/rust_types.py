@@ -7,9 +7,10 @@
 
 import re
 
+from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import FrozenSet
-from typing import Iterable
 from typing import List
 from typing import Optional
 
@@ -50,7 +51,14 @@ SUPPORTED_TYPE_EXTENDED_ATTRIBUTES = {
 }
 
 # The integer types, with the Rust type of their values.
-INTEGER_TYPES = {"long": "i32", "unsigned long": "u32", "long long": "i64", "unsigned long long": "u64"}
+INTEGER_TYPES = {
+    "short": "i16",
+    "unsigned short": "u16",
+    "long": "i32",
+    "unsigned long": "u32",
+    "long long": "i64",
+    "unsigned long long": "u64",
+}
 
 # The floating point types, with the Rust type of their values.
 FLOATING_POINT_TYPES = {"float": "f32", "unrestricted float": "f32", "double": "f64", "unrestricted double": "f64"}
@@ -58,6 +66,8 @@ FLOATING_POINT_TYPES = {"float": "f32", "unrestricted float": "f32", "double": "
 # The types whose values are plain data, with the Rust type of their values. None of these Rust types is or holds a
 # cell, which holds_cells() relies on.
 PLAIN_DATA_TYPES = {
+    "ByteString": "ByteString",
+    "CSSOMString": "Utf16String",
     "DOMString": "Utf16String",
     "USVString": "UsvString",
     "boolean": "bool",
@@ -68,6 +78,10 @@ PLAIN_DATA_TYPES = {
 
 # The unions that the bindings runtime has a type for, by the name of the typedef that names the union.
 RUNTIME_UNION_TYPES = {"ArrayBufferView": "ArrayBufferView", "BufferSource": "BufferSource"}
+
+# The unions that no typedef names and more than one interface's IDL uses, whose enums the bindings runtime defines,
+# by their type name.
+SHARED_UNNAMED_UNIONS = {"DOMStringOrDOMStringSequence": "crate::bindings::conversions"}
 
 DECIMAL_LITERAL = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?")
 
@@ -113,6 +127,70 @@ def is_implemented_in_rust(interface: Optional[Interface]) -> bool:
     return interface is not None and interface.extended_attributes.get("ImplementedIn") == "Rust"
 
 
+def is_member_implemented_in_rust(member) -> bool:
+    """Whether an attribute or an operation of an interface implemented in C++ is [ImplementedIn=Rust]: its bindings
+    and its steps are Rust code, which the C++ bindings call to define it on the interface prototype object."""
+    return member.extended_attributes.get("ImplementedIn") == "Rust"
+
+
+def rust_member_definition_entry_point(interface: Interface, member) -> str:
+    """The entry point of the Rust bindings that defines an [ImplementedIn=Rust] member of an interface implemented in
+    C++ on its interface prototype object."""
+    return f"web_rust_{title_case_to_snake_case(interface.name)}_define_{title_case_to_snake_case(member.name)}"
+
+
+def rust_implemented_members(interface: Optional[Interface]) -> Optional[Interface]:
+    """The interface implemented in C++ with only its members that are [ImplementedIn=Rust], without that extended
+    attribute, which is what the Rust bindings write bindings for. None if it has no such member."""
+    if interface is None or is_implemented_in_rust(interface):
+        return None
+    attributes = [attribute for attribute in interface.regular_attributes if is_member_implemented_in_rust(attribute)]
+    operations = [operation for operation in interface.regular_operations if is_member_implemented_in_rust(operation)]
+    if not attributes and not operations:
+        return None
+
+    def without_implemented_in(member):
+        extended_attributes = dict(member.extended_attributes)
+        del extended_attributes["ImplementedIn"]
+        return replace(member, extended_attributes=extended_attributes)
+
+    return replace(
+        interface,
+        extended_attributes={},
+        parent_name="",
+        constants=[],
+        regular_attributes=[without_implemented_in(attribute) for attribute in attributes],
+        static_attributes=[],
+        regular_operations=[without_implemented_in(operation) for operation in operations],
+        static_operations=[],
+        constructors=[],
+        stringifier=None,
+        iterable=None,
+        async_iterable=None,
+        named_property_getter=None,
+        indexed_property_getter=None,
+        named_property_setter=None,
+        named_property_deleter=None,
+        indexed_property_setter=None,
+        maplike=None,
+        setlike=None,
+    )
+
+
+# The interfaces implemented in C++ that an interface implemented in Rust can inherit from
+# (Libraries/LibWeb/Bindings/RustEventTarget.h).
+CPP_PARENT_INTERFACES = ("EventTarget", "Event")
+
+
+def cpp_ancestor(interface: Interface, context: GenerationContext) -> Optional[Interface]:
+    """The interface implemented in C++ that the interface inherits from, through any number of interfaces
+    implemented in Rust, if any."""
+    ancestor = context.interfaces.get(interface.parent_name)
+    while ancestor is not None and is_implemented_in_rust(ancestor):
+        ancestor = context.interfaces.get(ancestor.parent_name)
+    return ancestor
+
+
 def resolved_dictionary(idl_type: IDLType, context: GenerationContext) -> Optional[Dictionary]:
     return context.dictionaries.get(idl_type.name)
 
@@ -130,7 +208,8 @@ def rust_module_path(idl_path: Path) -> str:
     Encoding/TextEncoder.idl names crate::encoding::text_encoder."""
     parts = idl_path.parts
     namespace = parts[parts.index("LibWeb") + 1]
-    return f"crate::{title_case_to_snake_case(namespace)}::{title_case_to_snake_case(idl_path.stem)}"
+    module = "webidl" if namespace == "WebIDL" else title_case_to_snake_case(namespace)
+    return f"crate::{module}::{title_case_to_snake_case(idl_path.stem)}"
 
 
 def cpp_interface(idl_type: IDLType, context: GenerationContext) -> Optional[Interface]:
@@ -143,6 +222,20 @@ def cpp_interface(idl_type: IDLType, context: GenerationContext) -> Optional[Int
     if interface.is_namespace or interface.is_callback_interface:
         return None
     return interface
+
+
+def is_window_proxy(idl_type: IDLType) -> bool:
+    """Whether the type is WindowProxy, which no IDL file defines. Rust holds its values as the objects that scripts
+    see."""
+    return not isinstance(idl_type, (IDLParameterizedType, IDLUnionType)) and idl_type.name == "WindowProxy"
+
+
+def is_callback_interface(idl_type: IDLType, context: GenerationContext) -> bool:
+    """Whether the type names a callback interface."""
+    if isinstance(idl_type, (IDLParameterizedType, IDLUnionType)):
+        return False
+    interface = context.interfaces.get(idl_type.name)
+    return interface is not None and interface.is_callback_interface
 
 
 def cpp_interface_name_constant(interface: Interface) -> str:
@@ -209,18 +302,23 @@ def is_unnamed_union_of_cpp_interfaces(idl_type: IDLType, context: GenerationCon
     )
 
 
-def idl_type_name(idl_type: IDLType, what: str) -> str:
+def idl_type_name(idl_type: IDLType, what: str, context: Optional[GenerationContext] = None) -> str:
     """The name the Rust bindings give the type: Path2DOrDOMString for (Path2D or DOMString),
-    UnrestrictedDoubleSequence for sequence<unrestricted double>."""
+    UnrestrictedDoubleSequence for sequence<unrestricted double>. Given the context, a member union that one typedef
+    names has the typedef's name: DocumentOrXMLHttpRequestBodyInit for (Document or XMLHttpRequestBodyInit)."""
     if isinstance(idl_type, IDLUnionType):
-        name = "Or".join(idl_type_name(member_type, what) for member_type in idl_type.member_types)
+        if context is not None:
+            names = union_typedef_names(idl_type, context)
+            if len(names) == 1:
+                return f"{names[0]}OrNull" if idl_type.nullable else names[0]
+        name = "Or".join(idl_type_name(member_type, what, context) for member_type in idl_type.member_types)
     elif isinstance(idl_type, IDLParameterizedType) and idl_type.name == "record":
         key_type, value_type = idl_type.parameters
-        name = f"{idl_type_name(key_type, what)}{idl_type_name(value_type, what)}Record"
+        name = f"{idl_type_name(key_type, what, context)}{idl_type_name(value_type, what, context)}Record"
     elif isinstance(idl_type, IDLParameterizedType):
         if idl_type.name != "sequence":
             raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings have no name for")
-        name = f"{idl_type_name(idl_type.parameters[0], what)}Sequence"
+        name = f"{idl_type_name(idl_type.parameters[0], what, context)}Sequence"
     else:
         name = "".join(word[:1].upper() + word[1:] for word in idl_type.name.split(" "))
     return f"{name}OrNull" if idl_type.nullable else name
@@ -339,7 +437,7 @@ def rust_enumeration_variant(value: str, enumeration: Enumeration) -> str:
     way."""
     variant = string_to_cpp_enum_name(value)
     is_plain = value.isascii() and value.isprintable() and '"' not in value and "\\" not in value
-    if not is_plain or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", variant) or variant == "Self":
+    if not is_plain or not re.fullmatch(r"(?:[A-Z]|_[0-9])[A-Za-z0-9]*", variant) or variant == "Self":
         raise UnsupportedByRustBindings(
             f"The value {value!r} of the enumeration {enumeration.name} has no name that the Rust bindings can give "
             "its variant"
@@ -356,8 +454,11 @@ def rust_union_path(idl_type: IDLUnionType, context: GenerationContext, what: st
     if len(names) > 1:
         raise UnsupportedByRustBindings(f"{what} has the union type {idl_type}, which the typedefs {names} all name")
     if not names:
+        type_name = idl_type_name(idl_type.without_nullable(), what, context)
+        if type_name in SHARED_UNNAMED_UNIONS:
+            return f"{SHARED_UNNAMED_UNIONS[type_name]}::{type_name}"
         idl_path = unnamed_union_idl_path(idl_type, context, what)
-        return f"{rust_module_path(idl_path)}::{idl_type_name(idl_type.without_nullable(), what)}"
+        return f"{rust_module_path(idl_path)}::{type_name}"
     name = names[0]
     for module in context.modules:
         if any(typedef.name == name for typedef in module.typedefs):
@@ -375,13 +476,18 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return f"Option<{rust_type(idl_type.without_nullable(), context, what, is_result)}>"
     name = idl_type.name
     if isinstance(idl_type, IDLParameterizedType):
-        if name == "sequence":
-            return f"Vec<{rust_type(idl_type.parameters[0], context, what, is_result)}>"
-        if name == "Promise" and is_result:
+        if name in ("sequence", "FrozenArray"):
+            element_type = idl_type.parameters[0]
+            element = rust_type(element_type, context, what, is_result)
+            # NB: A Vec would hide cells that the implementation returns from the collector until they are converted.
+            if is_result and holds_cells(element_type, context):
+                return f"MarkedVec<'_, {element}>"
+            return f"Vec<{element}>"
+        if name == "Promise":
             return "WebIdlPromise"
         if name == "record":
             key_type, value_type = idl_type.parameters
-            if key_type.name not in ("DOMString", "USVString"):
+            if key_type.name not in ("ByteString", "DOMString", "USVString"):
                 raise UnsupportedByRustBindings(f"{what} has a record with keys of the type {key_type}")
             return f"Vec<({rust_type(key_type, context, what)}, {rust_type(value_type, context, what)})>"
         raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings do not convert yet")
@@ -393,6 +499,8 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return "Gc<Object>"
     if name in TYPED_ARRAY_NAMES:
         return "Gc<TypedArrayBase>"
+    if name in ("ArrayBuffer", "SharedArrayBuffer"):
+        return "Gc<ArrayBuffer>"
     callback_function = context.callback_function(idl_type)
     if callback_function is not None:
         # NB: A callback function value that the implementation receives keeps its callback context, and one that it
@@ -400,6 +508,8 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         if is_result:
             return "Gc<FunctionObject>"
         return "PromiseCallbackFunction" if is_promise_type(callback_function.return_type) else "CallbackFunction"
+    if is_callback_interface(idl_type, context) and not is_result:
+        return "CallbackInterface"
     interface = rust_interface(idl_type, context)
     if interface is not None:
         if inheriting_interfaces(interface, context) and not is_result:
@@ -407,11 +517,15 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
             #     that an implementation returns is one of exactly the interface, whose cell it created.
             return rust_any_interface_path(interface)
         return f"Ref<{rust_interface_path(interface)}>"
-    if cpp_interface(idl_type, context) is not None or is_unnamed_union_of_cpp_interfaces(idl_type, context):
+    if (
+        is_window_proxy(idl_type)
+        or cpp_interface(idl_type, context) is not None
+        or is_unnamed_union_of_cpp_interfaces(idl_type, context)
+    ):
         return "CppInterface"
     dictionary = resolved_dictionary(idl_type, context)
     if dictionary is not None:
-        return rust_dictionary_path(dictionary, context)
+        return rust_dictionary_type(dictionary, context)
     enumeration = context.enumeration(idl_type)
     if enumeration is not None:
         return rust_enumeration_path(enumeration, context)
@@ -423,7 +537,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return f"Option<{rust_type(optional_member, context, what)}>"
     if isinstance(idl_type, IDLUnionType):
         for member_type in union_member_types(idl_type, context):
-            rust_type(member_type, context, what)
+            rust_type(member_type, context, what, is_result)
         return rust_union_path(idl_type, context, what)
     raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings do not convert yet")
 
@@ -449,7 +563,7 @@ def holds_cells(
             return True
         return any_holds_cells(idl_type.flattened_member_types())
     if isinstance(idl_type, IDLParameterizedType):
-        if idl_type.name in ("sequence", "record"):
+        if idl_type.name in ("sequence", "FrozenArray", "record"):
             return any_holds_cells(idl_type.parameters)
         return True
     if idl_type.name in PLAIN_DATA_TYPES or context.enumeration(idl_type) is not None:
@@ -479,11 +593,59 @@ def is_sequence_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
     )
 
 
+def is_record_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
+    """Whether the type is a record whose values are or can hold cells, which the bindings gather in a MarkedVec for a
+    parameter."""
+    return (
+        isinstance(idl_type, IDLParameterizedType)
+        and idl_type.name == "record"
+        and not idl_type.nullable
+        and holds_cells(idl_type.parameters[1], context)
+    )
+
+
+def union_holds_sequence_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
+    """Whether the type is a union with a member that is a sequence of values that are or can hold cells, which the
+    enum of the union keeps alive in a MarkedVec, for as long as the reference to the VM that it was converted with
+    lives."""
+    return isinstance(idl_type, IDLUnionType) and any(
+        is_sequence_of_cells(member_type, context) for member_type in idl_type.flattened_member_types()
+    )
+
+
+def dictionary_holds_sequence_of_cells(dictionary: Dictionary, context: GenerationContext) -> bool:
+    """Whether a member of the dictionary is a sequence of values that are or can hold cells, or a union with such a
+    member, which the struct of the dictionary keeps alive in a MarkedVec, for as long as the reference to the VM that
+    it was converted with lives."""
+    return any(
+        is_sequence_of_cells(member.type, context) or union_holds_sequence_of_cells(member.type, context)
+        for member in dictionary.members
+    )
+
+
+def rust_dictionary_type(dictionary: Dictionary, context: GenerationContext) -> str:
+    """The Rust type of the struct of a dictionary: its path, with the lifetime of the reference to the VM when the
+    dictionary holds a sequence of values that are or can hold cells."""
+    path = rust_dictionary_path(dictionary, context)
+    if dictionary_holds_sequence_of_cells(dictionary, context):
+        return f"{path}<'_>"
+    return path
+
+
 def rust_parameter_type(parameter: OperationParameter, context: GenerationContext, what: str) -> str:
     """The Rust type the implementation receives for the parameter."""
+    if parameter.variadic:
+        element_type = rust_type(parameter.type, context, what)
+        if holds_cells(parameter.type, context):
+            return f"MarkedVec<'_, {element_type}>"
+        return f"Vec<{element_type}>"
     if is_sequence_of_cells(parameter.type, context):
         assert isinstance(parameter.type, IDLParameterizedType)
         value_type = f"MarkedVec<'_, {rust_type(parameter.type.parameters[0], context, what)}>"
+    elif is_record_of_cells(parameter.type, context):
+        assert isinstance(parameter.type, IDLParameterizedType)
+        key_type, record_value_type = (rust_type(type, context, what) for type in parameter.type.parameters)
+        value_type = f"MarkedVec<'_, ({key_type}, {record_value_type})>"
     else:
         value_type = rust_type(parameter.type, context, what)
     if parameter.optional and parameter.default_value is None:

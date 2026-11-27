@@ -190,11 +190,11 @@ pub(crate) fn property_initial_value(property_id: u16) -> &'static str {
 }
 
 pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: u16) -> bool {
-    if PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES
+    if PSEUDO_ELEMENT_TRANSITION_AND_ANIMATION_PROPERTIES
         .binary_search(&property_id)
         .is_ok()
     {
-        return true;
+        return PSEUDO_ELEMENT_ACCEPTS_ANIMATIONS[pseudo_element as usize];
     }
     match PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize] {
         Some(whitelist) => whitelist.binary_search(&property_id).is_ok(),
@@ -202,8 +202,8 @@ pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: 
     }
 }
 
-/// Whether a pseudo-element's own whitelist names the property, leaving out the properties every
-/// pseudo-element accepts.
+/// Whether a pseudo-element's own whitelist names the property, leaving out the transition and animation
+/// properties.
 pub(crate) fn pseudo_element_whitelist_names_property(pseudo_element: u8, property_id: u16) -> bool {
     PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize]
         .is_some_and(|whitelist| whitelist.binary_search(&property_id).is_ok())
@@ -218,7 +218,7 @@ pub struct FfiPropertyNumericRange {
 }
 
 pub fn property_numeric_ranges(property_id: u16) -> &'static [FfiPropertyNumericRange] {
-    PROPERTY_NUMERIC_RANGES[longhand_index(property_id)]
+    PROPERTY_NUMERIC_RANGES[property_index(property_id)]
 }
 
 /// Returns the longhand property identifiers in computation order.
@@ -297,15 +297,13 @@ fn shorthand_leaf_longhands() -> &'static [(u16, Box<[u16]>)] {
     })
 }
 
-/// The shorthand whose longhands, through any shorthand nested in it, are exactly `longhands`: the one a value pending
-/// substitution in each of them was written for.
-pub(crate) fn shorthand_with_leaf_longhands(mut longhands: Vec<u16>) -> Option<u16> {
-    longhands.sort_unstable();
-    longhands.dedup();
-    shorthand_leaf_longhands()
-        .iter()
-        .find(|(_, leaves)| **leaves == *longhands)
-        .map(|(shorthand, _)| *shorthand)
+/// Whether `longhand` is one of the longhands of `shorthand`, through any shorthand nested in it.
+pub(crate) fn shorthand_has_leaf_longhand(shorthand: u16, longhand: u16) -> bool {
+    property_is_shorthand(shorthand)
+        && shorthand_leaf_longhands()[usize::from(shorthand - FIRST_SHORTHAND_PROPERTY_ID)]
+            .1
+            .binary_search(&longhand)
+            .is_ok()
 }
 
 /// The shorthands whose longhands, through any shorthand nested in it, include all of `longhands`, with the fewest
@@ -328,6 +326,23 @@ pub fn longhands_for_shorthand(property_id: u16) -> &'static [u16] {
     SHORTHAND_EXPANSIONS[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
 }
 
+/// The longhands of a shorthand, through any shorthand nested in it.
+pub(crate) fn expanded_longhands_for_shorthand(property_id: u16) -> &'static [u16] {
+    if !property_is_shorthand(property_id) {
+        return &[];
+    }
+    EXPANDED_LONGHANDS_FOR_SHORTHAND[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+/// The shorthands a property maps to, in preferred order.
+pub(crate) fn shorthands_for_longhand(property_id: u16) -> &'static [u16] {
+    SHORTHANDS_FOR_LONGHAND[property_index(property_id)]
+}
+
+pub(crate) fn property_is_legacy_shorthand(property_id: u16) -> bool {
+    LEGACY_SHORTHANDS.binary_search(&property_id).is_ok()
+}
+
 pub(crate) fn property_is_positional_value_list_shorthand(property_id: u16) -> bool {
     POSITIONAL_VALUE_LIST_SHORTHANDS.binary_search(&property_id).is_ok()
 }
@@ -335,6 +350,11 @@ pub(crate) fn property_is_positional_value_list_shorthand(property_id: u16) -> b
 fn property_index(property_id: u16) -> usize {
     debug_assert!((FIRST_SHORTHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property_id));
     (property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize
+}
+
+/// The IDL attribute name of the property, https://drafts.csswg.org/cssom/#css-property-to-idl-attribute
+pub fn property_idl_name(property_id: u16) -> &'static str {
+    PROPERTY_IDL_NAMES[property_index(property_id)]
 }
 
 pub(crate) fn property_is_logical_alias_including_shorthands(property_id: u16) -> bool {

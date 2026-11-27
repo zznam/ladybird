@@ -9,6 +9,7 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
@@ -32,9 +33,18 @@ using ImageBitmapOptions = Bindings::ImageBitmapOptions;
 //         message carries alongside the memory of its SharedArrayBuffers. However many bitmaps a message transfers,
 //         their pixels then take one attachment, and the receiver uses them without copying.
 struct ImageBitmapSharedPixels {
+    AK_ALLOC_WITH_KMALLOC;
+
     Core::AnonymousBuffer buffer;
     u32 buffer_index { 0 };
     size_t used_size { 0 };
+};
+
+struct ReceivedImageBitmapSharedPixels {
+    AK_ALLOC_WITH_KMALLOC;
+
+    Vector<Core::AnonymousBuffer> buffers;
+    Vector<Optional<Core::AnonymousBuffer>> snapshots_of_buffers_without_resize_seals;
 };
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagebitmap
@@ -64,12 +74,10 @@ public:
     bool is_origin_clean() const;
     void set_origin_clean(bool);
 
-    // The bitmap of the bitmap data, which the ImageBitmap keeps until it is closed or transferred.
-    Gfx::Bitmap const* bitmap() const;
-    // The bitmap data with its color space.
+    // The bitmap data with its color space, which the ImageBitmap keeps until it is closed or transferred.
     Gfx::DecodedImageFrame const* frame() const;
 
-    static size_t shared_pixels_size(Gfx::Bitmap const&);
+    static size_t shared_pixels_size(Gfx::DecodedImageFrame const&);
 };
 
 }

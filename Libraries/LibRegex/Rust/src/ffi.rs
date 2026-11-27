@@ -8,7 +8,8 @@
 ///
 /// Provides a C-compatible API for use from C++ (LibJS, LibURL).
 /// All functions use `extern "C"` linkage and opaque pointer types.
-use crate::ast::Flags;
+use libregex_compiler::ast::Flags;
+
 use crate::regex::Regex;
 
 /// Opaque regex handle.
@@ -28,8 +29,8 @@ pub struct RustRegexFlags {
 }
 
 fn compile_pattern(
-    pattern: Vec<char>,
     flags: RustRegexFlags,
+    compile: impl FnOnce(Flags) -> Result<Regex, String>,
     error_out: *mut *const u8,
     error_len_out: *mut usize,
 ) -> *mut RustRegex {
@@ -44,11 +45,10 @@ fn compile_pattern(
         has_indices: flags.has_indices,
     };
 
-    match Regex::compile_chars(pattern, flags) {
+    match compile(flags) {
         Ok(regex) => Box::into_raw(Box::new(RustRegex(regex))),
-        Err(e) => {
+        Err(msg) => {
             if !error_out.is_null() && !error_len_out.is_null() {
-                let msg = e.to_string();
                 let leaked = msg.into_boxed_str();
                 unsafe {
                     *error_len_out = leaked.len();
@@ -80,22 +80,23 @@ pub unsafe extern "C" fn rust_regex_compile(
     }
 
     let code_units = unsafe { ak::slice_from_raw_parts(pattern, pattern_len) };
-    let pattern = char::decode_utf16(code_units.iter().copied())
-        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect();
-
-    compile_pattern(pattern, flags, error_out, error_len_out)
+    compile_pattern(
+        flags,
+        |flags| Regex::compile_utf16(code_units, flags, |error| error.to_string()),
+        error_out,
+        error_len_out,
+    )
 }
 
-/// Compile an ASCII-only regex pattern. Returns an opaque handle, or null on error.
+/// Compile a regex pattern of Latin-1 code units. Returns an opaque handle, or null on error.
 /// On error, writes the error message to `error_out` and `error_len_out`.
 /// The caller must free the error string with `rust_regex_free_error`.
 ///
 /// # Safety
-/// `pattern` must be a valid pointer to `pattern_len` ASCII bytes.
+/// `pattern` must be a valid pointer to `pattern_len` Latin-1 bytes.
 /// `error_out` and `error_len_out` must be valid pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_regex_compile_ascii(
+pub unsafe extern "C" fn rust_regex_compile_latin1(
     pattern: *const u8,
     pattern_len: usize,
     flags: RustRegexFlags,
@@ -107,9 +108,12 @@ pub unsafe extern "C" fn rust_regex_compile_ascii(
     }
 
     let bytes = unsafe { ak::slice_from_raw_parts(pattern, pattern_len) };
-    let pattern = bytes.iter().map(|byte| *byte as char).collect();
-
-    compile_pattern(pattern, flags, error_out, error_len_out)
+    compile_pattern(
+        flags,
+        |flags| Regex::compile_latin1(bytes, flags, |error| error.to_string()),
+        error_out,
+        error_len_out,
+    )
 }
 
 /// Free an error string returned by `rust_regex_compile`.
@@ -147,7 +151,7 @@ fn exec_into_internal<I: crate::vm::Input>(
     match regex.0.exec_into_input(input, start_pos, out) {
         VmResult::Match => 1,
         VmResult::NoMatch => 0,
-        VmResult::LimitExceeded => -1,
+        VmResult::LimitExceeded | VmResult::Interrupted => -1,
     }
 }
 
@@ -157,7 +161,7 @@ fn test_internal<I: crate::vm::Input>(regex: &RustRegex, input: I, start_pos: us
     match regex.0.test_input(input, start_pos) {
         VmResult::Match => 1,
         VmResult::NoMatch => 0,
-        VmResult::LimitExceeded => -1,
+        VmResult::LimitExceeded | VmResult::Interrupted => -1,
     }
 }
 
@@ -201,14 +205,14 @@ pub unsafe extern "C" fn rust_regex_exec_into(
     exec_into_internal(regex, input, start_pos, out_captures, out_capture_slots)
 }
 
-/// Execute a regex against ASCII input, writing captures into a caller-provided buffer.
+/// Execute a regex against Latin-1 input, writing captures into a caller-provided buffer.
 ///
 /// # Safety
 /// - `regex` must be a valid pointer from `rust_regex_compile`.
-/// - `input` must point to `input_len` ASCII code units.
+/// - `input` must point to `input_len` Latin-1 code units.
 /// - `out_captures` must point to a buffer of at least `capture_count * 2` i32s.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_regex_exec_into_ascii(
+pub unsafe extern "C" fn rust_regex_exec_into_latin1(
     regex: *const RustRegex,
     input: *const u8,
     input_len: usize,
@@ -252,12 +256,12 @@ pub unsafe extern "C" fn rust_regex_test(
     test_internal(regex, input, start_pos)
 }
 
-/// Test whether a regex matches anywhere in ASCII input.
+/// Test whether a regex matches anywhere in Latin-1 input.
 ///
 /// # Safety
 /// Same requirements as `rust_regex_test`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_regex_test_ascii(
+pub unsafe extern "C" fn rust_regex_test_latin1(
     regex: *const RustRegex,
     input: *const u8,
     input_len: usize,
@@ -331,14 +335,14 @@ pub unsafe extern "C" fn rust_regex_find_all(
     find_all_internal(regex, input, start_pos, out, out_capacity)
 }
 
-/// Find all non-overlapping matches in ASCII input.
+/// Find all non-overlapping matches in Latin-1 input.
 ///
 /// # Safety
 /// - `regex` must be a valid pointer from `rust_regex_compile`.
-/// - `input` must point to `input_len` ASCII code units.
+/// - `input` must point to `input_len` Latin-1 code units.
 /// - `out` must point to at least `out_capacity` i32s.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_regex_find_all_ascii(
+pub unsafe extern "C" fn rust_regex_find_all_latin1(
     regex: *const RustRegex,
     input: *const u8,
     input_len: usize,

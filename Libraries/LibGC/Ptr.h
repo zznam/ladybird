@@ -139,6 +139,15 @@ public:
         return *this;
     }
 
+    // NB: A member converts to a reference, a Ref and a Ptr, so assigning one would be ambiguous without this.
+    template<typename U>
+    Ref& operator=(NonnullMember<U> const& other)
+    requires(IsConvertible<U*, T*>)
+    {
+        m_ptr = static_cast<T*>(other.ptr());
+        return *this;
+    }
+
     template<typename U>
     Ref& operator=(Ref<U> const& foreign_cell)
     requires(IsForeignCellConvertibleToCell<U, T>)
@@ -287,6 +296,23 @@ public:
         return *this;
     }
 
+    // NB: A member converts to a reference, a Ref and a Ptr, so assigning one would be ambiguous without these.
+    template<typename U>
+    Ptr& operator=(NonnullMember<U> const& other)
+    requires(IsConvertible<U*, T*>)
+    {
+        m_ptr = static_cast<T*>(other.ptr());
+        return *this;
+    }
+
+    template<typename U>
+    Ptr& operator=(Member<U> const& other)
+    requires(IsConvertible<U*, T*>)
+    {
+        m_ptr = static_cast<T*>(other.ptr());
+        return *this;
+    }
+
     template<typename U>
     Ptr& operator=(Ptr<U> const& foreign_cell)
     requires(IsForeignCellConvertibleToCell<U, T>)
@@ -345,14 +371,6 @@ public:
 private:
     T* m_ptr { nullptr };
 };
-
-// Non-Owning GC::Ptr
-template<typename T>
-using RawPtr = Ptr<T>;
-
-// Non-Owning Ref
-template<typename T>
-using RawRef = Ref<T>;
 
 template<typename T, typename U>
 inline bool operator==(Ptr<T> const& a, Ptr<U> const& b)

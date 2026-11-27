@@ -4,576 +4,496 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The Mach port transport, which speaks with `IPC::TransportMachPort` on the other end.
-//!
-//! An IO thread waits on a port set holding the transport's receive right and a private wakeup port. It sends what the
-//! owner posts, and queues what arrives for the owner to take. The peer going away shows as `MACH_NOTIFY_NO_SENDERS` on
-//! the receive right, once the peer's last send right to it is gone.
+//! What the transports of every platform share: what the owner of a transport gets to see of what arrives, the
+//! bookkeeping of the IO thread that every transport of a process shares, and what callers hand a transport to send.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
-use crate::MAX_MESSAGE_ATTACHMENT_COUNT;
-use crate::attachment::Attachment;
-use crate::mach::{self, KernelError, MachPort, MessageBuffer, ReceiveError};
-use crate::receive_queue::IncomingQueue;
 pub use crate::receive_queue::ReceivedMessage;
+#[cfg(target_vendor = "apple")]
+pub use crate::transport_mach_port::{MachPortPair, TransportMachPort};
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub use crate::transport_socket::{SocketHandle, TransportSocket};
 
-/// The receive right and send right that make up one end of a connection, as `IPC::TransportHandle` holds them.
-pub struct MachPortPair {
-    pub receive_right: MachPort,
-    pub send_right: MachPort,
+/// The transport of this platform.
+#[cfg(target_vendor = "apple")]
+pub type Transport = TransportMachPort;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub type Transport = TransportSocket;
+
+/// What the IO thread shows every message that arrives, before the transport's owner gets to see it, and empty bytes
+/// once the peer is gone.
+pub type IncomingMessageObserver = Box<dyn Fn(&[u8]) + Send>;
+
+/// The bytes of a message that waits to be sent, which it owns, wherever they are.
+pub type OwnedPayload = Box<dyn AsRef<[u8]> + Send>;
+
+/// The time on `CLOCK_MONOTONIC`, which AK's `MonotonicTime` reads, and which keeps counting while the system sleeps.
+#[allow(unsafe_code)]
+pub(crate) fn clock_monotonic_nanoseconds() -> i64 {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // NB: now points to a local that the call writes to, and the clock always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    now.tv_sec * 1_000_000_000 + now.tv_nsec
+}
+
+/// A point in time on `CLOCK_MONOTONIC`, the clock of AK's `MonotonicTime`, which keeps counting while the system
+/// sleeps. A wait checks it again after every wakeup, so that it ends when its caller's deadline passes.
+#[derive(Clone, Copy)]
+pub struct MonotonicDeadline {
+    nanoseconds: i64,
+}
+
+impl MonotonicDeadline {
+    pub fn from_nanoseconds(nanoseconds: i64) -> Self {
+        Self { nanoseconds }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        let now = clock_monotonic_nanoseconds();
+        (now < self.nanoseconds).then(|| Duration::from_nanos(self.nanoseconds.abs_diff(now)))
+    }
+}
+
+/// The bytes of a message to post: owned already, or lent by a caller that hands them over only if the message has to
+/// wait, as C++ does with the buffer it encoded the message into.
+pub enum OutgoingPayload<'a> {
+    Owned(Vec<u8>),
+    Lent {
+        bytes: &'a [u8],
+        hand_over: &'a mut dyn FnMut() -> OwnedPayload,
+    },
+}
+
+impl OutgoingPayload<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Lent { bytes, .. } => bytes,
+        }
+    }
+}
+
+pub(crate) const IDLE_MEMORY_RELEASE_DELAY_IN_MILLISECONDS: u32 = 1000;
+
+pub(crate) fn release_unused_allocator_memory() {
+    // NB: The messages the IO thread receives are freed by the threads that handle them, and the allocator keeps that
+    //     memory until this thread allocates again or collects, which an idle process may never do. Unit tests
+    //     don't link AK, and use the system allocator.
+    #[cfg(ladybird_links_ak)]
+    ak::release_unused_allocator_memory();
+}
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+pub(crate) fn wait<'a, T>(condition: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    condition.wait(guard).unwrap_or_else(|error| error.into_inner())
+}
+
+pub(crate) fn wait_for<'a, T>(
+    condition: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> (MutexGuard<'a, T>, bool) {
+    let (guard, result) = condition
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|error| error.into_inner());
+    (guard, result.timed_out())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-enum IoThreadState {
+pub(crate) enum IoThreadState {
     Running = 0,
     SendPendingMessagesAndStop = 1,
     Stopped = 2,
 }
 
-struct PendingMessage {
-    bytes: Vec<u8>,
-    attachments: Vec<Attachment>,
-}
+pub(crate) struct AtomicIoThreadState(AtomicU8);
 
-#[derive(Default)]
-struct SendQueue {
-    pending: Vec<PendingMessage>,
-    in_progress: bool,
-    waiters_released: bool,
-}
+impl AtomicIoThreadState {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU8::new(IoThreadState::Running as u8))
+    }
 
-struct Shared {
-    state: AtomicU8,
-    send_queue: Mutex<SendQueue>,
-    sent: Condvar,
-    incoming: IncomingQueue,
-    wakeup_send_right: MachPort,
-}
-
-impl Shared {
-    fn state(&self) -> IoThreadState {
-        match self.state.load(Ordering::Acquire) {
+    pub(crate) fn load(&self) -> IoThreadState {
+        match self.0.load(Ordering::Acquire) {
             0 => IoThreadState::Running,
             1 => IoThreadState::SendPendingMessagesAndStop,
             _ => IoThreadState::Stopped,
         }
     }
 
-    fn set_state(&self, state: IoThreadState) {
-        self.state.store(state as u8, Ordering::Release);
+    pub(crate) fn store(&self, state: IoThreadState) {
+        self.0.store(state as u8, Ordering::Release);
     }
 
-    fn should_retry_send(&self) -> bool {
-        self.state() != IoThreadState::Stopped
-    }
-
-    fn wake_io_thread(&self) {
-        // NB: The wakeup is best-effort; a full wakeup queue already wakes the thread.
-        let _ = mach::send_header_only_message(&self.wakeup_send_right, mach::IPC_WAKEUP_MESSAGE_ID, Some(0));
-    }
-
-    fn lock_send_queue(&self) -> MutexGuard<'_, SendQueue> {
-        self.send_queue.lock().unwrap_or_else(|error| error.into_inner())
+    // NB: The IO thread may already have stopped on its own, as when the peer hung up. Stopped is final, so it is never
+    //     replaced by a new stop request.
+    pub(crate) fn request_stop(&self, desired_state: IoThreadState) {
+        let mut state = self.0.load(Ordering::Acquire);
+        while state != IoThreadState::Stopped as u8 {
+            match self
+                .0
+                .compare_exchange(state, desired_state as u8, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(current) => state = current,
+            }
+        }
     }
 }
 
-pub struct TransportMachPort {
-    shared: Arc<Shared>,
-    io_thread: Option<JoinHandle<()>>,
+/// What a transport has taken in for its owner, under the transport's incoming lock. `Barrier` is what the transport
+/// keeps there to tell when everything its peer sent before a receive barrier has arrived.
+#[derive(Default)]
+pub(crate) struct Incoming<Barrier> {
+    pub(crate) messages: VecDeque<ReceivedMessage>,
+    // NB: Set once this end's IO is over, which ends a wait for messages that can no longer come, even when the
+    //     transport's end went to a new owner and the peer is not gone.
+    pub(crate) local_io_is_over: bool,
+    pub(crate) barrier: Barrier,
+    wait_until_readable_interrupted: bool,
+    read_notification_pending: bool,
+    read_notification_pipe: Option<File>,
+    // NB: The owner mostly hears of messages through the pipe, so a change wakes the condition variable only when
+    //     something waits on it.
+    waiter_count: usize,
 }
 
-impl TransportMachPort {
-    /// A transport for this end, and the handle that makes the other end's transport.
-    pub fn create_paired() -> std::io::Result<(Self, MachPortPair)> {
-        let receive_a = MachPort::allocate_receive_right().map_err(KernelError)?;
-        let send_a = receive_a.make_send_right().map_err(KernelError)?;
-        let receive_b = MachPort::allocate_receive_right().map_err(KernelError)?;
-        let send_b = receive_b.make_send_right().map_err(KernelError)?;
-        // NB: The peer may receive messages before it has constructed its transport.
-        receive_b.raise_queue_limit();
-        Ok((
-            Self::new(receive_a, send_b)?,
-            MachPortPair {
-                receive_right: receive_b,
-                send_right: send_a,
-            },
-        ))
-    }
+/// The messages a transport's IO thread has taken in for the owner, and how the owner waits for them, which is the
+/// same for every transport.
+pub(crate) struct Inbox<Barrier> {
+    // NB: Written under the incoming lock, so that a reader under it sees it with the messages that came before.
+    peer_eof: AtomicBool,
+    incoming: Mutex<Incoming<Barrier>>,
+    changed: Condvar,
+    // NB: This has a lock of its own, which is taken before the incoming lock: the observer may interrupt a wait.
+    incoming_message_observer: Mutex<Option<IncomingMessageObserver>>,
+}
 
-    pub fn from_handle(handle: MachPortPair) -> std::io::Result<Self> {
-        Self::new(handle.receive_right, handle.send_right)
-    }
-
-    pub fn new(receive_right: MachPort, send_right: MachPort) -> std::io::Result<Self> {
-        let io = IoThread::new(receive_right, send_right).map_err(KernelError)?;
-        let shared = Arc::clone(&io.shared);
-        let io_thread = std::thread::Builder::new()
-            .name("IPC IO (Mach)".to_string())
-            .spawn(move || {
-                // NB: The IO thread only relays messages between the kernel and the owning thread. If it ran below
-                //     that thread, every message would wait on a lower-priority wakeup.
-                mach::set_current_thread_qos_to_user_interactive();
-                io.run();
-            })?;
-
-        Ok(Self {
-            shared,
-            io_thread: Some(io_thread),
-        })
-    }
-
-    /// Queues a message for the IO thread to send, or refuses it once the transport has stopped sending.
-    pub fn post_message(&self, bytes: Vec<u8>, attachments: Vec<Attachment>) -> std::io::Result<()> {
-        crate::validate_message_size(bytes.len(), attachments.len())?;
-        let mut queue = self.shared.lock_send_queue();
-        if self.shared.state() != IoThreadState::Running {
-            return Err(std::io::ErrorKind::NotConnected.into());
-        }
-        let was_empty = queue.pending.is_empty();
-        queue.pending.push(PendingMessage { bytes, attachments });
-        drop(queue);
-        if was_empty {
-            self.shared.wake_io_thread();
-        }
-        Ok(())
-    }
-
-    /// Waits until every message posted so far is sent, or the transport stops.
-    pub fn flush(&self) {
-        self.shared.wake_io_thread();
-        let mut queue = self.shared.lock_send_queue();
-        while !queue.waiters_released && (!queue.pending.is_empty() || queue.in_progress) {
-            queue = self.shared.sent.wait(queue).unwrap_or_else(|error| error.into_inner());
+impl<Barrier: Default> Inbox<Barrier> {
+    /// An inbox that writes a byte to the pipe when messages are there to read, or the peer is gone, and nothing more
+    /// until `acknowledge_read_notification()`.
+    pub(crate) fn new(read_notification_pipe: Option<OwnedFd>) -> Self {
+        Self {
+            peer_eof: AtomicBool::new(false),
+            incoming: Mutex::new(Incoming {
+                read_notification_pipe: read_notification_pipe.map(File::from),
+                ..Incoming::default()
+            }),
+            changed: Condvar::new(),
+            incoming_message_observer: Mutex::new(None),
         }
     }
+}
 
-    pub fn is_open(&self) -> bool {
-        self.shared.state() == IoThreadState::Running && !self.shared.incoming.lock().peer_eof
+impl<Barrier> Inbox<Barrier> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Incoming<Barrier>> {
+        lock(&self.incoming)
+    }
+
+    pub(crate) fn wait<'a>(
+        &self,
+        mut incoming: MutexGuard<'a, Incoming<Barrier>>,
+    ) -> MutexGuard<'a, Incoming<Barrier>> {
+        incoming.waiter_count += 1;
+        let mut incoming = wait(&self.changed, incoming);
+        incoming.waiter_count -= 1;
+        incoming
+    }
+
+    fn wait_for<'a>(
+        &self,
+        mut incoming: MutexGuard<'a, Incoming<Barrier>>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, Incoming<Barrier>> {
+        incoming.waiter_count += 1;
+        let mut incoming = wait_for(&self.changed, incoming, timeout).0;
+        incoming.waiter_count -= 1;
+        incoming
+    }
+
+    /// Changes the incoming state, and wakes whatever waits for a change.
+    pub(crate) fn update<Result>(&self, change: impl FnOnce(&mut Incoming<Barrier>) -> Result) -> Result {
+        let (result, has_waiters) = {
+            let mut incoming = self.lock();
+            let result = change(&mut incoming);
+            (result, incoming.waiter_count > 0)
+        };
+        if has_waiters {
+            self.changed.notify_all();
+        }
+        result
+    }
+
+    pub(crate) fn peer_eof(&self) -> bool {
+        self.peer_eof.load(Ordering::Acquire)
+    }
+
+    #[cfg(all(test, not(target_vendor = "apple")))]
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.lock().waiter_count > 0
+    }
+
+    pub(crate) fn notify_incoming_message_observer<'a>(&self, messages: impl IntoIterator<Item = &'a [u8]>) {
+        // NB: The observer runs under its lock, so once a new one is set, the old one is no longer running.
+        if let Some(observer) = &*lock(&self.incoming_message_observer) {
+            for bytes in messages {
+                observer(bytes);
+            }
+        }
+    }
+
+    fn schedule_read_notification(incoming: &mut Incoming<Barrier>) {
+        if incoming.read_notification_pending {
+            return;
+        }
+        incoming.read_notification_pending = true;
+        if let Some(pipe) = &incoming.read_notification_pipe {
+            // NB: An interrupted write wrote nothing, so it is retried. The pipe does not block, and a full one already
+            //     wakes the owner.
+            let _ = (&*pipe).write_all(&[0]);
+        }
+    }
+
+    /// Hands the messages to the owner, which the observer has seen already, along with what `change` does to the
+    /// incoming state under the same lock.
+    pub(crate) fn deliver(
+        &self,
+        messages: impl IntoIterator<Item = ReceivedMessage>,
+        change: impl FnOnce(&mut Incoming<Barrier>),
+    ) {
+        self.update(|incoming| {
+            let was_empty = incoming.messages.is_empty();
+            incoming.messages.extend(messages);
+            change(incoming);
+            if was_empty && !incoming.messages.is_empty() {
+                Self::schedule_read_notification(incoming);
+            }
+        });
+    }
+
+    /// Hands the last messages of the peer to the owner along with its departure, so that the owner can't take them
+    /// without learning that the peer is gone.
+    pub(crate) fn deliver_with_peer_eof(
+        &self,
+        messages: impl IntoIterator<Item = ReceivedMessage>,
+        change: impl FnOnce(&mut Incoming<Barrier>),
+    ) {
+        self.notify_incoming_message_observer([&[][..]]);
+        self.update(|incoming| {
+            incoming.messages.extend(messages);
+            change(incoming);
+            self.peer_eof.store(true, Ordering::Release);
+            Self::schedule_read_notification(incoming);
+        });
+    }
+
+    pub(crate) fn mark_peer_eof(&self) {
+        if !self.peer_eof() {
+            self.deliver_with_peer_eof([], |_| {});
+        }
+    }
+
+    pub(crate) fn end_local_io(&self) {
+        self.update(|incoming| incoming.local_io_is_over = true);
     }
 
     /// Waits for the next message, or returns `None` once the peer is gone and every message it sent was taken.
-    pub fn receive(&self) -> Option<ReceivedMessage> {
-        self.shared.incoming.receive()
-    }
-
-    /// Sends what is queued, then stops, which tells the peer that this end is gone.
-    pub fn close_after_sending_all_pending_messages(&mut self) {
-        self.stop(IoThreadState::SendPendingMessagesAndStop);
-    }
-
-    pub fn close(&mut self) {
-        self.stop(IoThreadState::Stopped);
-    }
-
-    fn stop(&mut self, state: IoThreadState) {
-        let Some(io_thread) = self.io_thread.take() else {
-            return;
-        };
-        self.shared.set_state(state);
-        self.shared.wake_io_thread();
-        let _ = io_thread.join();
-    }
-}
-
-impl Drop for TransportMachPort {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-struct IoThread {
-    shared: Arc<Shared>,
-    receive_right: MachPort,
-    send_right: Option<MachPort>,
-    port_set: MachPort,
-    wakeup_receive_right: MachPort,
-}
-
-impl IoThread {
-    fn new(receive_right: MachPort, send_right: MachPort) -> Result<Self, mach::KernReturn> {
-        let port_set = MachPort::allocate_port_set()?;
-        port_set.insert_member(&receive_right)?;
-        let wakeup_receive_right = MachPort::allocate_receive_right()?;
-        let wakeup_send_right = wakeup_receive_right.make_send_right()?;
-        port_set.insert_member(&wakeup_receive_right)?;
-        receive_right.raise_queue_limit();
-        receive_right.request_no_senders_notification()?;
-
-        let shared = Arc::new(Shared {
-            state: AtomicU8::new(IoThreadState::Running as u8),
-            send_queue: Mutex::default(),
-            sent: Condvar::new(),
-            incoming: IncomingQueue::default(),
-            wakeup_send_right,
-        });
-
-        Ok(Self {
-            shared,
-            receive_right,
-            send_right: Some(send_right),
-            port_set,
-            wakeup_receive_right,
-        })
-    }
-
-    fn run(mut self) {
-        let mut receive_buffer = MessageBuffer::new(mach::DEFAULT_RECEIVE_BUFFER_SIZE);
-        let mut send_buffer = MessageBuffer::new(4096);
+    pub(crate) fn receive(&self) -> Option<ReceivedMessage> {
+        let mut incoming = self.lock();
         loop {
-            if self.shared.state() == IoThreadState::Stopped {
-                break;
+            if let Some(message) = incoming.messages.pop_front() {
+                return Some(message);
             }
-
-            let messages_to_send = {
-                let mut queue = self.shared.lock_send_queue();
-                let messages = std::mem::take(&mut queue.pending);
-                if !messages.is_empty() {
-                    queue.in_progress = true;
-                }
-                messages
-            };
-            let sent_any = !messages_to_send.is_empty();
-            for message in messages_to_send {
-                if self.shared.state() == IoThreadState::Stopped {
-                    break;
-                }
-                self.send(&mut send_buffer, &mut receive_buffer, message);
+            if self.peer_eof() || incoming.local_io_is_over {
+                return None;
             }
-            if sent_any {
-                self.shared.lock_send_queue().in_progress = false;
-                self.shared.sent.notify_all();
-            }
-
-            if self.shared.state() == IoThreadState::Stopped {
-                break;
-            }
-            // NB: Waiting for a send to go through takes in what arrived meanwhile, which may include the wakeups for
-            //     messages posted since this thread took the queue.
-            if !self.shared.lock_send_queue().pending.is_empty() {
-                continue;
-            }
-            if self.shared.state() == IoThreadState::SendPendingMessagesAndStop {
-                self.shared.set_state(IoThreadState::Stopped);
-                break;
-            }
-
-            let received = mach::receive_message(&mut receive_buffer, &self.port_set);
-            if !self.handle_receive_result(received) {
-                break;
-            }
+            incoming = self.wait(incoming);
         }
+    }
 
-        self.shared.set_state(IoThreadState::Stopped);
+    /// Takes every message that has arrived, and whether the peer was gone as they were taken. Later arrivals can't
+    /// be skipped by reporting the peer gone.
+    pub(crate) fn take_incoming(&self) -> (Vec<ReceivedMessage>, bool) {
+        let mut incoming = self.lock();
+        let messages = std::mem::take(&mut incoming.messages).into();
+        (messages, self.peer_eof())
+    }
+
+    /// Waits until there is a message to take, the peer is gone, the wait is interrupted, or the deadline passes.
+    pub(crate) fn wait_until_readable(&self, deadline: Option<MonotonicDeadline>) {
+        let mut incoming = self.lock();
+        while incoming.messages.is_empty()
+            && !self.peer_eof()
+            && !incoming.local_io_is_over
+            && !incoming.wait_until_readable_interrupted
         {
-            let mut queue = self.shared.lock_send_queue();
-            queue.waiters_released = true;
-            queue.pending.clear();
+            match deadline {
+                None => incoming = self.wait(incoming),
+                Some(deadline) => {
+                    let Some(remaining) = deadline.remaining() else {
+                        break;
+                    };
+                    incoming = self.wait_for(incoming, remaining);
+                }
+            }
         }
-        self.shared.sent.notify_all();
-        // NB: As closing a socket does, dropping the send right tells the peer that this end is gone.
-        self.send_right = None;
-        self.shared.incoming.mark_peer_eof();
-        let _ = self.port_set.extract_member(&self.receive_right);
+        incoming.wait_until_readable_interrupted = false;
     }
 
-    fn send(&mut self, send_buffer: &mut MessageBuffer, receive_buffer: &mut MessageBuffer, message: PendingMessage) {
-        let Some(send_right) = &self.send_right else {
-            return;
-        };
-        let ports = message
-            .attachments
-            .into_iter()
-            .map(Attachment::into_mach_port)
-            .collect();
-        let result = mach::send_data_message(send_buffer, send_right, &message.bytes, ports, || {
-            // NB: The peer may be waiting to send to this side while this side waits for room in its queue, so take
-            //     in what it sent before retrying.
-            if !self.receive_queued_messages(receive_buffer) {
-                self.shared.set_state(IoThreadState::Stopped);
-            }
-            self.shared.should_retry_send()
-        });
-        if result != mach::MACH_MSG_SUCCESS {
-            eprintln!("TransportMachPort: send failed: {}", mach::error_string(result));
-            self.send_right = None;
-            self.shared.set_state(IoThreadState::Stopped);
+    pub(crate) fn interrupt_wait_until_readable(&self) {
+        self.update(|incoming| incoming.wait_until_readable_interrupted = true);
+    }
+
+    pub(crate) fn set_incoming_message_observer(
+        &self,
+        observer: Option<IncomingMessageObserver>,
+    ) -> Option<IncomingMessageObserver> {
+        std::mem::replace(&mut *lock(&self.incoming_message_observer), observer)
+    }
+
+    pub(crate) fn close_read_notification_pipe(&self) {
+        let pipe = self.lock().read_notification_pipe.take();
+        drop(pipe);
+    }
+
+    pub(crate) fn acknowledge_read_notification(&self) {
+        self.lock().read_notification_pending = false;
+    }
+
+    pub(crate) fn schedule_read_notification_if_readable(&self) {
+        let mut incoming = self.lock();
+        if !incoming.messages.is_empty() || self.peer_eof() {
+            Self::schedule_read_notification(&mut incoming);
+        }
+    }
+}
+
+/// Where a transport stands with the IO thread that every transport of the process shares. Both change only under the
+/// lock of that thread's attention list.
+#[derive(Default)]
+pub(crate) struct IoThreadMembership {
+    needs_attention: AtomicBool,
+    io_is_finished: AtomicBool,
+}
+
+pub(crate) trait SharesIoThread {
+    fn io_thread_membership(&self) -> &IoThreadMembership;
+}
+
+/// The transports that asked the shared IO thread to send their backlog, take note of a peer they found gone, or stop
+/// their IO, and how a transport's owner waits for its IO to be over.
+pub(crate) struct AttentionList<Transport> {
+    transports: Mutex<Vec<Arc<Transport>>>,
+    io_finished: Condvar,
+}
+
+impl<Transport: SharesIoThread> AttentionList<Transport> {
+    pub(crate) fn new() -> Self {
+        Self {
+            transports: Mutex::new(Vec::new()),
+            io_finished: Condvar::new(),
         }
     }
 
-    // NB: Takes in every message that is already queued, and returns whether to go on.
-    fn receive_queued_messages(&self, buffer: &mut MessageBuffer) -> bool {
-        while let Some(received) = mach::try_receive_message(buffer, &self.port_set).transpose() {
-            if !self.handle_receive_result(received) {
-                return false;
-            }
+    /// Puts the transport on the list, and answers whether the IO thread should be woken for it, which it need not be
+    /// once the transport's IO is over.
+    pub(crate) fn request(&self, transport: &Arc<Transport>) -> bool {
+        let mut transports = lock(&self.transports);
+        let membership = transport.io_thread_membership();
+        if membership.io_is_finished.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !membership.needs_attention.load(Ordering::Relaxed) {
+            membership.needs_attention.store(true, Ordering::Relaxed);
+            transports.push(Arc::clone(transport));
         }
         true
     }
 
-    // NB: Handles the outcome of receiving from the port set, and returns whether to go on.
-    fn handle_receive_result(&self, received: Result<mach::ReceivedMessage, ReceiveError>) -> bool {
-        match received {
-            Ok(message) if message.local_port == self.wakeup_receive_right.name() => true,
-            Ok(message) => self.handle_received(message),
-            Err(ReceiveError::Kernel(error)) => {
-                eprintln!(
-                    "TransportMachPort: mach_msg receive failed: {}",
-                    mach::error_string(error)
-                );
-                false
-            }
-            Err(ReceiveError::Malformed(what)) => {
-                eprintln!("TransportMachPort: Refusing a message with a malformed {what}");
-                false
-            }
+    pub(crate) fn is_empty(&self) -> bool {
+        lock(&self.transports).is_empty()
+    }
+
+    /// Moves the transports that asked for attention into `into`, which the IO thread serves next.
+    pub(crate) fn take(&self, into: &mut Vec<Arc<Transport>>) {
+        let mut transports = lock(&self.transports);
+        std::mem::swap(into, &mut *transports);
+        for transport in into.iter() {
+            transport
+                .io_thread_membership()
+                .needs_attention
+                .store(false, Ordering::Relaxed);
         }
     }
 
-    // NB: Handles a message that arrived on the receive right, and returns whether to go on.
-    fn handle_received(&self, message: mach::ReceivedMessage) -> bool {
-        match message.id {
-            mach::MACH_NOTIFY_NO_SENDERS => {
-                self.shared.incoming.mark_peer_eof();
-                true
-            }
-            mach::MACH_NOTIFY_SEND_ONCE | mach::IPC_RECEIVE_BARRIER_MESSAGE_ID => true,
-            mach::IPC_DATA_MESSAGE_ID | mach::IPC_INLINE_DATA_MESSAGE_ID => {
-                let Some((bytes, ports)) = message.data else {
-                    return false;
-                };
-                if ports.len() > MAX_MESSAGE_ATTACHMENT_COUNT {
-                    eprintln!("TransportMachPort: Refusing a message with {} attachments", ports.len());
-                    return false;
-                }
-                if bytes.bytes().is_empty() && ports.is_empty() {
-                    return true;
-                }
-                let attachments = ports
-                    .into_iter()
-                    .map(|(port, disposition)| Attachment::from_mach_port(port, disposition))
-                    .collect();
-                let message = ReceivedMessage { bytes, attachments };
-                self.shared.incoming.push([message]);
-                true
-            }
-            id => {
-                eprintln!("TransportMachPort: Refusing a message with ID {id:#x}");
-                false
-            }
+    pub(crate) fn wait_until_io_is_finished(&self, transport: &Transport) {
+        assert!(
+            !IS_SHARED_IO_THREAD.get(),
+            "the shared IO thread must not wait for itself"
+        );
+        let mut transports = lock(&self.transports);
+        while !transport.io_thread_membership().io_is_finished.load(Ordering::Relaxed) {
+            transports = wait(&self.io_finished, transports);
         }
+    }
+
+    // NB: The owner may destroy the transport as soon as this returns.
+    pub(crate) fn mark_io_finished(&self, transport: &Arc<Transport>) {
+        let mut transports = lock(&self.transports);
+        let membership = transport.io_thread_membership();
+        if membership.needs_attention.load(Ordering::Relaxed) {
+            transports.retain(|other| !Arc::ptr_eq(other, transport));
+            membership.needs_attention.store(false, Ordering::Relaxed);
+        }
+        membership.io_is_finished.store(true, Ordering::Relaxed);
+        self.io_finished.notify_all();
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mach::{PayloadBytes, PortRight};
-    use std::os::fd::OwnedFd;
+thread_local! {
+    static IS_SHARED_IO_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 
-    fn paired() -> (TransportMachPort, TransportMachPort) {
-        let (a, handle) = TransportMachPort::create_paired().unwrap();
-        (a, TransportMachPort::from_handle(handle).unwrap())
+pub(crate) fn is_shared_io_thread() -> bool {
+    IS_SHARED_IO_THREAD.get()
+}
+
+/// Starts the IO thread that every transport of the process shares, the first time a transport is made. Nothing waits
+/// for the thread, which goes with the process. If it can't start, what `create` made goes with the last reference,
+/// and the next transport tries again.
+pub(crate) fn start_shared_io_thread<IoThread: Send + Sync + 'static>(
+    io_thread: &'static OnceLock<Arc<IoThread>>,
+    name: &str,
+    create: impl FnOnce() -> std::io::Result<IoThread>,
+    run: fn(&IoThread),
+) -> std::io::Result<&'static IoThread> {
+    static STARTING: Mutex<()> = Mutex::new(());
+    if let Some(running) = io_thread.get() {
+        return Ok(running);
     }
-
-    #[test]
-    fn graceful_close_retries_a_full_queue() {
-        let receive = MachPort::allocate_receive_right().unwrap();
-        let send = receive.make_send_right().unwrap();
-        let ours = MachPort::allocate_receive_right().unwrap();
-        let io = IoThread::new(ours, send).unwrap();
-        let destination = io.send_right.as_ref().unwrap();
-        loop {
-            match mach::send_header_only_message(destination, mach::IPC_WAKEUP_MESSAGE_ID, Some(0)) {
-                mach::MACH_MSG_SUCCESS => (),
-                mach::MACH_SEND_TIMED_OUT => break,
-                error => panic!("queue fill failed: {}", mach::error_string(error)),
-            }
+    let _starting = lock(&STARTING);
+    if let Some(running) = io_thread.get() {
+        return Ok(running);
+    }
+    let created = Arc::new(create()?);
+    std::thread::Builder::new().name(name.to_string()).spawn({
+        let created = Arc::clone(&created);
+        move || {
+            IS_SHARED_IO_THREAD.set(true);
+            run(&created);
         }
-        io.shared.set_state(IoThreadState::SendPendingMessagesAndStop);
-        let mut receive_buffer = MessageBuffer::new(mach::DEFAULT_RECEIVE_BUFFER_SIZE);
-        let mut retried = false;
-        assert_eq!(
-            mach::send_data_message(&mut MessageBuffer::new(4096), destination, &[7], vec![], || {
-                retried = true;
-                let keep_sending = io.shared.should_retry_send();
-                mach::receive_message(&mut receive_buffer, &receive).unwrap();
-                keep_sending
-            }),
-            mach::MACH_MSG_SUCCESS
-        );
-        assert!(retried);
-        loop {
-            let message = mach::receive_message(&mut receive_buffer, &receive).unwrap();
-            if let Some((payload, _)) = message.data {
-                assert_eq!(payload.bytes(), [7]);
-                break;
-            }
-        }
-        io.shared.set_state(IoThreadState::Stopped);
-        assert!(!io.shared.should_retry_send());
-    }
-
-    #[test]
-    fn no_senders_keeps_pending_replies() {
-        let (io, peer) = {
-            let ours = MachPort::allocate_receive_right().unwrap();
-            let peer = MachPort::allocate_receive_right().unwrap();
-            (IoThread::new(ours, peer.make_send_right().unwrap()).unwrap(), peer)
-        };
-        io.shared.lock_send_queue().pending.push(PendingMessage {
-            bytes: vec![7],
-            attachments: vec![],
-        });
-        assert!(io.handle_received(mach::ReceivedMessage {
-            id: mach::MACH_NOTIFY_NO_SENDERS,
-            local_port: io.receive_right.name(),
-            data: None,
-        }));
-        assert!(io.shared.incoming.lock().peer_eof);
-        assert!(io.shared.state() == IoThreadState::Running);
-        io.shared.set_state(IoThreadState::SendPendingMessagesAndStop);
-        io.run();
-        let message = mach::receive_message(&mut MessageBuffer::new(mach::DEFAULT_RECEIVE_BUFFER_SIZE), &peer).unwrap();
-        assert_eq!(message.data.unwrap().0.bytes(), [7]);
-    }
-
-    #[test]
-    fn send_failure_leaves_eof_to_the_io_thread() {
-        let receive = MachPort::allocate_receive_right().unwrap();
-        let invalid_send = MachPort::adopt(mach::MACH_PORT_NULL, PortRight::Send);
-        let mut io = IoThread::new(receive, invalid_send).unwrap();
-        let transport = TransportMachPort {
-            shared: Arc::clone(&io.shared),
-            io_thread: None,
-        };
-        io.send(
-            &mut MessageBuffer::new(4096),
-            &mut MessageBuffer::new(mach::DEFAULT_RECEIVE_BUFFER_SIZE),
-            PendingMessage {
-                bytes: vec![1],
-                attachments: Vec::new(),
-            },
-        );
-        assert!(io.shared.state() == IoThreadState::Stopped);
-        assert!(!io.shared.incoming.lock().peer_eof);
-        assert!(io.handle_received(mach::ReceivedMessage {
-            id: mach::IPC_INLINE_DATA_MESSAGE_ID,
-            local_port: io.receive_right.name(),
-            data: Some((PayloadBytes::Inline(vec![7]), Vec::new())),
-        }));
-        io.run();
-        assert_eq!(transport.receive().unwrap().bytes(), [7]);
-        assert!(transport.receive().is_none());
-        assert_eq!(
-            transport.post_message(vec![2], Vec::new()).unwrap_err().kind(),
-            std::io::ErrorKind::NotConnected
-        );
-        assert!(transport.shared.lock_send_queue().pending.is_empty());
-        assert!(transport.receive().is_none());
-    }
-
-    #[test]
-    fn messages_arrive_in_order() {
-        let (a, b) = paired();
-        for i in 0..100u32 {
-            a.post_message(i.to_ne_bytes().to_vec(), Vec::new()).unwrap();
-        }
-        for i in 0..100u32 {
-            assert_eq!(b.receive().unwrap().bytes(), i.to_ne_bytes());
-        }
-    }
-
-    #[test]
-    fn peers_flooding_each_other_keep_receiving() {
-        let (a, b) = paired();
-        let count = 10 * mach::MACH_PORT_QLIMIT_MAX as u32;
-        for i in 0..count {
-            a.post_message(i.to_ne_bytes().to_vec(), Vec::new()).unwrap();
-            b.post_message(i.to_ne_bytes().to_vec(), Vec::new()).unwrap();
-        }
-        for i in 0..count {
-            assert_eq!(a.receive().unwrap().bytes(), i.to_ne_bytes());
-            assert_eq!(b.receive().unwrap().bytes(), i.to_ne_bytes());
-        }
-    }
-
-    #[test]
-    fn a_burst_of_posts_sends_one_wakeup() {
-        let receive = MachPort::allocate_receive_right().unwrap();
-        let peer = MachPort::allocate_receive_right().unwrap();
-        let io = IoThread::new(receive, peer.make_send_right().unwrap()).unwrap();
-        io.wakeup_receive_right.raise_queue_limit();
-        let transport = TransportMachPort {
-            shared: Arc::clone(&io.shared),
-            io_thread: None,
-        };
-        let mut buffer = MessageBuffer::new(mach::DEFAULT_RECEIVE_BUFFER_SIZE);
-        for _ in 0..2 {
-            for number in 0..100u32 {
-                transport
-                    .post_message(number.to_ne_bytes().to_vec(), Vec::new())
-                    .unwrap();
-            }
-            assert_eq!(
-                mach::send_header_only_message(
-                    &io.shared.wakeup_send_right,
-                    mach::IPC_RECEIVE_BARRIER_MESSAGE_ID,
-                    Some(0),
-                ),
-                mach::MACH_MSG_SUCCESS
-            );
-            assert_eq!(
-                mach::receive_message(&mut buffer, &io.wakeup_receive_right).unwrap().id,
-                mach::IPC_WAKEUP_MESSAGE_ID
-            );
-            assert_eq!(
-                mach::receive_message(&mut buffer, &io.wakeup_receive_right).unwrap().id,
-                mach::IPC_RECEIVE_BARRIER_MESSAGE_ID
-            );
-            let messages = std::mem::take(&mut transport.shared.lock_send_queue().pending);
-            assert_eq!(messages.len(), 100);
-            for (number, message) in messages.into_iter().enumerate() {
-                assert_eq!(message.bytes, (number as u32).to_ne_bytes());
-            }
-        }
-    }
-
-    #[test]
-    fn large_messages_go_out_of_line() {
-        let (a, b) = paired();
-        let bytes: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
-        a.post_message(bytes.clone(), Vec::new()).unwrap();
-        assert_eq!(b.receive().unwrap().bytes(), bytes);
-    }
-
-    #[test]
-    fn files_go_with_messages() {
-        let (a, b) = paired();
-        let (reader, writer) = std::io::pipe().unwrap();
-        a.post_message(vec![1], vec![Attachment::from_fd(OwnedFd::from(writer)).unwrap()])
-            .unwrap();
-        let message = b.receive().unwrap();
-        assert_eq!(message.bytes(), [1]);
-        let mut attachments = message.attachments;
-        let mut writer = std::fs::File::from(attachments.remove(0).into_fd().unwrap());
-        std::io::Write::write_all(&mut writer, b"ok").unwrap();
-        drop(writer);
-        let mut buffer = String::new();
-        std::io::Read::read_to_string(&mut std::fs::File::from(OwnedFd::from(reader)), &mut buffer).unwrap();
-        assert_eq!(buffer, "ok");
-    }
-
-    #[test]
-    fn the_peer_closing_ends_the_messages() {
-        let (mut a, b) = paired();
-        a.post_message(vec![7], Vec::new()).unwrap();
-        a.close_after_sending_all_pending_messages();
-        assert_eq!(b.receive().unwrap().bytes(), [7]);
-        assert!(b.receive().is_none());
-        assert!(!b.is_open());
-    }
+    })?;
+    Ok(io_thread.get_or_init(|| created))
 }

@@ -43,10 +43,10 @@ ErrorOr<String> decode(Decoder& decoder)
 template<>
 ErrorOr<Utf16String> decode(Decoder& decoder)
 {
-    auto is_ascii = TRY(decoder.decode<bool>());
+    auto has_latin1_storage = TRY(decoder.decode<bool>());
     auto length_in_code_units = TRY(decoder.decode_size());
 
-    return Utf16String::from_ipc_stream(decoder.stream(), length_in_code_units, is_ascii);
+    return Utf16String::from_ipc_stream(decoder.stream(), length_in_code_units, has_latin1_storage);
 }
 
 template<>
@@ -93,8 +93,12 @@ ErrorOr<JsonValue> decode(Decoder& decoder)
 template<>
 ErrorOr<AK::Duration> decode(Decoder& decoder)
 {
-    auto nanoseconds = TRY(decoder.decode<i64>());
-    return AK::Duration::from_nanoseconds(nanoseconds);
+    auto seconds = TRY(decoder.decode<i64>());
+    auto nanoseconds = TRY(decoder.decode<u32>());
+    auto duration = AK::Duration::maybe_from_seconds_and_nanoseconds(seconds, nanoseconds);
+    if (!duration.has_value())
+        return Error::from_string_literal("IPC: Invalid duration");
+    return duration.release_value();
 }
 
 template<>

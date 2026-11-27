@@ -12,6 +12,8 @@
 #include <AK/Function.h>
 #include <AK/StringView.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/CompressedPointer.h>
+#include <LibGC/Forward.h>
 #include <LibGC/RootVector.h>
 #include <LibJS/Embedding/Layout.h>
 #include <LibJS/Export.h>
@@ -19,8 +21,8 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Heap/EngineCell.h>
 #include <LibJS/Runtime/Completion.h>
-#include <LibJS/Runtime/IndexedProperties.h>
 #include <LibJS/Runtime/PrimitiveString.h>
+#include <LibJS/Runtime/PropertyAttributes.h>
 #include <LibJS/Runtime/PropertyDescriptor.h>
 #include <LibJS/Runtime/PropertyKey.h>
 #include <LibJS/Runtime/Shape.h>
@@ -76,7 +78,6 @@ public:
     ThrowCompletionOr<void> set(PropertyKey const&, Value, ShouldThrowExceptions);
     ThrowCompletionOr<bool> create_data_property(PropertyKey const&, Value, Optional<u32>* new_property_offset = nullptr, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr);
     ThrowCompletionOr<bool> create_data_property_or_throw(PropertyKey const&, Value);
-    void create_non_enumerable_data_property_or_throw(PropertyKey const&, Value);
     ThrowCompletionOr<void> define_property_or_throw(PropertyKey const&, PropertyDescriptor&);
     ThrowCompletionOr<bool> has_property(PropertyKey const&) const;
     ThrowCompletionOr<bool> has_own_property(PropertyKey const&) const;
@@ -149,12 +150,16 @@ public:
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
 
     void define_native_function(Realm&, PropertyKey const&, NativeFunctionPointer, i32 length, PropertyAttributes attributes);
-    void define_native_function(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)>, i32 length, PropertyAttributes attributes);
+    void define_native_function(Realm&, PropertyKey const&, GC::Ref<GC::Function<ThrowCompletionOr<Value>(VM&)>>, i32 length, PropertyAttributes attributes);
     void define_native_accessor(Realm&, PropertyKey const&, NativeFunctionPointer getter, NativeFunctionPointer setter, PropertyAttributes attributes);
-    void define_native_accessor(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> getter, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> setter, PropertyAttributes attributes);
+    void define_native_accessor(Realm&, PropertyKey const&, GC::Ptr<GC::Function<ThrowCompletionOr<Value>(VM&)>> getter, GC::Ptr<GC::Function<ThrowCompletionOr<Value>(VM&)>> setter, PropertyAttributes attributes);
 
     [[nodiscard]] bool is_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_FUNCTION); }
-    bool is_date() const;
+    bool is_weak_map() const;
+    bool is_weak_set() const;
+    bool is_generator() const;
+    bool is_proxy() const;
+    bool is_array_buffer() const;
     [[nodiscard]] bool is_raw_native_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION); }
     [[nodiscard]] bool is_direct_getter_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION); }
     [[nodiscard]] bool has_global_object_flag() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_GLOBAL_OBJECT); }
@@ -176,11 +181,11 @@ public:
     u32 indexed_array_like_size() const;
     // The runtime appends elements with the default attributes, the only ones LibJS's users append with.
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
-    // The element taken has the default attributes, whatever the ones it was stored with.
-    ValueAndAttributes indexed_take_first();
+    // Removes the first element, which must exist, and shifts the others down.
+    void indexed_take_first();
 
-    Shape& shape() { return *engine_field<Shape*>(JS_LAYOUT_OBJECT_SHAPE_OFFSET); }
-    Shape const& shape() const { return *engine_field<Shape*>(JS_LAYOUT_OBJECT_SHAPE_OFFSET); }
+    Shape& shape() { return *reinterpret_cast<Shape*>(GC::decompress_nonnull(engine_field<u32>(JS_LAYOUT_OBJECT_SHAPE_OFFSET))); }
+    Shape const& shape() const { return *reinterpret_cast<Shape const*>(GC::decompress_nonnull(engine_field<u32>(JS_LAYOUT_OBJECT_SHAPE_OFFSET))); }
 
     void convert_to_prototype_if_needed();
     void invalidate_property_lookup_caches();
@@ -234,13 +239,20 @@ protected:
     }
 
 private:
-    static_assert(JS_LAYOUT_OBJECT_SHAPE_SIZE == sizeof(void*));
-    static_assert(JS_LAYOUT_CELL_CLASS_SIZE == sizeof(void*));
+    static_assert(JS_LAYOUT_OBJECT_SHAPE_SIZE == sizeof(u32));
     static_assert(JS_LAYOUT_CLASS_ID_SIZE == sizeof(u16));
     static_assert(JS_LAYOUT_CLASS_PARENT_SIZE == sizeof(void*));
 
-    // The runtime's class of the object, which the first word of every cell points to.
-    u8 const* engine_class() const { return engine_field<u8 const*>(JS_LAYOUT_CELL_CLASS_OFFSET); }
+    // The runtime's class of the object, which the object's block holds, unless the block's class is tagged as one that
+    // classes share an allocator of: then the object keeps its class in its last word.
+    u8 const* engine_class() const
+    {
+        auto const* block = GC::HeapBlockBase::from_cell(GC::as_cell(this));
+        auto const* engine_class = static_cast<u8 const*>(block->foreign_type());
+        if (!(bit_cast<FlatPtr>(engine_class) & JS_LAYOUT_BLOCK_CLASS_TAIL_TAG))
+            return engine_class;
+        return engine_field<u8 const*>(block->type_info().cell_size - sizeof(void*));
+    }
 
     static u16 engine_class_id_of(u8 const* engine_class)
     {

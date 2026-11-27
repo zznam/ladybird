@@ -9,6 +9,7 @@
 //! like `%ArrayIteratorPrototype%.next` does.
 
 use super::Codegen;
+use super::RegisterList;
 use super::slow_path_calls::slow_path_saved_registers;
 use crate::asm::Address;
 use crate::asm::Condition;
@@ -18,14 +19,14 @@ use crate::asm::PortableMacroAssembler;
 use crate::ir::NodeId;
 use crate::ir::value;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// `OpenArrayIteration`: calls `RuntimeInfo::open_array_iteration`.
     pub(in crate::codegen) fn emit_open_array_iteration(&mut self, node: NodeId) {
         let (iterable, output) = (self.input(node, 0), self.output(node));
         let saved = slow_path_saved_registers::<M>()
             .without(output)
             .iter()
-            .collect::<Vec<_>>();
+            .collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
         self.masm.move64(M::ARGUMENT_GPRS[1], iterable);
         self.masm.move64(M::ARGUMENT_GPRS[0], self.pinned.vm);
@@ -42,8 +43,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let layout = self.runtime.layout;
         let other = self.masm.new_label();
         let fail = if invert { target } else { other };
-        // NB: Cells start with the pointer to their class.
-        self.masm.load64(scratch, &Address::new(object, 0));
+        self.emit_load_class(scratch, object);
         self.masm
             .branch64_imm(Condition::NotEqual, scratch, layout.array_iterator_class as i64, fail);
         self.masm

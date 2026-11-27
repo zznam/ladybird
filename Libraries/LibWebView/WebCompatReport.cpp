@@ -7,8 +7,10 @@
 #include <AK/Math.h>
 #include <AK/StringBuilder.h>
 #include <AK/WeakPtr.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibCore/Promise.h>
+#include <LibURL/Parser.h>
 #include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebView/Application.h>
@@ -27,11 +29,7 @@ static constexpr auto browser_version = BROWSER_VERSION ""sv;
 static constexpr auto platform = OS_STRING ""sv;
 static constexpr auto architecture = CPU_STRING ""sv;
 
-#ifdef NDEBUG
-static constexpr auto build_configuration = "release"sv;
-#else
-static constexpr auto build_configuration = "debug"sv;
-#endif
+static constexpr auto build_configuration = BROWSER_BUILD_CONFIGURATION ""sv;
 
 static String to_string(StringView text)
 {
@@ -121,18 +119,19 @@ void WebCompatReport::set_page_dumps(String dumps)
     m_page_dumps = MUST(String::formatted("{}\n(Truncated)\n", StringView { bytes.slice(0, length) }));
 }
 
-ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) const
+ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps, IncludePlatformFeatures include_platform_features) const
 {
     StringBuilder builder;
     builder.append("Ladybird web compatibility report, format 1\n"sv);
-    builder.appendff("Version: {}\nPlatform: {}\nArchitecture: {}\n", browser_version, platform, architecture);
-    builder.appendff("Build configuration: {}\n", build_configuration);
     append_build_information_for_process(builder, ProcessType::Browser);
     builder.appendff("URL: {}\n", m_page.url.serialize());
     builder.appendff("User agent: {}\n", m_page.user_agent);
     builder.appendff("Viewport size: {}\n", format_viewport_size(m_page.viewport_size));
     builder.appendff("Device pixel ratio: {}\n", m_page.device_pixel_ratio);
     builder.appendff("Zoom level: {}\n", format_zoom_level(m_page.zoom_level));
+
+    if (include_platform_features == IncludePlatformFeatures::Yes && m_platform_features.has_value())
+        builder.append(*m_platform_features);
 
     if (include_page_dumps == IncludePageDumps::Yes && m_page_dumps.has_value())
         builder.appendff("\n{}", *m_page_dumps);
@@ -141,7 +140,7 @@ ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) con
 }
 
 Optional<String> WebCompatReport::send(String const& description, Optional<ByteBuffer> screenshot_png,
-    IncludePageDumps include_page_dumps)
+    IncludePageDumps include_page_dumps, IncludePlatformFeatures include_platform_features)
 {
     VERIFY(!m_submission);
 
@@ -150,7 +149,7 @@ Optional<String> WebCompatReport::send(String const& description, Optional<ByteB
     if (screenshot_png.has_value() && screenshot_png->size() > maximum_screenshot_bytes)
         return "This screenshot is too large to include in a report."_string;
 
-    auto diagnostics_text = diagnostics(include_page_dumps);
+    auto diagnostics_text = diagnostics(include_page_dumps, include_platform_features);
     Vector<ReportSubmission::Attachment> attachments;
     attachments.append({
         .id = diagnostics_reference,
@@ -180,10 +179,9 @@ Optional<String> WebCompatReport::send(String const& description, Optional<ByteB
     contents.add_text("viewport_size"sv, "text"sv, viewport_size);
     contents.add("device_pixel_ratio"sv, "number"sv, m_page.device_pixel_ratio);
     contents.add("zoom_level"sv, "number"sv, m_page.zoom_level);
-    contents.add_text("platform"sv, "text"sv, platform);
-    contents.add_text("architecture"sv, "text"sv, architecture);
-    contents.add_text("git_commit"sv, "text"sv, LADYBIRD_COMMIT);
-    contents.add_text("build_configuration"sv, "text"sv, build_configuration);
+    contents.add_build_information(platform, architecture, LADYBIRD_COMMIT, build_configuration);
+    if (include_platform_features == IncludePlatformFeatures::Yes && m_platform_features.has_value())
+        contents.add_platform_features(*m_platform_features);
 
     auto manifest = ReportSubmission::build_manifest(contents, attachments);
     m_payload = ReportSubmission::Payload { move(manifest), move(attachments) };
@@ -234,6 +232,31 @@ void WebCompatReport::start_submission()
 
     m_submission = submission;
     submission->start();
+}
+
+URL::URL new_bug_report_url(BugReportDetails const& details)
+{
+    StringBuilder url;
+    url.append("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml"sv);
+    auto append_field = [&](StringView id, StringView value) {
+        url.appendff("&{}={}", id, URL::percent_encode(value, URL::PercentEncodeSet::Component));
+    };
+
+    // NB: These are the IDs of the fields in .github/ISSUE_TEMPLATE/bug_report.yml, where the architecture is a choice
+    //     of these values.
+    append_field("os"sv, platform);
+    append_field("architecture"sv, architecture == "x86_64"sv || architecture == "AArch64"sv ? architecture : "Other"sv);
+    append_field("commit"sv, LADYBIRD_COMMIT);
+
+    StringBuilder build_flags;
+    build_flags.appendff("Ladybird {}, {}", browser_version, build_configuration);
+    if (details.disable_sandbox == DisableSandbox::Yes)
+        build_flags.append(", sandbox: off"sv);
+    if (!details.gpu_painting_enabled)
+        build_flags.append(", GPU painting: off"sv);
+    append_field("build-flags"sv, build_flags.string_view());
+
+    return URL::Parser::basic_parse(url.string_view()).release_value();
 }
 
 }

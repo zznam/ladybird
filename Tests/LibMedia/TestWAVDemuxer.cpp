@@ -11,6 +11,7 @@
 #include <LibMedia/Containers/WAV/WAVDemuxer.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/Limits.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
@@ -254,6 +255,10 @@ TEST_CASE(demuxer_reads_speaker_positions_from_an_extensible_header)
     EXPECT_EQ(channel_map_of({ .channel_count = 4, .speaker_position_mask = front_left | front_right | side_left | side_right }), Audio::ChannelMap(Channel::FrontLeft, Channel::FrontRight, Channel::SideLeft, Channel::SideRight));
     EXPECT_EQ(channel_map_of({ .channel_count = 6, .speaker_position_mask = 0x3F }), Audio::ChannelMap::surround_5_1());
 
+    // The bits past the last position the header defines name no speaker.
+    constexpr u32 reserved_positions = (1 << 18) | (1 << 19);
+    EXPECT_EQ(channel_map_of({ .channel_count = 2, .speaker_position_mask = reserved_positions }), Audio::ChannelMap::stereo());
+
     // Positions that do not account for every channel are ignored in favour of the usual layout for the count.
     EXPECT_EQ(channel_map_of({ .channel_count = 6, .speaker_position_mask = front_left | front_right }), Audio::ChannelMap::surround_5_1());
     EXPECT_EQ(channel_map_of({ .channel_count = 6 }), Audio::ChannelMap::surround_5_1());
@@ -297,6 +302,17 @@ TEST_CASE(demuxer_declines_what_it_cannot_read)
     header_without_data.resize(12 + 8 + 16);
     auto no_data_chunk = demuxer_for(header_without_data);
     EXPECT_EQ(no_data_chunk.error().category(), Media::DecoderErrorCategory::Corrupted);
+}
+
+TEST_CASE(demuxer_refuses_sample_rates_outside_the_supported_range)
+{
+    EXPECT(!demuxer_for(make_wave({ .sample_rate = Media::MIN_AUDIO_SAMPLE_RATE })).is_error());
+    EXPECT(!demuxer_for(make_wave({ .sample_rate = Media::MAX_AUDIO_SAMPLE_RATE })).is_error());
+
+    auto too_slow = demuxer_for(make_wave({ .sample_rate = Media::MIN_AUDIO_SAMPLE_RATE - 1 }));
+    EXPECT_EQ(too_slow.error().category(), Media::DecoderErrorCategory::NotImplemented);
+    auto too_fast = demuxer_for(make_wave({ .sample_rate = Media::MAX_AUDIO_SAMPLE_RATE + 1 }));
+    EXPECT_EQ(too_fast.error().category(), Media::DecoderErrorCategory::NotImplemented);
 }
 
 TEST_CASE(demuxer_reads_to_the_end_of_a_stream_whose_data_size_is_left_open)

@@ -8,7 +8,6 @@ import http.server
 import json
 import os
 import runpy
-import subprocess
 import sys
 import tempfile
 import threading
@@ -75,14 +74,15 @@ with tempfile.TemporaryDirectory() as directory:
     )
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    port = helpers["unused_port"]()
-    process = subprocess.Popen(
-        [sys.argv[1], "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory],
-        env={**os.environ, "LADYBIRD_CONTENT_BLOCKER_LIST_UPDATE_TIMEOUT_MS": "1000"},
+    process, port = helpers["launch_webdriver"](
+        sys.argv[1],
+        "--headless",
+        "--profile-path",
+        directory,
+        env={**os.environ, "LADYBIRD_CONTENT_BLOCKER_LIST_UPDATE_TIMEOUT_MS": "5000"},
     )
     session = None
     try:
-        helpers["wait_for_port"](port)
         session = helpers["create_session"](port)
 
         def command(path, body):
@@ -138,59 +138,28 @@ with tempfile.TemporaryDirectory() as directory:
         )
         command("window", {"handle": settings_window})
         command("url", {"url": "about:about"})
-        command("url", {"url": "about:services"})
+        command("url", {"url": "about:settings#privacy"})
         settings()
         command("back", {})
         assert command("execute/sync", {"script": "return location.href", "args": []}) == "about:about"
-        command("url", {"url": "about:blocking"})
+        command("url", {"url": "about:settings#blocking"})
         state = settings()
-        assert state["contentBlockers"]["showBlockedCount"] is False
-        features = command(
-            "execute/async",
-            {
-                "script": """
-                const done = arguments[arguments.length - 1];
-                document.addEventListener('WebUIMessage', function receive(event) {
-                    if (event.detail.name !== 'loadFeatures') return;
-                    document.removeEventListener('WebUIMessage', receive);
-                    done(event.detail.data);
-                });
-                ladybird.sendMessage('loadFeatures');
-                """,
-                "args": [],
-            },
-        )
-        display = command(
-            "execute/sync",
-            {
-                "script": "return getComputedStyle(document.querySelector('#show-content-blocker-count-setting')).display",
-                "args": [],
-            },
-        )
-        assert (display != "none") == features["contentBlockingControls"]
-        command("execute/sync", {"script": "ladybird.sendMessage('setShowContentBlockerCount', false)", "args": []})
-        assert settings()["contentBlockers"]["showBlockedCount"] == (not features["contentBlockingControls"])
         assert command(
             "execute/sync",
             {
                 "script": """
                 const tab = document.querySelector('[aria-selected="true"]');
                 const panel = document.querySelector('#tab-blocking');
-                const description = panel.querySelector('#custom-content-blocker-subscription-url')
-                    .closest('.card-body').querySelector('.description');
-                const form = description.nextElementSibling;
-                const lists = panel.querySelector('#built-in-content-blocker-lists');
-                const heading = panel.querySelector('.filter-list-header .card-title');
-                const details = lists.querySelector('.description');
-                const metadata = lists.querySelector('.filter-list-metadata');
-                return location.hash === '#blocking' && tab.textContent === 'Blocking'
+                const lists = panel.querySelector('#content-blocker-lists');
+                const heading = panel.querySelector('.list-section .list-heading');
+                const details = lists.querySelector('.item-name .description');
+                const form = panel.querySelector('#add-filter-list-form');
+                return location.hash === '#blocking' && tab.textContent.trim() === 'Content blocking'
                     && heading.getBoundingClientRect().left === lists.getBoundingClientRect().left
-                    && metadata.getBoundingClientRect().top >= details.getBoundingClientRect().bottom
-                    && getComputedStyle(metadata).fontSize === '12px'
-                    && metadata.textContent.includes('easylist.to') && !details.textContent.includes('easylist.to')
-                    && ['label', '.description', 'summary', 'textarea'].every(selector =>
-                        getComputedStyle(panel.querySelector(selector)).fontSize === '14px')
-                    && form.getBoundingClientRect().top - description.getBoundingClientRect().bottom >= 16;
+                    && getComputedStyle(details).fontSize === '12px' && !details.textContent.includes('easylist.to')
+                    && form.hidden
+                    && ['label', 'summary', 'textarea'].every(selector =>
+                        getComputedStyle(panel.querySelector(selector)).fontSize === '13px');
             """,
                 "args": [],
             },
@@ -231,7 +200,7 @@ with tempfile.TemporaryDirectory() as directory:
             const editor = document.querySelector('#custom-content-blocker-filters');
             editor.value = 'unsaved rules';
             editor.dispatchEvent(new Event('input', {bubbles: true}));
-            document.querySelector('#tab-button-services').click();
+            document.querySelector('#tab-button-privacy').click();
         """,
                 "args": [],
             },

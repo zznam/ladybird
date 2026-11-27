@@ -13,10 +13,9 @@ mod rust_demangle;
 #[path = "../../../RustPanic.rs"]
 mod rust_panic;
 
-pub mod ast;
 pub mod bytecode;
-pub mod compiler;
+mod copy_out;
 pub mod ffi;
-pub mod parser;
 pub mod regex;
 pub mod vm;
+mod work_zone;

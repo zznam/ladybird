@@ -41,6 +41,14 @@ GC::Ptr<NavigableContainer> Navigable::container() const
     return m_container;
 }
 
+// The name content attribute of this navigable's container, which another process reports when it holds the container.
+Optional<Utf16FlyString> Navigable::container_name() const
+{
+    if (auto container = this->container())
+        return container->name();
+    return container_state().name;
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container-document
 GC::Ptr<DOM::Document> Navigable::container_document() const
 {
@@ -83,14 +91,18 @@ GC::Ptr<DOM::Node> Navigable::currently_focused_area_shown_by_focused_navigable(
 {
     if (!page().client().has_focus())
         return nullptr;
+    return focused_area_shown_by_focused_navigable_regardless_of_system_focus();
+}
 
+GC::Ptr<DOM::Node> Navigable::focused_area_shown_by_focused_navigable_regardless_of_system_focus()
+{
     auto focused_navigable = page().focused_navigable();
     if (!focused_navigable || (focused_navigable.ptr() != this && !is_ancestor_of(*focused_navigable)))
         return nullptr;
 
     for (auto navigable = focused_navigable; navigable; navigable = navigable->parent()) {
         if (auto* local_navigable = as_if<LocalNavigable>(*navigable))
-            return local_navigable->currently_focused_area();
+            return local_navigable->focused_area_regardless_of_system_focus();
         if (navigable.ptr() == this)
             return nullptr;
         if (auto container = navigable->container())
@@ -166,6 +178,26 @@ GC::Ref<Navigable> Navigable::top_level_traversable()
     return navigable;
 }
 
+// INTEROP: The spec only stops a frame from loading the URL of an ancestor, so a page that gives each copy of itself a
+//          new URL nests without end. Like other engines, we limit how deep frames can load documents. URLs that fetch
+//          nothing stay allowed at any depth.
+bool Navigable::is_too_deeply_nested_to_load(URL::URL const& url, MayNavigateToAFragment may_navigate_to_a_fragment) const
+{
+    static constexpr size_t maximum_depth = 10;
+
+    if (url_matches_about_blank(url) || url_matches_about_srcdoc(url) || url.scheme() == "javascript"sv)
+        return false;
+
+    // A navigation to a fragment of the active document stays in that document.
+    if (auto active_url = active_document_url(); may_navigate_to_a_fragment == MayNavigateToAFragment::Yes && url.fragment().has_value() && active_url.has_value() && url.equals(*active_url, URL::ExcludeFragment::Yes))
+        return false;
+
+    size_t depth = 1;
+    for (auto ancestor = parent(); ancestor; ancestor = ancestor->parent())
+        ++depth;
+    return depth > maximum_depth;
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
 WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
 {
@@ -215,6 +247,12 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         }
     }
 
+    // AD-HOC: See is_too_deeply_nested_to_load(). Only a navigation without a document resource or response can be one
+    //         to a fragment; a POST to a URL with a fragment still loads a document.
+    auto may_navigate_to_a_fragment = params.document_resource.has<Empty>() && !params.response ? MayNavigateToAFragment::Yes : MayNavigateToAFragment::No;
+    if (is_too_deeply_nested_to_load(params.url, may_navigate_to_a_fragment))
+        return {};
+
     // AD-HOC: Nothing the browser process can see names this URL's blob URL entry until the navigation commits, so
     //         ask it to keep the entry until then.
     if (auto const& blob_url_entry = params.url.blob_url_entry(); blob_url_entry.has_value() && source_document) {
@@ -262,13 +300,10 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     if (source.is_ancestor_of(target))
         return true;
 
-    // 3. If target is an ancestor of source, then:
-    if (target.is_ancestor_of(source)) {
-
-        // 1. If target is not a top-level traversable, then return true.
-        if (!target.is_top_level_traversable())
-            return true;
-
+    // 3. If target is an ancestor of source:
+    // AD-HOC: Only for a top-level target, which drops step 1, so that other ancestors reach step 5.
+    //         See https://github.com/whatwg/html/pull/13150
+    if (target.is_top_level_traversable() && target.is_ancestor_of(source)) {
         // 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
         //    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
         if (source_snapshot_params.has_transient_activation && has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedTopLevelNavigationWithUserActivation))
@@ -286,15 +321,8 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     // 4. If target is a top-level traversable:
     if (target.is_top_level_traversable()) {
         // 1. If source is the one permitted sandboxed navigator of target, then return true.
-        // NB: The one permitted sandboxed navigator is a browsing context, so we compare the active browsing contexts.
-        auto const* local_source = as_if<LocalNavigable>(source);
-        auto const* local_target = as_if<LocalNavigable>(target);
-        if (local_source && local_target) {
-            auto source_browsing_context = const_cast<LocalNavigable&>(*local_source).active_browsing_context();
-            auto target_browsing_context = const_cast<LocalNavigable&>(*local_target).active_browsing_context();
-            if (source_browsing_context && target_browsing_context && target_browsing_context->the_one_permitted_sandboxed_navigator() == source_browsing_context)
-                return true;
-        }
+        if (target.active_browsing_context_one_permitted_sandboxed_navigator().ptr() == &source)
+            return true;
 
         // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
         if (has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation))

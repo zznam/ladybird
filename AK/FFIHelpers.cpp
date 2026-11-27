@@ -41,10 +41,10 @@ StringView ffi_string_view(u8 const* ptr, size_t len)
 
 }
 
-extern "C" FlatPtr ladybird_utf16_string_create_uninitialized(size_t length, bool has_ascii_storage)
+extern "C" FlatPtr ladybird_utf16_string_create_uninitialized(size_t length, bool has_latin1_storage)
 {
-    auto storage_type = has_ascii_storage
-        ? AK::Detail::Utf16StringData::StorageType::ASCII
+    auto storage_type = has_latin1_storage
+        ? AK::Detail::Utf16StringData::StorageType::Latin1
         : AK::Detail::Utf16StringData::StorageType::UTF16;
     auto data = AK::Detail::Utf16StringData::create_uninitialized_for_ffi(storage_type, length);
     return reinterpret_cast<FlatPtr>(&data.leak_ref());
@@ -110,20 +110,20 @@ extern "C" FlatPtr ladybird_utf16_string_to_well_formed(u16 const* data, size_t 
     return reinterpret_cast<FlatPtr>(&string.leak_ref());
 }
 
-extern "C" size_t ladybird_size_required_to_decode_base64(void const* data, size_t length, bool has_ascii_storage)
+extern "C" size_t ladybird_size_required_to_decode_base64(void const* data, size_t length, bool has_latin1_storage)
 {
-    if (has_ascii_storage)
+    if (has_latin1_storage)
         return AK::size_required_to_decode_base64(AK::ffi_string_view(static_cast<u8 const*>(data), length));
     return AK::size_required_to_decode_base64(AK::Utf16View { static_cast<char16_t const*>(data), length });
 }
 
-extern "C" u8 ladybird_decode_base64_into(void const* data, size_t length, bool has_ascii_storage, bool url, u8 last_chunk_handling, u8* output, size_t* output_length, size_t* read)
+extern "C" u8 ladybird_decode_base64_into(void const* data, size_t length, bool has_latin1_storage, bool url, u8 last_chunk_handling, u8* output, size_t* output_length, size_t* read)
 {
     auto handling = static_cast<AK::LastChunkHandling>(last_chunk_handling);
     Bytes bytes { output, *output_length };
 
     auto result = [&] {
-        if (has_ascii_storage) {
+        if (has_latin1_storage) {
             auto input = AK::ffi_string_view(static_cast<u8 const*>(data), length);
             return url ? AK::decode_base64url_into(input, bytes, handling) : AK::decode_base64_into(input, bytes, handling);
         }
@@ -201,6 +201,11 @@ extern "C" void ladybird_dealloc(void* pointer, size_t alignment)
     ak_kfree(pointer);
 }
 
+extern "C" void ladybird_release_unused_allocator_memory()
+{
+    ak_kmalloc_collect();
+}
+
 extern "C" void* ladybird_realloc(void* pointer, size_t old_size, size_t new_size, size_t alignment)
 {
     if (alignment <= alignof(max_align_t))
@@ -216,9 +221,4 @@ extern "C" void* ladybird_realloc(void* pointer, size_t old_size, size_t new_siz
 extern "C" void* ladybird_js_object_storage_alloc(size_t size)
 {
     return ak_kmalloc(HeapPartition::JSObjectStorage, size);
-}
-
-extern "C" void* ladybird_js_object_storage_realloc(void* pointer, size_t new_size)
-{
-    return ak_krealloc(HeapPartition::JSObjectStorage, pointer, new_size);
 }

@@ -9,11 +9,12 @@
 
 #include <AK/Base64.h>
 #include <AK/NumericLimits.h>
-#include <AK/QuickSort.h>
+#include <AK/StdLibExtras.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <LibCompositing/CanvasColorSpace.h>
 #include <LibCore/Timer.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
@@ -21,6 +22,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/ScalingMode.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/TypedArray.h>
@@ -35,11 +37,8 @@
 #include <LibWeb/EventTiming/PerformanceEventTiming.h>
 #include <LibWeb/Fetch/BindingsGlue.h>
 #include <LibWeb/Fetch/FetchMethod.h>
-#include <LibWeb/HTML/BroadcastChannel.h>
-#include <LibWeb/HTML/Canvas/PredefinedColorSpace.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/EventSource.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -53,39 +52,30 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Timer.h>
+#include <LibWeb/HTML/VisibilityStateEntry.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
-#include <LibWeb/HighResolutionTime/SupportedPerformanceTypes.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/IndexedDB/IDBDatabase.h>
 #include <LibWeb/IndexedDB/IDBFactory.h>
-#include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/LargestContentfulPaint/LargestContentfulPaint.h>
-#include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
+#include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/PaintTiming/PerformancePaintTiming.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
-#include <LibWeb/PerformanceTimeline/EntryTypes.h>
-#include <LibWeb/PerformanceTimeline/EventNames.h>
-#include <LibWeb/PerformanceTimeline/PerformanceObserver.h>
-#include <LibWeb/PerformanceTimeline/PerformanceObserverEntryList.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
-#include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
+#include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/ServiceWorker/CacheStorage.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedScript.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicyFactory.h>
-#include <LibWeb/UserTiming/PerformanceMark.h>
-#include <LibWeb/UserTiming/PerformanceMeasure.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -109,39 +99,28 @@ namespace Web::HTML {
 
 WindowOrWorkerGlobalScopeMixin::~WindowOrWorkerGlobalScopeMixin() = default;
 
-void WindowOrWorkerGlobalScopeMixin::initialize()
+void WindowOrWorkerGlobalScopeMixin::register_permission_status(DOM::EventTarget& status)
 {
-    bool global_is_window = is<HTML::Window>(this_impl());
-
-#define __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES(entry_type, cpp_class, globals)                                                       \
-    if (HighResolutionTime::is_supported_for_global(HighResolutionTime::SupportedPerformanceEntryTypeGlobals::globals, global_is_window)) { \
-        m_performance_entry_buffer_map.set(entry_type,                                                                                      \
-            PerformanceTimeline::PerformanceEntryTuple {                                                                                    \
-                .performance_entry_buffer = {},                                                                                             \
-                .max_buffer_size = cpp_class::max_buffer_size(),                                                                            \
-                .available_from_timeline = cpp_class::available_from_timeline(),                                                            \
-                .dropped_entries_count = 0,                                                                                                 \
-            });                                                                                                                             \
-    }
-    ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
-#undef __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
+    m_permission_statuses.append(status);
 }
 
 void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
 {
-    visitor.visit(m_performance);
     visitor.visit(m_timers);
-    visitor.visit(m_registered_performance_observer_objects);
     visitor.visit(m_indexed_db);
-    for (auto& entry : m_performance_entry_buffer_map)
-        entry.value.visit_edges(visitor);
-    visitor.visit(m_registered_event_sources);
     visitor.visit(m_strongly_referenced_broadcast_channels);
+    visitor.visit(m_objects_with_pending_activity);
+
+    // A PermissionStatus with a change listener must stay alive while its global does, so the listener can hear of a
+    // change even when nothing else refers to the status.
+    m_permission_statuses.remove_all_matching([](auto const& status) { return !status; });
+    for (auto const& status : m_permission_statuses) {
+        if (status->has_event_listener(EventNames::change))
+            visitor.visit(*status);
+    }
     visitor.visit(m_crypto);
     visitor.visit(m_cache_storage);
-    visitor.visit(m_resource_timing_secondary_buffer);
     visitor.visit(m_trusted_type_policy_factory);
-    visitor.ignore(m_outstanding_rejected_promises_weak_set);
     visitor.visit(m_about_to_be_notified_rejected_promises_list);
 }
 
@@ -222,7 +201,7 @@ void WindowOrWorkerGlobalScopeMixin::queue_microtask(WebIDL::CallbackType& callb
         document = &static_cast<Window&>(this_impl()).associated_document();
 
     // The queueMicrotask(callback) method must queue a microtask to invoke callback with « » and "report".
-    HTML::queue_a_microtask(document, GC::create_function(GC::Heap::the(), [&callback] {
+    HTML::queue_a_microtask(document, GC::create_function(GC::Heap::the(), GC::captures(callback), [](auto& callback) {
         (void)WebIDL::invoke_callback(callback, {}, WebIDL::ExceptionBehavior::Report, {});
     }));
 }
@@ -239,22 +218,25 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap(JS::Realm& realm, Image
     create_image_bitmap_impl(realm, promise, image, sx, sy, sw, sh, move(options));
 }
 
-// https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
-WebIDL::ExceptionOr<JS::Value> WindowOrWorkerGlobalScopeMixin::structured_clone(JS::Realm& realm, JS::Value value, Bindings::StructuredSerializeOptions const& options)
-{
-    // 1. Let serialized be ? StructuredSerializeWithTransfer(value, options["transfer"]).
-    auto serialized = TRY(HTML::structured_serialize_with_transfer(realm, value, options.transfer));
-
-    // 2. Let deserializeRecord be ? StructuredDeserializeWithTransfer(serialized, this's relevant realm).
-    auto deserialized = TRY(HTML::structured_deserialize_with_transfer(serialized, realm));
-
-    // 3. Return deserializeRecord.[[Deserialized]].
-    return deserialized.deserialized;
-}
-
 extern "C" {
 // Defined in Bindings/Rust/src/canvas_2d/exports.rs.
 bool web_canvas_2d_read_back_video_frame(void* video_wrapper, Optional<Gfx::DecodedImageFrame>* out_frame);
+// Defined in Bindings/Rust/src/html/exports.rs.
+void web_rust_event_source_forcibly_close_all(JSVM*, void* realm);
+JSCompletion web_rust_structured_clone(JSVM*, void* realm, JSValue, JSObject* const* transfer, size_t count);
+// Defined in Bindings/Rust/src/performance_timeline/exports.rs.
+HighResolutionTime::Performance* web_rust_performance_timeline_performance(JSVM*, void* realm);
+void web_rust_performance_timeline_queue_performance_entry(JSVM*, void* realm, PerformanceTimeline::PerformanceEntry*);
+void web_rust_performance_timeline_add_performance_entry(JSVM*, void* realm, PerformanceTimeline::PerformanceEntry*, bool check_if_performance_buffer_is_full);
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
+WebIDL::ExceptionOr<JS::Value> WindowOrWorkerGlobalScopeMixin::structured_clone(JS::Realm& realm, JS::Value value, Bindings::StructuredSerializeOptions const& options)
+{
+    Vector<JSObject*> transfer;
+    for (auto const& object : options.transfer)
+        transfer.append(JS::HostABI::object_to_abi(object.ptr()));
+    return TRY(JS::HostABI::completion_from_abi<JS::Value>(web_rust_structured_clone(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::value_to_abi(value), transfer.data(), transfer.size())));
 }
 
 static Compositor::CompositorHost* compositor_host_for(JS::Object& global_object)
@@ -275,9 +257,7 @@ static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> scale_bitmap(Compositor::CompositorHo
         return Error::from_string_literal("No compositor to scale the bitmap");
 
     auto output = TRY(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size));
-    Compositing::DisplayListResourceStorage resource_storage;
-    auto display_list = Painting::record_image_frame_display_list(Gfx::DecodedImageFrame { input }, output->rect().to_type<float>(), scaling_mode, resource_storage);
-    if (!compositor_host->rasterize_display_list(display_list, resource_storage, output))
+    if (!Painting::rasterize_image_frame(*compositor_host, TRY(Gfx::DecodedImageFrame::create(input)), output->rect().to_type<float>(), scaling_mode, output))
         return Error::from_string_literal("Unable to scale the bitmap");
     return output;
 }
@@ -288,10 +268,9 @@ enum class ImageIsImageElementOrBlob : u8 {
 };
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#cropped-to-the-source-rectangle-with-formatting
-static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatting(Compositor::CompositorHost const* compositor_host, Gfx::DecodedImageFrame const& input_frame, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions const& options, ImageIsImageElementOrBlob image_is_image_element_or_blob = ImageIsImageElementOrBlob::No)
+static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatting(Compositor::CompositorHost const* compositor_host, Gfx::Bitmap const& input, Gfx::ColorSpace const& input_color_space, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions const& options, ImageIsImageElementOrBlob image_is_image_element_or_blob = ImageIsImageElementOrBlob::No)
 {
     // 1. Let input be the bitmap data being transformed.
-    auto const& input = input_frame.bitmap();
 
     // 2. If sx, sy, sw and sh are specified, let sourceRectangle be a rectangle whose corners are the four points
     //    (sx, sy), (sx+sw, sy), (sx+sw, sy+sh), (sx, sy+sh). Otherwise, let sourceRectangle be a rectangle whose
@@ -412,10 +391,20 @@ static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatt
             continue;
         output = TRY(scale_bitmap(compositor_host, *output, size, scaling_pass.mode));
     }
-    auto output_color_space = input_frame.color_space();
+    auto output_color_space = input_color_space;
 
-    // FIXME: 8. If the value of the imageOrientation member of options is "flipY", output must be flipped vertically,
-    //  disregarding any image orientation metadata of the source (such as EXIF metadata), if any. [EXIF]
+    // 8. If the value of the imageOrientation member of options is "flipY", output must be flipped vertically,
+    //    disregarding any image orientation metadata of the source (such as EXIF metadata), if any. [EXIF]
+    //    If the value is "from-image", no extra step is needed.
+    if (options.image_orientation == Bindings::ImageOrientation::FlipY) {
+        // NB: Cropping and scaling produced a copy, so swapping rows does not modify the source bitmap.
+        for (i32 y = 0; y < output->height() / 2; ++y) {
+            auto* top_row = output->scanline(y);
+            auto* bottom_row = output->scanline(output->height() - y - 1);
+            for (i32 x = 0; x < output->width(); ++x)
+                AK::swap(top_row[x], bottom_row[x]);
+        }
+    }
 
     // 9. If image is an img element or a Blob object, let val be the value of the colorSpaceConversion member of
     //    options, and then run these substeps:
@@ -433,7 +422,81 @@ static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatt
     // FIXME: 10. Let val be the value of premultiplyAlpha member of options, and then run these substeps:
 
     // 11. Return output.
-    return Gfx::DecodedImageFrame { *output, move(output_color_space) };
+    return Gfx::DecodedImageFrame::create(*output, move(output_color_space));
+}
+
+struct VectorImageRaster {
+    Gfx::DecodedImageFrame frame;
+    Gfx::IntRect source_rectangle;
+    ImageBitmapOptions options;
+};
+
+// A vector image that is resized up is rasterized at the scale it is resized to, rather than scaled up from its natural
+// size, so that it stays sharp. Returns that raster, with the source rectangle in its pixels and the output size as
+// resize options, for cropping to the source rectangle with formatting.
+static Optional<VectorImageRaster> rasterize_vector_image_for_resize(Layout::ImageProvider const& image, Gfx::IntSize natural_size, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions const& options)
+{
+    auto image_data = image.decoded_image_data();
+    if (!image_data || !is<SVG::SVGDecodedImageData>(*image_data))
+        return {};
+    if (!options.resize_width.has_value() && !options.resize_height.has_value())
+        return {};
+
+    auto source_rectangle = Gfx::IntRect { {}, natural_size };
+    if (sx.has_value() && sy.has_value() && sw.has_value() && sh.has_value()) {
+        if (*sw < 0 || *sh < 0)
+            return {};
+        source_rectangle = { *sx, *sy, *sw, *sh };
+    }
+    if (source_rectangle.is_empty())
+        return {};
+
+    auto output_width = options.resize_width.has_value()
+        ? static_cast<i64>(*options.resize_width)
+        : ceil_div(static_cast<i64>(source_rectangle.width()) * *options.resize_height, static_cast<i64>(source_rectangle.height()));
+    auto output_height = options.resize_height.has_value()
+        ? static_cast<i64>(*options.resize_height)
+        : ceil_div(static_cast<i64>(source_rectangle.height()) * *options.resize_width, static_cast<i64>(source_rectangle.width()));
+    if (output_width <= source_rectangle.width() && output_height <= source_rectangle.height())
+        return {};
+
+    // Every size and coordinate below must fit in an int.
+    auto fits_in_int = [](double value) { return value >= NumericLimits<int>::min() && value <= NumericLimits<int>::max(); };
+    if (!fits_in_int(static_cast<double>(output_width)) || !fits_in_int(static_cast<double>(output_height)))
+        return {};
+
+    // The image is rasterized at one scale in both directions, as the vector image would be fitted into a raster of
+    // another aspect ratio rather than stretched. Cropping then scales the rest of the way to the output size.
+    auto scale = max(static_cast<double>(output_width) / source_rectangle.width(), static_cast<double>(output_height) / source_rectangle.height());
+    auto raster_width = ceil(natural_size.width() * scale);
+    auto raster_height = ceil(natural_size.height() * scale);
+    auto raster_source_x = round(source_rectangle.x() * scale);
+    auto raster_source_y = round(source_rectangle.y() * scale);
+    auto raster_source_width = round(source_rectangle.width() * scale);
+    auto raster_source_height = round(source_rectangle.height() * scale);
+    if (!fits_in_int(raster_width) || !fits_in_int(raster_height) || !fits_in_int(raster_source_x) || !fits_in_int(raster_source_y) || !fits_in_int(raster_source_width) || !fits_in_int(raster_source_height))
+        return {};
+    // A small source rectangle resized up would need a raster far larger than the output.
+    if (raster_width * raster_height > 4.0 * static_cast<double>(output_width) * static_cast<double>(output_height))
+        return {};
+
+    auto frame = image.default_image_frame(Gfx::IntSize { static_cast<int>(raster_width), static_cast<int>(raster_height) });
+    if (!frame.has_value())
+        return {};
+
+    auto raster_options = options;
+    raster_options.resize_width = static_cast<WebIDL::UnsignedLong>(output_width);
+    raster_options.resize_height = static_cast<WebIDL::UnsignedLong>(output_height);
+    return VectorImageRaster {
+        .frame = frame.release_value(),
+        .source_rectangle = {
+            static_cast<int>(raster_source_x),
+            static_cast<int>(raster_source_y),
+            static_cast<int>(raster_source_width),
+            static_cast<int>(raster_source_height),
+        },
+        .options = raster_options,
+    };
 }
 
 void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, GC::Ref<WebIDL::Promise> p, ImageBitmapSource& image, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions options) const
@@ -487,7 +550,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     begin_rendering_pending_operation(GC::as_cell(p.ptr()), window->associated_document(), RenderingPendingReason::ImageDecodes);
             }
             // Run these step in parallel:
-            Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [=]() {
+            Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(blob, p, sx, sy, sw, sh, options), [](auto& blob, auto& p, auto& sx, auto& sy, auto& sw, auto& sh, auto& options) {
                 // 1. Let imageData be the result of reading image's data. If an error occurs during reading of the
                 //    object, then queue a global task, using the bitmap task source, to reject promise with an
                 //    "InvalidStateError" DOMException and abort these steps.
@@ -506,7 +569,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     //    (e.g., a vector graphic with no natural size), then queue a global task, using the bitmap
                     //    task source, to reject promise with an "InvalidStateError" DOMException and abort these steps.
                     auto& realm = WebIDL::promise_realm(*p);
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p), [](auto& p) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image does not contain a supported image format"_utf16));
@@ -514,18 +577,21 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                 };
 
                 auto on_successful_decode = [p = GC::Root(*p), sx, sy, sw, sh, options](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
+                    // NB: Only the first frame is used, so an animation the decoder opened is stopped right away.
+                    if (result.session_id != 0)
+                        Web::Platform::ImageCodecPlugin::the().stop_animation_decode(result.session_id);
                     if (Core::StatsLog::the())
                         end_rendering_pending_operation(GC::as_cell(p.ptr()));
                     // 4. Set imageBitmap's bitmap data to imageData, cropped to the source rectangle with formatting.
                     // If this is an animated image, imageBitmap's bitmap data must only be taken from the default image
                     // of the animation (the one that the format defines is to be used when animation is not supported
                     // or is disabled), or, if there is no such image, the first frame of the animation.
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(WebIDL::promise_realm(*p).global_object()), Gfx::DecodedImageFrame { *result.frames.take_first().bitmap, result.color_space }, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(WebIDL::promise_realm(*p).global_object()), *result.frames.take_first().bitmap, result.color_space, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
                         auto& realm = WebIDL::promise_realm(*p);
-                        queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p] {
+                        queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p), [](auto& p) {
                             auto& realm = WebIDL::promise_realm(*p);
                             TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                             WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
@@ -537,7 +603,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     auto& realm = WebIDL::promise_realm(*p);
 
                     // 5. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         Bindings::resolve_image_bitmap_promise(realm, *p, GC::Ref { *image_bitmap });
@@ -570,7 +636,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
             }
 
             // 3. Set imageBitmap's bitmap data to image's image data, cropped to the source rectangle with formatting.
-            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), Gfx::DecodedImageFrame { *bitmap_or_error.release_value(), gfx_color_space_for(image_data->color_space()) }, sx, sy, sw, sh, options);
+            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *bitmap_or_error.release_value(), Compositing::gfx_color_space_for(image_data->color_space()), sx, sy, sw, sh, options);
             // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
             // Spec issue: https://github.com/whatwg/html/issues/3323
             if (cropped_bitmap_or_error.is_error()) {
@@ -580,7 +646,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
             auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
             // 4. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-            queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+            queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                 auto& realm = WebIDL::promise_realm(*p);
                 TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                 Bindings::resolve_image_bitmap_promise(realm, *p, image_bitmap);
@@ -599,7 +665,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *canvas_frame, sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *canvas_frame->bitmap_sharing_pixels(), canvas_frame->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -612,7 +678,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     image_bitmap->set_origin_clean(canvas->is_origin_clean());
 
                     // 3. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         Bindings::resolve_image_bitmap_promise(realm, *p, image_bitmap);
@@ -628,7 +694,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     }
 
                     // 1. Set imageBitmap's bitmap data to a copy of image's bitmap data, cropped to the source rectangle with formatting.
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *source_image_bitmap->frame(), sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *source_image_bitmap->frame()->bitmap_sharing_pixels(), source_image_bitmap->frame()->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -641,7 +707,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     image_bitmap->set_origin_clean(source_image_bitmap->is_origin_clean());
 
                     // 3. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         Bindings::resolve_image_bitmap_promise(realm, *p, image_bitmap);
@@ -666,7 +732,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Video has no frame"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *video_frame, sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *video_frame->bitmap_sharing_pixels(), video_frame->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -680,7 +746,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         image_bitmap->set_origin_clean(false);
 
                     // 4. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         Bindings::resolve_image_bitmap_promise(realm, *p, image_bitmap);
@@ -709,7 +775,17 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     //    the animation.
                     Optional<Gfx::DecodedImageFrame> decoded_frame;
                     if (has_natural_dimensions) {
-                        decoded_frame = image_element->default_image_frame(Gfx::IntSize { *image_element->intrinsic_width(), *image_element->intrinsic_height() });
+                        Gfx::IntSize natural_size { *image_element->intrinsic_width(), *image_element->intrinsic_height() };
+                        if (auto raster = rasterize_vector_image_for_resize(*image_element, natural_size, sx, sy, sw, sh, options); raster.has_value()) {
+                            decoded_frame = move(raster->frame);
+                            sx = raster->source_rectangle.x();
+                            sy = raster->source_rectangle.y();
+                            sw = raster->source_rectangle.width();
+                            sh = raster->source_rectangle.height();
+                            options = raster->options;
+                        } else {
+                            decoded_frame = image_element->default_image_frame(natural_size);
+                        }
                     } else {
                         decoded_frame = image_element->default_image_frame(Gfx::IntSize { *options.resize_width, *options.resize_height });
                     }
@@ -717,7 +793,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image could not be rendered"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *decoded_frame, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *decoded_frame->bitmap_sharing_pixels(), decoded_frame->color_space(), sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -731,7 +807,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         image_bitmap->set_origin_clean(false);
 
                     // 5. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
-                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
+                    queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(p, image_bitmap), [](auto& p, auto& image_bitmap) {
                         auto& realm = WebIDL::promise_realm(*p);
                         TemporaryExecutionContext const context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
                         Bindings::resolve_image_bitmap_promise(realm, *p, image_bitmap);
@@ -755,17 +831,24 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::set_interval(TimerHandl
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-cleartimeout
 void WindowOrWorkerGlobalScopeMixin::clear_timeout(i32 id)
 {
-    if (auto timer = m_timers.get(id); timer.has_value())
-        timer.value()->stop();
-    m_timers.remove(id);
+    // The clearTimeout(id) and clearInterval(id) method steps are to remove this's map of setTimeout and setInterval IDs[id].
+    if (m_internal_timer_ids.contains(id))
+        return;
+    cancel_timeout_steps(id);
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-clearinterval
 void WindowOrWorkerGlobalScopeMixin::clear_interval(i32 id)
 {
-    if (auto timer = m_timers.get(id); timer.has_value())
+    clear_timeout(id);
+}
+
+void WindowOrWorkerGlobalScopeMixin::cancel_timeout_steps(i32 timer_key)
+{
+    if (auto timer = m_timers.get(timer_key); timer.has_value())
         timer.value()->stop();
-    m_timers.remove(id);
+    m_timers.remove(timer_key);
+    m_internal_timer_ids.remove(timer_key);
 }
 
 void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
@@ -773,6 +856,7 @@ void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
     for (auto& it : m_timers)
         it.value->stop();
     m_timers.clear();
+    m_internal_timer_ids.clear();
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps
@@ -814,9 +898,8 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
 
     // 4. If the surrounding agent's event loop's currently running task is a task that was created by this algorithm,
     //    then let nesting level be the task's timer nesting level. Otherwise, let nesting level be 0.
-    // NB: Only a task created by this algorithm carries a nonzero timer nesting level — so reading the level of
-    //     whatever task is running covers both cases. A microtask counts as its own task here — so a timer scheduled
-    //     from one starts over at 0 even when the checkpoint follows a deeply-nested timer callback.
+    // NB: Only a task created by this algorithm, or a microtask run in such a task's checkpoint, carries a nonzero
+    //     timer nesting level — so reading the level of whatever task is running covers both cases.
     u32 nesting_level = 0;
     if (auto currently_running_task = relevant_agent(relevant_global_object(*this)).event_loop->currently_running_task())
         nesting_level = currently_running_task->timer_nesting_level();
@@ -844,11 +927,13 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
     // FIXME: 8. Let uniqueHandle be null.
 
     // 9. Let task be a task that runs the following substeps:
-    auto task = GC::create_function(GC::Heap::the(), Function<void()>([this, handler = move(function_or_string), timeout, arguments = move(arguments), repeat, id, initiating_script]() {
+    auto task = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), move(function_or_string), timeout, move(arguments), repeat, id, initiating_script), [](auto& this_object, auto& handler, auto& timeout, auto& arguments, auto& repeat, auto& id, auto& initiating_script) {
+        auto& self = as<WindowOrWorkerGlobalScopeMixin>(this_object);
+
         // FIXME: 1. Assert: uniqueHandle is a unique internal value, not null.
 
         // 2. If id does not exist in global's map of setTimeout and setInterval IDs, then abort these steps.
-        if (!m_timers.contains(id))
+        if (!self.m_timers.contains(id))
             return;
 
         // FIXME: 3. If global's map of setTimeout and setInterval IDs[id] does not equal uniqueHandle, then abort these steps.
@@ -858,10 +943,10 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
             // 5. If handler is a Function, then invoke handler given arguments and "report", and with callback this value set to thisArg.
             [&](GC::Root<WebIDL::CallbackType> const& callback) {
                 auto this_value = [&]() -> JS::Value {
-                    if (auto* window = as_if<Window>(this_impl()))
+                    if (auto* window = as_if<Window>(self.this_impl()))
                         return &window->window()->object();
-                    auto& realm = relevant_realm(*this);
-                    return Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { this_impl() });
+                    auto& realm = relevant_realm(self);
+                    return Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { self.this_impl() });
                 }();
                 (void)WebIDL::invoke_callback(*callback, this_value, WebIDL::ExceptionBehavior::Report, arguments);
             },
@@ -870,7 +955,7 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
                 // 1. Assert: handler is a string.
 
                 // 2. Let settings object be global's relevant settings object.
-                auto& settings_object = relevant_settings_object(*this);
+                auto& settings_object = relevant_settings_object(self);
 
                 // 3. Let fetch options be the default classic script fetch options.
                 auto options = default_script_fetch_options();
@@ -901,7 +986,7 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
                 }
 
                 // 6. Let script be the result of creating a classic script given handler, settings object, base URL, and fetch options.
-                auto filename = base_url.to_byte_string();
+                auto filename = initiating_script ? initiating_script->filename() : base_url.to_byte_string();
                 auto script = ClassicScript::create(move(filename), source, settings_object, move(base_url));
                 script->set_fetch_options(move(options));
 
@@ -910,7 +995,7 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
             });
 
         // 7. If id does not exist in global's map of setTimeout and setInterval IDs, then abort these steps.
-        if (!m_timers.contains(id))
+        if (!self.m_timers.contains(id))
             return;
 
         // FIXME: 8. If global's map of setTimeout and setInterval IDs[id] does not equal uniqueHandle, then abort these steps.
@@ -918,15 +1003,17 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
         switch (repeat) {
         // 9. If repeat is true, then perform the timer initialization steps again, given global, handler, timeout, arguments, true, and id.
         case Repeat::Yes:
-            MUST(run_timer_initialization_steps(handler, timeout, move(arguments), repeat, id));
+            // NB: The arguments are copied rather than moved, as this task may run again while its callback is on the
+            //     stack, e.g. from a nested event loop the callback spins.
+            MUST(self.run_timer_initialization_steps(handler, timeout, GC::RootVector<JS::Value> { arguments.span() }, repeat, id));
             break;
 
         // 10. Otherwise, remove global's map of active timers[id].
         case Repeat::No:
-            m_timers.remove(id);
+            self.m_timers.remove(id);
             break;
         }
-    }));
+    });
 
     // 11. Increment nesting level by one.
     nesting_level++;
@@ -936,31 +1023,34 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
     // NB: The task the event loop runs is the one completionStep queues — so that's what carries step 12's nesting
     //     level. queue_global_task() creates its task internally; so, this queues one by hand to get at it — and a
     //     fresh one per firing.
-    Function<void()> completion_step = [this, task = move(task), nesting_level, id]() mutable {
+    auto completion_step = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), task, nesting_level, id), [](auto& this_object, auto& task, auto& nesting_level, auto& id) {
+        auto& self = as<WindowOrWorkerGlobalScopeMixin>(this_object);
+
         // NB: The spec arms a timer's next firing only once its task has run — so only a firing that timer claims
         //     queues one. Queueing the rest would run a burst of callbacks back to back, at a stale nesting level
         //     that keeps them from being clamped, and the burst grows the busier the event loop is.
-        auto timer = m_timers.get(id);
+        auto timer = self.m_timers.get(id);
         if (!timer.has_value() || !(*timer)->claim_firing())
             return;
 
-        auto& global = relevant_global_object(*this);
+        auto& global = relevant_global_object(self);
         GC::Ptr<DOM::Document const> document;
         if (auto* window = window_from_global_object(global))
             document = &window->associated_document();
-        auto queued_task = Task::create(Task::Source::TimerTask, document, GC::create_function(GC::Heap::the(), [this, task, timer = *timer] {
+        auto queued_task = Task::create(Task::Source::TimerTask, document, GC::create_function(GC::Heap::the(), GC::captures(this_object, task, *timer), [](auto& this_object, auto& task, auto& timer) {
+            auto& self = as<WindowOrWorkerGlobalScopeMixin>(this_object);
             timer->release_firing();
-            HTML::TemporaryExecutionContext execution_context { relevant_settings_object(*this), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+            HTML::TemporaryExecutionContext execution_context { relevant_settings_object(self), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
             task->function()();
         }));
         queued_task->set_timer_nesting_level(nesting_level);
         relevant_agent(global).event_loop->task_queue().add(queued_task);
-    };
+    });
 
     // 14. Set uniqueHandle to the result of running steps after a timeout given global, "setTimeout/setInterval",
     //     timeout, and completionStep.
     //     FIXME: run_steps_after_a_timeout() needs to be updated to return a unique internal value that can be used here.
-    run_steps_after_a_timeout_impl(timeout, throttling_class, move(completion_step), id, repeat);
+    run_steps_after_a_timeout_impl(timeout, throttling_class, completion_step, id, repeat);
 
     // FIXME: 15. Set global's map of setTimeout and setInterval IDs[id] to uniqueHandle.
 
@@ -968,395 +1058,37 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
     return id;
 }
 
-// 1. https://www.w3.org/TR/performance-timeline/#dfn-relevant-performance-entry-tuple
-PerformanceTimeline::PerformanceEntryTuple& WindowOrWorkerGlobalScopeMixin::relevant_performance_entry_tuple(Utf16FlyString const& entry_type)
-{
-    // 1. Let map be the performance entry buffer map associated with globalObject.
-    // 2. Return the result of getting the value of an entry from map, given entryType as the key.
-    auto tuple = m_performance_entry_buffer_map.get(entry_type);
-
-    // This shouldn't be called with entry types that aren't in `ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES`.
-    VERIFY(tuple.has_value());
-    return tuple.value();
-}
-
-// https://www.w3.org/TR/performance-timeline/#dfn-queue-a-performanceentry
 void WindowOrWorkerGlobalScopeMixin::queue_performance_entry(GC::Ref<PerformanceTimeline::PerformanceEntry> new_entry)
 {
-    // 1. Let interested observers be an initially empty set of PerformanceObserver objects.
-    Vector<GC::Root<PerformanceTimeline::PerformanceObserver>> interested_observers;
-
-    // 2. Let entryType be newEntry’s entryType value.
-    auto const& entry_type = new_entry->entry_type();
-
-    // 3. Let relevantGlobal be newEntry's relevant global object.
-    // NOTE: Already is `this`.
-
-    // 4. For each registered performance observer regObs in relevantGlobal's list of registered performance observer
-    //    objects:
-    for (auto const& registered_observer : m_registered_performance_observer_objects) {
-        // 1. If regObs's options list contains a PerformanceObserverInit options whose entryTypes member includes entryType
-        //    or whose type member equals to entryType:
-        auto iterator = registered_observer->options_list().find_if([&entry_type](PerformanceTimeline::PerformanceObserverInit const& entry) {
-            if (entry.entry_types.has_value())
-                return entry.entry_types->contains_slow(entry_type);
-
-            VERIFY(entry.type.has_value());
-            return entry.type.value() == entry_type;
-        });
-
-        if (!iterator.is_end()) {
-            // 1. If should add entry with newEntry and options returns true, append regObs's observer to interested observers.
-            if (new_entry->should_add_entry(*iterator) == PerformanceTimeline::ShouldAddEntry::Yes)
-                interested_observers.append(registered_observer);
-        }
-    }
-
-    // 5. For each observer in interested observers:
-    for (auto const& observer : interested_observers) {
-        // 1. Append newEntry to observer's observer buffer.
-        observer->append_to_observer_buffer({}, new_entry);
-    }
-
-    // AD-HOC: Steps 6-9 are not here because other engines do not add to the performance entry buffer when queuing
-    //         the performance observer task. The users of the Performance Timeline specification also do not expect
-    //         this function to add to the entry buffer, instead queuing the observer task, then adding to the entry
-    //         buffer separately.
-
-    // 10. Queue the PerformanceObserver task with relevantGlobal as input.
-    queue_the_performance_observer_task();
+    auto& realm = relevant_realm(*this);
+    web_rust_performance_timeline_queue_performance_entry(JS::HostABI::vm_to_abi(realm.vm()), &realm, new_entry.ptr());
 }
 
-// https://www.w3.org/TR/performance-timeline/#dfn-queue-a-performanceentry
-// AD-HOC: This is a separate function because the users of this specification queues PerformanceObserver tasks and add
-//         to the entry buffer separately.
 void WindowOrWorkerGlobalScopeMixin::add_performance_entry(GC::Ref<PerformanceTimeline::PerformanceEntry> new_entry, CheckIfPerformanceBufferIsFull check_if_performance_buffer_is_full)
 {
-    // 6. Let tuple be the relevant performance entry tuple of entryType and relevantGlobal.
-    auto& tuple = relevant_performance_entry_tuple(new_entry->entry_type());
-
-    // AD-HOC: We have a custom flag to always append to the buffer by default, as other performance specs do this by default
-    //         (either they don't have a limit, or they check the limit themselves). This flag allows compatibility for specs
-    //         that rely do and don't rely on this.
-    bool is_buffer_full = false;
-    auto should_add = PerformanceTimeline::ShouldAddEntry::Yes;
-
-    if (check_if_performance_buffer_is_full == CheckIfPerformanceBufferIsFull::Yes) {
-        // 7. Let isBufferFull be the return value of the determine if a performance entry buffer is full algorithm with tuple
-        //    as input.
-        is_buffer_full = tuple.is_full();
-
-        // 8. Let shouldAdd be the result of should add entry with newEntry as input.
-        should_add = new_entry->should_add_entry();
-    }
-
-    // 9. If isBufferFull is false and shouldAdd is true, append newEntry to tuple's performance entry buffer.
-    if (!is_buffer_full && should_add == PerformanceTimeline::ShouldAddEntry::Yes)
-        tuple.performance_entry_buffer.append(new_entry);
-}
-
-void WindowOrWorkerGlobalScopeMixin::clear_performance_entry_buffer(Badge<HighResolutionTime::Performance>, Utf16FlyString const& entry_type)
-{
-    auto& tuple = relevant_performance_entry_tuple(entry_type);
-    tuple.performance_entry_buffer.clear();
-}
-
-void WindowOrWorkerGlobalScopeMixin::remove_entries_from_performance_entry_buffer(Badge<HighResolutionTime::Performance>, Utf16FlyString const& entry_type, Utf16View entry_name)
-{
-    auto& tuple = relevant_performance_entry_tuple(entry_type);
-    tuple.performance_entry_buffer.remove_all_matching([&entry_name](GC::Root<PerformanceTimeline::PerformanceEntry> const& entry) {
-        return entry->name().utf16_view() == entry_name;
-    });
-}
-
-// https://www.w3.org/TR/performance-timeline/#dfn-filter-buffer-map-by-name-and-type
-ErrorOr<Vector<GC::Root<PerformanceTimeline::PerformanceEntry>>> WindowOrWorkerGlobalScopeMixin::filter_buffer_map_by_name_and_type(Optional<Utf16String> const& name, Optional<Utf16FlyString> type) const
-{
-    // 1. Let result be an initially empty list.
-    Vector<GC::Root<PerformanceTimeline::PerformanceEntry>> result;
-
-    // 2. Let map be the performance entry buffer map associated with the relevant global object of this.
-    auto const& map = m_performance_entry_buffer_map;
-
-    // 3. Let tuple list be an empty list.
-    Vector<PerformanceTimeline::PerformanceEntryTuple const&> tuple_list;
-
-    // 4. If type is not null, append the result of getting the value of entry on map given type as key to tuple list.
-    //    Otherwise, assign the result of get the values on map to tuple list.
-    if (type.has_value()) {
-        auto maybe_tuple = map.get(type.value());
-        if (maybe_tuple.has_value())
-            TRY(tuple_list.try_append(maybe_tuple.release_value()));
-    } else {
-        for (auto const& it : map)
-            TRY(tuple_list.try_append(it.value));
-    }
-
-    // 5. For each tuple in tuple list, run the following steps:
-    for (auto const& tuple : tuple_list) {
-        // 1. Let buffer be tuple's performance entry buffer.
-        auto const& buffer = tuple.performance_entry_buffer;
-
-        // 2. If tuple's availableFromTimeline is false, continue to the next tuple.
-        if (tuple.available_from_timeline == PerformanceTimeline::AvailableFromTimeline::No)
-            continue;
-
-        // 3. Let entries be the result of running filter buffer by name and type with buffer, name and type as inputs.
-        Optional<Utf16String> type_string;
-        if (type.has_value())
-            type_string = Utf16String::from_utf16(type->view());
-        auto entries = TRY(filter_buffer_by_name_and_type(buffer, name, move(type_string)));
-
-        // 4. For each entry in entries, append entry to result.
-        TRY(result.try_extend(entries));
-    }
-
-    // 6. Sort results's entries in chronological order with respect to startTime
-    quick_sort(result, [](auto const& left_entry, auto const& right_entry) {
-        return left_entry->start_time() < right_entry->start_time();
-    });
-
-    // 7. Return result.
-    return result;
-}
-
-void WindowOrWorkerGlobalScopeMixin::register_performance_observer(Badge<PerformanceTimeline::PerformanceObserver>, GC::Ref<PerformanceTimeline::PerformanceObserver> observer)
-{
-    m_registered_performance_observer_objects.set(observer, AK::HashSetExistingEntryBehavior::Keep);
-}
-
-void WindowOrWorkerGlobalScopeMixin::unregister_performance_observer(Badge<PerformanceTimeline::PerformanceObserver>, GC::Ref<PerformanceTimeline::PerformanceObserver> observer)
-{
-    m_registered_performance_observer_objects.remove(observer);
-}
-
-bool WindowOrWorkerGlobalScopeMixin::has_registered_performance_observer(GC::Ref<PerformanceTimeline::PerformanceObserver> observer)
-{
-    return m_registered_performance_observer_objects.contains(observer);
-}
-
-// https://w3c.github.io/performance-timeline/#dfn-queue-the-performanceobserver-task
-void WindowOrWorkerGlobalScopeMixin::queue_the_performance_observer_task()
-{
-    // 1. If relevantGlobal's performance observer task queued flag is set, terminate these steps.
-    if (m_performance_observer_task_queued)
-        return;
-
-    // 2. Set relevantGlobal's performance observer task queued flag.
-    m_performance_observer_task_queued = true;
-
-    // 3. Queue a task that consists of running the following substeps. The task source for the queued task is the performance
-    //    timeline task source.
-    queue_global_task(Task::Source::PerformanceTimeline, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this]() {
-        auto& realm = relevant_realm(*this);
-        HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-
-        // 1. Unset performance observer task queued flag of relevantGlobal.
-        m_performance_observer_task_queued = false;
-
-        // 2. Let notifyList be a copy of relevantGlobal's list of registered performance observer objects.
-        GC::RootVector notify_list { m_registered_performance_observer_objects.values() };
-
-        // 3. For each registered performance observer object registeredObserver in notifyList, run these steps:
-        for (auto& registered_observer : notify_list) {
-            // 1. Let po be registeredObserver's observer.
-            // 2. Let entries be a copy of po’s observer buffer.
-            // 4. Empty po’s observer buffer.
-            auto entries = registered_observer->take_records();
-
-            // 3. If entries is empty, return.
-            // FIXME: Do they mean `continue`?
-            if (entries.is_empty())
-                continue;
-
-            GC::RootVector<GC::Ref<PerformanceTimeline::PerformanceEntry>> entries_as_gc_ptrs;
-            for (auto& entry : entries)
-                entries_as_gc_ptrs.append(*entry);
-
-            // 5. Let observerEntryList be a new PerformanceObserverEntryList, with its entry list set to entries.
-            auto observer_entry_list = PerformanceTimeline::PerformanceObserverEntryList::create(move(entries_as_gc_ptrs));
-
-            // 6. Let droppedEntriesCount be null.
-            Optional<u64> dropped_entries_count;
-
-            // 7. If po's requires dropped entries is set, perform the following steps:
-            if (registered_observer->requires_dropped_entries()) {
-                // 1. Set droppedEntriesCount to 0.
-                dropped_entries_count = 0;
-
-                // 2. For each PerformanceObserverInit item in registeredObserver's options list:
-                for (auto const& item : registered_observer->options_list()) {
-                    // 1. For each DOMString entryType that appears either as item's type or in item's entryTypes:
-                    auto increment_dropped_entries_count = [this, &dropped_entries_count](Utf16FlyString const& type) {
-                        // 1. Let map be relevantGlobal's performance entry buffer map.
-                        auto const& map = m_performance_entry_buffer_map;
-
-                        // 2. Let tuple be the result of getting the value of entry on map given entryType as key.
-                        auto const& tuple = map.get(type);
-                        VERIFY(tuple.has_value());
-
-                        // 3. Increase droppedEntriesCount by tuple's dropped entries count.
-                        dropped_entries_count.value() += tuple->dropped_entries_count;
-                    };
-
-                    if (item.type.has_value()) {
-                        increment_dropped_entries_count(item.type.value());
-                    } else {
-                        VERIFY(item.entry_types.has_value());
-                        for (auto const& type : item.entry_types.value())
-                            increment_dropped_entries_count(type);
-                    }
-                }
-
-                // 3. Set po's requires dropped entries to false.
-                registered_observer->unset_requires_dropped_entries({});
-            }
-
-            // 8. Let callbackOptions be a PerformanceObserverCallbackOptions with its droppedEntriesCount set to
-            //    droppedEntriesCount if droppedEntriesCount is not null, otherwise unset.
-            // 9. Call po’s observer callback with observerEntryList as the first argument, with po as the second
-            //    argument and as callback this value, and with callbackOptions as the third argument.
-            //    If this throws an exception, report the exception.
-            auto completion = registered_observer->invoke_callback(observer_entry_list, dropped_entries_count);
-            if (completion.is_abrupt())
-                HTML::report_exception(completion, realm);
-        }
-    }));
-}
-
-// https://w3c.github.io/resource-timing/#dfn-add-a-performanceresourcetiming-entry
-void WindowOrWorkerGlobalScopeMixin::add_resource_timing_entry(Badge<ResourceTiming::PerformanceResourceTiming>, GC::Ref<ResourceTiming::PerformanceResourceTiming> entry)
-{
-    // 1. If can add resource timing entry returns true and resource timing buffer full event pending flag is false,
-    //    run the following substeps:
-    if (can_add_resource_timing_entry() && !m_resource_timing_buffer_full_event_pending) {
-        // a. Add new entry to the performance entry buffer.
-        // b. Increase resource timing buffer current size by 1.
-        add_performance_entry(entry);
-
-        // c. Return.
-        return;
-    }
-
-    // 2. If resource timing buffer full event pending flag is false, run the following substeps:
-    if (!m_resource_timing_buffer_full_event_pending) {
-        // a. Set resource timing buffer full event pending flag to true.
-        m_resource_timing_buffer_full_event_pending = true;
-
-        // b. Queue a task on the performance timeline task source to run fire a buffer full event.
-        HTML::queue_a_task(HTML::Task::Source::PerformanceTimeline, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this] {
-            fire_resource_timing_buffer_full_event();
-        }));
-    }
-
-    // 3. Add new entry to the resource timing secondary buffer.
-    // 4. Increase resource timing secondary buffer current size by 1.
-    m_resource_timing_secondary_buffer.append(entry);
-}
-
-// https://w3c.github.io/resource-timing/#dfn-can-add-resource-timing-entry
-bool WindowOrWorkerGlobalScopeMixin::can_add_resource_timing_entry()
-{
-    // 1. If resource timing buffer current size is smaller than resource timing buffer size limit, return true.
-    // 2. Return false.
-    return resource_timing_buffer_current_size() < m_resource_timing_buffer_size_limit;
-}
-
-// https://w3c.github.io/resource-timing/#dfn-resource-timing-buffer-current-size
-size_t WindowOrWorkerGlobalScopeMixin::resource_timing_buffer_current_size()
-{
-    // A resource timing buffer current size which is initially 0.
-    auto const& resource_timing_tuple = relevant_performance_entry_tuple(PerformanceTimeline::EntryTypes::resource);
-    return resource_timing_tuple.performance_entry_buffer.size();
-}
-
-// https://w3c.github.io/resource-timing/#dfn-fire-a-buffer-full-event
-void WindowOrWorkerGlobalScopeMixin::fire_resource_timing_buffer_full_event()
-{
-    // 1. While resource timing secondary buffer is not empty, run the following substeps:
-    while (!m_resource_timing_secondary_buffer.is_empty()) {
-        // 1. Let number of excess entries before be resource timing secondary buffer current size.
-        auto number_of_excess_entries_before = m_resource_timing_secondary_buffer.size();
-
-        // 2. If can add resource timing entry returns false, then fire an event named resourcetimingbufferfull at the Performance object.
-        if (!can_add_resource_timing_entry()) {
-            auto full_event = DOM::Event::create(PerformanceTimeline::EventNames::resourcetimingbufferfull,
-                HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-            performance()->dispatch_event(full_event);
-        }
-
-        // 3. Run copy secondary buffer.
-        copy_resource_timing_secondary_buffer();
-
-        // 4. Let number of excess entries after be resource timing secondary buffer current size.
-        auto number_of_excess_entries_after = m_resource_timing_secondary_buffer.size();
-
-        // 5. If number of excess entries before is lower than or equals number of excess entries after, then remove
-        //    all entries from resource timing secondary buffer, set resource timing secondary buffer current size to
-        //    0, and abort these steps.
-        if (number_of_excess_entries_before <= number_of_excess_entries_after) {
-            m_resource_timing_secondary_buffer.clear();
-            break;
-        }
-    }
-
-    // 2. Set resource timing buffer full event pending flag to false.
-    m_resource_timing_buffer_full_event_pending = false;
-}
-
-// https://w3c.github.io/resource-timing/#dfn-copy-secondary-buffer
-void WindowOrWorkerGlobalScopeMixin::copy_resource_timing_secondary_buffer()
-{
-    // 1. While resource timing secondary buffer is not empty and can add resource timing entry returns true,
-    //    run the following substeps:
-    while (!m_resource_timing_secondary_buffer.is_empty() && can_add_resource_timing_entry()) {
-        // 1. Let entry be the oldest PerformanceResourceTiming in resource timing secondary buffer.
-        // 2. Add entry to the end of performance entry buffer.
-        // 3. Increment resource timing buffer current size by 1.
-        // 4. Remove entry from resource timing secondary buffer.
-        // 5. Decrement resource timing secondary buffer current size by 1.
-        auto entry = m_resource_timing_secondary_buffer.take_first();
-        auto& resource_tuple = relevant_performance_entry_tuple(PerformanceTimeline::EntryTypes::resource);
-        resource_tuple.performance_entry_buffer.append(entry);
-    }
-}
-
-void WindowOrWorkerGlobalScopeMixin::register_event_source(Badge<EventSource>, GC::Ref<EventSource> event_source)
-{
-    m_registered_event_sources.set(event_source);
-}
-
-void WindowOrWorkerGlobalScopeMixin::unregister_event_source(Badge<EventSource>, GC::Ref<EventSource> event_source)
-{
-    m_registered_event_sources.remove(event_source);
+    auto& realm = relevant_realm(*this);
+    web_rust_performance_timeline_add_performance_entry(JS::HostABI::vm_to_abi(realm.vm()), &realm, new_entry.ptr(), check_if_performance_buffer_is_full == CheckIfPerformanceBufferIsFull::Yes);
 }
 
 void WindowOrWorkerGlobalScopeMixin::forcibly_close_all_event_sources()
 {
-    for (auto event_source : m_registered_event_sources)
-        event_source->forcibly_close();
+    auto& realm = relevant_realm(*this);
+    web_rust_event_source_forcibly_close_all(JS::HostABI::vm_to_abi(realm.vm()), &realm);
 }
 
-void WindowOrWorkerGlobalScopeMixin::add_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel> channel)
+void WindowOrWorkerGlobalScopeMixin::add_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget> channel)
 {
     m_strongly_referenced_broadcast_channels.set(channel);
 }
 
-void WindowOrWorkerGlobalScopeMixin::remove_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel> channel)
+void WindowOrWorkerGlobalScopeMixin::remove_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget> channel)
 {
     m_strongly_referenced_broadcast_channels.remove(channel);
 }
 
 void WindowOrWorkerGlobalScopeMixin::close_all_idb_connections()
 {
-    IndexedDB::Database::for_each_database([&](IndexedDB::Database& database) {
-        for (auto& connection : database.associated_connections_as_root_vector()) {
-            if (connection->close_pending())
-                continue;
-            if (&connection->relevant_global_scope() == this)
-                IndexedDB::close_a_database_connection(connection);
-        }
-    });
+    IndexedDB::close_all_database_connections(relevant_realm(*this));
 }
 
 void WindowOrWorkerGlobalScopeMixin::register_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket> web_socket)
@@ -1367,6 +1099,19 @@ void WindowOrWorkerGlobalScopeMixin::register_web_socket(Badge<WebSockets::WebSo
 void WindowOrWorkerGlobalScopeMixin::unregister_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket> web_socket)
 {
     m_registered_web_sockets.remove(web_socket);
+}
+
+void WindowOrWorkerGlobalScopeMixin::set_has_pending_activity(DOM::EventTarget& object, bool has_pending_activity)
+{
+    if (has_pending_activity)
+        m_objects_with_pending_activity.set(object);
+    else
+        m_objects_with_pending_activity.remove(object);
+}
+
+bool WindowOrWorkerGlobalScopeMixin::has_pending_activity(DOM::EventTarget const& object) const
+{
+    return m_objects_with_pending_activity.contains(const_cast<DOM::EventTarget&>(object));
 }
 
 WindowOrWorkerGlobalScopeMixin::AffectedAnyWebSockets WindowOrWorkerGlobalScopeMixin::make_disappear_all_web_sockets()
@@ -1382,20 +1127,36 @@ WindowOrWorkerGlobalScopeMixin::AffectedAnyWebSockets WindowOrWorkerGlobalScopeM
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#run-steps-after-a-timeout
-i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step)
+i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(u64 timeout, GC::Ref<GC::Function<void()>> completion_step)
 {
     auto timer_key = m_timer_id_allocator.allocate();
-    auto remove_timer_and_complete = [this, timer_key, completion_step = move(completion_step)] mutable {
-        m_timers.remove(timer_key);
-        completion_step();
-    };
-    // NB: A timeout another specification waits on — an idle callback's, an AbortSignal's — isn't one of the page's
-    //     own yield points, so a hidden document holds it back like a chained timer, however short it is.
-    run_steps_after_a_timeout_impl(timeout, TimerThrottlingClass::Chained, move(remove_timer_and_complete), timer_key);
+    m_internal_timer_ids.set(timer_key);
+    run_internal_timer(timer_key, timeout, completion_step);
     return timer_key;
 }
 
-void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass throttling_class, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat)
+void WindowOrWorkerGlobalScopeMixin::run_internal_timer(i32 timer_key, u64 timeout, GC::Ref<GC::Function<void()>> completion_step)
+{
+    // AD-HOC: A timer waits at most NumericLimits<i32>::max() milliseconds, so a longer timeout waits in parts under
+    //         the same timer key.
+    auto part = min(timeout, static_cast<u64>(NumericLimits<i32>::max()));
+    auto remaining = timeout - part;
+    auto complete_part = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), timer_key, remaining, completion_step), [](auto& this_object, auto& timer_key, auto& remaining, auto& completion_step) {
+        auto& global_scope = as<WindowOrWorkerGlobalScopeMixin>(this_object);
+        global_scope.m_timers.remove(timer_key);
+        if (remaining > 0) {
+            global_scope.run_internal_timer(timer_key, remaining, completion_step);
+            return;
+        }
+        global_scope.m_internal_timer_ids.remove(timer_key);
+        completion_step->function()();
+    });
+    // NB: A timeout another specification waits on — an idle callback's, an AbortSignal's — isn't one of the page's
+    //     own yield points, so a hidden document holds it back like a chained timer, however short it is.
+    run_steps_after_a_timeout_impl(static_cast<i32>(part), TimerThrottlingClass::Chained, complete_part, timer_key);
+}
+
+void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass throttling_class, GC::Ref<GC::Function<void()>> completion_step, Optional<i32> timer_key, Repeat repeat)
 {
     // 1. Assert: if timerKey is given, then the caller of this algorithm is the timer initialization steps. (Other specifications must not pass timerKey.)
     // Note: This is enforced by the caller.
@@ -1411,20 +1172,19 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
     //     throttled_timer_delay()), so the delay the timer is armed with can differ from the one it was asked for.
     auto deadline = HighResolutionTime::unsafe_shared_current_time() + timeout;
     auto throttled_delay = throttled_timer_delay(throttling_class, deadline);
+    if (throttling_class != TimerThrottlingClass::Immediate || repeat == Repeat::Yes)
+        m_earliest_timer_deadline = min(m_earliest_timer_deadline, deadline);
 
     // NB: The intensive tier paces chained timers by their wake-ups (see throttled_timer_delay()), so note when one
-    //     runs while the document is hidden. The step itself goes into a GC::Function rather than into the wrapper's
-    //     captures: Timer::visit_edges() scans only the bytes of the callable the timer holds, and an AK::Function
-    //     nested in there keeps its own captures out of line once they outgrow its inline storage, where that scan
-    //     can't see them. An AbortSignal.timeout() signal lives nowhere else until it aborts, so a collection would
-    //     sweep it. A GC::Function scans its own callable's captures, whatever their size.
+    //     runs while the document is hidden.
+    Timer::Callback timer_callback = completion_step;
     if (throttling_class == TimerThrottlingClass::Chained) {
-        auto step = GC::create_function(GC::Heap::the(), move(completion_step));
-        completion_step = [this, step] {
-            if (timers_are_throttled())
-                m_last_chained_timer_wake_up = HighResolutionTime::unsafe_shared_current_time();
-            step->function()();
-        };
+        timer_callback = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), completion_step), [](auto& global, auto& completion_step) {
+            auto& scope = relevant_window_or_worker_global_scope(global);
+            if (scope.timers_are_throttled())
+                scope.m_last_chained_timer_wake_up = HighResolutionTime::unsafe_shared_current_time();
+            (*completion_step)();
+        });
     }
 
     // NB: We deviate from the spec here slightly by reusing existing timers if a timer_key is provided.
@@ -1433,7 +1193,7 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
         auto result = m_timers.get(timer_key.value());
         if (result.has_value()) {
             existing_timer = result.value().ptr();
-            existing_timer->set_callback(move(completion_step));
+            existing_timer->set_callback(timer_callback);
             existing_timer->set_throttling_class(throttling_class);
             existing_timer->set_deadline(deadline);
             // A throttled delay runs from now to the wake-up, so the timer restarts on it; unthrottled, a repeating
@@ -1455,7 +1215,7 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
     // completed. The task callback still calls run_timer_initialization_steps to update nesting
     // levels and potentially clamp the interval.
     auto repeating = repeat == Repeat::Yes ? Timer::Repeating::Yes : Timer::Repeating::No;
-    auto timer = existing_timer ? GC::Ref { *existing_timer } : Timer::create(throttled_delay.value_or(timeout), move(completion_step), timer_key.value(), repeating, throttling_class, deadline);
+    auto timer = existing_timer ? GC::Ref { *existing_timer } : Timer::create(throttled_delay.value_or(timeout), timer_callback, timer_key.value(), repeating, throttling_class, deadline);
 
     // FIXME: 4. Set global's map of active timers[timerKey] to startTime plus milliseconds.
     m_timers.set(timer_key.value(), timer);
@@ -1470,8 +1230,31 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
 
     // NB: Don't restart an already-active repeating timer. It's already firing on schedule and
     // restarting it would cause drift (next fire = now + interval instead of previous fire + interval).
-    if (!existing_timer)
-        timer->start();
+    if (!existing_timer) {
+        // OPTIMIZATION: A timer with no delay has nothing to wait for. Unless a timer that expired before this one started
+        //               still waits for the platform event loop, it needs no pass through that loop, so its task comes
+        //               before the tasks queued after this. One that does not repeat needs no clock at all.
+        bool can_fire_now = throttling_class == TimerThrottlingClass::Immediate && !has_expired_timer_yet_to_fire(deadline);
+        if (!can_fire_now || repeating == Timer::Repeating::Yes)
+            timer->start();
+        if (can_fire_now)
+            timer->fire_now();
+    }
+}
+
+// NB: An expired timer's firing comes from the platform event loop, and its task goes ahead of those of the timers that
+//     started after it expired. m_earliest_timer_deadline never comes after the real earliest deadline, so this only
+//     looks through the timers after that deadline has passed.
+bool WindowOrWorkerGlobalScopeMixin::has_expired_timer_yet_to_fire(double now)
+{
+    if (now < m_earliest_timer_deadline)
+        return false;
+    m_earliest_timer_deadline = NumericLimits<double>::max();
+    for (auto& it : m_timers) {
+        if (it.value->is_active() && !it.value->has_queued_firing())
+            m_earliest_timer_deadline = min(m_earliest_timer_deadline, it.value->deadline());
+    }
+    return now >= m_earliest_timer_deadline;
 }
 
 // A delay for Core::Timer: whole milliseconds, never negative, and no more than it can hold.
@@ -1592,8 +1375,8 @@ void WindowOrWorkerGlobalScopeMixin::push_onto_outstanding_rejected_promises_wea
 
 bool WindowOrWorkerGlobalScopeMixin::remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise> promise)
 {
-    return m_outstanding_rejected_promises_weak_set.remove_first_matching([&](GC::Ptr<JS::Promise> promise_in_set) {
-        return promise == promise_in_set;
+    return m_outstanding_rejected_promises_weak_set.remove_first_matching([&](auto const& promise_in_set) {
+        return promise == promise_in_set.ptr();
     });
 }
 
@@ -1631,8 +1414,12 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
     auto& global_object = relevant_global_object(*this);
 
     // 5. Queue a global task on the DOM manipulation task source given global to run the following substep:
-    queue_global_task(Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), [this, &global, list = move(list)] {
-        auto& realm = relevant_realm(*this);
+    queue_global_task(Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), GC::captures(global, move(list)), [](auto& global, auto& list) {
+        auto& self = as<WindowOrWorkerGlobalScopeMixin>(global);
+        auto& realm = relevant_realm(self);
+
+        // NB: The weak set drops the promises that died once here, rather than each time a promise is added to it.
+        self.m_outstanding_rejected_promises_weak_set.remove_all_matching([](auto const& promise_in_set) { return !promise_in_set; });
 
         // 1. For each promise p in list:
         for (auto const& promise : list->elements()) {
@@ -1643,18 +1430,7 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
 
             // 2. Let notHandled be the result of firing an event named unhandledrejection at global, using PromiseRejectionEvent, with the cancelable attribute initialized to true,
             //    the promise attribute initialized to p, and the reason attribute initialized to the value of p's [[PromiseResult]] internal slot.
-            PromiseRejectionEventInit event_init {
-                {
-                    .bubbles = false,
-                    .cancelable = true,
-                    .composed = false,
-                },
-                // Sadly we can't use .promise and .reason here, as we can't use the designator on the initialization of EventInit above.
-                /* .promise = */ *promise,
-                /* .reason = */ promise->result(),
-            };
-
-            auto promise_rejection_event = PromiseRejectionEvent::create(realm.global_object(), HTML::EventNames::unhandledrejection, event_init);
+            auto promise_rejection_event = create_promise_rejection_event(realm, HTML::EventNames::unhandledrejection, { .cancelable = true }, *promise, promise->result());
 
             bool not_handled = global.dispatch_event(*promise_rejection_event);
 
@@ -1662,7 +1438,7 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
 
             // 4. If p's [[PromiseIsHandled]] internal slot is false, add p to settings object's outstanding rejected promises weak set.
             if (!promise->is_handled())
-                m_outstanding_rejected_promises_weak_set.append(*promise);
+                self.push_onto_outstanding_rejected_promises_weak_set(promise);
 
             // This algorithm results in promise rejections being marked as handled or not handled. These concepts parallel handled and not handled script errors.
             // If a rejection is still not handled after this, then the rejection may be reported to a developer console.
@@ -1675,15 +1451,14 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
 // https://w3c.github.io/hr-time/#dom-windoworworkerglobalscope-performance
 GC::Ref<HighResolutionTime::Performance> WindowOrWorkerGlobalScopeMixin::performance()
 {
-    if (!m_performance)
-        m_performance = GC::Heap::the().allocate<HighResolutionTime::Performance>(this_impl());
-    return GC::Ref { *m_performance };
+    auto& realm = relevant_realm(*this);
+    return *web_rust_performance_timeline_performance(JS::HostABI::vm_to_abi(realm.vm()), &realm);
 }
 
 GC::Ref<IndexedDB::IDBFactory> WindowOrWorkerGlobalScopeMixin::indexed_db()
 {
     if (!m_indexed_db)
-        m_indexed_db = GC::Heap::the().allocate<IndexedDB::IDBFactory>(*this);
+        m_indexed_db = IndexedDB::IDBFactory::create(relevant_realm(*this));
     return *m_indexed_db;
 }
 
@@ -1714,8 +1489,21 @@ GC::Ref<ServiceWorker::CacheStorage> WindowOrWorkerGlobalScopeMixin::caches()
 GC::Ref<TrustedTypes::TrustedTypePolicyFactory> WindowOrWorkerGlobalScopeMixin::trusted_types()
 {
     if (!m_trusted_type_policy_factory)
-        m_trusted_type_policy_factory = GC::Heap::the().allocate<TrustedTypes::TrustedTypePolicyFactory>(this_impl());
+        m_trusted_type_policy_factory = TrustedTypes::TrustedTypePolicyFactory::create(relevant_realm(*this));
     return *m_trusted_type_policy_factory;
+}
+
+extern "C" {
+
+// Called by Bindings/Rust/src/html/window_or_worker_global_scope.rs.
+TrustedTypes::TrustedTypePolicyFactory* web_html_window_or_worker_global_scope_trusted_types(JSObject* global_object);
+
+TrustedTypes::TrustedTypePolicyFactory* web_html_window_or_worker_global_scope_trusted_types(JSObject* global_object)
+{
+    auto* global = window_or_worker_global_scope_from_global_object(*JS::HostABI::object_from_abi(global_object));
+    VERIFY(global);
+    return global->trusted_types().ptr();
+}
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#windoworworkerglobalscope-mixin:extract-an-origin
@@ -1744,18 +1532,17 @@ bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()
 }
 
 // A site-compatibility rule can expose a gated interface or member to the documents and workers it matches, without
-// exposing it to the web at large. The rule is keyed by the URL the environment was created with, so it holds for the
-// lifetime of that global, the same way the global switch does.
+// exposing it to the web at large. The rule is keyed by the environment's top-level site and its own, so it holds for
+// the lifetime of that global, the same way the global switch does.
 bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(EnvironmentSettingsObject const& settings, StringView name)
 {
     if (s_experimental_interfaces_exposed)
         return true;
 
-    // The first global of a page is set up before the loader exists, and holds nothing a rule could match anyway.
-    if (!ResourceLoader::is_initialized())
-        return false;
-
-    return ResourceLoader::the().site_compatibility_exposes_experimental_interface(settings.creation_url, name);
+    // NB: A Window's interfaces are set up before it has a document to take the origin of.
+    auto origin = settings.creation_url.origin();
+    auto top_level_origin = settings.top_level_origin.value_or(origin);
+    return current_loader_config()->config.exposes_experimental_interface(top_level_origin, origin, name);
 }
 
 }
@@ -1766,6 +1553,30 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> fetch(JS::Realm& realm, HTML::Wind
 {
     (void)global_scope;
     return Fetch::fetch(realm, input, init);
+}
+
+}
+
+namespace Web::HTML {
+
+extern "C" void web_html_window_or_worker_global_scope_register_permission_status(JSObject* global_object, DOM::EventTarget* status);
+
+void web_html_window_or_worker_global_scope_register_permission_status(JSObject* global_object, DOM::EventTarget* status)
+{
+    if (auto* global_scope = window_or_worker_global_scope_from_global_object(*JS::HostABI::object_from_abi(global_object)))
+        global_scope->register_permission_status(*status);
+}
+
+extern "C" void web_html_window_or_worker_global_scope_run_steps_after_a_timeout(JSObject* global_object, u64 milliseconds, void* cell, void (*steps)(JSVM*, void*));
+
+void web_html_window_or_worker_global_scope_run_steps_after_a_timeout(JSObject* global_object, u64 milliseconds, void* cell, void (*steps)(JSVM*, void*))
+{
+    auto& global = *JS::HostABI::object_from_abi(global_object);
+    auto* scope = window_or_worker_global_scope_from_global_object(global);
+    VERIFY(scope);
+    scope->run_steps_after_a_timeout(milliseconds, GC::create_function(GC::Heap::the(), GC::captures(global, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& global, auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(global.vm()), cell.ptr());
+    }));
 }
 
 }

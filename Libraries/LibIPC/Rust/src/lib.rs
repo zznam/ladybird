@@ -10,16 +10,42 @@
 
 #![deny(unsafe_code)]
 
+extern crate self as libipc_rust;
+
+#[cfg(feature = "allocator")]
+extern crate ladybird_allocator;
+
+#[cfg(feature = "cpp_transport")]
+#[allow(unsafe_code)]
+#[path = "../../../RustDemangle.rs"]
+mod rust_demangle;
+
+#[cfg(feature = "cpp_transport")]
+#[allow(unsafe_code)]
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
+
 pub mod attachment;
+pub mod cpp_connection;
+#[cfg(all(target_os = "macos", feature = "cpp_transport"))]
+pub mod cpp_mach_bootstrap;
+#[cfg(all(unix, feature = "cpp_transport"))]
+pub mod cpp_transport;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+mod poller;
 mod receive_queue;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 mod shared_memory;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 mod socket;
-#[cfg(target_vendor = "apple")]
+#[cfg(unix)]
 pub mod transport;
-#[cfg(not(target_vendor = "apple"))]
-pub mod transport_socket;
+#[cfg(target_vendor = "apple")]
+mod transport_mach_port;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+mod transport_socket;
+#[cfg(windows)]
+pub mod transport_windows;
 pub mod wire;
 
 /// The most attachments a message may carry, as `IPC::MAX_MESSAGE_FD_COUNT`.
@@ -37,17 +63,19 @@ fn validate_message_size(payload_size: usize, attachment_count: usize) -> std::i
 
 #[cfg(target_vendor = "apple")]
 pub mod mach;
+#[cfg(target_os = "macos")]
+pub mod mach_bootstrap;
 
 pub use attachment::Attachment;
-pub use wire::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder, EndpointMessage};
+pub use wire::{
+    Decode, DecodeError, Decoder, DispatchError, Encode, EncodeError, EncodedMessage, Encoder, EndpointMessage,
+    Misbehavior,
+};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(target_vendor = "apple")]
-    use transport::TransportMachPort as Transport;
-    #[cfg(not(target_vendor = "apple"))]
-    use transport_socket::TransportSocket as Transport;
+    use transport::Transport;
 
     #[test]
     fn outgoing_message_size_limits() {
@@ -67,13 +95,10 @@ mod tests {
     #[test]
     fn refusing_too_many_attachments_keeps_the_connection_open() {
         // NB: On sockets, every attachment holds a descriptor until the message is sent.
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         socket::raise_descriptor_limit();
         let (a, handle) = Transport::create_paired().unwrap();
-        #[cfg(target_vendor = "apple")]
         let b = Transport::from_handle(handle).unwrap();
-        #[cfg(not(target_vendor = "apple"))]
-        let b = Transport::new(handle).unwrap();
         let (mut reader, writer) = std::io::pipe().unwrap();
         let attachments = (0..=MAX_MESSAGE_ATTACHMENT_COUNT)
             .map(|_| Attachment::from_fd(writer.try_clone().unwrap().into()).unwrap())

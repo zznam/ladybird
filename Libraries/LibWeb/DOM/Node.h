@@ -43,12 +43,6 @@ enum class UserSelect : u8;
 
 }
 
-namespace Web::Layout {
-
-enum class LayoutUpdatePropagation : u8;
-
-}
-
 namespace Web::Layout::RustFFI {
 
 struct FfiBoxMarks;
@@ -58,6 +52,7 @@ struct FfiBoxMarks;
 namespace Web::Bindings {
 
 struct GetRootNodeOptions;
+struct SetHTMLOptions;
 
 }
 
@@ -92,12 +87,14 @@ enum class RootNodeComposed {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
-    X(HTMLObjectElementContentDocumentResized)        \
+    X(EmbeddedDocumentResized)                        \
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
+    X(ImplicitAnchorChange)                           \
     X(KeyframeEffect)                                 \
     X(LayoutTreeUpdate)                               \
     X(MathMLAttributeChange)                          \
+    X(FrameScrollingAttributeChange)                  \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
@@ -114,11 +111,12 @@ enum class SetNeedsLayoutReason {
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
     X(CharacterDataReplaceData)                           \
-    X(ElementSetInnerHTML)                                \
     X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLImageElementUpdateTheImageData)                 \
     X(HTMLInputElementSrcAttribute)                       \
+    X(HTMLInputElementTypeAttribute)                      \
+    X(HTMLEmbedElementRepresentationChanged)              \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
     X(LanguageChangeUnderCasingTextTransform)             \
@@ -127,15 +125,18 @@ enum class SetNeedsLayoutReason {
     X(NodeInsertBefore)                                   \
     X(NodeInsertBeforeWithDisplayContents)                \
     X(NodeRemove)                                         \
-    X(NodeSetTextContent)                                 \
+    X(TableCellSpanAttribute)                             \
     X(None)                                               \
-    X(PseudoElementBoxEscapedRebuildRoot)                 \
-    X(ShadowRootSetInnerHTML)                             \
     X(SlotAssignmentChange)                               \
     X(StyleChange)                                        \
+    X(StyleRebuild)                                       \
     X(SVGResourceContentChange)                           \
     X(SVGResourceElementRemoved)                          \
-    X(TopLayerMembershipChange)
+    X(SVGResourceReferenceChange)                         \
+    X(SVGUseElementShadowTreeRebuild)                     \
+    X(TopLayerMembershipChange)                           \
+    X(WhitespaceTextBoxChange)                            \
+    X(WritingSuggestionChange)
 
 enum class SetNeedsLayoutTreeUpdateReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASON(e) e,
@@ -209,6 +210,7 @@ public:
     virtual bool is_svg_text_path_element() const { return false; }
     virtual bool is_svg_geometry_element() const { return false; }
     virtual bool is_svg_filter_element() const { return false; }
+    virtual bool is_mathml_anchor_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -218,6 +220,8 @@ public:
     bool is_editable() const;
     bool is_editing_host() const;
     bool is_editable_or_editing_host() const { return is_editable() || is_editing_host(); }
+    // NB: A false answer settles is_editable_or_editing_host() without asking what kind of node this is.
+    bool may_be_editable_or_editing_host() const;
     GC::Ptr<Node> editing_host();
 
     bool has_spelling_markers() const { return m_has_spelling_markers; }
@@ -410,11 +414,11 @@ public:
     Node* parent_node() { return parent(); }
     Node const* parent_node() const { return parent(); }
 
-    static constexpr size_t parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
-    static constexpr size_t first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
-    static constexpr size_t last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
-    static constexpr size_t previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
-    static constexpr size_t next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
+    static constexpr GC::MemberOffset first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
+    static constexpr GC::MemberOffset last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
+    static constexpr GC::MemberOffset previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
 
     GC::Ptr<Element> parent_element();
     GC::Ptr<Element const> parent_element() const;
@@ -445,6 +449,8 @@ public:
         Type type {};
         GC::Ref<Node> node;
         AffectsElements affects_elements { AffectsElements::No };
+        // For a removal, the sibling that was before the removed node, if any.
+        GC::Ptr<Node> old_previous_sibling {};
     };
     // FIXME: It would be good if we could always provide this metadata for use in optimizations.
     virtual void children_changed(ChildrenChangedMetadata const&) { }
@@ -461,18 +467,13 @@ public:
     // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
     // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
     [[nodiscard]] bool has_layout_box() const { return m_has_layout_box; }
+    [[nodiscard]] bool may_have_layout_box() const;
     [[nodiscard]] bool is_rendered() const { return m_has_committed_box; }
     void set_box_presence(Badge<Layout::NodeArena>, bool has_layout_box, bool has_committed_box)
     {
         m_has_layout_box = has_layout_box;
         m_has_committed_box = has_committed_box;
     }
-    Element const* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor) const;
-    Element* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor)
-    {
-        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(read, inclusive_ancestor));
-    }
-
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
     // Queues `marks` for the node's box, which the render state finds as it applies them: the marks may be made beside a
     // frame in flight, which holds the boxes.
@@ -480,14 +481,6 @@ public:
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
-    void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
-
-    // Whether the node's layout subtree can leave the parent's box without restructuring the
-    // anonymous boxes around it, so the parent's subtree keeps its layout tree.
-    static bool can_detach_layout_subtree_in_place(Layout::BegunRead const& read, Element const& element, Element const& parent, bool box_is_block_level);
-    // Whether a list item's box appearing or disappearing changes the list-item counter value of
-    // some item that stays in the list.
-    static bool list_item_box_change_renumbers_list(Element const& list_item);
 
     // Does what a removal does to the layout nodes of this subtree that stay until the parent's layout is rebuilt,
     // while the StyleNodeIDs they are found through are still current.
@@ -504,9 +497,6 @@ public:
 
     [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
 
-    [[nodiscard]] bool child_needs_layout_tree_update() const;
-    void set_child_needs_layout_tree_update(bool);
-
     // The number of animations associated with this node's shadow-including inclusive subtree. A
     // synchronous read of layout geometry has to catch up the style of a throttled animation that
     // could change what it sees, and this count answers "there is none in here" for a whole subtree
@@ -514,12 +504,6 @@ public:
     [[nodiscard]] u32 associated_animation_count_in_subtree() const { return m_associated_animation_count_in_subtree; }
     void change_associated_animation_count_in_subtree(i32 delta);
 
-    [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
-    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups);
-    // Tell the style engine of this node's mark, which it keeps for the node's style node.
-    void publish_children_explicitly_inherit_mark();
-
-    void record_style_environment_change();
     CSS::StyleScope& style_scope();
     CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
 
@@ -552,8 +536,6 @@ public:
     bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
 
     [[nodiscard]] UniqueNodeID unique_id() const;
-    // The node's unique id, without giving it one if it has none.
-    [[nodiscard]] Optional<UniqueNodeID> unique_id_if_assigned() const;
     static Node* from_unique_id(UniqueNodeID);
 
     Optional<String> webdriver_node_id() const;
@@ -561,7 +543,11 @@ public:
 
     WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
 
-    WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-parsing-and-serialization
+    // NB: These are the NonDocumentTypeChildNode methods, which are exposed on Element and CharacterData objects.
+    WebIDL::ExceptionOr<void> before_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> after_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> replace_with_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
 
     void replace_all(GC::Ptr<Node>);
     void replace_all(GC::RootVector<GC::Ref<Node>>);
@@ -643,8 +629,6 @@ public:
     bool is_inert() const;
 
     bool has_inclusive_ancestor_with_display_none_ignoring_animations() const;
-    bool has_inclusive_ancestor_with_event_listener(Utf16FlyString const& type) const;
-
     GC::Ptr<ShadowRoot> containing_shadow_root();
     GC::Ptr<ShadowRoot const> containing_shadow_root() const
     {
@@ -667,8 +651,8 @@ protected:
         // "Nodes have a strong reference to registered observers in their registered observer list." https://dom.spec.whatwg.org/#garbage-collection
         OwnPtr<Vector<GC::Ref<RegisteredObserver>>> registered_observer_list;
 
-        GC::Ptr<NodeList> child_nodes;
-        GC::Ptr<HTMLCollection> children;
+        GC::Member<NodeList> child_nodes;
+        GC::Member<HTMLCollection> children;
         OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
 
         // The collections getElementsByTagName() returned, which it may return again for the same argument while the
@@ -699,8 +683,8 @@ protected:
     virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
-    GC::Ptr<Document> m_document;
-    GC::Ptr<Node> m_root;
+    GC::Member<Document> m_document;
+    GC::Member<Node> m_root;
     NodeType m_type { NodeType::INVALID };
     bool m_has_layout_box { false };
     bool m_has_committed_box { false };
@@ -708,10 +692,13 @@ protected:
     enum LayoutTreeUpdateReuseReason : u8 {
         ChildListInsertion = 1,
         PseudoElementChange = 2,
+        // NB: Bits 4 and 8 are the marks themselves, and 32 and 64 notes of the mark.
+        ChildListRemoval = 16,
+        // The element's box may stay if a fresh build gives it a box of the same kind.
+        Restyle = 128,
     };
     [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
-    u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };
@@ -733,19 +720,10 @@ protected:
     static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
 private:
-    enum class LayoutSubtreeRemoval {
-        DetachInPlace,
-        RebuildParent,
-    };
-    enum class AncestorsMayHaveFirstLetter {
-        No,
-        Yes,
-    };
-
     void run_node_iterator_pre_removing_steps();
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
-    void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
+    void update_layout_tree_for_removal(Node& parent);
     GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);

@@ -84,17 +84,15 @@ fn calendar_date_of(plain_date_time: &PlainDateTime) -> CalendarDate {
 
 impl PlainDateTimePrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<PlainDateTimePrototype> {
-        realm.create_object(
-            vm,
-            PlainDateTimePrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| PlainDateTimePrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -526,22 +524,22 @@ impl PlainDateTimePrototype {
         let mut fields = iso_date_to_fields(Utf16View::of_string(&calendar), iso_date_time.iso_date, DateType::Date);
 
         // 6. Set fields.[[Hour]] to plainDateTime.[[ISODateTime]].[[Time]].[[Hour]].
-        fields.hour = Some(iso_date_time.time.hour);
+        fields.hour = Some(f64::from(iso_date_time.time.hour));
 
         // 7. Set fields.[[Minute]] to plainDateTime.[[ISODateTime]].[[Time]].[[Minute]].
-        fields.minute = Some(iso_date_time.time.minute);
+        fields.minute = Some(f64::from(iso_date_time.time.minute));
 
         // 8. Set fields.[[Second]] to plainDateTime.[[ISODateTime]].[[Time]].[[Second]].
-        fields.second = Some(iso_date_time.time.second);
+        fields.second = Some(f64::from(iso_date_time.time.second));
 
         // 9. Set fields.[[Millisecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Millisecond]].
-        fields.millisecond = Some(iso_date_time.time.millisecond);
+        fields.millisecond = Some(f64::from(iso_date_time.time.millisecond));
 
         // 10. Set fields.[[Microsecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Microsecond]].
-        fields.microsecond = Some(iso_date_time.time.microsecond);
+        fields.microsecond = Some(f64::from(iso_date_time.time.microsecond));
 
         // 11. Set fields.[[Nanosecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Nanosecond]].
-        fields.nanosecond = Some(iso_date_time.time.nanosecond);
+        fields.nanosecond = Some(f64::from(iso_date_time.time.nanosecond));
 
         // 12. Let partialDateTime be ? PrepareCalendarFields(calendar, temporalDateTimeLike, « YEAR, MONTH, MONTH-CODE, DAY », « HOUR, MINUTE, SECOND, MILLISECOND, MICROSECOND, NANOSECOND », PARTIAL).
         const CALENDAR_FIELD_NAMES: [CalendarField; 4] = [

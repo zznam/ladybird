@@ -120,18 +120,16 @@ fn clamp(value: f64, min: f64, max: f64) -> f64 {
     value
 }
 
-/// The native functions of Array.prototype.push and slice, which JIT code knows.
+/// The native functions of Array.prototype.push, slice and splice, which JIT code knows.
 pub(crate) static PUSH_FUNCTION: RawNativeFunctionPointer = raw_native!(ArrayPrototype::push);
 pub(crate) static SLICE_FUNCTION: RawNativeFunctionPointer = raw_native!(ArrayPrototype::slice);
+pub(crate) static SPLICE_FUNCTION: RawNativeFunctionPointer = raw_native!(ArrayPrototype::splice);
 
 impl ArrayPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<ArrayPrototype> {
-        realm.create_object(
-            vm,
-            ArrayPrototype {
-                base: Array::new_with_class(vm, Self::CLASS, realm, realm.object_prototype()),
-            },
-        )
+        realm.create_object(vm, |_| ArrayPrototype {
+            base: Array::new_with_class(vm, Self::CLASS, realm, realm.object_prototype()),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -181,7 +179,7 @@ impl ArrayPrototype {
         define_native_function(&names.slice, SLICE_FUNCTION, 2);
         define_native_javascript_backed_function(&names.some, intrinsics.some_array_prototype_function(vm));
         define_native_function(&names.sort, raw_native!(ArrayPrototype::sort), 1);
-        define_native_function(&names.splice, raw_native!(ArrayPrototype::splice), 2);
+        define_native_function(&names.splice, SPLICE_FUNCTION, 2);
         define_native_function(&names.toLocaleString, raw_native!(ArrayPrototype::to_locale_string), 0);
         define_native_function(&names.toReversed, raw_native!(ArrayPrototype::to_reversed), 0);
         define_native_function(&names.toSorted, raw_native!(ArrayPrototype::to_sorted), 1);
@@ -1093,6 +1091,13 @@ impl ArrayPrototype {
 
         // 3. Let len be ? LengthOfArrayLike(obj).
         let length = length_of_array_like(vm, &object)?;
+
+        // AD-HOC: Step 8.a says "Perform ? Set(obj, ! ToString(𝔽(j)), sortedList[j], true)." All major engines skip
+        // indexed reads and writes for lengths below two. Sites rely on this when sorting frozen singletons.
+        // https://github.com/tc39/ecma262/issues/4101
+        if length < 2 {
+            return Ok(Value::from_object(object));
+        }
 
         // 4. Let SortCompare be a new Abstract Closure with parameters (x, y) that captures comparefn and performs the following steps when called:
         let comparefn_function = (!comparefn.is_undefined()).then(|| comparefn.as_function());
@@ -2036,14 +2041,17 @@ pub fn array_merge_sort(
         let x = left.get(left_index).expect("the index is below the size");
         let y = right.get(right_index).expect("the index is below the size");
 
-        let comparison_result = compare_func(x, y)?;
+        // INTEROP: The later element is passed as the first argument, and the earlier one stays first unless it compares
+        //          below it. Most other engines do the same, and server rendered pages depend on it when they sort with
+        //          an inconsistent comparator such as `() => 1`, which then has to leave the order unchanged.
+        let comparison_result = compare_func(y, x)?;
 
-        if comparison_result <= 0.0 {
-            append(x);
-            left_index += 1;
-        } else {
+        if comparison_result < 0.0 {
             append(y);
             right_index += 1;
+        } else {
+            append(x);
+            left_index += 1;
         }
     }
 

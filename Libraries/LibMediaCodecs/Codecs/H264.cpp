@@ -10,6 +10,7 @@
 #include <LibMediaCodecs/Codecs/H264.h>
 #include <LibMediaCodecs/Codecs/NALUnit.h>
 #include <LibMediaCodecs/Codecs/RBSPBitReader.h>
+#include <LibMediaCodecs/Codecs/SupplementalEnhancementInformation.h>
 
 namespace Media::Codecs {
 
@@ -49,6 +50,7 @@ Optional<H264::Parameters> H264::parse_configuration_record(ReadonlyBytes record
 }
 
 static constexpr size_t NAL_UNIT_HEADER_SIZE = 1;
+static constexpr u8 FORBIDDEN_ZERO_BIT_MASK = 0x80;
 static constexpr u8 NAL_UNIT_TYPE_MASK = 0x1F;
 static constexpr u8 SEQUENCE_PARAMETER_SET_NAL_UNIT_TYPE = 7;
 static constexpr u8 PICTURE_PARAMETER_SET_NAL_UNIT_TYPE = 8;
@@ -58,6 +60,8 @@ static constexpr u8 NAL_REF_IDC_MASK = 0x60;
 static constexpr u8 NAL_REF_IDC_SHIFT = 5;
 static constexpr u8 FIRST_CODED_SLICE_NAL_UNIT_TYPE = 1;
 static constexpr u8 LAST_CODED_SLICE_NAL_UNIT_TYPE = 5;
+static constexpr u8 INSTANTANEOUS_DECODING_REFRESH_NAL_UNIT_TYPE = 5;
+static constexpr u8 SUPPLEMENTAL_ENHANCEMENT_INFORMATION_NAL_UNIT_TYPE = 6;
 
 // The profiles whose sequence parameter sets carry the chroma format and scaling matrix fields.
 // ITU-T H.264 (08/2024), 7.3.2.1.1.
@@ -100,10 +104,16 @@ static void skip_hrd_parameters(Codecs::RBSPBitReader& reader)
 
 static constexpr u8 MAXIMUM_REORDER_FRAME_COUNT = 16;
 
+struct VideoUsabilityInformation {
+    CodingIndependentCodePoints cicp;
+    Optional<u32> stated_max_reorder_frame_count;
+};
+
 // ITU-T H.264 (08/2024), E.1.1: vui_parameters(), through max_num_reorder_frames.
-// Returns the max_num_reorder_frames the bitstream restriction states, if it states one at all.
-static Optional<u32> parse_stated_max_reorder_frame_count(Codecs::RBSPBitReader& reader)
+static VideoUsabilityInformation parse_video_usability_information(Codecs::RBSPBitReader& reader)
 {
+    VideoUsabilityInformation information;
+
     static constexpr u8 EXTENDED_SAMPLE_ASPECT_RATIO = 255;
 
     if (reader.read_bit()) { // aspect_ratio_info_present_flag
@@ -113,15 +123,16 @@ static Optional<u32> parse_stated_max_reorder_frame_count(Codecs::RBSPBitReader&
             reader.skip_bits(16); // sar_height
         }
     }
-    if (reader.read_bit())       // overscan_info_present_flag
-        reader.skip_bits(1);     // overscan_appropriate_flag
-    if (reader.read_bit()) {     // video_signal_type_present_flag
-        reader.skip_bits(3);     // video_format
-        reader.skip_bits(1);     // video_full_range_flag
+    if (reader.read_bit())   // overscan_info_present_flag
+        reader.skip_bits(1); // overscan_appropriate_flag
+    if (reader.read_bit()) { // video_signal_type_present_flag
+        reader.skip_bits(3); // video_format
+        auto video_full_range_flag = reader.read_bit();
+        information.cicp.set_video_full_range_flag(video_full_range_flag ? VideoFullRangeFlag::Full : VideoFullRangeFlag::Studio);
         if (reader.read_bit()) { // colour_description_present_flag
-            reader.skip_bits(8); // colour_primaries
-            reader.skip_bits(8); // transfer_characteristics
-            reader.skip_bits(8); // matrix_coefficients
+            information.cicp.set_color_primaries(static_cast<ColorPrimaries>(reader.read_bits<u8>(8)));
+            information.cicp.set_transfer_characteristics(static_cast<TransferCharacteristics>(reader.read_bits<u8>(8)));
+            information.cicp.set_matrix_coefficients(static_cast<MatrixCoefficients>(reader.read_bits<u8>(8)));
         }
     }
     if (reader.read_bit()) {               // chroma_loc_info_present_flag
@@ -145,13 +156,14 @@ static Optional<u32> parse_stated_max_reorder_frame_count(Codecs::RBSPBitReader&
     reader.skip_bits(1);     // pic_struct_present_flag
 
     if (!reader.read_bit()) // bitstream_restriction_flag
-        return {};
-    reader.skip_bits(1);                      // motion_vectors_over_pic_boundaries_flag
-    reader.read_unsigned_exp_golomb();        // max_bytes_per_pic_denom
-    reader.read_unsigned_exp_golomb();        // max_bits_per_mb_denom
-    reader.read_unsigned_exp_golomb();        // log2_max_mv_length_horizontal
-    reader.read_unsigned_exp_golomb();        // log2_max_mv_length_vertical
-    return reader.read_unsigned_exp_golomb(); // max_num_reorder_frames
+        return information;
+    reader.skip_bits(1);                                                            // motion_vectors_over_pic_boundaries_flag
+    reader.read_unsigned_exp_golomb();                                              // max_bytes_per_pic_denom
+    reader.read_unsigned_exp_golomb();                                              // max_bits_per_mb_denom
+    reader.read_unsigned_exp_golomb();                                              // log2_max_mv_length_horizontal
+    reader.read_unsigned_exp_golomb();                                              // log2_max_mv_length_vertical
+    information.stated_max_reorder_frame_count = reader.read_unsigned_exp_golomb(); // max_num_reorder_frames
+    return information;
 }
 
 static u8 max_reorder_frame_count_for_level(u8 level_idc, u32 macroblocks_per_frame)
@@ -213,6 +225,20 @@ u8 H264::nal_ref_idc(u8 nal_unit_header)
 }
 
 // ITU-T H.264 (08/2024), Table 7-1.
+ColorMetadata H264::high_dynamic_range_metadata_of_nal_unit(ReadonlyBytes nal_unit)
+{
+    if (nal_unit.size() <= NAL_UNIT_HEADER_SIZE || (nal_unit[0] & FORBIDDEN_ZERO_BIT_MASK) != 0)
+        return {};
+    if ((nal_unit[0] & NAL_UNIT_TYPE_MASK) != SUPPLEMENTAL_ENHANCEMENT_INFORMATION_NAL_UNIT_TYPE)
+        return {};
+    return high_dynamic_range_metadata_of_sei_payload(nal_unit.slice(NAL_UNIT_HEADER_SIZE));
+}
+
+bool H264::begins_coded_video_sequence(u8 nal_unit_header)
+{
+    return (nal_unit_header & NAL_UNIT_TYPE_MASK) == INSTANTANEOUS_DECODING_REFRESH_NAL_UNIT_TYPE;
+}
+
 bool H264::is_parameter_set(u8 nal_unit_header)
 {
     auto nal_unit_type = nal_unit_header & NAL_UNIT_TYPE_MASK;
@@ -225,7 +251,9 @@ bool H264::is_parameter_set(u8 nal_unit_header)
 // ITU-T H.264 (08/2024), 7.3.2.1.1: seq_parameter_set_data().
 Optional<H264::SequenceParameterSet> H264::parse_sequence_parameter_set(ReadonlyBytes nal_unit)
 {
-    if (nal_unit.is_empty() || (nal_unit[0] & NAL_UNIT_TYPE_MASK) != SEQUENCE_PARAMETER_SET_NAL_UNIT_TYPE || (nal_unit[0] & 0x80) != 0)
+    if (nal_unit.is_empty() || (nal_unit[0] & FORBIDDEN_ZERO_BIT_MASK) != 0)
+        return {};
+    if ((nal_unit[0] & NAL_UNIT_TYPE_MASK) != SEQUENCE_PARAMETER_SET_NAL_UNIT_TYPE)
         return {};
     Codecs::RBSPBitReader reader { nal_unit.slice(NAL_UNIT_HEADER_SIZE) };
     auto profile_idc = reader.read_bits<u8>(8);
@@ -239,11 +267,14 @@ Optional<H264::SequenceParameterSet> H264::parse_sequence_parameter_set(Readonly
     if (reader.has_overrun() || seq_parameter_set_id > 31)
         return {};
 
+    // ITU-T H.264 (08/2024), 7.4.2.1.1: absent chroma_format_idc is inferred as 1 (4:2:0), and absent bit depths as 8.
+    u32 chroma_format_idc = 1;
+    u32 bit_depth_luma_minus8 = 0;
     if (profile_has_chroma_format_fields(profile_idc)) {
-        auto chroma_format_idc = reader.read_unsigned_exp_golomb();
+        chroma_format_idc = reader.read_unsigned_exp_golomb();
         if (chroma_format_idc == 3)
-            reader.skip_bits(1);           // separate_colour_plane_flag
-        reader.read_unsigned_exp_golomb(); // bit_depth_luma_minus8
+            reader.skip_bits(1); // separate_colour_plane_flag
+        bit_depth_luma_minus8 = reader.read_unsigned_exp_golomb();
         reader.read_unsigned_exp_golomb(); // bit_depth_chroma_minus8
         reader.skip_bits(1);               // qpprime_y_zero_transform_bypass_flag
         if (reader.read_bit()) {           // seq_scaling_matrix_present_flag
@@ -286,15 +317,24 @@ Optional<H264::SequenceParameterSet> H264::parse_sequence_parameter_set(Readonly
         reader.read_unsigned_exp_golomb(); // frame_crop_bottom_offset
     }
 
-    Optional<u32> stated_count;
+    VideoUsabilityInformation video_usability_information;
     if (reader.read_bit()) // vui_parameters_present_flag
-        stated_count = parse_stated_max_reorder_frame_count(reader);
+        video_usability_information = parse_video_usability_information(reader);
+    auto stated_count = video_usability_information.stated_max_reorder_frame_count;
 
-    if (reader.has_overrun())
+    // ITU-T H.264 (08/2024), 7.4.2.1.1: chroma_format_idc is in 0 to 3, bit_depth_luma_minus8 in 0 to 6.
+    if (reader.has_overrun() || chroma_format_idc > 3 || bit_depth_luma_minus8 > 6)
         return {};
     // ITU-T H.264 (08/2024), E.2.1: Infer absent max_num_reorder_frames as zero for these
     // profiles with constraint_set3_flag set, and as MaxDpbFrames otherwise.
-    SequenceParameterSet parameter_set { .seq_parameter_set_id = static_cast<u8>(seq_parameter_set_id), .max_num_reorder_frames = 0 };
+    SequenceParameterSet parameter_set {
+        .seq_parameter_set_id = static_cast<u8>(seq_parameter_set_id),
+        .max_num_reorder_frames = 0,
+        .profile_idc = profile_idc,
+        .chroma_format_idc = static_cast<u8>(chroma_format_idc),
+        .bit_depth_luma = static_cast<u8>(bit_depth_luma_minus8 + 8),
+        .cicp = video_usability_information.cicp,
+    };
     if (stated_count.has_value()) {
         parameter_set.max_num_reorder_frames = static_cast<u8>(min(*stated_count, static_cast<u32>(MAXIMUM_REORDER_FRAME_COUNT)));
     } else if (!(constraint_set3_flag && first_is_one_of(profile_idc, 44, 86, 100, 110, 122, 244))) {
@@ -307,7 +347,9 @@ Optional<H264::SequenceParameterSet> H264::parse_sequence_parameter_set(Readonly
 // ITU-T H.264 (08/2024), 7.3.2.2: pic_parameter_set_rbsp(), through seq_parameter_set_id.
 Optional<H264::PictureParameterSet> H264::parse_picture_parameter_set(ReadonlyBytes nal_unit)
 {
-    if (nal_unit.is_empty() || (nal_unit[0] & NAL_UNIT_TYPE_MASK) != PICTURE_PARAMETER_SET_NAL_UNIT_TYPE || (nal_unit[0] & 0x80) != 0)
+    if (nal_unit.is_empty() || (nal_unit[0] & FORBIDDEN_ZERO_BIT_MASK) != 0)
+        return {};
+    if ((nal_unit[0] & NAL_UNIT_TYPE_MASK) != PICTURE_PARAMETER_SET_NAL_UNIT_TYPE)
         return {};
     Codecs::RBSPBitReader reader { nal_unit.slice(NAL_UNIT_HEADER_SIZE) };
     auto pic_parameter_set_id = reader.read_unsigned_exp_golomb();

@@ -4,20 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include "ReportServer.h"
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibFileSystem/FileSystem.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportReview.h>
 
 using namespace ReportServerTest;
@@ -28,6 +27,10 @@ constexpr auto report_text = "Ladybird crash report, format 1\n"
                              "Process: WebContent\n"
                              "Version: 1.0\n"
                              "Build configuration: Release\n"
+                             "Platform features: [{\"id\":\"gpu_painting\",\"state\":\"Enabled\"}]\n"
+                             "GPU device: NVIDIA GeForce RTX 3090 (10de:2204)\n"
+                             "GPU driver: NVIDIA 615.78.08\n"
+                             "Platform facts: {}\n"
                              "Termination signal: SIGSEGV\n"
                              "Termination signal number: 11\n"
                              "\n"
@@ -68,20 +71,14 @@ ByteString write_report(ByteString const& directory, StringView name)
 
 }
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(crash_report_submission)
 {
-    auto test_directory = ByteString::formatted("{}/Ladybird-TestCrashReportSubmission-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_directory, FileSystem::RecursionMode::Allowed));
-    });
+    Test::HeadlessTestEnvironment environment { "TestCrashReportSubmission"sv };
+    auto const& test_directory = environment.directory();
+
     MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, LexicalPath::join(test_directory, "config"sv).string(), Core::Environment::Overwrite::Yes));
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     ReportServer server;
     MUST(Core::Environment::set("LADYBIRD_REPORTS_ENDPOINT"sv, server.endpoint(), Core::Environment::Overwrite::Yes));
@@ -139,6 +136,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(manifest_field(manifest, "url"sv)->as_string() == "https://example.com/"sv);
     VERIFY(manifest_field(manifest, "signal"sv)->as_string() == "SIGSEGV"sv);
     VERIFY(manifest_field(manifest, "process"sv)->as_string() == "WebContent"sv);
+    auto features = manifest_field(manifest, "platform_features"sv)->as_array();
+    VERIFY(features.size() == 1);
+    VERIFY(features.at(0).as_object().get_string("id"sv) == "gpu_painting"sv);
+    VERIFY(manifest_field(manifest, "gpu_device"sv)->as_string() == "NVIDIA GeForce RTX 3090 (10de:2204)"sv);
+    VERIFY(manifest_field(manifest, "gpu_driver"sv)->as_string() == "NVIDIA 615.78.08"sv);
+    // The full facts stay in the attached text.
+    VERIFY(!manifest_field(manifest, "platform_facts"sv).has_value());
 
     auto attachments = manifest.get_array("attachments"sv).value();
     VERIFY(attachments.size() == 1);
@@ -150,7 +154,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     // Once the server has a report, the local copy has done its job.
     VERIFY(!FileSystem::exists(LexicalPath::join(reports_directory, "Seen"sv, name).string()));
-    VERIFY(!store.has_pending_reports());
+    VERIFY(MUST(store.pending_report_names()).is_empty());
 
     // A request the server rejects would be rejected again, so it ends the submission until the user tries again.
     server.requests.clear();
@@ -218,6 +222,66 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(server.requests.size() == 2);
     VERIFY(server.requests[1].path == "/api/v1/reports"sv);
 
+    // Only one place sends a report at a time, and a report sent from a review counts as on its way until it has gone,
+    // even when the review goes first.
+    WebView::CrashReportOutbox outbox { store };
+    name = write_report(reports_directory, "2026-10-01T15-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview first_review { store };
+        WebView::CrashReportReview second_review { store };
+        MUST(first_review.open(name));
+        MUST(second_review.open(name));
+        server.respond_with(challenge("fifth"sv));
+        server.respond_with({ 200, R"({"receipt":"receipt-4"})", {} });
+        VERIFY(!outbox.send_from_review(first_review, ""_string, {}).has_value());
+        VERIFY(outbox.is_sending(name));
+        VERIFY(outbox.send_from_review(second_review, ""_string, {}).has_value());
+    }
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(name); });
+    VERIFY(MUST(store.pending_report_names()).is_empty());
+
+    // Choosing to keep nothing stops what a review has started.
+    name = write_report(reports_directory, "2026-10-01T16-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview review_to_stop { store };
+        MUST(review_to_stop.open(name));
+        auto requests_before = server.requests.size();
+        VERIFY(!outbox.send_from_review(review_to_stop, ""_string, {}).has_value());
+        VERIFY(outbox.is_sending(name));
+        // Stopping a request doesn't recall one already on its way, which could then reach the server later and take
+        // the response queued for the next report. So stop it once the server has it, unanswered.
+        Core::EventLoop::current().spin_until([&] { return server.requests.size() > requests_before; });
+        outbox.discard_all();
+        VERIFY(!outbox.is_sending(name));
+    }
+    VERIFY(MUST(store.pending_report_names()).is_empty());
+
+    // Reports still waiting behind one that failed after retries keep what the user chose for them.
+    auto first_name = write_report(reports_directory, "2026-10-01T17-00-00Z-WebContent-abc123.txt"sv);
+    auto second_name = write_report(reports_directory, "2026-10-01T18-00-00Z-WebContent-abc123.txt"sv);
+    server.respond_with({ 503, "{}", {} });
+    server.respond_with({ 400, "{}", {} });
+    Vector<WebView::CrashReportOutbox::Report> reports;
+    reports.append({ first_name, "I clicked a link"_string, "https://example.com/"_string });
+    reports.append({ second_name, "I clicked a link"_string, "https://example.com/other"_string });
+    outbox.send(move(reports));
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(first_name) && !outbox.is_sending(second_name); });
+    VERIFY(outbox.could_not_send(second_name));
+    VERIFY(outbox.failed_attempt(second_name)->description == "I clicked a link"sv);
+    VERIFY(outbox.failed_attempt(second_name)->url == "https://example.com/other"sv);
+
+    // A report that fails after its review went away keeps what the user chose, and its submission ID.
+    name = write_report(reports_directory, "2026-10-01T19-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview departing_review { store };
+        MUST(departing_review.open(name));
+        server.respond_with({ 400, "{}", {} });
+        VERIFY(!outbox.send_from_review(departing_review, "I closed the tab"_string, {}).has_value());
+    }
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(name); });
+    VERIFY(outbox.could_not_send(name));
+    VERIFY(outbox.failed_attempt(name)->description == "I closed the tab"sv);
+    VERIFY(!outbox.failed_attempt(name)->manifest.is_empty());
+
     outln("PASS: Crash reports reach the report server in the format it expects");
-    return 0;
 }

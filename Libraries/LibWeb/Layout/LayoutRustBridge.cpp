@@ -14,6 +14,7 @@
 #include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -55,7 +56,6 @@
 #include <LibWeb/SVG/SVGPolylineElement.h>
 #include <LibWeb/SVG/SVGRectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
-#include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 #include <LibWeb/SVG/SVGTextPositioningElement.h>
@@ -63,13 +63,11 @@
 
 namespace Web::Layout {
 
-static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
 static_assert(to_underlying(CSS::StyleGroupIndex::GridValues) == RustFFI::STYLE_GROUP_INDEX_GRID);
 static_assert(to_underlying(CSS::StyleGroupIndex::ContentValues) == RustFFI::STYLE_GROUP_INDEX_CONTENT);
 static_assert(to_underlying(CSS::StyleGroupIndex::AnchorValues) == RustFFI::STYLE_GROUP_INDEX_ANCHOR);
-static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTableValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TABLE);
+static_assert(to_underlying(CSS::StyleGroupIndex::InheritedListTableValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_LIST_TABLE);
 static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTextValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TEXT);
-static_assert(to_underlying(CSS::StyleGroupIndex::InheritedBoxValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_BOX);
 static_assert(to_underlying(CSS::StyleGroupIndex::FontValues) == RustFFI::STYLE_GROUP_INDEX_FONT);
 static_assert(to_underlying(CSS::StyleGroupIndex::SVGResetValues) == RustFFI::STYLE_GROUP_INDEX_SVG_RESET);
 static_assert(to_underlying(CSS::StyleGroupIndex::BorderValues) == RustFFI::STYLE_GROUP_INDEX_BORDER);
@@ -143,23 +141,51 @@ static CSS::StyleAtomID svg_style_reference_fragment_atom(DOM::Element& element,
 // The four resources `mask`, `clip-path`, `fill` and `stroke` name. Read from the record's group payloads rather than
 // through a materialized view: this runs for every SVG graphics element whose style record is replaced, and pinning a
 // record to look at four properties is most of the cost of looking at them.
+static Array<Optional<CSS::URL>, 4> svg_style_reference_urls(CSS::ComputedValuesFFI::StyleRecordGroups const* record_groups)
+{
+    if (!record_groups)
+        return {};
+    auto const& mask = CSS::style_record_group<CSS::ComputedValues::MaskValues>(record_groups);
+    auto const& svg = CSS::style_record_group<CSS::ComputedValues::InheritedSVGValues>(record_groups);
+    return {
+        mask.mask_url_value(),
+        mask.clip_path_value(),
+        svg.fill_url_value(),
+        svg.stroke_url_value(),
+    };
+}
+
 static Array<CSS::StyleAtomID, 4> svg_style_reference_atoms(DOM::Element& element)
 {
     if (!is<SVG::SVGGraphicsElement>(element))
         return {};
-    auto const* payloads = static_cast<void const* const*>(element.style_record_payloads());
-    if (!payloads)
-        return {};
-    auto const* mask_payload = static_cast<CSS::ComputedValues::MaskValues const*>(payloads[CSS::ComputedValues::MaskValues::style_group_index]);
-    auto const* svg_payload = static_cast<CSS::ComputedValues::InheritedSVGValues const*>(payloads[CSS::ComputedValues::InheritedSVGValues::style_group_index]);
-    if (!mask_payload || !svg_payload)
-        return {};
+    auto urls = svg_style_reference_urls(element.style_record_groups());
     return {
-        svg_style_reference_fragment_atom(element, mask_payload->mask_url_value()),
-        svg_style_reference_fragment_atom(element, mask_payload->clip_path_value()),
-        svg_style_reference_fragment_atom(element, svg_payload->fill_url_value()),
-        svg_style_reference_fragment_atom(element, svg_payload->stroke_url_value()),
+        svg_style_reference_fragment_atom(element, urls[0]),
+        svg_style_reference_fragment_atom(element, urls[1]),
+        svg_style_reference_fragment_atom(element, urls[2]),
+        svg_style_reference_fragment_atom(element, urls[3]),
     };
+}
+
+bool svg_style_references_differ(CSS::InstalledStyle const& old_style, CSS::InstalledStyle const& new_style)
+{
+    auto const* old_groups = old_style.groups();
+    auto const* new_groups = new_style.groups();
+    if (old_groups && new_groups
+        && CSS::style_record_group_payload<CSS::ComputedValues::MaskValues::style_group_index>(old_groups) == CSS::style_record_group_payload<CSS::ComputedValues::MaskValues::style_group_index>(new_groups)
+        && CSS::style_record_group_payload<CSS::ComputedValues::InheritedSVGValues::style_group_index>(old_groups) == CSS::style_record_group_payload<CSS::ComputedValues::InheritedSVGValues::style_group_index>(new_groups))
+        return false;
+
+    auto old_urls = svg_style_reference_urls(old_groups);
+    auto new_urls = svg_style_reference_urls(new_groups);
+    for (size_t i = 0; i < old_urls.size(); ++i) {
+        if (old_urls[i].has_value() != new_urls[i].has_value())
+            return true;
+        if (old_urls[i].has_value() && old_urls[i]->url() != new_urls[i]->url())
+            return true;
+    }
+    return false;
 }
 
 RustFFI::FfiSvgAttributeFacts svg_geometry_facts(DOM::Element const& element)
@@ -183,6 +209,12 @@ RustFFI::FfiSvgAttributeFacts svg_geometry_facts(DOM::Element const& element)
         facts.line_y1 = to_ffi_number_percentage(line_element->y1_value());
         facts.line_x2 = to_ffi_number_percentage(line_element->x2_value());
         facts.line_y2 = to_ffi_number_percentage(line_element->y2_value());
+    }
+    if (auto const* geometry_element = as_if<SVG::SVGGeometryElement>(element)) {
+        if (auto path_length = geometry_element->author_path_length(); path_length.has_value()) {
+            facts.has_path_length = true;
+            facts.path_length = *path_length;
+        }
     }
     return facts;
 }
@@ -243,9 +275,10 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
 
     auto geometry = svg_geometry_facts(dom_node);
 
-    SVG::SVGTextPositioningElement::ParsedTextPositioning text_positioning;
-    if (auto const* text_positioning_element = as_if<SVG::SVGTextPositioningElement>(dom_node))
-        text_positioning = text_positioning_element->parsed_text_positioning();
+    SVG::SVGTextContentElement::ParsedTextLength text_length;
+    if (auto const* text_positioning_element = as_if<SVG::SVGTextPositioningElement>(dom_node)) {
+        text_length = text_positioning_element->parsed_text_length();
+    }
 
     CSS::StyleAtomID reference_fragment;
     SVG::NumberPercentage start_offset = SVG::NumberPercentage::create_number(0);
@@ -284,8 +317,6 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
     return {
         .is_graphics_element = is<SVG::SVGGraphicsElement>(dom_node),
         .is_use_element = is<SVG::SVGUseElement>(dom_node),
-        .is_svg_svg_element = is<SVG::SVGSVGElement>(dom_node),
-        .is_symbol_element = is<SVG::SVGSymbolElement>(dom_node),
         .is_text_element = is<SVG::SVGTextElement>(dom_node),
         .is_fit_to_view_box = fit_to_view_box != nullptr,
         .has_active_view_box = active_view_box.has_value(),
@@ -306,10 +337,10 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
         .line_y1 = geometry.line_y1,
         .line_x2 = geometry.line_x2,
         .line_y2 = geometry.line_y2,
-        .text_x = to_ffi_svg_length_value(text_positioning.x),
-        .text_y = to_ffi_svg_length_value(text_positioning.y),
-        .text_dx = to_ffi_svg_length_value(text_positioning.dx),
-        .text_dy = to_ffi_svg_length_value(text_positioning.dy),
+        .has_path_length = geometry.has_path_length,
+        .path_length = geometry.path_length,
+        .text_length = to_ffi_svg_length_value(text_length.text_length),
+        .text_length_adjusts_glyphs = text_length.adjusts_glyphs,
         .reference_fragment_atom = reference_fragment.value(),
         .mask_reference_atom = style_references[0].value(),
         .clip_path_reference_atom = style_references[1].value(),
@@ -357,25 +388,35 @@ void publish_element_scroll_offset(DOM::Element const& element)
     RustFFI::render_state_set_element_scroll_offset(document.layout_node_arena().host(), element.style_node_id().value(), offset);
 }
 
+void publish_writing_suggestion(DOM::Document& document, DOM::Text const* text, size_t offset, Utf16View remainder)
+{
+    // A text node without a style node identity has no box to show a suggestion in, so it publishes that none shows.
+    auto identity = text ? text->style_node_id().value() : 0;
+    // Nothing is published before a layout tree exists, so there's nothing to withdraw.
+    if (identity == 0 && !document.layout_node_arena_if_created())
+        return;
+    Vector<u16> code_units;
+    code_units.ensure_capacity(remainder.length_in_code_units());
+    for (size_t i = 0; i < remainder.length_in_code_units(); ++i)
+        code_units.unchecked_append(remainder.code_unit_at(i));
+    RustFFI::render_state_set_writing_suggestion(document.layout_node_arena().host(), identity, offset, code_units.span());
+}
+
 void publish_table_spans(DOM::Element const& element)
 {
     if (element.style_node_id().value() == 0)
         return;
     u16 column_span = 1;
     u16 row_span = 1;
-    u32 raw_column_span = 1;
     if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
         column_span = static_cast<u16>(cell->col_span());
         row_span = static_cast<u16>(cell->row_span());
     } else if (auto const* column = as_if<HTML::HTMLTableColElement>(element)) {
         column_span = static_cast<u16>(column->span());
-        // The raw span keeps the unclamped attribute value; its only consumer is the table formatting context's column
-        // handling, so other elements' span attributes stay out of the mirror.
-        raw_column_span = column->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
     } else {
         return;
     }
-    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span, raw_column_span);
+    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span);
 }
 
 // The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
@@ -384,12 +425,30 @@ void publish_svg_attribute_facts(DOM::Element& element)
 {
     VERIFY(element.style_node_id() != 0);
     auto points = svg_shape_points(element);
+    Vector<RustFFI::FfiSvgTextPosition> text_positions;
+    if (auto const* text_element = as_if<SVG::SVGTextPositioningElement>(element)) {
+        auto positioning = text_element->parsed_text_positioning();
+        auto length = max(max(positioning.x.size(), positioning.y.size()), max(positioning.dx.size(), positioning.dy.size()));
+        text_positions.ensure_capacity(length);
+        auto value_at = [](auto const& values, size_t index) {
+            return index < values.size() ? to_ffi_svg_length_value(values[index]) : RustFFI::FfiSvgLengthValue {};
+        };
+        for (size_t index = 0; index < length; ++index) {
+            text_positions.unchecked_append({
+                .x = value_at(positioning.x, index),
+                .y = value_at(positioning.y, index),
+                .dx = value_at(positioning.dx, index),
+                .dy = value_at(positioning.dy, index),
+            });
+        }
+    }
     static_assert(sizeof(Gfx::FloatPoint) == sizeof(RustFFI::FfiFloatPoint));
     RustFFI::render_state_set_svg_attribute_facts(
         element.document().layout_node_arena().host(),
         element.style_node_id().value(),
         build_svg_attribute_facts(element),
-        ReadonlySpan<RustFFI::FfiFloatPoint> { reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()), points.size() });
+        ReadonlySpan<RustFFI::FfiFloatPoint> { reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()), points.size() },
+        text_positions.span());
 }
 
 // The unit of a published MathML length. Mirrors Rust `math_length_unit`.
@@ -527,15 +586,6 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
                 commit_messages.append(*read, messages[index]);
             // The pass that produced them reads back what they change before it ends.
             commit_messages.apply(*read); },
-        .container_length_bases = [](void* document_pointer, u32 style_node) -> RustFFI::FfiContainerLengthBases {
-            auto& document = *static_cast<DOM::Document*>(document_pointer);
-            auto element = document.style_computer().element_for_style_node(style_node);
-            VERIFY(element);
-            auto context = CSS::Length::ResolutionContext::for_element(DOM::AbstractElement { *element });
-            return {
-                .width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context),
-                .height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context),
-            }; },
         .take_built_scroll_containers = [](void* context, BegunRead const* read, RustFFI::FfiBuiltScrollContainer const* built, size_t count) {
             auto& document = *static_cast<DOM::Document*>(context);
             for (auto const& scroll_container : ReadonlySpan<RustFFI::FfiBuiltScrollContainer> { built, count })

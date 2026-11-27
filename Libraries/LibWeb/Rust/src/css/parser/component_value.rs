@@ -4,13 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::fmt::Write;
+
 use crate::css::css_tokenizer::{
     ParserSource, ParserString, ParserToken, ParserTokenKind, SmallParserTokenList, SourcePosition, TextDetacher,
 };
 use crate::css::serialize::{StringUnits, TextSink, serialize_a_string, serialize_an_identifier};
 use smallvec::SmallVec;
 
-const MAXIMUM_COMPONENT_VALUE_NESTING_DEPTH: usize = 256;
+pub(crate) const MAXIMUM_COMPONENT_VALUE_NESTING_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ComponentValueList<T = Vec<ComponentValue>> {
@@ -141,17 +143,6 @@ impl ComponentValue {
         }
     }
 
-    pub(crate) fn end_of_file() -> Self {
-        Self {
-            kind: ComponentKind::Token(ParserTokenKind::EndOfFile),
-            original_source_text: ParserSource::empty(),
-            opening_source_length: 0,
-            closing_source_length: 0,
-            start_position: SourcePosition::default(),
-            end_position: SourcePosition::default(),
-        }
-    }
-
     pub(crate) fn is_whitespace(&self) -> bool {
         matches!(self.kind, ComponentKind::Token(ParserTokenKind::Whitespace))
     }
@@ -173,8 +164,12 @@ impl ComponentValue {
     }
 
     pub(crate) fn ident(&self) -> Option<&[u16]> {
+        self.ident_string().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn ident_string(&self) -> Option<&ParserString> {
         match &self.kind {
-            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value.as_ref()),
+            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value),
             _ => None,
         }
     }
@@ -336,13 +331,10 @@ fn serialize_token(sink: &mut TextSink, kind: &ParserTokenKind) {
         }
         ParserTokenKind::BadUrl => sink.push_ascii("url()"),
         ParserTokenKind::Delim(value) => sink.push_code_point(*value),
-        ParserTokenKind::Number { value, .. } => sink.push_ascii(&value.to_string()),
-        ParserTokenKind::Percentage { value, .. } => {
-            sink.push_ascii(&value.to_string());
-            sink.push_ascii("%");
-        }
+        ParserTokenKind::Number { value, .. } => write!(sink, "{value}").unwrap(),
+        ParserTokenKind::Percentage { value, .. } => write!(sink, "{value}%").unwrap(),
         ParserTokenKind::Dimension { value, unit, .. } => {
-            sink.push_ascii(&value.to_string());
+            write!(sink, "{value}").unwrap();
             unit.iter().for_each(|&code_unit| sink.push_code_unit(code_unit));
         }
         ParserTokenKind::Whitespace => sink.push_ascii(" "),
@@ -487,24 +479,8 @@ fn is_same_token_kind(left: &ParserTokenKind, right: &ParserTokenKind) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
-/// The tokens that component values are consumed from, which a source may produce only as they're asked for.
-pub(crate) trait ParserTokens {
-    fn token(&mut self, index: usize) -> Option<&ParserToken>;
-    fn token_mut(&mut self, index: usize) -> Option<&mut ParserToken>;
-}
-
-impl ParserTokens for [ParserToken] {
-    fn token(&mut self, index: usize) -> Option<&ParserToken> {
-        self.get(index)
-    }
-
-    fn token_mut(&mut self, index: usize) -> Option<&mut ParserToken> {
-        self.get_mut(index)
-    }
-}
-
-fn consume_component_values<T: ParserTokens + ?Sized>(
-    tokens: &mut T,
+fn consume_component_values(
+    tokens: &mut [ParserToken],
     position: &mut usize,
     ending: Option<&ParserTokenKind>,
     depth: usize,
@@ -516,7 +492,7 @@ fn consume_component_values<T: ParserTokens + ?Sized>(
 
     let mut values = Vec::with_capacity(4);
     let mut token_count = 0;
-    while let Some(token) = tokens.token(*position) {
+    while let Some(token) = tokens.get(*position) {
         if ending.is_some_and(|ending| is_same_token_kind(&token.kind, ending)) {
             break;
         }
@@ -528,8 +504,8 @@ fn consume_component_values<T: ParserTokens + ?Sized>(
     Ok(ComponentValueList::with_token_count(values, token_count))
 }
 
-pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
-    tokens: &mut T,
+pub(crate) fn consume_a_component_value(
+    tokens: &mut [ParserToken],
     position: &mut usize,
     depth: usize,
     take_tokens: bool,
@@ -538,7 +514,7 @@ pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
         return Err(());
     }
     let token = if take_tokens {
-        let token = tokens.token_mut(*position).ok_or(())?;
+        let token = tokens.get_mut(*position).ok_or(())?;
         std::mem::replace(
             token,
             ParserToken {
@@ -549,7 +525,7 @@ pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
             },
         )
     } else {
-        tokens.token(*position).ok_or(())?.clone()
+        tokens.get(*position).ok_or(())?.clone()
     };
     *position += 1;
     let opening_source_length = token.source.len();
@@ -568,7 +544,7 @@ pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
             )?;
             let last_child_source = function_values.last().map(|value| &value.original_source_text);
             let mut closing_source = None;
-            if let Some(closing) = tokens.token(*position)
+            if let Some(closing) = tokens.get(*position)
                 && matches!(closing.kind, ParserTokenKind::CloseParen)
             {
                 *position += 1;
@@ -603,7 +579,7 @@ pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
             let block_values = consume_component_values(tokens, position, Some(&ending), depth + 1, take_tokens)?;
             let last_child_source = block_values.last().map(|value| &value.original_source_text);
             let mut closing_source = None;
-            if let Some(closing) = tokens.token(*position)
+            if let Some(closing) = tokens.get(*position)
                 && is_same_token_kind(&closing.kind, &ending)
             {
                 *position += 1;
@@ -662,6 +638,19 @@ impl ComponentValueTokens for &[ParserToken] {
 
 pub(crate) fn consume_a_list_of_component_values(tokens: impl ComponentValueTokens) -> Result<Vec<ComponentValue>, ()> {
     consume_a_counted_list_of_component_values(tokens).map(ComponentValueList::into_vec)
+}
+
+/// Whether `values` nest deeper than a list of component values consumed from text may.
+pub(crate) fn exceeds_component_value_nesting_limit(values: &[ComponentValue]) -> bool {
+    fn exceeds(values: &[ComponentValue], depth: usize) -> bool {
+        values.iter().any(|value| match &value.kind {
+            ComponentKind::Token(_) => false,
+            ComponentKind::Function { values, .. } | ComponentKind::SimpleBlock { values, .. } => {
+                depth >= MAXIMUM_COMPONENT_VALUE_NESTING_DEPTH || exceeds(values, depth + 1)
+            }
+        })
+    }
+    exceeds(values, 0)
 }
 
 pub(crate) fn consume_a_counted_list_of_component_values(

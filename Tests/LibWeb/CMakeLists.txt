@@ -1,26 +1,42 @@
+add_subdirectory("test-web")
+
+if (BUILD_TESTING AND NOT WIN32)
+    ladybird_python_test(test-webdriver-http-error-responses.py ARGS $<TARGET_FILE:WebDriver>)
+endif()
+
+if (BUILD_BROWSER_TESTS_ONLY)
+    return()
+endif()
+
+ladybird_test_suite(LibWeb)
+
 set(TEST_SOURCES
-    BenchmarkDisplayListRecording.cpp
-    TestAudioWorkletPipe.cpp
+    TestBlobBytes.cpp
     TestContentBlocker.cpp
-    TestControlMessageQueue.cpp
-    TestCSSIDSpeed.cpp
-    TestCSSInheritedProperty.cpp
-    TestCSSPropertyList.cpp
     TestCSSDecodeBytes.cpp
-    TestDownloadReader.cpp
-    TestDump.cpp
+    TestCSSIDSpeed.cpp
+    TestCSSPropertyList.cpp
     TestEventLoop.cpp
     TestFaviconDecoding.cpp
+    TestFetchAlgorithms.cpp
+    TestFetchBodyDeliveryGate.cpp
+    TestFetchBodyStream.cpp
+    TestFetchByteChannel.cpp
+    TestFetchController.cpp
+    TestFetchControllerRegistry.cpp
     TestFetchEngineMessages.cpp
+    TestFetchEngineRecord.cpp
     TestFetchExecutor.cpp
+    TestFetchManualRedirects.cpp
     TestFetchResponse.cpp
+    TestFetchTaskDestination.cpp
     TestFetchURL.cpp
-    TestHTMLTokenizer.cpp
+    TestFetchWholeBodyRead.cpp
     TestHighResolutionTime.cpp
+    TestHTMLTokenizer.cpp
     TestImageData.cpp
-    TestInitialLoadTracker.cpp
     TestInlineStyle.cpp
-    TestMicrosyntax.cpp
+    TestLoaderConfig.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
     TestSecureContexts.cpp
@@ -28,7 +44,6 @@ set(TEST_SOURCES
     TestSharedCompiledStyleSheet.cpp
     TestSimpleRealm.cpp
     TestSourceHighlighter.cpp
-    TestStorageAreaMirror.cpp
     TestStructuredSerializeCorpus.cpp
     TestStructuredSerializeDurability.cpp
     TestStructuredSerializeFormat.cpp
@@ -47,81 +62,32 @@ if (NOT WIN32)
         TestCSSSyntaxParser.cpp
         TestLengthAbsolutizeParity.cpp
         TestStylePropertyMetadataParity.cpp
-        TestStyleStructRef.cpp
-        TestStyleValueEquality.cpp
     )
 endif()
 
-foreach(source IN LISTS TEST_SOURCES)
-    set(test_libraries LibCompositing LibWeb)
-    if (source STREQUAL "TestSimpleRealm.cpp")
-        list(APPEND test_libraries LibGC LibJS)
-    endif()
-    ladybird_test("${source}" LibWeb LIBS ${test_libraries})
-endforeach()
-
-
-target_link_libraries(BenchmarkDisplayListRecording PRIVATE LibGC LibGfx LibIPC LibJS LibURL LibWebView)
-target_link_libraries(TestAudioWorkletPipe PRIVATE LibCore LibThreading)
-target_link_libraries(TestContentBlocker PRIVATE LibURL)
-target_link_libraries(TestStorageAreaMirror PRIVATE LibURL LibWebCommon)
-target_link_libraries(TestFetchEngineMessages PRIVATE LibCore LibIPC LibRequests)
-target_link_libraries(TestFetchExecutor PRIVATE LibCore LibIPC LibThreading)
-if (NOT WIN32)
-    target_link_libraries(TestCSSSyntaxParser PRIVATE LibThreading)
-endif()
-target_link_libraries(TestDownloadReader PRIVATE LibGC LibJS LibURL)
-target_link_libraries(TestFaviconDecoding PRIVATE LibCore LibGC LibGfx LibJS)
-target_link_libraries(TestFetchResponse PRIVATE LibGC LibHTTP LibJS LibRequests LibURL)
-target_link_libraries(TestFetchURL PRIVATE LibURL)
-target_link_libraries(TestImageData PRIVATE LibGC LibJS)
-target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
-target_link_libraries(TestStructuredSerializeCorpus PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
-target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC LibWasm)
-target_link_libraries(TestStructuredSerializeFormat PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
-target_link_libraries(TestStructuredSerializeHardening PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
-target_link_libraries(TestStructuredSerializeSharedArrayBuffer PRIVATE LibGC LibJS LibIPC)
-target_link_libraries(TestSecureContexts PRIVATE LibURL)
-target_link_libraries(TestSessionHistoryEntry PRIVATE LibJS LibURL)
-target_link_libraries(TestSourceHighlighter PRIVATE LibURL)
-target_link_libraries(TestWrapperWorld PRIVATE LibGC LibJS LibURL)
-target_link_libraries(TestSharedCompiledStyleSheet PRIVATE LibGC LibJS LibURL)
-target_sources(TestWorldCallback PRIVATE
-    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/DOM/IDLEventListener.cpp
-    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
+target_sources(TestLibWeb PRIVATE
+    ${TEST_SOURCES}
+    ${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/DOM/IDLEventListener.cpp
+    ${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
 )
-target_link_libraries(TestWorldCallback PRIVATE LibGC LibJS LibWeb)
-target_sources(TestWindowProxyWorld PRIVATE
-    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/DOM/IDLEventListener.cpp
-    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
-)
-target_link_libraries(TestWindowProxyWorld PRIVATE LibGC LibJS LibWeb)
+target_link_libraries(TestLibWeb PRIVATE LibCompositing LibCrypto LibFileSystem LibGC LibGfx LibHTTP LibIPC LibJS LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
 
-add_subdirectory("test-web")
-
-if (BUILD_TESTING AND NOT WIN32)
-    add_test(
-        NAME TestWebDriverHTTPErrorResponses
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-http-error-responses.py $<TARGET_FILE:WebDriver>
-    )
-    set_tests_properties(TestWebDriverHTTPErrorResponses PROPERTIES TIMEOUT 120)
-endif()
+# NB: This one needs a process of its own: its agents must not share one with the persistent main-thread VM of the suite.
+ladybird_test(TestAgentThreads.cpp LibWeb LIBS LibCore LibGC LibGfx LibIPC LibJS LibThreading LibURL LibWeb LibWebCommon)
 
 # The check reads the symbols of the build's objects with nm, which can't see into an LTO build's bitcode objects and
 # isn't the toolchain's symbol reader on Windows.
 if (BUILD_TESTING AND NOT WIN32 AND NOT CMAKE_INTERPROCEDURAL_OPTIMIZATION)
-    add_test(
+    ladybird_python_test("${LADYBIRD_SOURCE_DIR}/Meta/check-dead-rust-exports.py"
         NAME TestDeadRustExports
-        COMMAND ${Python3_EXECUTABLE} ${LADYBIRD_SOURCE_DIR}/Meta/check-dead-rust-exports.py
+        ARGS
             --nm ${CMAKE_NM}
             --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
             --source-root ${LADYBIRD_SOURCE_DIR}
             $<TARGET_FILE:libweb_bindings_rust>
-            $<TARGET_FILE:libweb_content_blocker_rust>
-    )
+            $<TARGET_FILE:libweb_content_blocker_rust>)
 endif()
 
-target_link_libraries(TestInlineStyle PRIVATE LibCore LibGC LibGfx LibJS LibURL)
 
 add_subdirectory("AccessibilityBridge")
 add_subdirectory("AccessibilityBridgeMac")

@@ -213,16 +213,17 @@ struct LocationWrapperTraits {
         }
 
         // 2. Throw a "SecurityError" DOMException.
-        auto& realm = HTML::relevant_realm(wrapper);
-        return throw_completion(realm, WebIDL::SecurityError::create(realm, Utf16String::formatted("Can't define property '{}' on cross-origin object", property_key)));
+        return throw_completion(*wrapper.vm().current_realm(), WebIDL::SecurityError::create(Utf16String::formatted("Can't define property '{}' on cross-origin object", property_key)));
     }
 
     // 7.10.5.7 [[Get]] ( P, Receiver ), https://html.spec.whatwg.org/multipage/history.html#location-get
     static JS::ThrowCompletionOr<JS::Value> get(JS::HostObject const& wrapper, JS::PropertyKey const& property_key, JS::Value receiver, JS::CacheableGetPropertyMetadata* cacheable_metadata, JS::Object::PropertyLookupPhase phase)
     {
         // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinaryGet(this, P, Receiver).
-        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
-            return wrapper.ordinary_get(property_key, receiver, cacheable_metadata, phase);
+        if (HTML::is_platform_object_same_origin(location_of(wrapper))) {
+            auto may_cache_lookup = phase == JS::Object::PropertyLookupPhase::OwnProperty;
+            return wrapper.ordinary_get(property_key, receiver, may_cache_lookup ? cacheable_metadata : nullptr, phase);
+        }
 
         // 2. Return ? CrossOriginGet(this, P, Receiver).
         return HTML::cross_origin_get(wrapper.vm(), wrapper, property_key, receiver);
@@ -232,8 +233,10 @@ struct LocationWrapperTraits {
     static JS::ThrowCompletionOr<bool> set(JS::HostObject& wrapper, JS::PropertyKey const& property_key, JS::Value value, JS::Value receiver, JS::CacheableSetPropertyMetadata* cacheable_metadata, JS::Object::PropertyLookupPhase phase)
     {
         // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinarySet(this, P, V, Receiver).
-        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
-            return wrapper.ordinary_set(property_key, value, receiver, cacheable_metadata, phase);
+        if (HTML::is_platform_object_same_origin(location_of(wrapper))) {
+            auto may_cache_lookup = phase == JS::Object::PropertyLookupPhase::OwnProperty;
+            return wrapper.ordinary_set(property_key, value, receiver, may_cache_lookup ? cacheable_metadata : nullptr, phase);
+        }
 
         // 2. Return ? CrossOriginSet(this, P, V, Receiver).
         return HTML::cross_origin_set(wrapper.vm(), wrapper, property_key, value, receiver);
@@ -247,8 +250,7 @@ struct LocationWrapperTraits {
             return wrapper.ordinary_delete(property_key);
 
         // 2. Throw a "SecurityError" DOMException.
-        auto& realm = HTML::relevant_realm(wrapper);
-        return throw_completion(realm, WebIDL::SecurityError::create(realm, Utf16String::formatted("Can't delete property '{}' on cross-origin object", property_key)));
+        return throw_completion(*wrapper.vm().current_realm(), WebIDL::SecurityError::create(Utf16String::formatted("Can't delete property '{}' on cross-origin object", property_key)));
     }
 
     // 7.10.5.10 [[OwnPropertyKeys]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-ownpropertykeys
@@ -262,6 +264,11 @@ struct LocationWrapperTraits {
 
         // 2. Return CrossOriginOwnPropertyKeys(this).
         return HTML::cross_origin_own_property_keys(location);
+    }
+
+    static void preserve_identity(JS::HostObject& wrapper)
+    {
+        preserve_identity_of_platform_object(wrapper);
     }
 
     static void finalize(JS::HostObject& wrapper)

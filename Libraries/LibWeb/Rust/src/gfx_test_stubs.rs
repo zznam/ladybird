@@ -7,8 +7,13 @@
 //! Stand-ins for the LibGfx font, shaping and path entry points, which a unit test links through a document's render
 //! state, without the C++ runtime, but never reaches.
 
-use libgfx_rust::text_layout::{DrawGlyph, TextType};
+use libgfx_rust::text_layout::{DrawGlyph, JoiningContext, ShapedGlyph, TextType};
 use std::ffi::c_void;
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_is_invisible(_font: *const c_void) -> bool {
+    unreachable!("no unit test reads a font");
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_font_is_emoji_font(_font: *const c_void) -> bool {
@@ -20,6 +25,8 @@ extern "C" fn ladybird_gfx_emoji_presentation_for_code_point(
     _code_point: u32,
     _next_code_point: u32,
     _has_next_code_point: bool,
+    _code_point_after_next: u32,
+    _has_code_point_after_next: bool,
 ) -> u8 {
     unreachable!("no unit test reads a font");
 }
@@ -31,6 +38,43 @@ extern "C" fn ladybird_gfx_font_contains_glyph(_font: *const c_void, _code_point
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_font_glyph_id(_font: *const c_void, _code_point: u32) -> u32 {
+    unreachable!("no unit test reads a font");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_math_data(_font: *const c_void) -> *const libgfx_rust::math_table::FfiMathData {
+    unreachable!("no unit test reads a font");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_glyph_metrics(
+    _font: *const c_void,
+    _glyph_id: u32,
+    _out_metrics: *mut libgfx_rust::math_table::FfiGlyphMetrics,
+) {
+    unreachable!("no unit test reads a font");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_math_glyph_variants(
+    _font: *const c_void,
+    _glyph_id: u32,
+    _horizontal: bool,
+    _out_variants: *mut libgfx_rust::math_table::FfiMathGlyphVariant,
+    _capacity: usize,
+) -> usize {
+    unreachable!("no unit test reads a font");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_math_glyph_assembly(
+    _font: *const c_void,
+    _glyph_id: u32,
+    _horizontal: bool,
+    _out_parts: *mut libgfx_rust::math_table::FfiMathGlyphPart,
+    _capacity: usize,
+    _out_italics_correction: *mut f32,
+) -> usize {
     unreachable!("no unit test reads a font");
 }
 
@@ -47,6 +91,8 @@ extern "C" fn ladybird_gfx_system_fallback_font(
     _slope: u8,
     _prefer_color_emoji: bool,
     _point_size: f32,
+    _features: *const c_void,
+    _feature_count: usize,
 ) -> *const c_void {
     unreachable!("no unit test reads a font");
 }
@@ -74,8 +120,10 @@ extern "C" fn ladybird_gfx_shape_text_uncached(
     _text_type: TextType,
     _letter_spacing: f32,
     _word_spacing: f32,
+    _joining_context: JoiningContext,
+    _vertical_forms: bool,
     _sink: *mut c_void,
-    _emit: unsafe extern "C" fn(*mut c_void, *const DrawGlyph, usize, f32, usize, f32),
+    _emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32, f32, bool),
 ) {
     unreachable!("no unit test shapes text");
 }
@@ -83,7 +131,18 @@ extern "C" fn ladybird_gfx_shape_text_uncached(
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_glyph_run_bounding_box(
     _font: *const c_void,
-    _glyphs: *const DrawGlyph,
+    _glyphs: *const ShapedGlyph,
+    _glyph_count: usize,
+    _scale: f32,
+    _out_rect: *mut f32,
+) {
+    unreachable!("no unit test shapes text");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_glyph_run_ink_bounding_box(
+    _font: *const c_void,
+    _glyphs: *const ShapedGlyph,
     _glyph_count: usize,
     _scale: f32,
     _out_rect: *mut f32,
@@ -95,7 +154,7 @@ extern "C" fn ladybird_gfx_glyph_run_bounding_box(
 #[allow(clippy::too_many_arguments)]
 extern "C" fn ladybird_gfx_glyph_run_glyph_intercepts(
     _font: *const c_void,
-    _glyphs: *const DrawGlyph,
+    _glyphs: *const ShapedGlyph,
     _glyph_count: usize,
     _scale: f32,
     _y_top: f32,

@@ -1,8 +1,10 @@
 # Crash reports
 
 On macOS and Linux, Ladybird saves local text reports when the browser or a
-helper process crashes: WebContent, WebWorker, RequestServer, ImageDecoder
-and Compositor. Reports are stored in
+helper process crashes: WebContent, RequestServer, ImageDecoder, Compositor,
+MediaServer, AudioServer and VideoDecoderServer. A worker runs on a thread of a
+WebContent process, so its crash is a WebContent crash and is reported as one.
+Reports are stored in
 `~/Library/Application Support/Ladybird/CrashReports/` on macOS and
 `~/.local/share/Ladybird/CrashReports/` on Linux, or under
 `$XDG_DATA_HOME/Ladybird/CrashReports/` if that variable is set.
@@ -64,9 +66,9 @@ Git metadata report an unknown revision; local source modifications and
 build-machine target to reproduce.
 
 Reports also contain the time of the crash, the browser version, platform,
-architecture, numeric kernel release, build configuration, process uptime when
-available, termination signal or exit code, signal code when available, and a
-bounded native stack. Stack frames identify their binaries by Mach-O UUID on
+architecture, numeric kernel release, build configuration, whether the sandbox
+was off, process uptime when available, termination signal or exit code, signal
+code when available, and a bounded native stack. Stack frames identify their binaries by Mach-O UUID on
 macOS or ELF build ID on Linux and contain object addresses with the load
 relocation removed. When a binary is also loaded in the surviving browser, its
 nearest available native symbol and the offset from that symbol are included.

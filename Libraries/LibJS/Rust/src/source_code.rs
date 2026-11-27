@@ -7,27 +7,32 @@
 //! The code a script, module or function was compiled from, which functions keep to compile themselves lazily and to
 //! recover their [[SourceText]].
 
-use std::cell::OnceCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ak::Utf16String;
 
+use crate::source_text::SourceText;
 use crate::utf16::Utf16View;
 
 pub struct SourceCode {
     filename: Utf16String,
-    code: Utf16String,
-    // The code widened to UTF-16 code units, made on first use for code in the ASCII storage kind, for an embedder
-    // that hands the code to a parser on another thread through SourceCode::utf16_data().
-    utf16_code_units_of_ascii_code: OnceCell<Box<[u16]>>,
+    code: Arc<SourceText>,
 }
 
 impl SourceCode {
     pub fn create(filename: Utf16String, code: Utf16String) -> Rc<SourceCode> {
         Rc::new(Self {
             filename,
-            code,
-            utf16_code_units_of_ascii_code: OnceCell::new(),
+            code: SourceText::of(&code),
+        })
+    }
+
+    /// Source code under `filename` that shares the code of `other`, parked or not.
+    pub fn create_sharing_code(filename: Utf16String, other: &SourceCode) -> Rc<SourceCode> {
+        Rc::new(Self {
+            filename,
+            code: Arc::clone(&other.code),
         })
     }
 
@@ -35,22 +40,13 @@ impl SourceCode {
         &self.filename
     }
 
-    pub fn code(&self) -> &Utf16String {
-        &self.code
+    /// The code, which is decompressed first if nothing asked for it in a while (see [`SourceText`]).
+    pub fn code(&self) -> Utf16String {
+        self.code.get()
     }
 
     pub fn length_in_code_units(&self) -> usize {
-        Utf16View::of_string(&self.code).length_in_code_units()
-    }
-
-    /// The code as UTF-16 code units, which stay where they are for as long as the source code lives.
-    pub fn utf16_code_units(&self) -> &[u16] {
-        match Utf16View::of_string(&self.code) {
-            Utf16View::Utf16(code_units) => code_units,
-            ascii @ Utf16View::Ascii(_) => self
-                .utf16_code_units_of_ascii_code
-                .get_or_init(|| ascii.code_units().collect()),
-        }
+        self.code.length_in_code_units()
     }
 
     pub fn source_text_from_offsets(&self, start_offset: usize, length: usize) -> Utf16String {
@@ -60,7 +56,7 @@ impl SourceCode {
 
         assert!(start_offset <= usize::MAX - length);
 
-        Utf16View::of_string(&self.code)
+        Utf16View::of_string(&self.code.get())
             .substring_view(start_offset, length)
             .to_utf16_string()
     }

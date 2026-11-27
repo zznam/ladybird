@@ -6,10 +6,10 @@
 
 #pragma once
 
-#include <AK/HashTable.h>
 #include <AK/Vector.h>
 #include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 
@@ -55,7 +55,6 @@ public:
     Vector<GC::Root<Navigable>> document_tree_child_navigables();
 
     virtual GC::Ptr<WindowProxy> active_window_proxy() override;
-    GC::Ref<WindowProxy> active_window_proxy_in_realm_of(Window&);
     GC::Ref<RemoteWindow> active_window();
     virtual Utf16String const& target_name() const override { return m_replicated_state.target_name; }
     virtual Optional<u64> browsing_context_group_id() const override { return m_replicated_state.browsing_context_group_id; }
@@ -65,7 +64,9 @@ public:
 
     virtual Optional<URL::URL> active_document_url() const override { return m_replicated_state.active_document_url; }
     virtual Optional<URL::Origin> active_document_origin() const override { return m_replicated_state.active_document_origin; }
+    virtual SandboxingFlagSet active_document_sandboxing_flag_set() const override { return m_replicated_state.active_document_sandboxing_flag_set; }
     virtual bool active_document_is_fully_active() const override { return m_replicated_state.active_document_is_fully_active; }
+    virtual bool active_window_has_sticky_activation() const override { return m_replicated_state.active_window_has_sticky_activation; }
     virtual bool active_document_is_completely_loaded() const override { return m_replicated_state.active_document_is_completely_loaded; }
     virtual bool active_document_is(DOM::Document const&) const override { return false; }
     virtual Vector<GC::Root<Navigable>> active_document_inclusive_descendant_navigables() override;
@@ -76,6 +77,7 @@ public:
     virtual bool active_browsing_context_is_auxiliary() const override { return m_replicated_state.active_browsing_context_is_auxiliary; }
     GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const;
     virtual GC::Ptr<Navigable> active_browsing_context_opener_navigable() const override;
+    virtual GC::Ptr<Navigable> active_browsing_context_one_permitted_sandboxed_navigator() const override;
     virtual ReplicatedContainerState container_state() const override;
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const override;
@@ -87,7 +89,6 @@ private:
     RemoteNavigable(GC::Ref<Page>, CrossProcessId, GC::Ptr<Navigable> parent, ReplicatedNavigableState);
 
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
 
     virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) override;
 
@@ -107,7 +108,7 @@ private:
     bool m_has_been_destroyed { false };
 };
 
-WEB_API HashTable<GC::RawRef<RemoteNavigable>>& all_remote_navigables();
+WEB_API GC::WeakHashSet<RemoteNavigable>& all_remote_navigables();
 WEB_API GC::Ptr<RemoteNavigable> remote_navigable_with_id(Page const&, CrossProcessId);
 
 }

@@ -59,7 +59,7 @@ pub(crate) const MAXIMUM_COLUMN_COUNT: usize = 1000;
 
 pub(crate) fn effects_need_unbroken_box(style: ComputedValuesView<'_>) -> bool {
     crate::painting::style_queries::clip_path_has_value(style.mask())
-        || crate::painting::style_queries::mask_layers_have_image(style.mask())
+        || crate::painting::style_queries::has_css_mask_image(style.mask())
         || style.effects().backdrop_filter.operations.length != 0
 }
 
@@ -191,6 +191,7 @@ pub(crate) struct BlockBreakToken {
     pub(crate) node: Node,
     pub(crate) consumed_block_size: CssPixels,
     pub(crate) resume: BlockResume,
+    pub(crate) deferred_floats: Vec<Node>,
 }
 
 impl BlockResume {
@@ -213,12 +214,39 @@ impl BlockBreakToken {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LineRootFragmentation {
     pub(crate) block_size: Option<CssPixels>,
     pub(crate) resume: Option<LinePosition>,
+    pub(crate) deferred_floats: Vec<Node>,
     pub(crate) fragmentainer_had_content: bool,
     pub(crate) break_before_is_avoided: bool,
+}
+
+/// The layout of a box in the pass that measures the contents of a multicol container, which later passes over the
+/// columns place wherever the box stays unbroken.
+pub(super) struct ColumnBoxLayout {
+    pub(super) entry: std::sync::Arc<in_flow_block_cache::InFlowBlockEntry>,
+    pub(super) fragment: std::sync::Arc<fragment_tree::Fragment>,
+    /// How far a column has to reach below the start of the box's border box for nothing in the box to break.
+    pub(super) block_size_that_stays_unbroken: CssPixels,
+}
+
+#[derive(Default)]
+pub(crate) struct ColumnBoxLayouts {
+    layouts_by_slot: RefCell<HashMap<u32, Rc<ColumnBoxLayout>>>,
+}
+
+impl ColumnBoxLayouts {
+    pub(super) fn keep(&self, node: Node, layout: ColumnBoxLayout) {
+        self.layouts_by_slot
+            .borrow_mut()
+            .insert(node.slot_index(), Rc::new(layout));
+    }
+
+    pub(super) fn layout_of(&self, node: Node) -> Option<Rc<ColumnBoxLayout>> {
+        self.layouts_by_slot.borrow().get(&node.slot_index()).cloned()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -229,39 +257,56 @@ pub(crate) struct FragmentainerOutcome {
     pub(crate) tallest_unbreakable_block_size: CssPixels,
     pub(crate) violates_break_avoidance: bool,
     pub(crate) overflows: bool,
+    /// How far the in-flow content laid out in the fragmentainer reaches: the furthest block end of its boxes and lines,
+    /// which a negative margin after them doesn't take back.
+    pub(crate) content_block_end: CssPixels,
+    /// The furthest block end of the unbreakable lines of a line root inside the box being laid out, which counts toward
+    /// `content_block_end` only once that box stays in the fragmentainer.
+    pub(crate) pending_nested_lines_block_end: Option<CssPixels>,
 }
 
-pub(crate) struct FragmentainerContext {
+/// The space a fragmentainer run lays out in: the fragmentainer's size, the break the run continues from, how it
+/// breaks, and the memos the columns of a multi-column box share.
+pub(crate) struct FragmentainerSpace {
     pub(crate) block_size: Option<CssPixels>,
     pub(crate) honors_forced_breaks: bool,
     pub(crate) incoming: Option<Rc<BlockBreakToken>>,
     pub(crate) inline_items: Rc<inline_level_iterator::InlineItemCache>,
+    pub(crate) box_layouts: Rc<ColumnBoxLayouts>,
+    /// Whether this run keeps the layouts of its boxes for the passes after it, which place them instead.
+    pub(crate) keeps_box_layouts: bool,
     pub(crate) early_break_before: Option<Node>,
     pub(crate) allows_early_break_requests: bool,
-    outcome: RefCell<FragmentainerOutcome>,
 }
 
-impl FragmentainerContext {
-    pub(crate) fn new(
-        block_size: Option<CssPixels>,
-        honors_forced_breaks: bool,
-        incoming: Option<Rc<BlockBreakToken>>,
-        inline_items: Rc<inline_level_iterator::InlineItemCache>,
-        early_break_before: Option<Node>,
-        allows_early_break_requests: bool,
-    ) -> Self {
-        Self {
-            block_size,
-            honors_forced_breaks,
-            incoming,
-            inline_items,
-            early_break_before,
-            allows_early_break_requests,
-            outcome: RefCell::new(FragmentainerOutcome::default()),
-        }
+impl FragmentainerSpace {
+    pub(crate) fn exceeds(&self, block_end: CssPixels) -> bool {
+        self.block_size.is_some_and(|block_size| block_end > block_size)
+    }
+}
+
+/// The fragmentainer a run lays out in, as the run sees it: its space, and what the run found out so far about
+/// breaking in it, which the run's state keeps.
+#[derive(Clone, Copy)]
+pub(crate) struct Fragmentainer<'run> {
+    space: &'run FragmentainerSpace,
+    outcome: &'run RefCell<FragmentainerOutcome>,
+}
+
+impl std::ops::Deref for Fragmentainer<'_> {
+    type Target = FragmentainerSpace;
+
+    fn deref(&self) -> &FragmentainerSpace {
+        self.space
+    }
+}
+
+impl<'run> Fragmentainer<'run> {
+    pub(crate) fn new(space: &'run FragmentainerSpace, outcome: &'run RefCell<FragmentainerOutcome>) -> Self {
+        Self { space, outcome }
     }
 
-    pub(crate) fn outcome_mut(&self) -> RefMut<'_, FragmentainerOutcome> {
+    pub(crate) fn outcome_mut(&self) -> RefMut<'run, FragmentainerOutcome> {
         self.outcome.borrow_mut()
     }
 
@@ -274,14 +319,6 @@ impl FragmentainerContext {
             outcome.needs_early_break_before = Some(node);
         }
         true
-    }
-
-    pub(crate) fn take_outcome(&self) -> FragmentainerOutcome {
-        self.outcome.take()
-    }
-
-    pub(crate) fn exceeds(&self, block_end: CssPixels) -> bool {
-        self.block_size.is_some_and(|block_size| block_end > block_size)
     }
 
     pub(crate) fn note_space_shortage(&self, block_end: CssPixels) {
@@ -304,4 +341,33 @@ impl FragmentainerContext {
         let mut outcome = self.outcome.borrow_mut();
         outcome.tallest_unbreakable_block_size = outcome.tallest_unbreakable_block_size.max(block_size);
     }
+
+    pub(crate) fn note_content_block_end(&self, block_end: CssPixels) {
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.content_block_end = outcome.content_block_end.max(block_end);
+    }
+
+    pub(crate) fn note_pending_nested_lines_block_end(&self, block_end: CssPixels) {
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.pending_nested_lines_block_end = Some(
+            outcome
+                .pending_nested_lines_block_end
+                .map_or(block_end, |end| end.max(block_end)),
+        );
+    }
+
+    pub(crate) fn take_pending_nested_lines_block_end(&self) -> Option<CssPixels> {
+        self.outcome.borrow_mut().pending_nested_lines_block_end.take()
+    }
+}
+
+/// What the run of a fragmentainer hands the run of the box the fragmentainer belongs to.
+pub(crate) struct FragmentainerRunResult {
+    pub(crate) layout: super::formatting_context::LayoutResult,
+    pub(crate) outcome: FragmentainerOutcome,
+    /// What the run laid out in the fragmentainer, where it builds fragments, as the fragmentainer has no fragment of
+    /// its own.
+    pub(crate) contents: Option<super::fragment_tree::RunContents>,
+    /// The lines the run laid out in the fragmentainer.
+    pub(crate) root_line_data: Option<std::sync::Arc<super::inline_content::InlineContent>>,
 }

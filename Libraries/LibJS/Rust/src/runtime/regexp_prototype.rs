@@ -42,7 +42,7 @@ use crate::runtime::realm::Realm;
 use crate::runtime::realm_watchpoints;
 use crate::runtime::regexp_constructor::is_raw_native_function_running;
 use crate::runtime::regexp_legacy_static_properties::{
-    invalidate_legacy_regexp_static_properties, update_legacy_regexp_static_properties_lazy,
+    LegacyCaptureSlots, invalidate_legacy_regexp_static_properties, update_legacy_regexp_static_properties_lazy,
 };
 #[cfg(feature = "jit")]
 use crate::runtime::regexp_object::NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET;
@@ -52,10 +52,8 @@ use crate::runtime::regexp_object::{
 use crate::runtime::regexp_string_iterator::RegExpStringIterator;
 use crate::runtime::string_prototype::code_point_at;
 use crate::runtime::value::same_value;
+use crate::u32_from_usize;
 use crate::utf16::{Utf16StringBuilder, Utf16View, concatenate};
-
-/// The most legacy static properties ($1-$9) a match updates.
-const MAX_LEGACY_CAPTURES: u32 = 9;
 
 fn contains_code_unit(string: &Utf16String, code_unit: u8) -> bool {
     Utf16View::of_string(string)
@@ -216,9 +214,6 @@ fn increment_last_index(
     )
 }
 
-/// get_or_compile_regex(): the compiled regex of a RegExp object, which is compiled the first time it is asked for.
-/// Returns None for a pattern the regex engine cannot compile.
-// FIXME: Add an eviction policy to bound the size of this cache.
 struct RegexCacheKey {
     pattern: Utf16String,
     flags: RegExpFlags,
@@ -241,14 +236,31 @@ impl Hash for RegexCacheKey {
     }
 }
 
-thread_local! {
-    /// The compiled regexes of every pattern and flags. Compiled regexes hold no cells, and each thread runs its own
-    /// VM, so each thread keeps its own.
-    static REGEX_CACHE: RefCell<HashMap<RegexCacheKey, Rc<EcmaScriptRegex>, foldhash::fast::RandomState>> =
-        RefCell::new(HashMap::default());
+/// The compiled regexes of the VM by pattern and flags, so that RegExp objects of one pattern share one. Compiled
+/// regexes hold no cells. A regex stays for as long as a RegExp object holds it, and one collection longer.
+#[derive(Default)]
+pub struct RegexCache {
+    regexes: RefCell<HashMap<RegexCacheKey, Rc<EcmaScriptRegex>, foldhash::fast::RandomState>>,
 }
 
-fn get_or_compile_regex(regexp_object: &RegExpObject) -> Option<Rc<EcmaScriptRegex>> {
+impl RegexCache {
+    /// Lets go of every regex, for a process that is short of memory.
+    pub(crate) fn clear(&self) {
+        let mut regexes = self.regexes.borrow_mut();
+        regexes.clear();
+        regexes.shrink_to_fit();
+    }
+
+    /// Lets go of the regexes that only the cache holds. RegExp objects that die in a collection let go of theirs when
+    /// they are swept, after this runs, so their regexes go at the next collection.
+    pub(crate) fn remove_unused(&self) {
+        self.regexes.borrow_mut().retain(|_, regex| Rc::strong_count(regex) > 1);
+    }
+}
+
+/// get_or_compile_regex(): the compiled regex of a RegExp object, which is compiled the first time it is asked for.
+/// Returns None for a pattern the regex engine cannot compile.
+fn get_or_compile_regex(vm: &Vm, regexp_object: &RegExpObject) -> Option<Rc<EcmaScriptRegex>> {
     // Fast path: check the inline cache on the RegExpObject.
     if let Some(cached) = regexp_object.cached_regex() {
         return Some(cached);
@@ -262,7 +274,7 @@ fn get_or_compile_regex(regexp_object: &RegExpObject) -> Option<Rc<EcmaScriptReg
         flags: flag_bits,
     };
 
-    if let Some(cached) = REGEX_CACHE.with_borrow(|cache| cache.get(&cache_key).cloned()) {
+    if let Some(cached) = vm.regex_cache().regexes.borrow().get(&cache_key).cloned() {
         regexp_object.set_cached_regex(Some(Rc::clone(&cached)));
         return Some(cached);
     }
@@ -280,7 +292,10 @@ fn get_or_compile_regex(regexp_object: &RegExpObject) -> Option<Rc<EcmaScriptReg
         EcmaScriptRegex::compile(Utf16View::Utf16(&normalized_pattern), compile_flags_for(flag_bits)).ok()?;
 
     let compiled = Rc::new(compiled);
-    REGEX_CACHE.with_borrow_mut(|cache| cache.insert(cache_key, Rc::clone(&compiled)));
+    vm.regex_cache()
+        .regexes
+        .borrow_mut()
+        .insert(cache_key, Rc::clone(&compiled));
     regexp_object.set_cached_regex(Some(Rc::clone(&compiled)));
     Some(compiled)
 }
@@ -290,7 +305,7 @@ struct ExecWithLastIndexResult {
     effective_last_index: usize,
 }
 
-fn exec_with_unicode_last_index_retry(
+fn exec_with_unicode_last_index(
     compiled_regex: &EcmaScriptRegex,
     utf16_view: Utf16View<'_>,
     last_index: usize,
@@ -316,68 +331,21 @@ fn exec_with_unicode_last_index_retry(
         return exec_at(last_index);
     }
 
-    // NB: V8/SpiderMonkey first try the code point that starts at the
-    // surrogate pair boundary, but zero-width patterns can still match at the
-    // original low-surrogate index when that earlier retry fails. Consuming
-    // retries must still be rejected so /u and /v regexes never split the
-    // surrogate pair.
-    let snapped_result = exec_at(last_index - 1);
-    if snapped_result.result != MatchResult::NoMatch {
-        return snapped_result;
-    }
-
-    let retried_result = exec_at(last_index);
-    if retried_result.result != MatchResult::Match {
-        return retried_result;
-    }
-
-    let match_start = compiled_regex.capture_slot(0);
-    let match_end = compiled_regex.capture_slot(1);
-    if match_start >= 0 && match_end >= 0 && match_start as usize == last_index && match_end as usize == last_index {
-        return retried_result;
-    }
-
-    ExecWithLastIndexResult {
-        result: MatchResult::NoMatch,
-        effective_last_index: last_index,
-    }
-}
-
-/// The start and end of each of the first nine captures of the last exec of `compiled_regex`, which the legacy
-/// static properties are updated with.
-/// The capture slots that the legacy static properties record for $1 through $9, kept inline.
-struct LegacyCaptureSlots {
-    starts: [i32; MAX_LEGACY_CAPTURES as usize],
-    ends: [i32; MAX_LEGACY_CAPTURES as usize],
-    count: usize,
-}
-
-impl LegacyCaptureSlots {
-    fn starts(&self) -> &[i32] {
-        &self.starts[..self.count]
-    }
-
-    fn ends(&self) -> &[i32] {
-        &self.ends[..self.count]
-    }
+    // https://tc39.es/ecma262/#sec-regexpbuiltinexec
+    // 13.b. Let inputIndex be the index into input of the character that was obtained from element lastIndex of string.
+    exec_at(last_index - 1)
 }
 
 fn legacy_capture_slots(compiled_regex: &EcmaScriptRegex, n_capture_groups: u32) -> LegacyCaptureSlots {
     let total_groups = compiled_regex.total_groups();
-    let capture_count = MAX_LEGACY_CAPTURES.min(n_capture_groups);
-    let mut slots = LegacyCaptureSlots {
-        starts: [-1; MAX_LEGACY_CAPTURES as usize],
-        ends: [-1; MAX_LEGACY_CAPTURES as usize],
-        count: capture_count as usize,
-    };
-    for group in 0..capture_count {
-        let group_index = group + 1;
-        if group_index < total_groups {
-            slots.starts[group as usize] = compiled_regex.capture_slot(group_index * 2);
-            slots.ends[group as usize] = compiled_regex.capture_slot(group_index * 2 + 1);
+    LegacyCaptureSlots::new(n_capture_groups as usize, |slot| {
+        let slot = u32_from_usize(slot);
+        if slot / 2 < total_groups {
+            compiled_regex.capture_slot(slot)
+        } else {
+            -1
         }
-    }
-    slots
+    })
 }
 
 fn throw_backtrack_limit_exceeded<T>(vm: &Vm) -> ThrowCompletionOr<T> {
@@ -457,13 +425,13 @@ fn regexp_builtin_exec(
     }
     let last_index = last_index as usize;
 
-    let Some(compiled_regex) = get_or_compile_regex(&regexp_object) else {
+    let Some(compiled_regex) = get_or_compile_regex(vm, &regexp_object) else {
         return Ok(Value::NULL);
     };
 
     let unicode_mode = flag_bits.has(RegExpFlags::UNICODE) || flag_bits.has(RegExpFlags::UNICODE_SETS);
     let utf16_view = string.utf16_string_view();
-    let exec_result = exec_with_unicode_last_index_retry(&compiled_regex, utf16_view, last_index, unicode_mode, sticky);
+    let exec_result = exec_with_unicode_last_index(&compiled_regex, utf16_view, last_index, unicode_mode, sticky);
     if exec_result.result == MatchResult::LimitExceeded {
         return throw_backtrack_limit_exceeded(vm);
     }
@@ -628,8 +596,7 @@ fn regexp_builtin_exec(
             string,
             match_index,
             end_index,
-            legacy_captures.starts(),
-            legacy_captures.ends(),
+            &legacy_captures,
         );
     } else if realm == regexp_object.realm() {
         invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
@@ -808,17 +775,15 @@ fn has_intrinsic_getter(
 
 impl RegExpPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<RegExpPrototype> {
-        realm.create_object(
-            vm,
-            RegExpPrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| RegExpPrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -1298,7 +1263,7 @@ impl RegExpPrototype {
         // getter reading these very bits, which the predicate has just confirmed is what would happen.
         let full_unicode = is_unicode || is_unicode_sets;
 
-        let Some(compiled_regex) = get_or_compile_regex(&typed_regexp) else {
+        let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp) else {
             return Ok(None);
         };
 
@@ -1390,7 +1355,7 @@ impl RegExpPrototype {
                     break;
                 }
 
-                let exec_result = exec_with_unicode_last_index_retry(
+                let exec_result = exec_with_unicode_last_index(
                     &compiled_regex,
                     utf16_view,
                     last_index as usize,
@@ -1496,8 +1461,7 @@ impl RegExpPrototype {
                 string,
                 last_match_start,
                 last_match_end,
-                legacy_captures.starts(),
-                legacy_captures.ends(),
+                &legacy_captures,
             );
         } else if had_match && realm == typed_regexp.realm() {
             invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
@@ -1547,7 +1511,7 @@ impl RegExpPrototype {
         if flag_bits.has(RegExpFlags::STICKY) {
             return Ok(None);
         }
-        let Some(compiled_regex) = get_or_compile_regex(&typed_regexp) else {
+        let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp) else {
             return Ok(None);
         };
         if !compiled_regex.named_groups().is_empty() {
@@ -1564,7 +1528,7 @@ impl RegExpPrototype {
         let mut last_index = 0;
         while last_index <= length {
             let exec_result =
-                exec_with_unicode_last_index_retry(&compiled_regex, string_view, last_index, full_unicode, false);
+                exec_with_unicode_last_index(&compiled_regex, string_view, last_index, full_unicode, false);
             if exec_result.result == MatchResult::LimitExceeded {
                 return throw_backtrack_limit_exceeded(vm);
             }
@@ -1599,17 +1563,14 @@ impl RegExpPrototype {
 
         if let Some(last_match) = slots.rchunks(slots_per_match).next() {
             if typed_regexp.legacy_features_enabled() && realm == typed_regexp.realm() {
-                let capture_count = (slots_per_match / 2 - 1).min(MAX_LEGACY_CAPTURES as usize);
-                let starts: Vec<i32> = (1..=capture_count).map(|group| last_match[group * 2]).collect();
-                let ends: Vec<i32> = (1..=capture_count).map(|group| last_match[group * 2 + 1]).collect();
+                let legacy_captures = LegacyCaptureSlots::new(slots_per_match / 2 - 1, |slot| last_match[slot]);
                 update_legacy_regexp_static_properties_lazy(
                     vm,
                     realm.intrinsics().regexp_constructor(vm),
                     string,
                     last_match[0] as usize,
                     last_match[1] as usize,
-                    &starts,
-                    &ends,
+                    &legacy_captures,
                 );
             } else if realm == typed_regexp.realm() {
                 invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
@@ -1757,7 +1718,7 @@ impl RegExpPrototype {
             native_matches.slots.len() / native_matches.slots_per_match
         });
         let captures: MarkedVec<'_, Value> = MarkedVec::new(vm);
-        let mut replacer_args = Vec::new();
+        let replacer_args = MarkedVec::new(vm);
         for result_index in 0..result_count {
             // OPTIMIZATION: A replacement string reads the match and its captures where they are in the string, so the
             //               results of matches that ran natively need no strings of their own, and GetSubstitution
@@ -1882,10 +1843,9 @@ impl RegExpPrototype {
             // k. If functionalReplace is true, then
             let replacement = if replace_value.is_function() {
                 // i. Let replacerArgs be the list-concatenation of « matched », captures, and « 𝔽(position), S ».
-                // NB: Everything in the list is kept alive by the captures, the variables above, and the caller.
                 replacer_args.clear();
                 replacer_args.push(Value::from_string(matched));
-                captures.with_values(|captures| replacer_args.extend_from_slice(captures));
+                replacer_args.extend_from_slice(&captures.values());
                 replacer_args.push(Value::from_f64(position));
                 replacer_args.push(Value::from_string(string));
 
@@ -1896,8 +1856,12 @@ impl RegExpPrototype {
                 }
 
                 // iii. Let replValue be ? Call(replaceValue, undefined, replacerArgs).
-                let replace_result =
-                    call_function_object(vm, replace_value.as_function(), Value::UNDEFINED, &replacer_args)?;
+                let replace_result = call_function_object(
+                    vm,
+                    replace_value.as_function(),
+                    Value::UNDEFINED,
+                    &replacer_args.values(),
+                )?;
 
                 // iv. Let replacement be ? ToString(replValue).
                 replace_result.to_utf16_string(vm)?
@@ -2091,7 +2055,7 @@ impl RegExpPrototype {
 
     /// The fast path of symbol_split_impl(): split with an unmodified RegExp, which bypasses the spec's
     /// SpeciesConstructor/Construct overhead and calls the regex directly with explicit start positions. Returns None
-    /// when the regex cannot be compiled, in which case the generic path runs.
+    /// when the RegExp is sticky or the regex cannot be compiled, in which case the generic path runs.
     fn symbol_split_fast_path(
         vm: &Vm,
         realm: Gc<Realm>,
@@ -2099,11 +2063,15 @@ impl RegExpPrototype {
         string: Gc<PrimitiveString>,
         limit_value: Value,
     ) -> ThrowCompletionOr<Option<Value>> {
-        let Some(compiled_regex) = get_or_compile_regex(&typed_regexp) else {
+        // The compiled regex of a sticky pattern only matches at the position it is run from.
+        let flag_bits = typed_regexp.flag_bits();
+        if flag_bits.has(RegExpFlags::STICKY) {
+            return Ok(None);
+        }
+        let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp) else {
             return Ok(None);
         };
 
-        let flag_bits = typed_regexp.flag_bits();
         let is_unicode = flag_bits.has(RegExpFlags::UNICODE);
         let is_unicode_sets = flag_bits.has(RegExpFlags::UNICODE_SETS);
         let unicode_matching = is_unicode || is_unicode_sets;
@@ -2177,8 +2145,7 @@ impl RegExpPrototype {
                     string,
                     match_start,
                     match_end,
-                    legacy_captures.starts(),
-                    legacy_captures.ends(),
+                    &legacy_captures,
                 );
             }
 
@@ -2478,10 +2445,9 @@ impl RegExpPrototype {
             // Only use fast path when we don't need to update lastIndex.
             if !global
                 && !sticky
-                && let Some(compiled_regex) = get_or_compile_regex(&typed_regexp)
+                && let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp)
             {
-                let string_data = string.utf16_string();
-                let utf16_view = Utf16View::of_string(&string_data);
+                let utf16_view = string.utf16_string_view();
 
                 if !typed_regexp.legacy_features_enabled() {
                     // Fastest path: just test, no captures or legacy props.
@@ -2515,8 +2481,7 @@ impl RegExpPrototype {
                         string,
                         match_start,
                         match_end,
-                        legacy_captures.starts(),
-                        legacy_captures.ends(),
+                        &legacy_captures,
                     );
                 }
                 return Ok(Value::from_bool(matched));

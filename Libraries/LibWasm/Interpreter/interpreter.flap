@@ -292,14 +292,15 @@ inline fn call_host_function(function: u64, return_ip: u64, context_pointer: u64
     store64([context_pointer, CONTEXT_ARGUMENT_1], top);
     store64([context_pointer, CONTEXT_ARGUMENT_2], return_ip);
     store64([context_pointer, CONTEXT_ARGUMENT_3], fp);
-    # The helper may clobber every allocatable register, so nothing but its result is kept across it.
+    # The helper may clobber every allocatable register, so nothing but its result and the context is kept across it.
+    let saved_context = context();
     ip = return_ip;
     let new_top: u64 = call_helper(wasm_runtime_call_host, context_pointer);
     guard new_top != 0 else @cold {
         trap(TRAP_RUNTIME);
     };
     if new_top == 1 @cold {
-        resume_at_handler();
+        resume_at_handler(saved_context);
     }
     vsp = new_top;
     dispatch;
@@ -315,14 +316,15 @@ inline fn call_compiled_function(function: u64, return_ip: u64, context_pointer:
     store64([context_pointer, CONTEXT_ARGUMENT_1], top);
     store64([context_pointer, CONTEXT_ARGUMENT_2], return_ip);
     store64([context_pointer, CONTEXT_ARGUMENT_3], fp);
-    # The helper may clobber every allocatable register, so nothing but its result is kept across it.
+    # The helper may clobber every allocatable register, so nothing but its result and the context is kept across it.
+    let saved_context = context();
     ip = return_ip;
     let new_top: u64 = call_helper(wasm_runtime_call_compiled, context_pointer);
     guard new_top != 0 else @cold {
         trap(TRAP_RUNTIME);
     };
     if new_top == 1 @cold {
-        resume_at_handler();
+        resume_at_handler(saved_context);
     }
     if new_top == 2 @cold {
         let pending_context = context();
@@ -336,8 +338,7 @@ inline fn call_compiled_function(function: u64, return_ip: u64, context_pointer:
 }
 
 # Continue at the exception handler the runtime found, which it left in the context's arguments.
-inline fn resume_at_handler() {
-    let context_pointer = context();
+inline fn resume_at_handler(context_pointer: u64) {
     let mut handler_fp: u64;
     load64(handler_fp, [context_pointer, CONTEXT_ARGUMENTS]);
     let mut handler_ip: u64;
@@ -371,7 +372,7 @@ inline fn throw_exception(tag: u64, exception: u64) {
     guard caught != 0 else @cold {
         trap(TRAP_RUNTIME);
     };
-    resume_at_handler();
+    resume_at_handler(context_pointer);
 }
 
 handler Throw() @opcode(0x08) {
@@ -787,10 +788,21 @@ handler Enter() @opcode(0xf0) {
     load64(function, [record, ENTRY_FUNCTION]);
     let mut param_slots: u64;
     load32(param_slots, [function, FUNCTION_PARAM_SLOTS]);
+    let mut result_slots: u64;
+    load32(result_slots, [function, FUNCTION_RESULT_SLOTS]);
+    let mut operand_slots: u64 = param_slots;
+    if result_slots > param_slots {
+        operand_slots = result_slots;
+    }
     let entry_sp: u64 = sp;
     let runtime_fp = align_down_16(entry_sp - FRAME_HEADER_SIZE - SPILL_AREA_SIZE);
     let arguments_top = runtime_fp - FRAME_HEADER_SIZE - (param_slots << 3);
-    let new_sp = align_down_16(arguments_top - SPILL_AREA_SIZE);
+    let new_sp = align_down_16(runtime_fp - FRAME_HEADER_SIZE - (operand_slots << 3) - SPILL_AREA_SIZE);
+    let mut limit: u64;
+    load64(limit, [context_pointer, CONTEXT_STACK_LIMIT]);
+    guard new_sp >= limit else @cold {
+        trap_with(TRAP_STACK_EXHAUSTED, context_pointer);
+    };
     # The native code that entered the interpreter touched the stack above its frame, but maybe not the page of the
     # entry frame's stack pointer.
     let _ = atomic_load8([entry_sp, 0]);
@@ -890,6 +902,14 @@ handler Block() @opcode(0x02) {
 }
 
 handler Loop() @opcode(0x03) {
+    # Another thread stops the code of a store by making its stack limit the highest address. Calls notice, but only
+    # this stops a loop that does not call.
+    let interrupt_context = context();
+    let mut stack_limit: u64;
+    load64(stack_limit, [interrupt_context, CONTEXT_STACK_LIMIT]);
+    if stack_limit + 1 == 0 @cold {
+        trap_with(TRAP_STACK_EXHAUSTED, interrupt_context);
+    }
     let function = frame_word(FRAME_FUNCTION);
     let mut budget: u64;
     load32(budget, [function, FUNCTION_TIER_UP_BUDGET]);
@@ -905,7 +925,7 @@ handler Loop() @opcode(0x03) {
         # stack, or a tail call it made pending.
         let results_top: u64 = call_helper(wasm_runtime_tier_up, context_pointer);
         if results_top == 1 {
-            resume_at_handler();
+            resume_at_handler(context_pointer);
         }
         if results_top == 2 {
             trap(TRAP_RUNTIME);
@@ -7225,18 +7245,6 @@ inline fn rtt_is_subtype(subtype: u64, identity: u64) -> u64 {
     result
 }
 
-# A field value as it is stored: packed fields keep only their bits.
-inline fn packed_value(value: u64, kind: u64) -> u64 {
-    let mut stored = value;
-    if kind == STORAGE_I8 {
-        stored = value & 0xff;
-    }
-    if kind == STORAGE_I16 {
-        stored = value & 0xffff;
-    }
-    stored
-}
-
 # A packed value sign-extended to an i32.
 inline fn sign_extend_packed(value: u64, kind: u64) -> u64 {
     let mut shift: u64 = 48;
@@ -7251,10 +7259,46 @@ inline fn sign_extend_packed(value: u64, kind: u64) -> u64 {
     result
 }
 
+# The bits of the field or element at `address`, whose storage is `kind`, zero-extended (the low half of a v128).
+inline fn load_stored(address: u64, kind: u64) -> u64 {
+    let mut value: u64 = 0;
+    if kind == STORAGE_I8 {
+        load8(value, [address, 0]);
+    } else {
+        if kind == STORAGE_I16 {
+            load16(value, [address, 0]);
+        } else {
+            if kind == STORAGE_32 {
+                load32(value, [address, 0]);
+            } else {
+                load64(value, [address, 0]);
+            }
+        }
+    }
+    value
+}
+
+# Store the bits of `value` that a field or element at `address` whose storage is `kind`, not v128, holds.
+inline fn store_number(address: u64, kind: u64, value: u64) {
+    if kind == STORAGE_I8 {
+        store8([address, 0], value);
+    } else {
+        if kind == STORAGE_I16 {
+            store16([address, 0], value);
+        } else {
+            if kind == STORAGE_32 {
+                store32([address, 0], value);
+            } else {
+                store64([address, 0], value);
+            }
+        }
+    }
+}
+
 # Push the value of the field or element at `address`, whose storage is `kind`, replacing `popped` slots.
 inline fn push_stored(address: u64, kind: u64, popped: u64) {
-    let mut low: u64;
-    load64(low, [address, 0]);
+    # The low half of a v128 is a load of 64 bits too.
+    let low = load_stored(address, kind);
     if kind == STORAGE_V128 {
         let mut high: u64;
         load64(high, [address, 8]);
@@ -7275,8 +7319,7 @@ inline fn pop_into_storage(address: u64, kind: u64) {
         store64([address, 0], low);
         store64([address, 8], high);
     } else {
-        let stored = packed_value(low, kind);
-        store64([address, 0], stored);
+        store_number(address, kind, low);
     }
 }
 
@@ -7287,27 +7330,20 @@ inline fn pop_storage_value(kind: u64) -> (u64, u64) {
     if kind == STORAGE_V128 {
         high = pop();
     }
-    let stored = packed_value(low, kind);
-    (stored, high)
+    (low, high)
 }
 
 inline fn store_storage_value(address: u64, kind: u64, low: u64, high: u64) {
-    store64([address, 0], low);
     if kind == STORAGE_V128 {
+        store64([address, 0], low);
         store64([address, 8], high);
+    } else {
+        store_number(address, kind, low);
     }
 }
 
+# The bytes an element of `kind` takes, in an array and in a data segment alike.
 inline fn storage_size(kind: u64) -> u64 {
-    let mut size: u64 = 8;
-    if kind == STORAGE_V128 {
-        size = 16;
-    }
-    size
-}
-
-# The bytes an element of `kind` takes in a data segment.
-inline fn data_size(kind: u64) -> u64 {
     let mut size: u64 = 8;
     if kind == STORAGE_I8 {
         size = 1;
@@ -7324,35 +7360,10 @@ inline fn data_size(kind: u64) -> u64 {
     size
 }
 
-# Copy `count` elements of `kind` from a data segment's bytes at `source` into elements at `destination`.
+# Copy `count` elements of `kind` from a data segment's bytes at `source` into elements at `destination`, which
+# are stored as the segment holds them.
 inline fn copy_data_elements(destination: u64, source: u64, count: u64, kind: u64) {
-    let size = data_size(kind);
-    let element_size = storage_size(kind);
-    let mut index: u64 = 0;
-    while index < count {
-        let from = source + (index * size);
-        let to = destination + (index * element_size);
-        let mut low: u64 = 0;
-        let mut high: u64 = 0;
-        if kind == STORAGE_I8 {
-            load8(low, [from, 0]);
-        }
-        if kind == STORAGE_I16 {
-            load16(low, [from, 0]);
-        }
-        if kind == STORAGE_32 {
-            load32(low, [from, 0]);
-        }
-        if kind == STORAGE_64 {
-            load64(low, [from, 0]);
-        }
-        if kind == STORAGE_V128 {
-            load64(low, [from, 0]);
-            load64(high, [from, 8]);
-        }
-        store_storage_value(to, kind, low, high);
-        index = index + 1;
-    }
+    copy_bytes(destination, source, count * storage_size(kind));
 }
 
 inline fn non_null(reference: u64) -> u64 {
@@ -7394,8 +7405,16 @@ inline fn check_array_range(start: u64, count: u64, length: u64) {
     };
 }
 
-inline fn element_address(array: u64, index: u64, kind: u64) -> u64 {
-    let size = storage_size(kind);
+# The bytes an element of `array` takes.
+inline fn array_element_size(array: u64) -> u64 {
+    let mut rtt: u64;
+    load64(rtt, [array, 0]);
+    let mut size: u64;
+    load32(size, [rtt, RTT_SIZE]);
+    size
+}
+
+inline fn element_address(array: u64, index: u64, size: u64) -> u64 {
     let data = object_data(array);
     data + (index * size)
 }
@@ -7480,8 +7499,7 @@ handler StructGetS() @opcode(0xfb, 0x3) {
     let [type_index, field_index, length] = two_immediates();
     let object = non_null(unary_operand());
     let [address, kind] = field_of(object, type_index, field_index);
-    let mut value: u64;
-    load64(value, [address, 0]);
+    let value = load_stored(address, kind);
     let extended = sign_extend_packed(value, kind);
     set_top(extended);
     advance(length);
@@ -7490,9 +7508,8 @@ handler StructGetS() @opcode(0xfb, 0x3) {
 handler StructGetU() @opcode(0xfb, 0x4) {
     let [type_index, field_index, length] = two_immediates();
     let object = non_null(unary_operand());
-    let [address, _] = field_of(object, type_index, field_index);
-    let mut value: u64;
-    load64(value, [address, 0]);
+    let [address, kind] = field_of(object, type_index, field_index);
+    let value = load_stored(address, kind);
     set_top(value);
     advance(length);
 }
@@ -7526,10 +7543,11 @@ handler ArrayNew() @opcode(0xfb, 0x6) {
     let wide_count: u64 = alias(count);
     let array = allocate_array(type_index, wide_count);
     let kind = array_element_kind(array);
+    let size = array_element_size(array);
     let [low, high] = pop_storage_value(kind);
     let mut index: u64 = 0;
     while index < wide_count {
-        let address = element_address(array, index, kind);
+        let address = element_address(array, index, size);
         store_storage_value(address, kind, low, high);
         index = index + 1;
     }
@@ -7550,11 +7568,12 @@ handler ArrayNewFixed() @opcode(0xfb, 0x8) {
     let [type_index, count, length] = two_immediates();
     let array = allocate_array(type_index, count);
     let kind = array_element_kind(array);
+    let size = array_element_size(array);
     # The last element is on top.
     let mut index = count;
     while index != 0 {
         index = index - 1;
-        let address = element_address(array, index, kind);
+        let address = element_address(array, index, size);
         pop_into_storage(address, kind);
     }
     push(array);
@@ -7575,7 +7594,7 @@ handler ArrayNewData() @opcode(0xfb, 0x9) {
     let segment = segment_at(INSTANCE_DATA_SEGMENTS, data_index);
     let mut segment_length: u64;
     load64(segment_length, [segment, SEGMENT_LENGTH]);
-    let byte_count = wide_count * data_size(kind);
+    let byte_count = wide_count * storage_size(kind);
     check_range(wide_source, byte_count, segment_length, TRAP_MEMORY_OUT_OF_BOUNDS);
     let array = allocate_array(type_index, wide_count);
     let mut contents: u64;
@@ -7611,7 +7630,7 @@ inline fn checked_element(array: u64, index: u64) -> (u64, u64) {
         trap(TRAP_ARRAY_OUT_OF_BOUNDS);
     };
     let kind = array_element_kind(checked);
-    let address = element_address(checked, index, kind);
+    let address = element_address(checked, index, array_element_size(checked));
     (address, kind)
 }
 
@@ -7627,8 +7646,7 @@ handler ArrayGetS() @opcode(0xfb, 0xc) {
     let [_, length] = one_immediate();
     let [array, index] = binary_operands();
     let [address, kind] = checked_element(array, index);
-    let mut value: u64;
-    load64(value, [address, 0]);
+    let value = load_stored(address, kind);
     let extended = sign_extend_packed(value, kind);
     set_top(extended);
     advance(length);
@@ -7637,9 +7655,8 @@ handler ArrayGetS() @opcode(0xfb, 0xc) {
 handler ArrayGetU() @opcode(0xfb, 0xd) {
     let [_, length] = one_immediate();
     let [array, index] = binary_operands();
-    let [address, _] = checked_element(array, index);
-    let mut value: u64;
-    load64(value, [address, 0]);
+    let [address, kind] = checked_element(array, index);
+    let value = load_stored(address, kind);
     set_top(value);
     advance(length);
 }
@@ -7679,9 +7696,10 @@ handler ArrayFill() @opcode(0xfb, 0x10) {
     let start = pop();
     let array = non_null(pop());
     check_array_range(start, count, array_length(array));
+    let size = array_element_size(array);
     let mut index: u64 = 0;
     while index < count {
-        let address = element_address(array, start + index, kind);
+        let address = element_address(array, start + index, size);
         store_storage_value(address, kind, low, high);
         index = index + 1;
     }
@@ -7699,8 +7717,8 @@ handler ArrayCopy() @opcode(0xfb, 0x11) {
     check_array_range(destination_start, count, array_length(destination));
     let kind = array_element_kind(destination);
     let size = storage_size(kind);
-    let from = element_address(source, source_start, kind);
-    let to = element_address(destination, destination_start, kind);
+    let from = element_address(source, source_start, size);
+    let to = element_address(destination, destination_start, size);
     copy_bytes(to, from, count * size);
     advance(length);
 }
@@ -7716,11 +7734,11 @@ handler ArrayInitData() @opcode(0xfb, 0x12) {
     let segment = segment_at(INSTANCE_DATA_SEGMENTS, data_index);
     let mut segment_length: u64;
     load64(segment_length, [segment, SEGMENT_LENGTH]);
-    let byte_count = count * data_size(kind);
+    let byte_count = count * storage_size(kind);
     check_range(source, byte_count, segment_length, TRAP_MEMORY_OUT_OF_BOUNDS);
     let mut contents: u64;
     load64(contents, [segment, SEGMENT_CONTENTS]);
-    let to = element_address(array, destination_start, kind);
+    let to = element_address(array, destination_start, array_element_size(array));
     copy_data_elements(to, contents + source, count, kind);
     advance(length);
 }
@@ -7738,7 +7756,7 @@ handler ArrayInitElem() @opcode(0xfb, 0x13) {
     check_range(source, count, segment_length, TRAP_TABLE_OUT_OF_BOUNDS);
     let mut contents: u64;
     load64(contents, [segment, SEGMENT_CONTENTS]);
-    let to = element_address(array, destination_start, STORAGE_64);
+    let to = element_address(array, destination_start, 8);
     copy_elements(to, contents + (source << 3), count);
     advance(length);
 }

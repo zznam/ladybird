@@ -107,17 +107,15 @@ fn calendar_date_of(zoned_date_time: &ZonedDateTime, iso_date_time: &ISODateTime
 
 impl ZonedDateTimePrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<ZonedDateTimePrototype> {
-        realm.create_object(
-            vm,
-            ZonedDateTimePrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| ZonedDateTimePrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -763,22 +761,22 @@ impl ZonedDateTimePrototype {
         let mut fields = iso_date_to_fields(calendar_view, iso_date_time.iso_date, DateType::Date);
 
         // 10. Set fields.[[Hour]] to isoDateTime.[[Time]].[[Hour]].
-        fields.hour = Some(iso_date_time.time.hour);
+        fields.hour = Some(f64::from(iso_date_time.time.hour));
 
         // 11. Set fields.[[Minute]] to isoDateTime.[[Time]].[[Minute]].
-        fields.minute = Some(iso_date_time.time.minute);
+        fields.minute = Some(f64::from(iso_date_time.time.minute));
 
         // 12. Set fields.[[Second]] to isoDateTime.[[Time]].[[Second]].
-        fields.second = Some(iso_date_time.time.second);
+        fields.second = Some(f64::from(iso_date_time.time.second));
 
         // 13. Set fields.[[Millisecond]] to isoDateTime.[[Time]].[[Millisecond]].
-        fields.millisecond = Some(iso_date_time.time.millisecond);
+        fields.millisecond = Some(f64::from(iso_date_time.time.millisecond));
 
         // 14. Set fields.[[Microsecond]] to isoDateTime.[[Time]].[[Microsecond]].
-        fields.microsecond = Some(iso_date_time.time.microsecond);
+        fields.microsecond = Some(f64::from(iso_date_time.time.microsecond));
 
         // 15. Set fields.[[Nanosecond]] to isoDateTime.[[Time]].[[Nanosecond]].
-        fields.nanosecond = Some(iso_date_time.time.nanosecond);
+        fields.nanosecond = Some(f64::from(iso_date_time.time.nanosecond));
 
         // 16. Set fields.[[OffsetString]] to FormatUTCOffsetNanoseconds(offsetNanoseconds).
         fields.offset_string = Some(Utf16String::from_utf8(&format_utc_offset_nanoseconds(

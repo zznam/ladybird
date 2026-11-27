@@ -125,6 +125,25 @@ describe("testing behavior", () => {
         expect(passed).toBeTrue();
     });
 
+    test("reads the specifier before evaluating the options", () => {
+        let specifier = "./empty.mjs";
+        let passed = false;
+        let error = null;
+
+        import(specifier, ((specifier = "./does-not-exist.mjs"), undefined))
+            .then(() => {
+                passed = true;
+            })
+            .catch(err => {
+                error = err;
+            });
+
+        runQueuedPromiseJobs();
+        if (error) throw error;
+
+        expect(passed).toBeTrue();
+    });
+
     test("expectModulePassed works", () => {
         expectModulePassed("./single-const-export.mjs");
     });
@@ -173,8 +192,35 @@ describe("in- and exports", () => {
         expectModulePassed("./declarations-tests.mjs");
     });
 
+    test("var declarations can repeat a name", () => {
+        expectModulePassed("./var-redeclaration.mjs");
+    });
+
     test("string '*' is not a full namespace import", () => {
         expectModulePassed("./string-import-names.mjs");
+    });
+
+    test("a name after the empty name keeps its meaning in functions", () => {
+        expectModulePassed("./empty-string-export-after-functions.mjs");
+    });
+
+    test("string module names preserve trailing NULs", () => {
+        const result = expectModulePassed("./trailing-nul-export-names.mjs");
+        expect(result.a).toBe(1);
+        expect(result["a\0"]).toBe(2);
+        expect(result["a\0\0"]).toBe(3);
+        expect(result.ab).toBe(1);
+        expect(result["ab\0"]).toBe(2);
+        expect(result["ab\0\0"]).toBe(3);
+        expect(result.b).toBe(4);
+        expect(result["b\0\0"]).toBe(2);
+        expect(result[""]).toBe(1);
+        expect(result["\0"]).toBe(2);
+        expect(result["\0\0"]).toBe(3);
+        expect(result["only\0\0"]).toBe(3);
+        expect(result).not.toHaveProperty("only");
+        expect(result.readB()).toBe(4);
+        expectModulePassed("./trailing-nul-import-names.mjs");
     });
 
     test("can combine string and default exports", () => {
@@ -341,9 +387,33 @@ describe("scoping in modules", () => {
         const result = expectModulePassed("./module-level-bindings-with-top-level-await.mjs");
         expect(result.counterAfterAwait).toBe(11);
     });
+
+    test("direct eval at the top level of a module with top-level await is not in a function", () => {
+        const result = expectModulePassed("./eval-with-top-level-await.mjs");
+        expect(result.errors).toEqual(["SyntaxError", "SyntaxError", "SyntaxError", "SyntaxError"]);
+        expect(result.thisValues).toEqual([undefined, undefined]);
+    });
 });
 
 describe("top-level await", () => {
+    test("await continuations interleave with chained promise reactions", () => {
+        const result = expectModulePassed("./top-level-await-job-order.mjs");
+        const ticksFirst = ["tick 1", "await 1", "tick 2", "await 2", "tick 3", "await 3", "tick 4", "await 4"];
+        for (const order of result.ordersAfterAwait) {
+            expect(order).toEqual(ticksFirst);
+        }
+        expect(result.orderBeforeAwait).toEqual([
+            "await 1",
+            "tick 1",
+            "await 2",
+            "tick 2",
+            "await 3",
+            "tick 3",
+            "await 4",
+            "tick 4",
+        ]);
+    });
+
     test("for await at the top level", () => {
         const result = expectModulePassed("./top-level-for-await.mjs");
         expect(result.result).toEqual([1, 2, "a", "b", "closed", "first", "iterator failed", "1x", "2x"]);

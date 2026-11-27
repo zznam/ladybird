@@ -6,12 +6,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Array.h>
 #include <AK/Assertions.h>
 #include <AK/ByteBuffer.h>
 #include <AK/Format.h>
+#include <AK/GenericShorthands.h>
 #include <AK/LexicalPath.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/ScopeGuard.h>
 #include <AK/Types.h>
 #include <AK/kmalloc.h>
 #include <LibCore/EventLoop.h>
@@ -24,29 +27,36 @@
 #include <LibGfx/Palette.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/SystemTheme.h>
+#include <LibWebCommon/CSS/SystemColor.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CrashReport.h>
-#include <LibWebView/CrashReportStore.h>
-#include <LibWebView/PlatformColors.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebContentClient.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
+#include <UI/Qt/Icon.h>
 #include <UI/Qt/ReportReview.h>
-#include <UI/Qt/ScreenshotSelectionOverlay.h>
 #include <UI/Qt/ScreenshotViewer.h>
 #include <UI/Qt/WebCompatReportReview.h>
 #ifdef AK_OS_MACOS
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/InputMethodUtils.h>
+#include <UI/Qt/Menu.h>
+#include <UI/Qt/PlainText.h>
+#include <UI/Qt/PlatformColors.h>
 #include <UI/Qt/SelectDropdown.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/SystemAppearance.h>
+#include <UI/Qt/Theme.h>
 #include <UI/Qt/WebContentView.h>
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+#    include <UI/Qt/WaylandPageSurface.h>
+#endif
 
 #if defined(Q_OS_MACOS)
 #    include "WebContentViewAccessibility.h"
@@ -68,7 +78,7 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
-#include <QPainterPathStroker>
+
 #include <QPalette>
 #include <QPixmap>
 #include <QPointer>
@@ -79,16 +89,29 @@
 #include <QStyleHints>
 #include <QTextEdit>
 #include <QTimer>
-#include <QToolTip>
 #include <QVBoxLayout>
 #include <QWheelEvent>
+#include <QWindow>
 
 template<>
 constexpr bool AllocatedWithSystemAllocator<QKeyEvent> = true;
 
 namespace Ladybird {
 
-bool is_using_dark_system_theme(QWidget&);
+// Whether pages get the dark system colors. This follows the website color scheme setting rather than the interface
+// theme, so pages can stay light in a dark window.
+static bool websites_prefer_dark()
+{
+    switch (Application::settings().appearance().website_color_scheme) {
+    case WebView::ThemePreference::System:
+        return SystemAppearance::the().prefers_dark();
+    case WebView::ThemePreference::Light:
+        return false;
+    case WebView::ThemePreference::Dark:
+        return true;
+    }
+    VERIFY_NOT_REACHED();
+}
 
 static QWidget* initial_web_content_view_parent([[maybe_unused]] QWidget* window)
 {
@@ -99,9 +122,23 @@ static QWidget* initial_web_content_view_parent([[maybe_unused]] QWidget* window
 #endif
 }
 
-WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable, WebContentViewInitialState initial_state)
+static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget&, WebContentView::PaletteMode);
+static Optional<RemoteView::ScreenRects> screen_rects_from_qt();
+
+WebContentView::WebContentView(QWidget* window, Optional<u64> hub_view_id, WebContentViewInitialState initial_state)
     : WebContentViewBase(initial_web_content_view_parent(window))
-    , WebView::ViewImplementation(initial_state.is_private)
+    , RemoteView(hub_view_id, {
+                                  .is_private = initial_state.is_private,
+                                  .device_pixel_ratio = devicePixelRatio(),
+                                  .maximum_frames_per_second = initial_state.maximum_frames_per_second,
+                                  .display_id = initial_state.display_id,
+                                  .screen_shows_high_dynamic_range = initial_state.screen_shows_high_dynamic_range,
+                                  .system_theme = make_system_theme_from_qt_palette(*this, PaletteMode::Default),
+                                  .screen_rects = screen_rects_from_qt(),
+                                  .owner_view_id = initial_state.owner_view_id,
+                                  .websites_prefer_dark = websites_prefer_dark(),
+                                  .is_tab = initial_state.is_tab,
+                              })
 {
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     // Keep the QRhiWidget out of the top-level QWidget backing store. If it is
@@ -112,7 +149,8 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     setParent(window);
     setApi(QRhiWidget::Api::Direct3D11);
 #elif defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
-    // The page is shown by a layer of this widget's own native view; Qt only paints the chrome behind its corners.
+    // The page is shown by a layer of this widget's own native view, and Qt paints the widget only while that layer does
+    // not cover it (see update_whether_qt_paints_view()).
     setAttribute(Qt::WA_DontCreateNativeAncestors);
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_OpaquePaintEvent);
@@ -134,14 +172,12 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     setFocusPolicy(Qt::FocusPolicy::StrongFocus);
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-    create_vulkan_window();
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    if (!create_page_surface())
+#    endif
+        create_vulkan_window();
 #endif
 
-    m_device_pixel_ratio = devicePixelRatio();
-    m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
-    m_display_id = initial_state.display_id;
-
-    set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     on_page_background_color_change = [this](Gfx::Color) {
         update_iosurface_layer_background_color();
@@ -160,26 +196,27 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     for (auto* screen : QGuiApplication::screens())
         watch_screen_geometry(*screen);
 
-    QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
+    auto update_palette_soon = [this] {
         QTimer::singleShot(0, this, [this] {
             update_palette();
             schedule_repaint();
         });
-    });
+    };
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, this, update_palette_soon);
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, this, update_palette_soon);
 
     m_tooltip_hover_timer.setSingleShot(true);
 
     QObject::connect(&m_tooltip_hover_timer, &QTimer::timeout, this, [this] {
         if (m_tooltip_text.has_value())
-            QToolTip::showText(
-                QCursor::pos(),
-                qstring_from_ak_string(m_tooltip_text.value()),
-                this);
+            show_tooltip(QCursor::pos(), qstring_from_ak_string(m_tooltip_text.value()), *this);
     });
 
-    if (initial_state.owner_view)
-        set_owner_view(*initial_state.owner_view);
-    initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
+    // NB: The Hub made this view without knowing what the UI knows about the screens and its theme.
+    if (hub_view_id.has_value()) {
+        update_palette();
+        update_screen_rects();
+    }
 
     m_accessibility_manager = make<WebView::AccessibilityTreeManager>();
 
@@ -217,60 +254,25 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     QAccessible::installActivationObserver(this);
 #endif
 
-    on_accessibility_tree_received = [this](auto nodes) {
-        m_accessibility_manager->update_tree(AK::move(nodes));
+    on_accessibility_tree_received = [this](u64 sequence, auto nodes) {
+        m_accessibility_whole_tree_pending = false;
+        m_accessibility_manager->update_tree(AK::move(nodes), sequence);
+        did_update_accessibility_tree({});
+    };
 
-#if defined(Q_OS_MACOS)
-        // Only the first tree for a page announces the load. WebContent rebuilds the tree on DOM mutations too, and
-        // announcing each of those would move VoiceOver's cursor back to the top of the page while the user is reading
-        // it. Same gate as the AT-SPI focus post in the branch below.
-        // NB: A page load never moves the keyboard focus, with or without an assistive technology. For example, a new
-        //     tab's location editor keeps the focus while the new tab page loads.
-        auto const announce_load = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
-        if (announce_load)
-            m_posted_initial_accessibility_focus = true;
-        // An assistive technology that turned up mid-page got no focused element from its first queries: The first tree
-        // has AppKit look the focus up again — if the page has the keyboard focus (update_accessibility_tree() checks).
-        auto const report_focus = m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty();
-        if (report_focus)
-            m_report_accessibility_focus_with_next_tree = false;
-        QTimer::singleShot(100, this, [this, announce_load, report_focus] {
-            update_accessibility_tree(this, announce_load, report_focus);
-        });
-#elif !defined(Q_OS_WIN)
-        // Prune interfaces for nodes no longer in the tree.
-        QList<i64> stale_ids;
-        for (auto it = m_accessibility_elements.begin(); it != m_accessibility_elements.end(); ++it) {
-            if (!it.value()->isValid())
-                stale_ids.append(it.key());
+    on_accessibility_tree_changed = [this](u64 base_sequence, u64 sequence, auto delta) {
+        // Once the whole tree has been asked for, every change before it arrives is to a tree this view doesn't hold.
+        if (m_accessibility_whole_tree_pending)
+            return;
+        auto removed_ids = m_accessibility_manager->apply_delta(delta, base_sequence, sequence);
+        if (!removed_ids.has_value()) {
+            // A change to a tree this view doesn't hold (one it dropped while it didn't display the tab, e.g.), or one
+            // that doesn't fit the tree it holds: Start over from the whole tree.
+            m_accessibility_whole_tree_pending = true;
+            request_accessibility_tree();
+            return;
         }
-        for (auto id : stale_ids) {
-            auto* iface = m_accessibility_elements.take(id);
-            QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface));
-        }
-
-        // An assistive technology that turned up mid-page found no tree to take the focus from: Tell it where the focus
-        // is now that there's one — if the page has the keyboard focus at all.
-        if (m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
-            m_report_accessibility_focus_with_next_tree = false;
-            if (hasFocus())
-                announce_accessibility_focus();
-        }
-
-        // Post a Focus AT-SPI2 event on the document root the first time a tree arrives. This is what lets Orca's
-        // browse-mode commands (H/K/L structural nav) work on page load — without the user having to Tab/click into the
-        // page first. The event is posted unconditionally — even when the address bar has Qt focus — because our Orca
-        // script re-suspends browse-mode commands when it later sees a focus event for an editable chrome widget. So if
-        // the user explicitly focuses the address bar (Ctrl+L, mouse click), typing there still works. Firing this on
-        // every subsequent tree update would be wrong: it would re-focus the document root while the user is
-        // mid-navigation — causing Orca to re-present the current structural-nav target.
-        if (!m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
-            m_posted_initial_accessibility_focus = true;
-            QTimer::singleShot(1000, this, [this] {
-                notify_accessibility_focus_on_document_root();
-            });
-        }
-#endif
+        did_update_accessibility_tree(removed_ids.release_value());
     };
 
     on_accessibility_focus_changed = [this](i64 node_id) {
@@ -306,6 +308,9 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
 #endif
 
     on_ready_to_paint = [this]() {
+        if (m_screenshot_selection_overlay)
+            m_screenshot_selection_overlay->page_did_paint();
+
         // Nothing of the page shows while an overlay covers it, which repaints the page once it goes away.
         if (!is_page_covered_by_overlay()) {
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -314,7 +319,6 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
             schedule_repaint();
 #endif
         }
-        emit ready_to_paint();
     };
 
     on_cursor_change = [this](auto cursor) {
@@ -325,6 +329,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         if (active)
             close_select_dropdown_after_crash();
         set_crash_overlay_visible(active);
+        emit crash_overlay_changed();
     };
 
     on_crash_report_saved = [this] {
@@ -335,34 +340,18 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         start_web_compat_report();
     };
 
+    on_request_screenshot = [this] {
+        start_screenshot();
+    };
+
 #ifdef AK_OS_MACOS
     on_request_dictionary_lookup = [this](auto const& lookup, auto position) {
         show_appkit_dictionary_lookup(*this, lookup, position);
     };
 #endif
 
-    on_request_tooltip_override = [this](auto position, auto const& tooltip) {
-        m_tooltip_override = true;
-        if (m_tooltip_hover_timer.isActive())
-            m_tooltip_hover_timer.stop();
-
-        auto tooltip_without_carriage_return = tooltip.contains("\r"sv)
-            ? tooltip.replace("\r\n"sv, "\n"sv, ReplaceMode::All).replace("\r"sv, "\n"sv, ReplaceMode::All)
-            : tooltip;
-        QToolTip::showText(
-            mapToGlobal(QPoint(position.x(), position.y())),
-            qstring_from_ak_string(tooltip_without_carriage_return),
-            this);
-    };
-
-    on_stop_tooltip_override = [this]() {
-        m_tooltip_override = false;
-    };
-
     on_enter_tooltip_area = [this](auto const& tooltip) {
-        m_tooltip_text = tooltip.contains("\r"sv)
-            ? tooltip.replace("\r\n"sv, "\n"sv, ReplaceMode::All).replace("\r"sv, "\n"sv, ReplaceMode::All)
-            : tooltip;
+        m_tooltip_text = tooltip;
     };
 
     on_leave_tooltip_area = [this]() {
@@ -382,18 +371,43 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         select_dropdown_closed(selected_item_id);
     };
 
+    on_show_validation_message = [this](Gfx::IntPoint position, Utf16String const& message) {
+        if (isVisible() && this->window()->isActiveWindow())
+            show_tooltip(map_point_to_global_position(position), qstring_from_utf16_string(message), *this);
+    };
+
     on_request_select_dropdown = [this](Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) {
+        // NB: The view has a native window of its own, which Qt refuses as the transient parent of a popup. The
+        //     dropdown opens from the top-level window instead, which can change when the tab moves to another one.
+        if (m_select_dropdown->parentWidget() != this->window())
+            m_select_dropdown->setParent(this->window(), m_select_dropdown->windowFlags());
         m_select_dropdown->open(map_point_to_global_position(content_position), minimum_width, items);
     };
 }
 
 WebContentView::~WebContentView()
 {
+#if defined(Q_OS_MACOS)
+    // An assistive technology can still hold elements of this view's accessibility tree, which goes away with it.
+    uninstall_accessibility(this);
+#endif
+
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     destroy_iosurface_layer();
 #elif defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    // NB: The page can outlive the view, and must get back the backing stores the compositor of the desktop held.
+    if (m_page_surface)
+        destroy_page_surface();
+#    endif
     destroy_vulkan_window();
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    release_all_retired_backing_stores();
+#    endif
 #endif
+
+    // NB: The dropdown can belong to the top-level window, which outlives the view.
+    delete m_select_dropdown;
 
 #if !defined(Q_OS_WIN)
     QAccessible::removeActivationObserver(this);
@@ -414,11 +428,17 @@ void WebContentView::prepare_for_window_move()
     QCoreApplication::sendEvent(this, &window_about_to_change_event);
 
     destroy();
+#elif defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+    release_vulkan_window_surface_for_move();
 #endif
 }
 
 void WebContentView::finish_window_move()
 {
+    // NB: The dropdown moves to the new top-level window too, because the old one can close and delete it.
+    if (m_select_dropdown->parentWidget() != window())
+        m_select_dropdown->setParent(window(), m_select_dropdown->windowFlags());
+
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     create();
 #    if defined(Q_OS_MACOS)
@@ -426,6 +446,9 @@ void WebContentView::finish_window_move()
     install_accessibility(this);
 #    endif
     show();
+#elif defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+    if (m_vulkan_window && QGuiApplication::platformName().startsWith(QStringLiteral("wayland")))
+        schedule_vulkan_window_update();
 #endif
 }
 
@@ -742,6 +765,15 @@ static Web::UIEvents::KeyCode get_keycode_from_qt_key_event(QKeyEvent const& eve
         { Qt::Key_Z, Web::UIEvents::Key_Z },
     };
 
+#if defined(AK_OS_MACOS)
+    // Qt reports the Command key as Key_Control and the Control key as Key_Meta on macOS, just as it swaps their
+    // modifiers (see get_modifiers_from_qt_keyboard_modifiers()), so swap them back.
+    if (event.key() == Qt::Key_Control)
+        return Web::UIEvents::Key_LeftSuper;
+    if (event.key() == Qt::Key_Meta)
+        return Web::UIEvents::Key_LeftControl;
+#endif
+
     for (auto const& mapping : mappings) {
         if (event.key() == mapping.qt_key)
             return mapping.serenity_key;
@@ -788,16 +820,40 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
 
     if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && (key == Qt::Key_BracketLeft || key == Qt::Key_BracketRight))
         return true;
+#else
+    if (modifiers == Qt::ControlModifier && key == Qt::Key_F4)
+        return true;
 #endif
 
     if (modifiers == Qt::ControlModifier && key == Qt::Key_PageUp)
         return true;
+
+    // F6 moves focus between the chrome and the page, and the sidebar shows or hides with its own shortcut.
+    if (modifiers == Qt::NoModifier && key == Qt::Key_F6)
+        return true;
+#if defined(AK_OS_MACOS)
+    if (modifiers == (Qt::ControlModifier | Qt::AltModifier) && key == Qt::Key_S)
+        return true;
+#else
+    if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_S)
+        return true;
+#endif
 
     return false;
 }
 
 void WebContentView::keyPressEvent(QKeyEvent* event)
 {
+    if (m_compositor_layer_picker.has_value()) {
+        if (event->key() == Qt::Key_Escape) {
+            auto picker = m_compositor_layer_picker.release_value();
+            unsetCursor();
+            picker.on_cancel();
+        }
+        event->accept();
+        return;
+    }
+
     if (is_node_picker_active()) {
         if (event->key() == Qt::Key_Escape)
             node_picker_cancel();
@@ -811,12 +867,14 @@ void WebContentView::keyPressEvent(QKeyEvent* event)
         return;
     }
 
+    if (m_screenshot_selection_overlay)
+        m_screenshot_selection_overlay->page_did_scroll();
     enqueue_native_event(Web::KeyEvent::Type::KeyDown, *event);
 }
 
 void WebContentView::keyReleaseEvent(QKeyEvent* event)
 {
-    if (is_node_picker_active()) {
+    if (m_compositor_layer_picker.has_value() || is_node_picker_active()) {
         event->accept();
         return;
     }
@@ -853,6 +911,11 @@ void WebContentView::leaveEvent(QEvent* event)
 
 void WebContentView::handle_pointer_leave()
 {
+    if (m_compositor_layer_picker.has_value()) {
+        m_compositor_layer_picker->on_leave();
+        return;
+    }
+
     if (is_node_picker_active()) {
         clear_node_picker();
         return;
@@ -870,17 +933,21 @@ void WebContentView::cancel_mouse_press()
 
 void WebContentView::mouseMoveEvent(QMouseEvent* event)
 {
+    if (m_compositor_layer_picker.has_value()) {
+        auto position = node_picker_position_for(*event);
+        m_compositor_layer_picker->on_hover({ position.x().value(), position.y().value() });
+        event->accept();
+        return;
+    }
+
     if (is_node_picker_active()) {
         node_picker_hover(node_picker_position_for(*event));
         event->accept();
         return;
     }
 
-    if (!m_tooltip_override) {
-        if (QToolTip::isVisible())
-            QToolTip::hideText();
-        m_tooltip_hover_timer.start(600);
-    }
+    hide_tooltip();
+    m_tooltip_hover_timer.start(600);
 
     enqueue_native_event(Web::MouseEvent::Type::MouseMove, *event);
     WebContentViewBase::mouseMoveEvent(event);
@@ -888,6 +955,18 @@ void WebContentView::mouseMoveEvent(QMouseEvent* event)
 
 void WebContentView::mousePressEvent(QMouseEvent* event)
 {
+    if (m_compositor_layer_picker.has_value()) {
+        if (event->button() == Qt::MouseButton::LeftButton) {
+            auto position = node_picker_position_for(*event);
+            auto picker = m_compositor_layer_picker.release_value();
+            unsetCursor();
+            m_swallows_mouse_release_after_compositor_layer_pick = true;
+            picker.on_pick({ position.x().value(), position.y().value() });
+        }
+        event->accept();
+        return;
+    }
+
     if (is_node_picker_active()) {
         if (event->button() == Qt::MouseButton::LeftButton) {
             auto position = node_picker_position_for(*event);
@@ -918,7 +997,13 @@ void WebContentView::mousePressEvent(QMouseEvent* event)
 
 void WebContentView::mouseReleaseEvent(QMouseEvent* event)
 {
-    if (is_node_picker_active()) {
+    if (m_swallows_mouse_release_after_compositor_layer_pick) {
+        m_swallows_mouse_release_after_compositor_layer_pick = false;
+        event->accept();
+        return;
+    }
+
+    if (m_compositor_layer_picker.has_value() || is_node_picker_active()) {
         event->accept();
         return;
     }
@@ -937,6 +1022,42 @@ void WebContentView::wheelEvent(QWheelEvent* event)
         event->ignore();
         return;
     }
+
+    // The momentum that remains of a scroll on a touchpad goes on moving the page by a pixel or so for a while after it
+    // looks to have stopped, which a screenshot selection does not wait for.
+    auto is_momentum_running_out = first_is_one_of(event->phase(), Qt::ScrollMomentum, Qt::ScrollEnd) && event->pixelDelta().manhattanLength() <= 1;
+    if (m_screenshot_selection_overlay && !is_momentum_running_out)
+        m_screenshot_selection_overlay->page_did_scroll();
+
+#ifdef AK_OS_MACOS
+    // Qt makes a second wheel event of some scroll events, with no delta and the phase and time of the first, whose
+    // phase would read as an end of the gesture, or a beginning of another, in its own right.
+    bool repeats_last_wheel_event = event->phase() == m_last_wheel_event_phase && event->timestamp() == m_last_wheel_event_timestamp;
+    m_last_wheel_event_phase = event->phase();
+    m_last_wheel_event_timestamp = event->timestamp();
+    if (repeats_last_wheel_event && event->pixelDelta().isNull() && event->angleDelta().isNull()) {
+        event->accept();
+        return;
+    }
+
+    // Qt ends a scroll if momentum hasn't already begun, and begins another with the momentum it did not see coming.
+    // Check what the underlying scroll event says: hold Qt's ScrollEnd back while momentum is about to follow it, and
+    // drop it for that momentum, labelled as such, or send it ahead of whatever else comes.
+    auto momentum_transition = take_appkit_scroll_momentum_transition_for(*event);
+    if (auto wheel_end = AK::exchange(m_wheel_end_awaiting_momentum, nullptr)) {
+        if (momentum_transition != AppKitScrollMomentumTransition::Began)
+            enqueue_native_event(Web::MouseEvent::Type::MouseWheel, *wheel_end);
+    }
+    if (momentum_transition == AppKitScrollMomentumTransition::WillBegin) {
+        m_wheel_end_awaiting_momentum.reset(event->clone());
+        event->accept();
+        return;
+    }
+    if (momentum_transition == AppKitScrollMomentumTransition::Began) {
+        enqueue_native_event(Web::MouseEvent::Type::MouseWheel, *event, Web::ScrollGesturePhase::Momentum);
+        return;
+    }
+#endif
 
     enqueue_native_event(Web::MouseEvent::Type::MouseWheel, *event);
 }
@@ -1014,46 +1135,41 @@ void WebContentView::focusOutEvent(QFocusEvent*)
 
 void WebContentView::update_page_focus()
 {
-    // Focus can move between this widget, the native window container, and the embedded native window in bursts of
-    // events whose order is not meaningful (e.g. the container reports losing focus after native focus has already
-    // moved to the embedded window). Instead of trusting individual events, evaluate the resulting focus state once
-    // the burst has settled.
+    // A change of the active window and the change of focus it leads to arrive as separate events. Instead of trusting
+    // individual events, evaluate the resulting focus state once they have all arrived.
     QTimer::singleShot(0, this, [this] {
-        auto focused = hasFocus();
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-        if (!focused)
-            focused = vulkan_window_has_native_focus();
-#endif
-        set_has_system_focus(focused);
+        set_has_system_focus(hasFocus());
     });
 }
 
 Optional<WebContentView::Paintable> WebContentView::current_paintable() const
 {
-    Gfx::SharedImageBuffer const* shared_image_buffer = nullptr;
-    Gfx::IntSize bitmap_size;
-
-    if (m_has_usable_bitmap) {
-        VERIFY(m_front_bitmap.shared_image_buffer);
-        shared_image_buffer = m_front_bitmap.shared_image_buffer.ptr();
-        bitmap_size = m_front_bitmap.last_painted_size.to_type<int>();
-    } else if (m_backup_shared_image_buffer) {
-        shared_image_buffer = m_backup_shared_image_buffer.ptr();
-        bitmap_size = m_backup_bitmap_size.to_type<int>();
-    }
-
-    if (!shared_image_buffer)
+    auto frame = backing_stores().displayed_frame();
+    if (!frame.has_value())
         return {};
-    return Paintable { shared_image_buffer, bitmap_size };
+    return Paintable {
+        .shared_image_buffer = frame->shared_image_buffer,
+        .bitmap_size = frame->size,
+        .bitmap_id = frame->bitmap_id.value_or(-1),
+        .page_id = frame->bitmap_id.has_value() ? backing_stores_page_id() : 0,
+    };
 }
 
 void WebContentView::schedule_repaint()
 {
 #if defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    release_retired_backing_stores_no_longer_painted();
+#    endif
+    m_frame_read_from_gpu = {};
+    ++m_page_window_content_serial;
     schedule_vulkan_window_update();
 #elif defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
     present_current_paintable_as_layer_contents();
 #else
+#    ifdef LADYBIRD_QT_USE_D3D_RHI_WIDGET
+    update_whether_view_hosts_remote_layer();
+#    endif
 #    ifdef LADYBIRD_QT_USE_RHI_WIDGET
     m_force_full_repaint = true;
 #    endif
@@ -1075,10 +1191,10 @@ void WebContentView::schedule_frame_damage_repaint()
         return;
     }
 
-    auto logical_left = static_cast<int>(floor(m_pending_frame_damage.x() / m_device_pixel_ratio));
-    auto logical_top = static_cast<int>(floor(m_pending_frame_damage.y() / m_device_pixel_ratio));
-    auto logical_right = static_cast<int>(ceil(m_pending_frame_damage.right() / m_device_pixel_ratio));
-    auto logical_bottom = static_cast<int>(ceil(m_pending_frame_damage.bottom() / m_device_pixel_ratio));
+    auto logical_left = static_cast<int>(floor(m_pending_frame_damage.x() / device_pixel_ratio()));
+    auto logical_top = static_cast<int>(floor(m_pending_frame_damage.y() / device_pixel_ratio()));
+    auto logical_right = static_cast<int>(ceil(m_pending_frame_damage.right() / device_pixel_ratio()));
+    auto logical_bottom = static_cast<int>(ceil(m_pending_frame_damage.bottom() / device_pixel_ratio()));
     update(QRect(logical_left, logical_top, logical_right - logical_left, logical_bottom - logical_top).intersected(rect()));
 }
 #endif
@@ -1099,14 +1215,26 @@ void WebContentView::did_accept_presented_backing_store(i32, Gfx::IntRect damage
 #if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
 void WebContentView::paintEvent(QPaintEvent*)
 {
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    // NB: Qt commits the browser window right after it paints it, which shows what the page surface committed while
+    //     synchronized. After that, the page surface can show each frame at once again, unless it committed more in
+    //     the meantime, which only the browser window's next commit may show.
+    if (m_page_surface && m_page_surface->is_synchronized()) {
+        QTimer::singleShot(0, this, [this, commit_count = m_page_surface->commit_count()] {
+            if (m_page_surface && m_page_surface->commit_count() == commit_count)
+                m_page_surface->set_synchronized(false);
+        });
+    }
+#    endif
+
     QPainter painter(this);
-    painter.scale(1 / m_device_pixel_ratio, 1 / m_device_pixel_ratio);
+    painter.scale(1 / device_pixel_ratio(), 1 / device_pixel_ratio());
 
     auto paintable = current_paintable();
-    Gfx::Bitmap const* bitmap = nullptr;
+    RefPtr<Gfx::Bitmap const> bitmap;
     Gfx::IntSize bitmap_size;
     if (paintable.has_value()) {
-        bitmap = paintable->shared_image_buffer->bitmap().ptr();
+        bitmap = cpu_bitmap_to_paint(*paintable);
         bitmap_size = paintable->bitmap_size;
     }
 
@@ -1117,7 +1245,7 @@ void WebContentView::paintEvent(QPaintEvent*)
         auto background_color = page_background_color();
         auto fallback_color = QColor(background_color.red(), background_color.green(), background_color.blue());
 
-        if (m_scales_frames_to_fit && !bitmap_size.is_empty()) {
+        if (scales_frames_to_fit() && !bitmap_size.is_empty()) {
             auto destination = rect_fitting_frame(bitmap_size, m_viewport_size);
             painter.fillRect(QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()), fallback_color);
             painter.setRenderHint(QPainter::SmoothPixmapTransform);
@@ -1138,16 +1266,38 @@ void WebContentView::paintEvent(QPaintEvent*)
     }
 
     auto background_color = page_background_color();
-    painter.fillRect(QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()), QColor(background_color.red(), background_color.green(), background_color.blue()));
+    QRegion background { QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()) };
+#    ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    // NB: Filling the part of the widget under the page's window would only touch memory that nobody sees. During a
+    //     resize, that is most of a window-sized buffer at every step.
+    background -= rect_covered_by_page_window();
+#    endif
+    for (auto const& rect : background)
+        painter.fillRect(rect, QColor(background_color.red(), background_color.green(), background_color.blue()));
 }
 #endif
 
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
 void WebContentView::paintEvent(QPaintEvent*)
 {
-    // The page layer has rounded corners, so the area outside them should match the chrome around this view.
+    // Qt still sends paint events to a view that paints on screen, which has no paint engine to paint with.
+    if (testAttribute(Qt::WA_PaintOnScreen))
+        return;
+    // Qt paints the view only while an overlay hides the page layer, and the chrome color lies behind the overlay.
     QPainter painter(this);
     painter.fillRect(rect(), ChromeStyle::chrome_background(window()->palette()));
+}
+#endif
+
+#if !defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+RefPtr<Gfx::Bitmap const> WebContentView::cpu_bitmap_of(Paintable const& paintable) const
+{
+    return paintable.shared_image_buffer->bitmap_if_present();
+}
+
+RefPtr<Gfx::Bitmap const> WebContentView::cpu_bitmap_to_paint(Paintable const& paintable) const
+{
+    return cpu_bitmap_of(paintable);
 }
 #endif
 
@@ -1158,12 +1308,21 @@ QImage WebContentView::visible_snapshot() const
     if (!paintable.has_value())
         return {};
 
-    if (auto bitmap = paintable->shared_image_buffer->bitmap_if_present()) {
+    if (auto bitmap = cpu_bitmap_of(*paintable)) {
         auto width = min(bitmap->width(), paintable->bitmap_size.width());
         auto height = min(bitmap->height(), paintable->bitmap_size.height());
         if (width <= 0 || height <= 0)
             return {};
 
+#ifdef AK_OS_MACOS
+        // The Compositor announces a frame once its GPU work is scheduled, not once it's done. Reading the surface
+        // on the CPU needs it locked, which also waits for those pending GPU writes — without the lock, a snapshot
+        // of a page that redraws every frame can catch it half-drawn.
+        auto const& surface = paintable->shared_image_buffer->iosurface_handle();
+        if (!surface.lock_read_only())
+            return {};
+        ScopeGuard unlock_surface = [&] { surface.unlock_read_only(); };
+#endif
         QImage image(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), bitmap->pitch(), QImage::Format_RGB32);
         return image.copy(0, 0, width, height);
     }
@@ -1176,65 +1335,46 @@ QImage WebContentView::visible_snapshot() const
 #endif
 }
 
-Optional<QPixmap> WebContentView::tab_preview_pixmap(QSize const& maximum_size) const
+bool WebContentView::holds_displayed_frame() const
 {
-    if (maximum_size.isEmpty())
-        return {};
+    auto paintable = current_paintable();
+    return paintable.has_value() && paintable->shared_image_buffer;
+}
 
-    auto snapshot = visible_snapshot();
-    if (snapshot.isNull())
-        return {};
+void WebContentView::take_visible_snapshot(Function<void(QImage)> on_snapshot)
+{
+    if (holds_displayed_frame() || !current_paintable().has_value()) {
+        on_snapshot(visible_snapshot());
+        return;
+    }
 
-    auto preview_size = snapshot.size().scaled(maximum_size, Qt::KeepAspectRatio);
-    if (preview_size.isEmpty())
-        return {};
+    take_frame_snapshot([self = QPointer { this }, on_snapshot = AK::move(on_snapshot)](Optional<Gfx::ShareableBitmap> snapshot) {
+        if (!self)
+            return;
+        auto const* bitmap = snapshot.has_value() && snapshot->is_valid() ? snapshot->bitmap() : nullptr;
+        if (!bitmap) {
+            on_snapshot({});
+            return;
+        }
+        QImage image(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), bitmap->pitch(), QImage::Format_RGB32);
+        on_snapshot(image.copy());
+    });
+}
 
-    auto preview = QPixmap::fromImage(snapshot).scaled(preview_size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    if (preview.isNull())
-        return {};
+void WebContentView::add_frame_notification_interest()
+{
+    if (m_frame_notification_interest++ == 0)
+        set_wants_frame_notifications(true);
+}
 
-    return preview;
+void WebContentView::remove_frame_notification_interest()
+{
+    VERIFY(m_frame_notification_interest > 0);
+    if (--m_frame_notification_interest == 0)
+        set_wants_frame_notifications(false);
 }
 
 namespace {
-
-static void draw_crash_overlay_icon(QPainter& painter, QColor const& color)
-{
-    auto draw_path = [&](QPainterPath const& path) {
-        QPainterPathStroker stroker;
-        stroker.setWidth(1.5);
-        stroker.setCapStyle(Qt::RoundCap);
-        stroker.setJoinStyle(Qt::RoundJoin);
-        painter.fillPath(stroker.createStroke(path), color);
-    };
-
-    QPainterPath page_outline(QPointF(11.75, 0.75));
-    page_outline.lineTo(2.75, 0.75);
-    page_outline.cubicTo(1.65, 0.75, 0.75, 1.65, 0.75, 2.75);
-    page_outline.lineTo(0.75, 18.75);
-    page_outline.cubicTo(0.75, 19.85, 1.65, 20.75, 2.75, 20.75);
-    page_outline.lineTo(14.75, 20.75);
-    page_outline.cubicTo(15.85, 20.75, 16.75, 19.85, 16.75, 18.75);
-    page_outline.lineTo(16.75, 5.75);
-    page_outline.closeSubpath();
-    draw_path(page_outline);
-
-    QPainterPath page_details(QPointF(10.75, 0.75));
-    page_details.lineTo(10.75, 4.75);
-    page_details.cubicTo(10.75, 5.85, 11.65, 6.75, 12.75, 6.75);
-    page_details.lineTo(16.75, 6.75);
-    page_details.moveTo(4.75, 9.75);
-    page_details.lineTo(6.75, 11.75);
-    page_details.moveTo(6.75, 9.75);
-    page_details.lineTo(4.75, 11.75);
-    page_details.moveTo(10.75, 9.75);
-    page_details.lineTo(12.75, 11.75);
-    page_details.moveTo(12.75, 9.75);
-    page_details.lineTo(10.75, 11.75);
-    page_details.moveTo(5.75, 16.75);
-    page_details.cubicTo(6.75, 14.08, 10.75, 14.08, 11.75, 16.75);
-    draw_path(page_details);
-}
 
 static constexpr int PAGE_OVERLAY_MAXIMUM_WIDTH = 640;
 static constexpr int PAGE_OVERLAY_MARGIN = 32;
@@ -1242,7 +1382,7 @@ static constexpr int CRASH_SCREEN_ICON_SPACING = 16;
 
 static QString crash_screen_message()
 {
-    return WebContentView::tr("This page crashed. You can reload it to try again.");
+    return WebContentView::tr("Something went wrong while showing this page. Your other tabs are fine.");
 }
 
 class CrashOverlayIcon final : public QWidget {
@@ -1252,16 +1392,14 @@ public:
     explicit CrashOverlayIcon(QWidget* parent)
         : QWidget(parent)
     {
-        setFixedSize(39, 48);
+        setFixedSize(40, 40);
     }
 
 protected:
     virtual void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing);
-        painter.scale(width() / 17.5, height() / 21.5);
-        draw_crash_overlay_icon(painter, palette().color(QPalette::WindowText));
+        create_chrome_icon(ChromeIcon::Warning, Theme::panel().muted).paint(&painter, rect());
     }
 };
 
@@ -1279,6 +1417,7 @@ public:
         setWidgetResizable(true);
         setBackgroundRole(QPalette::Window);
         viewport()->setBackgroundRole(QPalette::Window);
+        apply_interface_palette();
 
         // Qt scrolls opaque content by moving the pixels it painted before, which leaves stale text behind the
         // translucent fields of a review inside this native view. Transparent content is repainted instead, on top of
@@ -1307,18 +1446,48 @@ public:
     QWidget& content() { return *m_content; }
     QWidget& column() { return *m_column; }
 
+    virtual bool event(QEvent* event) override
+    {
+        if (event->type() == QEvent::PaletteChange)
+            apply_interface_palette();
+        return QScrollArea::event(event);
+    }
+
+    // The column reaches from the top of the tab to its bottom rather than being centered in it.
+    void set_fills_height()
+    {
+        m_fills_height = true;
+        m_layout->setStretch(0, 0);
+        m_layout->setStretch(1, 1);
+        m_layout->setStretch(2, 0);
+    }
+
     // The column takes all of the tab rather than being centered in it, so a review's full report gets as much room as
     // the tab has.
     void set_fills_tab(bool fills_tab)
     {
-        m_layout->setStretch(1, fills_tab ? 1 : 0);
+        m_layout->setStretch(1, fills_tab || m_fills_height ? 1 : 0);
         m_column->setMaximumWidth(fills_tab ? QWIDGETSIZE_MAX : PAGE_OVERLAY_MAXIMUM_WIDTH);
     }
 
 private:
+    // The overlay is in the interface theme's colors, like the review it holds, whichever appearance Qt's palette has.
+    void apply_interface_palette()
+    {
+        // Setting the palette changes it, which would bring us back here.
+        if (m_is_applying_interface_palette)
+            return;
+        m_is_applying_interface_palette = true;
+        setPalette(QPalette {});
+        setPalette(Theme::interface_palette(palette()));
+        m_is_applying_interface_palette = false;
+    }
+
     QWidget* m_content { nullptr };
     QWidget* m_column { nullptr };
     QVBoxLayout* m_layout { nullptr };
+    bool m_fills_height { false };
+    bool m_is_applying_interface_palette { false };
 };
 
 class CrashOverlayUrlLabel final : public QLabel {
@@ -1388,7 +1557,7 @@ void WebContentView::set_crash_overlay_visible(bool visible)
         heading_layout->setContentsMargins(0, 0, 0, 0);
         heading_layout->setSpacing(ReportReview::item_spacing);
 
-        auto* title = ReportReview::create_title(tr("Ladybird flew off-course!"), heading);
+        m_crash_overlay_title = ReportReview::create_title({}, heading);
 
         m_crash_overlay_url = new CrashOverlayUrlLabel(heading);
 
@@ -1397,7 +1566,11 @@ void WebContentView::set_crash_overlay_visible(bool visible)
         m_crash_overlay_message->setForegroundRole(QPalette::PlaceholderText);
         m_crash_overlay_message->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-        m_crash_overlay_reload_button = new QPushButton(tr("Reload page"), column);
+        m_crash_overlay_reload_button = new QPushButton(tr("Reload"), column);
+        m_crash_overlay_reload_button->setStyleSheet(ChromeStyle::primary_button_style_sheet());
+        // NB: The style sheet draws the button over all of its widget, so the layout must place the widget itself
+        //     rather than the smaller native button inside it, or the column clips the button's edges.
+        m_crash_overlay_reload_button->setAttribute(Qt::WA_LayoutUsesWidgetRect);
         QObject::connect(m_crash_overlay_reload_button, &QPushButton::clicked, this, [this] {
             reload();
         });
@@ -1406,7 +1579,7 @@ void WebContentView::set_crash_overlay_visible(bool visible)
         m_crash_overlay_reload_shortcut->setContext(Qt::WidgetWithChildrenShortcut);
         QObject::connect(m_crash_overlay_reload_shortcut, &QShortcut::activated, m_crash_overlay_reload_button, &QPushButton::click);
 
-        heading_layout->addWidget(title);
+        heading_layout->addWidget(m_crash_overlay_title);
         heading_layout->addWidget(m_crash_overlay_url);
         heading_layout->addWidget(m_crash_overlay_message);
 
@@ -1438,7 +1611,13 @@ void WebContentView::set_crash_overlay_visible(bool visible)
     if (m_crash_report_container)
         m_crash_report_container->hide();
     m_crash_overlay_url->show();
-    m_crash_overlay_message->setText(crash_screen_message());
+    if (crash_overlay_is_for_memory_limit()) {
+        m_crash_overlay_title->setText(tr("This tab ran out of memory"));
+        m_crash_overlay_message->setText(tr("This page used too much memory, so it was stopped."));
+    } else {
+        m_crash_overlay_title->setText(tr("This tab crashed"));
+        m_crash_overlay_message->setText(crash_screen_message());
+    }
     m_crash_overlay_reload_button->show();
     m_crash_overlay_reload_shortcut->setEnabled(true);
 
@@ -1451,14 +1630,6 @@ void WebContentView::set_crash_overlay_visible(bool visible)
     // The report is often written after the crash screen appears, in which case it is shown once it is saved.
     show_crash_report_review();
     schedule_repaint();
-}
-
-void WebContentView::review_hidden_crash_report(ByteString const& report_name)
-{
-    set_crash_overlay_visible(true);
-    show_crash_report_review(report_name);
-    if (!m_crash_report_review)
-        set_crash_overlay_visible(false);
 }
 
 // A tab opened only for a review lets go of what it showed over its page once the user takes the tab elsewhere.
@@ -1478,33 +1649,40 @@ void WebContentView::leave_report_review()
     schedule_repaint();
 }
 
-// The frame and the page's dumps are taken right away, so the report shows the page as it was when the user asked. The
-// user selects what they saw on the page itself, and reviews the report in a tab of its own.
+// The page's dumps are taken right away, so the report describes the page as it was when the user asked. The user
+// selects what they saw on the page itself, and reviews the report in a tab of its own.
 void WebContentView::start_web_compat_report()
 {
     if (m_screenshot_selection_overlay)
         return;
 
     WebCompatReportCapture capture {
-        .page = WebView::WebCompatReport::describe_page(*this),
-        .frame = visible_snapshot(),
+        .page = describe_page(),
         .screenshot = {},
-        .page_dumps = WebView::WebCompatReport::request_page_dumps(*this),
+        .page_dumps = request_page_dumps(),
     };
-
-    auto review = [this](WebCompatReportCapture capture) {
+    select_web_compat_report_screenshot([this, capture = AK::move(capture)](QImage screenshot) mutable {
+        capture.screenshot = AK::move(screenshot);
         if (on_request_web_compat_report_review)
             on_request_web_compat_report_review(AK::move(capture));
-    };
-    if (capture.frame.isNull()) {
-        review(AK::move(capture));
-        return;
-    }
+    });
+}
 
-    auto frame = capture.frame;
-    select_screenshot(frame, [review = AK::move(review), capture = AK::move(capture)](QImage screenshot) mutable {
-        capture.screenshot = AK::move(screenshot);
-        review(AK::move(capture));
+// A report's screenshot is selected on the page itself, both when the report starts and when its review takes another.
+// Without a frame to select from, the report goes without one.
+void WebContentView::select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close)
+{
+    if (m_screenshot_selection_overlay)
+        return;
+
+    take_visible_snapshot([this, on_selected = AK::move(on_selected), on_close = AK::move(on_close)](QImage frame) mutable {
+        if (frame.isNull() || m_screenshot_selection_overlay) {
+            if (on_close)
+                on_close();
+            on_selected({});
+            return;
+        }
+        select_screenshot(frame, ScreenshotSelectionOverlay::Purpose::ReportIssue, AK::move(on_close)).on_finished = AK::move(on_selected);
     });
 }
 
@@ -1515,6 +1693,7 @@ void WebContentView::review_web_compat_report(WebCompatReportCapture capture)
         return;
 
     m_web_compat_report_overlay = new PageOverlay(this);
+    m_web_compat_report_overlay->set_fills_height();
     auto* column = &m_web_compat_report_overlay->column();
 
     auto* review = new WebCompatReportReview(AK::move(capture.page), AK::move(capture.screenshot), column);
@@ -1522,10 +1701,10 @@ void WebContentView::review_web_compat_report(WebCompatReportCapture capture)
     column_layout->setContentsMargins(0, 0, 0, 0);
     column_layout->addWidget(review);
 
-    review->on_select_screenshot = [this, review = QPointer { review }, frame = AK::move(capture.frame)] {
-        if (frame.isNull())
+    review->on_select_screenshot = [this, review = QPointer { review }] {
+        if (!on_request_web_compat_report_screenshot)
             return;
-        select_screenshot(frame, [review](QImage screenshot) {
+        on_request_web_compat_report_screenshot([review](QImage screenshot) {
             if (!review)
                 return;
             review->set_screenshot(AK::move(screenshot));
@@ -1547,6 +1726,10 @@ void WebContentView::review_web_compat_report(WebCompatReportCapture capture)
         if (on_close)
             on_close();
     };
+    review->on_close_tab = [this] {
+        if (on_close_web_compat_report_tab)
+            on_close_web_compat_report_tab();
+    };
     // The review is part of the overlay and cannot outlive it, even once leaving the review has let go of the overlay.
     review->on_report_text_visibility_change = [overlay = m_web_compat_report_overlay](bool visible) {
         overlay->set_fills_tab(visible);
@@ -1560,6 +1743,10 @@ void WebContentView::review_web_compat_report(WebCompatReportCapture capture)
         .when_rejected([](Error const& error) {
             warnln("Could not dump the page for a web compatibility report: {}", error);
         });
+    HubConnection::the().fetch_platform_features_description([review = QPointer { review }](ByteString description) {
+        if (review)
+            review->set_platform_features(description);
+    });
 
     m_web_compat_report_overlay->setGeometry(rect());
     m_web_compat_report_overlay->show();
@@ -1569,21 +1756,51 @@ void WebContentView::review_web_compat_report(WebCompatReportCapture capture)
 }
 
 // The selection shows a frame taken earlier, so the user selects what they saw, even while the page underneath changes.
-void WebContentView::select_screenshot(QImage const& frame, Function<void(QImage)> on_selected)
+ScreenshotSelectionOverlay& WebContentView::select_screenshot(QImage const& frame, ScreenshotSelectionOverlay::Purpose purpose, Function<void()> on_close)
+{
+    VERIFY(!m_screenshot_selection_overlay);
+
+    auto* overlay = new ScreenshotSelectionOverlay(frame, this, purpose);
+    m_screenshot_selection_overlay = overlay;
+    auto focus_to_restore = show_transient_overlay(*overlay);
+    // The overlay follows the page's frames while it scrolls underneath.
+    add_frame_notification_interest();
+    overlay->on_close = [this, overlay, focus_to_restore, on_close = AK::move(on_close)] {
+        remove_frame_notification_interest();
+        close_transient_overlay(*overlay, focus_to_restore);
+        if (on_close)
+            on_close();
+    };
+    overlay->on_request_page_frame = [this](Function<void(QImage)> on_frame) { take_visible_snapshot(AK::move(on_frame)); };
+    overlay->on_page_visibility_change = [this] { schedule_repaint(); };
+    return *overlay;
+}
+
+// The user selects the part of the page to save, or saves all of the page they see or the whole page. Without a frame
+// to select from, what the page shows is saved.
+void WebContentView::start_screenshot()
 {
     if (m_screenshot_selection_overlay)
         return;
 
-    auto* overlay = new ScreenshotSelectionOverlay(frame, this);
-    m_screenshot_selection_overlay = overlay;
-    auto focus_to_restore = show_transient_overlay(*overlay);
-    overlay->on_finished = [this, overlay, focus_to_restore, on_selected = AK::move(on_selected)](QImage screenshot) {
-        close_transient_overlay(*overlay, focus_to_restore);
-        on_selected(AK::move(screenshot));
-    };
-    overlay->on_canceled = [this, overlay, focus_to_restore] {
-        close_transient_overlay(*overlay, focus_to_restore);
-    };
+    take_visible_snapshot([this](QImage frame) {
+        if (m_screenshot_selection_overlay)
+            return;
+        if (frame.isNull()) {
+            take_and_save_screenshot(ScreenshotType::Visible);
+            return;
+        }
+
+        auto& overlay = select_screenshot(frame, ScreenshotSelectionOverlay::Purpose::SaveScreenshot);
+        overlay.on_finished = [this](QImage screenshot) {
+            auto image = screenshot.convertToFormat(QImage::Format_ARGB32);
+            auto bitmap = MUST(Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Unpremultiplied, { image.width(), image.height() }, image.bytesPerLine(), image.bits()));
+            save_screenshot(*bitmap);
+        };
+        overlay.on_full_page_requested = [this] {
+            take_and_save_screenshot(ScreenshotType::Full);
+        };
+    });
 }
 
 // An overlay shown for a moment, such as to select or view a screenshot, hands the focus back once it is done.
@@ -1610,52 +1827,106 @@ Array<QWidget*, 4> WebContentView::overlays() const
     return { m_crash_overlay, m_web_compat_report_overlay, m_screenshot_selection_overlay, m_screenshot_viewer };
 }
 
+namespace {
+
+class FloatingSurfaceWatcher final : public QObject {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    FloatingSurfaceWatcher(QWidget& surface, Function<void()> on_shown_or_hidden)
+        : QObject(&surface)
+        , m_on_shown_or_hidden(AK::move(on_shown_or_hidden))
+    {
+        surface.installEventFilter(this);
+    }
+
+private:
+    virtual bool eventFilter(QObject*, QEvent* event) override
+    {
+        if (event->type() == QEvent::Show || event->type() == QEvent::Hide)
+            m_on_shown_or_hidden();
+        return false;
+    }
+
+    Function<void()> m_on_shown_or_hidden;
+};
+
+}
+
+void WebContentView::add_floating_surface(QWidget& surface)
+{
+    if (any_of(m_floating_surfaces, [&](auto const& floating) { return floating.surface == &surface; }))
+        return;
+    auto* watcher = new FloatingSurfaceWatcher(surface, [view = QPointer { this }] {
+        if (view)
+            view->schedule_repaint();
+    });
+    m_floating_surfaces.append({ .surface = &surface, .watcher = watcher });
+
+    // A surface that already shows gets no event of being shown over this view.
+    if (surface.isVisible())
+        schedule_repaint();
+}
+
+void WebContentView::remove_floating_surface(QWidget& surface)
+{
+    auto removed = m_floating_surfaces.remove_all_matching([&](auto const& floating) {
+        if (floating.surface != &surface)
+            return false;
+        delete floating.watcher.data();
+        return true;
+    });
+    if (removed)
+        schedule_repaint();
+}
+
+void WebContentView::set_suggestions_over_page(bool suggestions_over_page)
+{
+    if (m_suggestions_over_page == suggestions_over_page)
+        return;
+    m_suggestions_over_page = suggestions_over_page;
+    schedule_repaint();
+}
+
+bool WebContentView::has_floating_surface_over_page() const
+{
+    return m_suggestions_over_page || any_of(m_floating_surfaces, [](auto const& floating) { return floating.surface && floating.surface->isVisible(); });
+}
+
 // Overlays are painted by Qt, underneath whatever presents the page on some platforms, which has to step aside for them.
 bool WebContentView::is_page_covered_by_overlay() const
 {
     for (auto* overlay : overlays()) {
-        if (overlay && !overlay->isHidden())
+        if (overlay && !overlay->isHidden() && !(overlay == m_screenshot_selection_overlay && m_screenshot_selection_overlay->reveals_page()))
             return true;
     }
     return false;
 }
 
-// A report of a crash with no crash screen of its own is reviewed in a blank tab opened for it.
-void WebContentView::show_crash_report_review(Optional<ByteString> const& hidden_crash_report_name)
+void WebContentView::show_crash_report_review()
 {
     if (!m_crash_report_container || m_crash_report_review)
         return;
 
-    auto is_hidden_crash = hidden_crash_report_name.has_value();
-    auto report_name = is_hidden_crash ? hidden_crash_report_name : crash_report_name();
+    auto report_name = crash_report_name();
     if (!report_name.has_value())
         return;
 
-    m_crash_report_review = new CrashReportReviewWidget(is_hidden_crash ? tr("Close tab") : tr("Reload page"), m_crash_report_container);
-    if (auto result = m_crash_report_review->open_report(report_name, is_hidden_crash ? Optional<String> {} : crash_report_website()); result.is_error()) {
+    m_crash_report_review = new CrashReportReviewWidget(tr("Reload page"), m_crash_report_container);
+    if (auto result = m_crash_report_review->open_report(*report_name, crash_report_website()); result.is_error()) {
         warnln("Could not open crash report {}: {}", *report_name, result.error());
         delete m_crash_report_review;
         m_crash_report_review = nullptr;
         return;
     }
-    m_crash_report_review->on_exit = [this, is_hidden_crash] {
-        // The tab was opened only for the review, and a report on its way keeps going without it. Closing it also
-        // declines the reports still waiting, so none of them is offered again.
-        if (is_hidden_crash) {
-            if (auto result = WebView::CrashReportStore::the().mark_all_seen(); result.is_error())
-                warnln("Could not mark crash reports as seen: {}", result.error());
-            if (on_close)
-                on_close();
-            return;
-        }
+    m_crash_report_review->on_exit = [this] {
         reload();
     };
     m_crash_report_review->on_report_text_visibility_change = [this](bool visible) {
         m_crash_overlay->set_fills_tab(visible);
     };
-    auto answered_message = is_hidden_crash ? tr("Part of Ladybird stopped unexpectedly.") : crash_screen_message();
-    m_crash_report_review->on_answered = [this, answered_message] {
-        m_crash_overlay_message->setText(answered_message);
+    m_crash_report_review->on_answered = [this] {
+        m_crash_overlay_message->setText(crash_screen_message());
     };
 
     // The review offers reloading among its own actions, and the website among its fields. It takes text, so Return
@@ -1664,9 +1935,7 @@ void WebContentView::show_crash_report_review(Optional<ByteString> const& hidden
     auto reload_button_had_focus = m_crash_overlay_reload_button->hasFocus();
     m_crash_overlay_reload_button->hide();
     m_crash_overlay_url->hide();
-    m_crash_overlay_message->setText(is_hidden_crash
-            ? tr("Part of Ladybird stopped unexpectedly. You can send us a crash report to help fix it.")
-            : tr("This page crashed. You can send us a crash report to help fix it."));
+    m_crash_overlay_message->setText(tr("This page crashed. You can send us a crash report to help fix it."));
     m_crash_report_container->layout()->addWidget(m_crash_report_review);
     m_crash_report_container->show();
     if (reload_button_had_focus)
@@ -1678,6 +1947,7 @@ void WebContentView::resizeEvent(QResizeEvent* event)
     WebContentViewBase::resizeEvent(event);
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     update_iosurface_layer_frame();
+    synchronize_resize_with_remote_layer();
 #endif
 
     for (auto* overlay : overlays()) {
@@ -1690,6 +1960,11 @@ void WebContentView::resizeEvent(QResizeEvent* event)
 #endif
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
     update_vulkan_window_geometry();
+#endif
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    // NB: The page surface would stick out of a browser window that shrinks, so it is cropped to the view.
+    if (m_page_surface && !QRect { QPoint { 0, 0 }, size() * device_pixel_ratio() }.contains(m_page_surface_rect))
+        update_page_surface(PageSurfaceContent::Unchanged);
 #endif
     // One window resize reaches the view as several resize events in one turn of the event loop
     // (the chrome around it settles after it). The page gets one viewport size per turn: the size
@@ -1708,7 +1983,7 @@ void WebContentView::resizeEvent(QResizeEvent* event)
 void WebContentView::set_viewport_rect(Gfx::IntRect rect)
 {
     m_viewport_size = rect.size();
-    handle_resize();
+    set_device_pixel_ratio_and_viewport(device_pixel_ratio(), viewport_size());
 }
 
 // A view in a tab that isn't the current one gets its geometry, but Qt holds the resize event back until the tab is
@@ -1722,7 +1997,7 @@ void WebContentView::push_viewport_size()
 
 void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
 {
-    m_device_pixel_ratio = device_pixel_ratio;
+    set_device_pixel_ratio_and_viewport(device_pixel_ratio, viewport_size());
     update_viewport_size();
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     present_current_paintable_as_layer_contents();
@@ -1731,6 +2006,10 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
 
 void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, [[maybe_unused]] int right)
 {
+#ifdef LADYBIRD_QT_USE_D3D_RHI_WIDGET
+    m_vertical_tabs_overlay_page = left != 0 || right != 0;
+    update_whether_view_hosts_remote_layer();
+#endif
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
     if (m_vertical_tab_overlay_left == left && m_vertical_tab_overlay_right == right)
         return;
@@ -1746,8 +2025,30 @@ void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, 
 #endif
 }
 
+#ifndef LADYBIRD_QT_USE_IOSURFACE_LAYER
+void WebContentView::set_page_dim(qreal)
+{
+    // NB: Elsewhere, the dialog dims the page by painting over it.
+}
+#endif
+
+#ifndef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+bool WebContentView::show_image_over_page(QImage const&, QPoint)
+{
+    return false;
+}
+
+void WebContentView::hide_image_over_page()
+{
+}
+#endif
+
 void WebContentView::set_bookmarks_bar_overlay_height([[maybe_unused]] int height)
 {
+#ifdef LADYBIRD_QT_USE_D3D_RHI_WIDGET
+    m_bookmarks_bar_overlays_page = height != 0;
+    update_whether_view_hosts_remote_layer();
+#endif
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
     if (m_bookmarks_bar_overlay_height == height)
         return;
@@ -1758,17 +2059,10 @@ void WebContentView::set_bookmarks_bar_overlay_height([[maybe_unused]] int heigh
 #endif
 }
 
-void WebContentView::set_zoom_level(double zoom_level)
-{
-    m_zoom_level = zoom_level;
-    page().async_set_zoom_level(m_zoom_level);
-    update_zoom();
-}
-
 void WebContentView::update_viewport_size()
 {
-    auto scaled_width = int(width() * m_device_pixel_ratio);
-    auto scaled_height = int(height() * m_device_pixel_ratio);
+    auto scaled_width = int(width() * device_pixel_ratio());
+    auto scaled_height = int(height() * device_pixel_ratio());
     Gfx::IntRect rect(0, 0, scaled_width, scaled_height);
 
     set_viewport_rect(rect);
@@ -1776,7 +2070,6 @@ void WebContentView::update_viewport_size()
 
 void WebContentView::update_zoom()
 {
-    ViewImplementation::update_zoom();
     update_viewport_size();
 }
 
@@ -1787,6 +2080,13 @@ void WebContentView::showEvent(QShowEvent* event)
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     // A frame may have arrived before this view had a native view to attach its layer to.
     present_current_paintable_as_layer_contents();
+#endif
+#ifdef LADYBIRD_QT_USE_D3D_RHI_WIDGET
+    update_whether_view_hosts_remote_layer();
+#endif
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    if (m_page_surface)
+        schedule_vulkan_window_update();
 #endif
 }
 
@@ -1805,12 +2105,22 @@ void WebContentView::hideEvent(QHideEvent* event)
 {
     WebContentViewBase::hideEvent(event);
     set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    if (m_page_surface)
+        hide_page_surface();
+#endif
 
     // Qt sends no Leave to a view hidden under the pointer (a tab switched away from with the keyboard, e.g.). So, tell
     // WebContent the pointer left. Otherwise, it keeps hovering the link under the pointer — and won't report the hover
     // again when the view comes back under it. WebContent handles the leave at its next rendering opportunity (when the
     // page is visible again). So, the tab hides the link-preview label for a hidden view itself (Tab::hideEvent).
     handle_pointer_leave();
+
+#ifdef AK_OS_MACOS
+    // Qt begins the momentum after a held end as a scroll of its own, which goes to the view under the pointer.
+    if (auto wheel_end = AK::exchange(m_wheel_end_awaiting_momentum, nullptr))
+        enqueue_native_event(Web::MouseEvent::Type::MouseWheel, *wheel_end);
+#endif
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
     // When this tab becomes inactive, deregister all its accessibility interfaces from Qt's global registry.
@@ -1821,67 +2131,89 @@ void WebContentView::hideEvent(QHideEvent* event)
 static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, WebContentView::PaletteMode mode)
 {
     auto qt_palette = widget.palette();
+    auto dark = websites_prefer_dark();
 
-    auto theme_file = mode == WebContentView::PaletteMode::Default ? "Default"sv : "Dark"sv;
+    auto theme_file = mode == WebContentView::PaletteMode::Dark || dark ? "Dark"sv : "Default"sv;
     auto theme_ini = MUST(Core::Resource::load_from_uri(MUST(String::formatted("resource://themes/{}.ini", theme_file))));
     auto theme = Gfx::load_system_theme(theme_ini->filesystem_path().to_byte_string()).release_value_but_fixme_should_propagate_errors();
 
     auto palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(theme);
     auto palette = Gfx::Palette(move(palette_impl));
 
+    // When the widgets' palette has the other appearance than pages get, pages keep the colors of the theme file instead.
+    // NB: The palette is judged by its own colors, as the platform theme may keep the system's palette whatever the
+    //     interface theme asks for.
+    auto qt_palette_is_dark = qt_palette.color(QPalette::Window).lightness() < 128;
+    auto qt_palette_matches = qt_palette_is_dark == dark;
     auto translate = [&](Gfx::ColorRole gfx_color_role, QPalette::ColorRole qt_color_role) {
+        if (!qt_palette_matches)
+            return;
         auto new_color = Gfx::Color::from_bgra(qt_palette.color(qt_color_role).rgba());
         palette.set_color(gfx_color_role, new_color);
     };
 
-    translate(Gfx::ColorRole::ThreedHighlight, QPalette::ColorRole::Light);
     translate(Gfx::ColorRole::ThreedShadow1, QPalette::ColorRole::Mid);
-    translate(Gfx::ColorRole::ThreedShadow2, QPalette::ColorRole::Dark);
-    translate(Gfx::ColorRole::HoverHighlight, QPalette::ColorRole::Light);
     translate(Gfx::ColorRole::Link, QPalette::ColorRole::Link);
-    translate(Gfx::ColorRole::VisitedLink, QPalette::ColorRole::LinkVisited);
     translate(Gfx::ColorRole::Button, QPalette::ColorRole::Button);
     translate(Gfx::ColorRole::ButtonText, QPalette::ColorRole::ButtonText);
+    // NB: Content whose color scheme is not the palette's own takes the selection color for its scheme.
 #ifdef AK_OS_MACOS
-    palette.set_color(Gfx::ColorRole::Selection, WebView::macos_web_selection_color());
-    palette.set_color(Gfx::ColorRole::InactiveSelection, WebView::macos_web_inactive_selection_color());
-    palette.set_color(Gfx::ColorRole::InactiveSelectionText, WebView::macos_web_inactive_selection_text_color());
+    palette.set_color(Gfx::ColorRole::Selection, macos_web_selection_color(dark ? Web::CSS::PreferredColorScheme::Dark : Web::CSS::PreferredColorScheme::Light));
+    palette.set_color(Gfx::ColorRole::LightSelection, macos_web_selection_color(Web::CSS::PreferredColorScheme::Light));
+    palette.set_color(Gfx::ColorRole::DarkSelection, macos_web_selection_color(Web::CSS::PreferredColorScheme::Dark));
+    palette.set_color(Gfx::ColorRole::InactiveSelection, macos_web_inactive_selection_color());
 #else
-    translate(Gfx::ColorRole::Selection, QPalette::ColorRole::Highlight);
+    // NB: Desktop highlight colors are mostly strong ones meant for white text, but selected content keeps its own text
+    //     color. On light content, a strong highlight becomes a tint, as in GTK's text views, so dark text and links
+    //     stay readable on it, while a light one already suits dark text. On dark content, a highlight is kept as long
+    //     as light text stays readable on it, so dark accents stay visible against the page, and lighter ones become
+    //     a tint.
+    auto selection_color = [](QColor highlight, Web::CSS::PreferredColorScheme color_scheme) {
+        auto color = Gfx::Color::from_bgra(highlight.rgba());
+        if (color.alpha() < 255)
+            return color;
+        if (color_scheme == Web::CSS::PreferredColorScheme::Dark) {
+            auto canvas = Web::CSS::SystemColor::canvas(color_scheme);
+            auto selection = canvas.blend(Web::CSS::SystemColor::transform_selection_background_color(color, color_scheme));
+            if (Web::CSS::SystemColor::canvas_text(color_scheme).contrast_ratio(selection) >= 4.5)
+                return color;
+            return color.with_alpha(115); // 45%
+        }
+        if (highlight.lightnessF() < 0.75f)
+            return color.with_alpha(77); // 30%
+        return color;
+    };
 
-    auto active_highlight = qt_palette.color(QPalette::Active, QPalette::ColorRole::Highlight);
+    // NB: Qt's palette does not follow the desktop's accent color, which desktops such as GNOME select text in.
+    auto active_highlight = Theme::desktop_accent().value_or(qt_palette.color(QPalette::Active, QPalette::ColorRole::Highlight));
     auto inactive_highlight = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::Highlight);
-    if (inactive_highlight != active_highlight) {
-        palette.set_color(Gfx::ColorRole::InactiveSelection, Gfx::Color::from_bgra(inactive_highlight.rgba()));
-        auto inactive_highlighted_text = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::HighlightedText);
-        palette.set_color(Gfx::ColorRole::InactiveSelectionText, Gfx::Color::from_bgra(inactive_highlighted_text.rgba()));
+    auto palette_color_scheme = dark ? Web::CSS::PreferredColorScheme::Dark : Web::CSS::PreferredColorScheme::Light;
+    palette.set_color(Gfx::ColorRole::Selection, selection_color(active_highlight, palette_color_scheme));
+    palette.set_color(Gfx::ColorRole::LightSelection, selection_color(active_highlight, Web::CSS::PreferredColorScheme::Light));
+    palette.set_color(Gfx::ColorRole::DarkSelection, selection_color(active_highlight, Web::CSS::PreferredColorScheme::Dark));
+    if (qt_palette_matches && !Theme::desktop_accent().has_value() && inactive_highlight != active_highlight) {
+        palette.set_color(Gfx::ColorRole::InactiveSelection, selection_color(inactive_highlight, palette_color_scheme));
     } else {
-        // The Qt theme does not differentiate inactive selections; use a neutral gray.
-        auto inactive_selection = is_using_dark_system_theme(widget) ? Gfx::Color(0x60, 0x60, 0x60) : Gfx::Color(0xd4, 0xd4, 0xd4);
+        // NB: Where the Qt theme has no inactive selection color of its own, its palette has the other appearance
+        //     than pages get, or the selection takes the desktop's accent, inactive selections are a neutral gray.
+        auto inactive_selection = dark ? Gfx::Color(0x60, 0x60, 0x60) : Gfx::Color(0xd4, 0xd4, 0xd4);
         palette.set_color(Gfx::ColorRole::InactiveSelection, inactive_selection);
     }
 #endif
 
-    palette.set_flag(Gfx::FlagRole::IsDark, is_using_dark_system_theme(widget));
+    palette.set_flag(Gfx::FlagRole::IsDark, dark);
 
     return theme;
 }
 
 void WebContentView::update_palette(PaletteMode mode)
 {
-    set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
+    set_page_background_color_to_system_canvas(websites_prefer_dark());
 
     // NB: Every page hosting documents of this tab takes the palette, including the pages of out-of-process iframes.
     //     Their prefers-color-scheme and system colors resolve against it.
     update_system_theme(make_system_theme_from_qt_palette(*this, mode));
-#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
-    update_iosurface_layer_border();
-#endif
-}
-
-Core::AnonymousBuffer WebContentView::system_theme()
-{
-    return make_system_theme_from_qt_palette(*this, PaletteMode::Default);
+    update_interface_color_scheme();
 }
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
@@ -1899,7 +2231,7 @@ void WebContentView::notify_accessibility_focus_on_document_root()
             // Mark the root as focused in the shared tree data *before* posting the Qt Focus event. Otherwise, state()
             // reports focused=false and Qt's AT-SPI2 bridge emits the focus event with detail1=0 (focus lost) rather
             // than detail1=1 (focus gained) — defeating the announcement.
-            m_accessibility_manager->set_focused_node(root->id);
+            m_accessibility_manager->show_focus_on_root();
             auto* root_iface = accessibility_interface_for_node(root->id);
             if (root_iface) {
                 QAccessibleEvent focus_event(root_iface, QAccessible::Focus);
@@ -1928,6 +2260,69 @@ void WebContentView::announce_accessibility_focus()
     notify_accessibility_focus_on_document_root();
 }
 #endif
+
+void WebContentView::did_update_accessibility_tree([[maybe_unused]] Optional<Vector<i64>> removed_ids)
+{
+#if defined(Q_OS_MACOS)
+    // Only the first tree for a page announces the load. WebContent rebuilds the tree on DOM mutations too, and
+    // announcing each of those would move VoiceOver's cursor back to the top of the page while the user is reading
+    // it. Same gate as the AT-SPI focus post in the branch below.
+    // NB: A page load never moves the keyboard focus, with or without an assistive technology. For example, a new
+    //     tab's location editor keeps the focus while the new tab page loads.
+    auto const announce_load = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
+    if (announce_load)
+        m_posted_initial_accessibility_focus = true;
+    // An assistive technology that turned up mid-page got no focused element from its first queries: The first tree
+    // has AppKit look the focus up again — if the page has the keyboard focus (update_accessibility_tree() checks).
+    auto const report_focus = m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty();
+    if (report_focus)
+        m_report_accessibility_focus_with_next_tree = false;
+    QTimer::singleShot(100, this, [this, announce_load, report_focus, removed_ids = AK::move(removed_ids)] {
+        update_accessibility_tree(this, announce_load, report_focus, removed_ids);
+    });
+#elif !defined(Q_OS_WIN)
+    // Prune interfaces for nodes no longer in the tree: after a change, the ones it removed; after a whole new tree,
+    // every one whose node is gone.
+    QList<i64> stale_ids;
+    if (removed_ids.has_value()) {
+        for (auto id : *removed_ids) {
+            if (m_accessibility_elements.contains(id))
+                stale_ids.append(id);
+        }
+    } else {
+        for (auto it = m_accessibility_elements.begin(); it != m_accessibility_elements.end(); ++it) {
+            if (!it.value()->isValid())
+                stale_ids.append(it.key());
+        }
+    }
+    for (auto id : stale_ids) {
+        auto* iface = m_accessibility_elements.take(id);
+        QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface));
+    }
+
+    // An assistive technology that turned up mid-page found no tree to take the focus from: Tell it where the focus
+    // is now that there's one — if the page has the keyboard focus at all.
+    if (m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
+        m_report_accessibility_focus_with_next_tree = false;
+        if (hasFocus())
+            announce_accessibility_focus();
+    }
+
+    // Post a Focus AT-SPI2 event on the document root the first time a tree arrives. This is what lets Orca's
+    // browse-mode commands (H/K/L structural nav) work on page load — without the user having to Tab/click into the
+    // page first. The event is posted unconditionally — even when the address bar has Qt focus — because our Orca
+    // script re-suspends browse-mode commands when it later sees a focus event for an editable chrome widget. So if
+    // the user explicitly focuses the address bar (Ctrl+L, mouse click), typing there still works. Firing this on
+    // every subsequent tree update would be wrong: it would re-focus the document root while the user is
+    // mid-navigation — causing Orca to re-present the current structural-nav target.
+    if (!m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
+        m_posted_initial_accessibility_focus = true;
+        QTimer::singleShot(1000, this, [this] {
+            notify_accessibility_focus_on_document_root();
+        });
+    }
+#endif
+}
 
 #if !defined(Q_OS_WIN)
 void WebContentView::fetch_accessibility_tree()
@@ -1962,12 +2357,12 @@ void WebContentView::watch_screen_geometry(QScreen& screen)
     });
 }
 
-Optional<WebView::ViewImplementation::ScreenRects> WebContentView::screen_rects() const
+static Optional<RemoteView::ScreenRects> screen_rects_from_qt()
 {
     auto screens = QGuiApplication::screens();
 
     if (!screens.empty()) {
-        ScreenRects result;
+        RemoteView::ScreenRects result;
         for (auto const& screen : screens) {
             // NOTE: QScreen::geometry() returns the 'device-independent pixels', we multiply
             //       by the device pixel ratio to get the 'physical pixels' of the display.
@@ -1987,11 +2382,44 @@ Optional<WebView::ViewImplementation::ScreenRects> WebContentView::screen_rects(
     return {};
 }
 
-void WebContentView::prepare_page_for_navigable(WebView::WebContentPage& page)
+Optional<RemoteView::ScreenRects> WebContentView::screen_rects() const
 {
-    ViewImplementation::prepare_page_for_navigable(page);
+    return screen_rects_from_qt();
+}
 
-    update_compositor_display_metadata(page);
+// Qt has no zoom cursors, so draw a magnifier with a plus or a minus in its lens, with the hotspot at the lens's center.
+static QCursor make_zoom_cursor(bool zoom_in, qreal device_pixel_ratio)
+{
+    static constexpr int size = 24;
+    static constexpr QPointF lens_center { 9.5, 9.5 };
+    static constexpr qreal lens_radius = 6.5;
+
+    QPixmap pixmap { qRound(size * device_pixel_ratio), qRound(size * device_pixel_ratio) };
+    pixmap.setDevicePixelRatio(device_pixel_ratio);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter { &pixmap };
+    painter.setRenderHint(QPainter::Antialiasing);
+    auto draw_shape = [&](QColor const& color, qreal width) {
+        painter.setPen(QPen { color, width, Qt::SolidLine, Qt::RoundCap });
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(lens_center, lens_radius, lens_radius);
+        painter.setPen(QPen { color, width + 1.5, Qt::SolidLine, Qt::RoundCap });
+        painter.drawLine(QPointF { 14.5, 14.5 }, QPointF { 21, 21 });
+        painter.setPen(QPen { color, width, Qt::SolidLine, Qt::RoundCap });
+        painter.drawLine(QPointF { 6.5, 9.5 }, QPointF { 12.5, 9.5 });
+        if (zoom_in)
+            painter.drawLine(QPointF { 9.5, 6.5 }, QPointF { 9.5, 12.5 });
+    };
+    // NB: A white outline under the black shape keeps the cursor visible on dark and light backgrounds alike.
+    draw_shape(Qt::white, 3.5);
+    painter.setBrush(QColor { 255, 255, 255, 160 });
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(lens_center, lens_radius - 1, lens_radius - 1);
+    draw_shape(Qt::black, 1.5);
+    painter.end();
+
+    return QCursor { pixmap, qRound(lens_center.x()), qRound(lens_center.y()) };
 }
 
 void WebContentView::update_cursor(Gfx::Cursor cursor)
@@ -1999,64 +2427,69 @@ void WebContentView::update_cursor(Gfx::Cursor cursor)
     cursor.visit([this](Gfx::StandardCursor standard_cursor) {
         switch (standard_cursor) {
         case Gfx::StandardCursor::Hidden:
-            apply_web_content_cursor(Qt::BlankCursor);
+            setCursor(Qt::BlankCursor);
             break;
         case Gfx::StandardCursor::Arrow:
-            apply_web_content_cursor(Qt::ArrowCursor);
+            setCursor(Qt::ArrowCursor);
             break;
         case Gfx::StandardCursor::Crosshair:
-            apply_web_content_cursor(Qt::CrossCursor);
+            setCursor(Qt::CrossCursor);
             break;
         case Gfx::StandardCursor::IBeam:
-            apply_web_content_cursor(Qt::IBeamCursor);
+            setCursor(Qt::IBeamCursor);
             break;
         case Gfx::StandardCursor::ResizeHorizontal:
-            apply_web_content_cursor(Qt::SizeHorCursor);
+            setCursor(Qt::SizeHorCursor);
             break;
         case Gfx::StandardCursor::ResizeVertical:
-            apply_web_content_cursor(Qt::SizeVerCursor);
+            setCursor(Qt::SizeVerCursor);
             break;
         case Gfx::StandardCursor::ResizeDiagonalTLBR:
-            apply_web_content_cursor(Qt::SizeFDiagCursor);
+            setCursor(Qt::SizeFDiagCursor);
             break;
         case Gfx::StandardCursor::ResizeDiagonalBLTR:
-            apply_web_content_cursor(Qt::SizeBDiagCursor);
+            setCursor(Qt::SizeBDiagCursor);
             break;
         case Gfx::StandardCursor::ResizeColumn:
-            apply_web_content_cursor(Qt::SplitHCursor);
+            setCursor(Qt::SplitHCursor);
             break;
         case Gfx::StandardCursor::ResizeRow:
-            apply_web_content_cursor(Qt::SplitVCursor);
+            setCursor(Qt::SplitVCursor);
             break;
         case Gfx::StandardCursor::Hand:
-            apply_web_content_cursor(Qt::PointingHandCursor);
+            setCursor(Qt::PointingHandCursor);
             break;
         case Gfx::StandardCursor::Help:
-            apply_web_content_cursor(Qt::WhatsThisCursor);
+            setCursor(Qt::WhatsThisCursor);
             break;
         case Gfx::StandardCursor::OpenHand:
-            apply_web_content_cursor(Qt::OpenHandCursor);
+            setCursor(Qt::OpenHandCursor);
             break;
         case Gfx::StandardCursor::Drag:
-            apply_web_content_cursor(Qt::ClosedHandCursor);
+            setCursor(Qt::ClosedHandCursor);
             break;
         case Gfx::StandardCursor::DragCopy:
-            apply_web_content_cursor(Qt::DragCopyCursor);
+            setCursor(Qt::DragCopyCursor);
             break;
         case Gfx::StandardCursor::Move:
-            apply_web_content_cursor(Qt::DragMoveCursor);
+            setCursor(Qt::DragMoveCursor);
             break;
         case Gfx::StandardCursor::Wait:
-            apply_web_content_cursor(Qt::BusyCursor);
+            setCursor(Qt::BusyCursor);
             break;
         case Gfx::StandardCursor::Disallowed:
-            apply_web_content_cursor(Qt::ForbiddenCursor);
+            setCursor(Qt::ForbiddenCursor);
+            break;
+        case Gfx::StandardCursor::ZoomIn:
+            setCursor(make_zoom_cursor(true, devicePixelRatioF()));
+            break;
+        case Gfx::StandardCursor::ZoomOut:
+            setCursor(make_zoom_cursor(false, devicePixelRatioF()));
             break;
         case Gfx::StandardCursor::Eyedropper:
-        case Gfx::StandardCursor::Zoom:
-            // FIXME: No corresponding Qt cursors, default to Arrow
+            // FIXME: No corresponding Qt cursor, default to Arrow
         default:
-            apply_web_content_cursor(Qt::ArrowCursor);
+            setCursor(Qt::ArrowCursor);
             break;
         } },
         [this](Gfx::ImageCursor const& image_cursor) {
@@ -2075,21 +2508,31 @@ void WebContentView::update_cursor(Gfx::Cursor cursor)
                 dbgln("Failed to set cursor: Couldn't create QPixmap from QImage.");
                 return;
             }
-            apply_web_content_cursor(QCursor { qpixmap, image_cursor.hotspot.x(), image_cursor.hotspot.y() });
+            setCursor(QCursor { qpixmap, image_cursor.hotspot.x(), image_cursor.hotspot.y() });
         });
 }
 
-void WebContentView::apply_web_content_cursor(QCursor const& cursor)
+void WebContentView::start_compositor_layer_picker(CompositorLayerPicker picker)
 {
-    setCursor(cursor);
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-    set_vulkan_window_cursor(cursor);
-#endif
+    stop_compositor_layer_picker();
+    m_compositor_layer_picker = AK::move(picker);
+    setCursor(Qt::CrossCursor);
+    // The page takes the Escape key that cancels the picking.
+    window()->activateWindow();
+    setFocus();
+}
+
+void WebContentView::stop_compositor_layer_picker()
+{
+    if (!m_compositor_layer_picker.has_value())
+        return;
+    m_compositor_layer_picker.clear();
+    unsetCursor();
 }
 
 Web::DevicePixelPoint WebContentView::node_picker_position_for(QSinglePointEvent const& event) const
 {
-    return { event.position().x() * m_device_pixel_ratio, event.position().y() * m_device_pixel_ratio };
+    return { event.position().x() * device_pixel_ratio(), event.position().y() * device_pixel_ratio() };
 }
 
 Web::DevicePixelSize WebContentView::viewport_size() const
@@ -2102,15 +2545,62 @@ QPoint WebContentView::map_point_to_global_position(Gfx::IntPoint position) cons
     return mapToGlobal(QPoint { position.x(), position.y() } / device_pixel_ratio());
 }
 
-Gfx::IntPoint WebContentView::to_content_position(Gfx::IntPoint widget_position) const
+void WebContentView::show_context_menu(Menu& menu, Gfx::IntPoint widget_position)
 {
-    return widget_position;
+    execute_context_menu_later(m_context_menu, *this, menu, map_point_to_global_position(widget_position));
 }
 
-Gfx::IntPoint WebContentView::to_widget_position(Gfx::IntPoint content_position) const
+#if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+// NB: Qt places this native view when the view moves within its parent, but not when a widget it is in moves or resizes,
+//     such as while the page slides along with the sidebar. The view watches the widgets it is in, and is placed again
+//     when they do.
+//     Qt knows nothing of the Wayland page surface at all, so that also has to follow the view itself.
+void WebContentView::watch_ancestors_for_moves()
 {
-    return content_position;
+    for (auto& ancestor : m_watched_ancestors) {
+        if (ancestor)
+            ancestor->removeEventFilter(this);
+    }
+    m_watched_ancestors.clear();
+    for (auto* ancestor = parentWidget(); ancestor && !ancestor->isWindow(); ancestor = ancestor->parentWidget()) {
+        ancestor->installEventFilter(this);
+        m_watched_ancestors.append(ancestor);
+    }
+    place_native_view_again();
 }
+
+bool WebContentView::eventFilter(QObject* watched, QEvent* event)
+{
+    if ((event->type() == QEvent::Move || event->type() == QEvent::Resize) && watched != this)
+        place_native_view_again();
+    return WebContentViewBase::eventFilter(watched, event);
+}
+#endif
+
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+void WebContentView::place_native_view_again()
+{
+    // NB: Presenting the frame again places it, and crops it to what the widgets the view is in still show of it.
+    if (m_page_surface && m_page_surface->is_showing())
+        update_page_surface(PageSurfaceContent::Unchanged);
+}
+#endif
+
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+void WebContentView::place_native_view_again()
+{
+    auto* native_view = windowHandle();
+    auto* native_parent = nativeParentWidget();
+    if (!native_view || !native_parent || !isVisible())
+        return;
+    if (native_view->geometry().topLeft() == mapTo(native_parent, QPoint()))
+        return;
+    // NB: Moving the view itself is what makes Qt place its native view, so it moves away and back.
+    auto position = pos();
+    move(position + QPoint(1, 0));
+    move(position);
+}
+#endif
 
 bool WebContentView::event(QEvent* event)
 {
@@ -2125,18 +2615,17 @@ bool WebContentView::event(QEvent* event)
         keyReleaseEvent(static_cast<QKeyEvent*>(event));
         return true;
     }
-    if (event->type() == QEvent::NativeGesture) {
-        auto const& native_gesture_event = *static_cast<QNativeGestureEvent const*>(event);
-        if (native_gesture_event.gestureType() == Qt::ZoomNativeGesture) {
-            Web::PinchEvent pinch_event;
-            auto const local_position = mapFromGlobal(native_gesture_event.globalPosition());
-            pinch_event.position = { local_position.x() * m_device_pixel_ratio, local_position.y() * m_device_pixel_ratio };
-            pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(native_gesture_event.modifiers());
-            pinch_event.scale_delta = native_gesture_event.value();
-            enqueue_input_event(AK::move(pinch_event));
-            return true;
-        }
-    }
+    if (event->type() == QEvent::NativeGesture && handle_native_gesture_event(*static_cast<QNativeGestureEvent const*>(event)))
+        return true;
+
+#if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+    if (event->type() == QEvent::ParentChange || event->type() == QEvent::Show)
+        watch_ancestors_for_moves();
+#endif
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    if (event->type() == QEvent::Move)
+        place_native_view_again();
+#endif
 
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::ThemeChange) {
         QTimer::singleShot(0, this, [this] {
@@ -2153,6 +2642,13 @@ bool WebContentView::event(QEvent* event)
             return false;
         }
 
+        // Qt has no shortcuts for keys it cannot map, so there is nothing to override. Accepting one anyway can keep the
+        // platform from handling the key press as a system shortcut.
+        if (key_event->key() == Qt::Key_unknown) {
+            event->ignore();
+            return false;
+        }
+
         event->accept();
         return true;
     }
@@ -2160,6 +2656,10 @@ bool WebContentView::event(QEvent* event)
     if (event->type() == QEvent::ActivationChange)
         update_page_focus();
 
+#ifdef LADYBIRD_QT_USE_D3D_RHI_WIDGET
+    if (event->type() == QEvent::WinIdChange)
+        native_window_changed();
+#endif
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     if (event->type() == QEvent::WinIdChange)
         present_current_paintable_as_layer_contents();
@@ -2170,93 +2670,36 @@ bool WebContentView::event(QEvent* event)
     return WebContentViewBase::event(event);
 }
 
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-bool WebContentView::handle_vulkan_window_event(QEvent* event)
+bool WebContentView::handle_native_gesture_event(QNativeGestureEvent const& event)
 {
-    switch (event->type()) {
-    case QEvent::KeyPress:
-        keyPressEvent(static_cast<QKeyEvent*>(event));
+    switch (event.gestureType()) {
+    case Qt::BeginNativeGesture:
+        m_native_gesture_state = NativeGestureState::Began;
         return true;
-    case QEvent::KeyRelease:
-        keyReleaseEvent(static_cast<QKeyEvent*>(event));
+    case Qt::EndNativeGesture:
+        m_native_gesture_state = NativeGestureState::None;
         return true;
-    case QEvent::MouseMove:
-        mouseMoveEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonPress:
-        mousePressEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonRelease:
-        mouseReleaseEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonDblClick:
-        // QWindow sends a MouseButtonPress before MouseButtonDblClick for the second click, so the press has already
-        // been forwarded and included in the click count.
-        return true;
-    case QEvent::Wheel:
-        wheelEvent(static_cast<QWheelEvent*>(event));
-        // An ignored event is reserved for a browser shortcut such as Ctrl+wheel zoom. A native window has no widget
-        // ancestors to propagate it through, so send it to the top-level window directly.
-        if (!event->isAccepted())
-            return QCoreApplication::sendEvent(window(), event);
-        return true;
-    case QEvent::Leave:
-        leaveEvent(event);
-        return true;
-    case QEvent::FocusIn:
-        focusInEvent(static_cast<QFocusEvent*>(event));
-        return true;
-    case QEvent::FocusOut:
-        focusOutEvent(static_cast<QFocusEvent*>(event));
-        return true;
-    case QEvent::InputMethod:
-        inputMethodEvent(static_cast<QInputMethodEvent*>(event));
-        return true;
-    case QEvent::DragEnter:
-        dragEnterEvent(static_cast<QDragEnterEvent*>(event));
-        return true;
-    case QEvent::DragMove:
-        dragMoveEvent(static_cast<QDragMoveEvent*>(event));
-        return true;
-    case QEvent::DragLeave:
-        dragLeaveEvent(static_cast<QDragLeaveEvent*>(event));
-        return true;
-    case QEvent::Drop:
-        dropEvent(static_cast<QDropEvent*>(event));
-        return true;
-    case QEvent::NativeGesture: {
-        auto const& native_gesture_event = *static_cast<QNativeGestureEvent const*>(event);
-        if (native_gesture_event.gestureType() == Qt::ZoomNativeGesture) {
-            Web::PinchEvent pinch_event;
-            auto const local_position = mapFromGlobal(native_gesture_event.globalPosition());
-            pinch_event.position = { local_position.x() * m_device_pixel_ratio, local_position.y() * m_device_pixel_ratio };
-            pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(native_gesture_event.modifiers());
-            pinch_event.scale_delta = native_gesture_event.value();
-            enqueue_input_event(AK::move(pinch_event));
-            return true;
-        }
-        return false;
-    }
-    case QEvent::ShortcutOverride: {
-        auto* key_event = static_cast<QKeyEvent*>(event);
-        if (is_browser_reserved_shortcut(*key_event)) {
-            event->ignore();
-            return false;
-        }
-
-        event->accept();
+    case Qt::ZoomNativeGesture: {
+        Web::PinchEvent pinch_event;
+        auto const local_position = mapFromGlobal(event.globalPosition());
+        pinch_event.position = { local_position.x() * device_pixel_ratio(), local_position.y() * device_pixel_ratio() };
+        pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(event.modifiers());
+        pinch_event.scale_delta = event.value();
+        pinch_event.continues_gesture = m_native_gesture_state == NativeGestureState::Zooming;
+        if (m_native_gesture_state == NativeGestureState::Began)
+            m_native_gesture_state = NativeGestureState::Zooming;
+        enqueue_input_event(AK::move(pinch_event));
         return true;
     }
     default:
         return false;
     }
 }
-#endif
 
-void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePointEvent const& event)
+void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePointEvent const& event, Optional<Web::ScrollGesturePhase> scroll_gesture_phase_the_platform_reports)
 {
-    Web::DevicePixelPoint position = { event.position().x() * m_device_pixel_ratio, event.position().y() * m_device_pixel_ratio };
-    auto screen_position = Gfx::IntPoint { event.globalPosition().x() * m_device_pixel_ratio, event.globalPosition().y() * m_device_pixel_ratio };
+    Web::DevicePixelPoint position = { event.position().x() * device_pixel_ratio(), event.position().y() * device_pixel_ratio() };
+    auto screen_position = Gfx::IntPoint { event.globalPosition().x() * device_pixel_ratio(), event.globalPosition().y() * device_pixel_ratio() };
 
     auto button = get_button_from_qt_mouse_button(event.button());
     auto buttons = get_buttons_from_qt_mouse_buttons(event.buttons());
@@ -2283,7 +2726,7 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
         wheel_tick_120ths_x = wheel_delta.tick_120ths.x();
         wheel_tick_120ths_y = wheel_delta.tick_120ths.y();
         wheel_delta_precision = wheel_delta.precision;
-        scroll_gesture_phase = scroll_gesture_phase_from_qt_event(wheel_event);
+        scroll_gesture_phase = scroll_gesture_phase_the_platform_reports.value_or(scroll_gesture_phase_from_qt_event(wheel_event));
     }
 
     enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, m_click_count, nullptr });
@@ -2300,10 +2743,10 @@ struct DragData : Web::BrowserInputData {
 
 void WebContentView::enqueue_native_event(Web::DragEvent::Type type, QDropEvent const& event)
 {
-    Web::DevicePixelPoint position = { event.position().x() * m_device_pixel_ratio, event.position().y() * m_device_pixel_ratio };
+    Web::DevicePixelPoint position = { event.position().x() * device_pixel_ratio(), event.position().y() * device_pixel_ratio() };
 
     auto global_position = mapToGlobal(event.position());
-    auto screen_position = Gfx::IntPoint { global_position.x() * m_device_pixel_ratio, global_position.y() * m_device_pixel_ratio };
+    auto screen_position = Gfx::IntPoint { global_position.x() * device_pixel_ratio(), global_position.y() * device_pixel_ratio() };
 
     auto button = get_button_from_qt_mouse_button(Qt::LeftButton);
     auto buttons = get_buttons_from_qt_mouse_buttons(event.buttons());

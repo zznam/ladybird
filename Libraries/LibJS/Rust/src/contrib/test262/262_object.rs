@@ -27,7 +27,6 @@ use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::script::Script;
-use crate::utf16::Utf16View;
 
 /// The $262 object that test262's INTERPRETING.md describes.
 #[repr(C)]
@@ -49,14 +48,11 @@ fn key(name: &str) -> PropertyKey {
 
 impl Dollar262Object {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<Dollar262Object> {
-        realm.create_object(
-            vm,
-            Dollar262Object {
-                base: Object::new_without_prototype(vm, Self::CLASS, realm, MayInterfereWithIndexedPropertyAccess::No),
-                agent: Cell::new(None),
-                is_htmldda: Cell::new(None),
-            },
-        )
+        realm.create_object(vm, |_| Dollar262Object {
+            base: Object::new_without_prototype(vm, Self::CLASS, realm, MayInterfereWithIndexedPropertyAccess::No),
+            agent: Cell::new(None),
+            is_htmldda: Cell::new(None),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -142,9 +138,7 @@ impl Dollar262Object {
         let realm = vm.current_realm().expect("$262.evalScript runs in a realm");
 
         // 3. Let s be ParseScript(sourceText, realm, hostDefined).
-        let mut source = Vec::new();
-        Utf16View::of_string(&source_text).append_to(&mut source);
-        let script_or_error = Script::parse(vm, &source, realm);
+        let script_or_error = Script::parse(vm, &source_text, realm);
 
         // 4. If s is a List of errors, then
         let script = match script_or_error {

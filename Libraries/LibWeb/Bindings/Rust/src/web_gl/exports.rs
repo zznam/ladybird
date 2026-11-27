@@ -8,27 +8,25 @@
 //! context of either kind.
 
 use core::ffi::c_void;
-use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use libjs_rust::api::{Gc, Realm, Vm};
+
 use super::canvas::Canvas;
-use super::fingerprint::verify_that_rust_and_cpp_agree_on_layouts_and_constants;
-use super::host::CppTransport;
+use super::context_loss::{
+    fire_webgl_context_event, lose_contexts_of_this_thread, register_context, restore_contexts_of_this_thread,
+};
+use super::host::{ContextCreation, RemoteContext};
 use super::proxy::recorder::Proxy;
 use super::state::{
-    ContextParameters, ContextRef, ContextState, MAX_WEBGL_DRAWING_BUFFER_DIMENSION, RenderingContext, WebGL1, WebGL2,
-    WebGLVersion,
+    ContextParameters, ContextRef, ContextState, RenderingContext, WebGL1, WebGL2, WebGLVersion,
+    drawing_buffer_dimension,
 };
 use super::web_gl_rendering_context::WebGLPowerPreference;
 use super::web_gl_rendering_context_base::WebGLContextAttributes;
-use crate::bindings::interface::{Interface, allocate, cell_into_abi, realm_arguments};
+use crate::bindings::interface::{InterfaceCell, allocate, cell_into_abi};
 
-/// The bytes of the names of the extensions C++ lends.
-fn extension_names(names: ak::Span<'_, ak::Span<'_, u8>>) -> Vec<Vec<u8>> {
-    names.as_slice().iter().map(|name| name.as_slice().to_vec()).collect()
-}
-
-/// Mirrors `Web::WebGL::RustContextAttributes`.
+/// Mirrors `Web::WebGL::ContextAttributes`.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ContextAttributes {
@@ -42,7 +40,6 @@ pub struct ContextAttributes {
     power_preference: u8,
     fail_if_major_performance_caveat: bool,
     desynchronized: bool,
-    xr_compatible: bool,
 }
 
 impl From<ContextAttributes> for WebGLContextAttributes {
@@ -62,7 +59,6 @@ impl From<ContextAttributes> for WebGLContextAttributes {
             },
             fail_if_major_performance_caveat: attributes.fail_if_major_performance_caveat,
             desynchronized: attributes.desynchronized,
-            xr_compatible: attributes.xr_compatible,
         }
     }
 }
@@ -83,62 +79,56 @@ impl From<WebGLContextAttributes> for ContextAttributes {
             },
             fail_if_major_performance_caveat: attributes.fail_if_major_performance_caveat,
             desynchronized: attributes.desynchronized,
-            xr_compatible: attributes.xr_compatible,
         }
     }
 }
 
 /// Mirrors `Web::WebGL::ContextCreationArguments`.
 #[repr(C)]
-pub struct ContextCreationArguments<'a> {
-    /// A RemoteWebGLTransport that has created its context, with a reference that the new context takes over.
-    transport: *mut c_void,
+pub struct ContextCreationArguments {
     is_webgl2: bool,
-    realm: *mut c_void,
+    realm: Gc<Realm>,
     canvas: *mut c_void,
     canvas_host: *mut c_void,
     canvas_is_offscreen: bool,
     context_attributes: ContextAttributes,
-    supported_extensions: ak::Span<'a, ak::Span<'a, u8>>,
 }
 
-/// The cell of a WebGLRenderingContext or of a WebGL2RenderingContext, which only C++ lends out, for as long as the
-/// context is live.
-#[repr(C)]
-pub struct ContextCell {
-    // NB: The cell is mutable behind a shared reference, and bigger than Rust sees, so a reference to one must not tell
-    //     the compiler that the memory behind it is read only or unaliased.
-    _opaque: core::cell::UnsafeCell<[u8; 0]>,
-    _not_send_sync_or_unpin: PhantomData<(*const (), core::marker::PhantomPinned)>,
+pub(super) fn create_remote_context(
+    canvas: Canvas,
+    webgl2: bool,
+    context_attributes: &WebGLContextAttributes,
+) -> Option<(RemoteContext, Vec<Vec<u8>>)> {
+    let (width, height) = canvas.bitmap_size();
+    let creation = ContextCreation {
+        webgl2,
+        size: libgfx_rust::IntSize {
+            width: drawing_buffer_dimension(width),
+            height: drawing_buffer_dimension(height),
+        },
+        depth: context_attributes.depth,
+        stencil: context_attributes.stencil,
+        antialias: context_attributes.antialias,
+    };
+    let connection = canvas.compositor_connection()?;
+    // SAFETY: The canvas handed over a reference to the connection.
+    unsafe { RemoteContext::create(connection, &creation) }
 }
 
-fn with_context<R>(context: &ContextCell, function: impl FnOnce(&ContextState) -> R) -> R {
-    let cell = NonNull::from(context).cast();
-    // SAFETY: A ContextCell is the live cell of one of the two classes, which the downcasts tell apart.
-    unsafe {
-        if let Some(context) = RenderingContext::<WebGL1>::CELL_CLASS.downcast(cell) {
-            return function(&context);
-        }
-        let context = RenderingContext::<WebGL2>::CELL_CLASS
-            .downcast(cell)
-            .expect("the cell is a WebGL context");
-        function(&context)
+fn with_context<R>(context: &InterfaceCell, function: impl FnOnce(&ContextState) -> R) -> R {
+    if let Some(context) = context.object_if::<RenderingContext<WebGL1>>() {
+        return function(&context);
     }
+    function(&context.object::<RenderingContext<WebGL2>>())
 }
 
 /// # Safety
 ///
 /// The pointers are the live VM and what [`ContextCreationArguments`] describes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_context_create(
-    vm: *mut c_void,
-    arguments: &ContextCreationArguments<'_>,
-) -> *mut c_void {
-    // SAFETY: The caller passes the live VM and a live realm.
-    let (vm, realm) = unsafe { realm_arguments(vm, arguments.realm) };
-    verify_that_rust_and_cpp_agree_on_layouts_and_constants();
+pub unsafe extern "C" fn web_webgl_context_create(vm: &Vm, arguments: &ContextCreationArguments) -> *mut c_void {
+    let realm = arguments.realm;
 
-    let transport = NonNull::new(arguments.transport).expect("C++ passes the transport");
     let canvas = Canvas {
         cell: NonNull::new(arguments.canvas).expect("C++ passes the canvas"),
         host: NonNull::new(arguments.canvas_host).expect("C++ passes the canvas"),
@@ -149,51 +139,53 @@ pub unsafe extern "C" fn web_webgl_context_create(
     } else {
         WebGLVersion::WebGL1
     };
-    let state = ContextState::new(ContextParameters {
-        // SAFETY: The caller hands over a reference to the transport.
-        proxy: Proxy::new(unsafe { CppTransport::from_raw(transport) }),
+    let context_attributes: WebGLContextAttributes = arguments.context_attributes.into();
+    let Some((remote_context, supported_opengl_extensions)) =
+        create_remote_context(canvas, version == WebGLVersion::WebGL2, &context_attributes)
+    else {
+        // https://www.khronos.org/registry/webgl/specs/latest/1.0/#fire-a-webgl-context-creation-error
+        // 1. Fire a WebGL context event named "webglcontextcreationerror" at canvas, optionally with its statusMessage attribute set to a platform dependent string about the nature of the failure.
+        fire_webgl_context_event(vm, canvas, "webglcontextcreationerror");
+        return core::ptr::null_mut();
+    };
+    let parameters = ContextParameters {
+        proxy: Proxy::new(remote_context),
         version,
         realm,
         canvas,
-        context_attributes: arguments.context_attributes.into(),
-        supported_opengl_extensions: extension_names(arguments.supported_extensions),
-    });
+        context_attributes,
+        supported_opengl_extensions,
+    };
+    // NB: The display list must be re-recorded so its DrawCanvas command refers to the new remote context's
+    //     canvas id. Content updates alone don't invalidate the display list, so do it here.
+    canvas.did_create_backing_storage();
     match version {
         WebGLVersion::WebGL1 => {
-            let context = allocate(vm, RenderingContext::<WebGL1>::new(state));
+            let context = allocate(vm, |defer_gc| {
+                RenderingContext::<WebGL1>::new(defer_gc, ContextState::new(defer_gc, parameters))
+            });
             context.set_context_ref(ContextRef::WebGL1(context));
+            register_context(vm, ContextRef::WebGL1(context));
             cell_into_abi(context)
         }
         WebGLVersion::WebGL2 => {
-            let context = allocate(vm, RenderingContext::<WebGL2>::new(state));
+            let context = allocate(vm, |defer_gc| {
+                RenderingContext::<WebGL2>::new(defer_gc, ContextState::new(defer_gc, parameters))
+            });
             context.set_context_ref(ContextRef::WebGL2(context));
+            register_context(vm, ContextRef::WebGL2(context));
             cell_into_abi(context)
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_canvas_host(context: &ContextCell) -> *mut c_void {
-    with_context(context, |context| context.canvas().host.as_ptr())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_realm(context: &ContextCell) -> *mut c_void {
-    with_context(context, |context| context.realm().as_ptr().cast())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_is_webgl2(context: &ContextCell) -> bool {
-    with_context(context, ContextState::is_webgl2)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_is_lost(context: &ContextCell) -> bool {
+pub extern "C" fn web_webgl_context_is_lost(context: &InterfaceCell) -> bool {
     with_context(context, ContextState::is_context_lost)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_canvas_id(context: &ContextCell, out_canvas_id: &mut u64) -> bool {
+pub extern "C" fn web_webgl_context_canvas_id(context: &InterfaceCell, out_canvas_id: &mut u64) -> bool {
     let Some(canvas_id) = with_context(context, |context| context.proxy.canvas_id()) else {
         return false;
     };
@@ -202,17 +194,16 @@ pub extern "C" fn web_webgl_context_canvas_id(context: &ContextCell, out_canvas_
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_set_size(context: &ContextCell, width: i32, height: i32) {
+pub extern "C" fn web_webgl_context_set_size(context: &InterfaceCell, width: i32, height: i32) {
     with_context(context, |context| {
-        context.proxy.set_size(
-            width.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION),
-            height.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION),
-        );
+        context
+            .proxy
+            .set_size(drawing_buffer_dimension(width), drawing_buffer_dimension(height));
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_present_for_compositing(context: &ContextCell) {
+pub extern "C" fn web_webgl_context_present_for_compositing(context: &InterfaceCell) {
     with_context(context, |context| {
         let preserve_drawing_buffer = context.context_creation_parameters.preserve_drawing_buffer;
         context.proxy.present_canvas_for_compositing(preserve_drawing_buffer);
@@ -220,76 +211,55 @@ pub extern "C" fn web_webgl_context_present_for_compositing(context: &ContextCel
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_clear_drawing_buffer(context: &ContextCell) {
+pub extern "C" fn web_webgl_context_clear_drawing_buffer(context: &InterfaceCell) {
     with_context(context, |context| context.proxy.clear_drawing_buffer());
 }
 
-/// A Gfx::Bitmap with a reference that the caller takes over, or null.
+/// A Gfx::DecodedImageFrame allocated with new that the caller takes over, or null.
 #[unsafe(no_mangle)]
 pub extern "C" fn web_webgl_context_read_back_drawing_buffer(
-    context: &ContextCell,
+    context: &InterfaceCell,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
 ) -> *mut c_void {
-    let bitmap = with_context(context, |context| {
+    let frame = with_context(context, |context| {
         context.proxy.read_back_drawing_buffer(x, y, width, height)
     });
-    bitmap.map_or(core::ptr::null_mut(), super::host::Bitmap::into_raw)
-}
-
-/// False when the context was lost already.
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_mark_lost(context: &ContextCell) -> bool {
-    with_context(context, ContextState::mark_lost)
+    frame.map_or(core::ptr::null_mut(), |frame| frame.hand_over_copy())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_set_restore_requested(context: &ContextCell, requested: bool) {
-    with_context(context, |context| context.set_context_restore_requested(requested));
+pub extern "C" fn web_webgl_lose_contexts_of_this_thread(vm: &Vm) {
+    lose_contexts_of_this_thread(vm);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_wants_restoring(context: &ContextCell) -> bool {
-    with_context(context, ContextState::wants_restoring)
+pub extern "C" fn web_webgl_restore_contexts_of_this_thread(vm: &Vm) {
+    restore_contexts_of_this_thread(vm);
 }
 
+/// Converts the options of getContext() to the dictionary, and answers true with the exception that the conversion
+/// threw.
+#[cfg(web_idl_bindings)]
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_actual_context_parameters(
-    context: &ContextCell,
+pub extern "C" fn web_webgl_context_attributes_from_value(
+    vm: &Vm,
+    value: libjs_rust::api::Value,
     out_context_attributes: &mut ContextAttributes,
-) {
-    let context_attributes = with_context(context, |context| context.actual_context_parameters);
-    *out_context_attributes = context_attributes.into();
-}
+    out_exception: &mut u64,
+) -> bool {
+    use crate::bindings::conversions::FromJs;
 
-/// The context takes over the reference to `transport`.
-///
-/// # Safety
-///
-/// `transport` is a RemoteWebGLTransport that has created its context.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_context_restore(
-    context: &ContextCell,
-    transport: *mut c_void,
-    supported_extensions: ak::Span<'_, ak::Span<'_, u8>>,
-) {
-    let transport = NonNull::new(transport).expect("C++ passes the transport");
-    // SAFETY: The caller hands over a reference to the transport.
-    let transport = unsafe { CppTransport::from_raw(transport) };
-    let supported_opengl_extensions = extension_names(supported_extensions);
-    with_context(context, |context| {
-        context.restore(transport, supported_opengl_extensions);
-    });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_xr_compatible(context: &ContextCell) -> bool {
-    with_context(context, ContextState::xr_compatible)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_set_xr_compatible(context: &ContextCell, xr_compatible: bool) {
-    with_context(context, |context| context.set_xr_compatible(xr_compatible));
+    match WebGLContextAttributes::from_js(vm, value) {
+        Ok(context_attributes) => {
+            *out_context_attributes = context_attributes.into();
+            false
+        }
+        Err(throw) => {
+            *out_exception = throw.value().to_raw();
+            true
+        }
+    }
 }

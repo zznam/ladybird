@@ -21,8 +21,9 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/AudioTrackList.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
@@ -130,6 +131,10 @@ void HTMLVideoElement::adopted_from(DOM::Document& old_document)
         m_load_event_delayer.emplace(document());
 
     release_presented_video_frame_held_for_callbacks();
+
+    // NB: See determine_element_poster_frame().
+    if (old_document.is_temporary_document_for_fragment_parsing())
+        determine_element_poster_frame(attribute(HTML::AttributeNames::poster)).release_value_but_fixme_should_propagate_errors();
 }
 
 void HTMLVideoElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -165,9 +170,9 @@ void HTMLVideoElement::set_intrinsic_video_dimensions(Optional<Gfx::Size<u32>> d
     //         dimensions are not available. This matches other browsers.
     if (dimensions.has_value()) {
         // the user agent must queue a media element task given the media element to fire an event named resize at the media element.
-        queue_a_media_element_task([](HTMLMediaElement& self) {
+        queue_a_media_element_task(GC::create_function(GC::Heap::the(), [](HTMLMediaElement& self) {
             self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::resize));
-        });
+        }));
 
         document().page().picture_in_picture_controller().video_size_did_change(*this, dimensions->to_type<int>());
     }
@@ -253,6 +258,13 @@ Optional<CSSPixelSize> HTMLVideoElement::natural_element_size() const
 // https://html.spec.whatwg.org/multipage/media.html#attr-video-poster
 WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optional<Utf16String> const& poster)
 {
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The poster frame is determined once the element is adopted into another
+    //         document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return {};
+
     auto& realm = HTML::relevant_realm(*this);
     // 1. If there is an existing instance of this algorithm running for this video element, abort that instance of
     //    this algorithm without changing the poster frame.
@@ -261,8 +273,10 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
 
     static constexpr auto finalize = [](HTMLVideoElement& self, RefPtr<Gfx::Bitmap> poster_frame) {
         self.m_poster_frame.clear();
-        if (poster_frame)
-            self.m_poster_frame = Gfx::DecodedImageFrame { *poster_frame };
+        if (poster_frame) {
+            if (auto frame = Gfx::DecodedImageFrame::create(*poster_frame); !frame.is_error())
+                self.m_poster_frame = frame.release_value();
+        }
         self.m_load_event_delayer.clear();
         self.m_fetch_controller = nullptr;
         self.update_representation();
@@ -289,18 +303,18 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
     //    and whose use-URL-credentials flag is set.
     auto request = Fetch::Infrastructure::Request::create();
     request->set_url(url_record.release_value());
-    request->set_client(&document().relevant_settings_object());
+    request->set_client(document().relevant_settings_object().address());
     request->set_destination(Fetch::Infrastructure::Request::Destination::Image);
     request->set_initiator_type(Fetch::Infrastructure::Request::InitiatorType::Video);
     request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
     request->set_use_url_credentials(true);
 
     // 6. Fetch request. This must delay the load event of the element's node document.
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
     m_load_event_delayer.emplace(document());
 
     // 7. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
-    fetch_algorithms_input.process_response = [weak_self = GC::Weak(*this), poster_url = request->url()](auto response) {
+    fetch_algorithms_input.process_response = GC::create_function(GC::Heap::the(), GC::captures(GC::Weak(*this), request->url()), [](auto& weak_self, auto& poster_url, GC::Ref<Fetch::Infrastructure::ResponseView> response) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -312,23 +326,24 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
             return;
         }
 
-        if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect) {
-            auto& filtered_response = static_cast<Fetch::Infrastructure::FilteredResponse&>(*response);
-            response = filtered_response.internal_response();
-        }
+        if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect)
+            response = response->unsafe_response();
 
         if (!response->body()) {
             finalize(self, nullptr);
             return;
         }
 
-        auto on_image_data_read = GC::create_function(GC::Heap::the(), [weak_self, poster_url](ByteBuffer image_data) {
+        auto on_image_data_read = GC::create_function(GC::Heap::the(), GC::captures(weak_self, poster_url), [](auto& weak_self, auto& poster_url, ByteBuffer image_data) {
             if (!weak_self)
                 return;
             // 6. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
             (void)Platform::ImageCodecPlugin::the().decode_image(
                 image_data,
                 [weak_self, poster_url](Web::Platform::DecodedImage& image) -> ErrorOr<void> {
+                    // NB: Only the first frame is used, so an animation the decoder opened is stopped right away.
+                    if (image.session_id != 0)
+                        Platform::ImageCodecPlugin::the().stop_animation_decode(image.session_id);
                     if (!weak_self)
                         return {};
                     RefPtr<Gfx::Bitmap> poster_frame;
@@ -354,14 +369,14 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
                 });
         });
 
-        auto on_body_read_error = GC::create_function(GC::Heap::the(), [weak_self](JS::Value) {
+        auto on_body_read_error = GC::create_function(GC::Heap::the(), GC::captures(weak_self), [](auto& weak_self, JS::Value) {
             if (!weak_self)
                 return;
             finalize(*weak_self, nullptr);
         });
 
         response->body()->fully_read(realm, on_image_data_read, on_body_read_error, GC::Ref { global });
-    };
+    });
 
     m_fetch_controller = Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 
@@ -594,6 +609,12 @@ void HTMLVideoElement::run_the_video_frame_request_callbacks(HighResolutionTime:
     ScopeGuard request_rendering_update_for_pending_callbacks = [&] {
         request_rendering_update_for_video_frame_callbacks();
     };
+
+    // AD-HOC: The playback state change that updates the ready state may arrive after the presented frame changes,
+    //         and createImageBitmap() requires at least HAVE_CURRENT_DATA. Don't let a callback run until it can
+    //         capture a frame.
+    if (ready_state() < ReadyState::HaveCurrentData)
+        return;
 
     // 2. Let metadata be the VideoFrameCallbackMetadata dictionary built from video's latest presented frame.
     // AD-HOC: The frame stays held until the rendering update has run its animation frame callbacks, so that the

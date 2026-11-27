@@ -17,8 +17,8 @@ namespace Web::SVG {
 static RustFFI::FfiUtf16View ffi_svg_input(Utf16View input)
 {
     return {
-        .ascii = input.has_ascii_storage() ? reinterpret_cast<u8 const*>(input.ascii_span().data()) : nullptr,
-        .utf16 = input.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
+        .latin1 = input.has_latin1_storage() ? input.latin1_span().data() : nullptr,
+        .utf16 = input.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
         .length = input.length_in_code_units(),
     };
 }
@@ -29,13 +29,6 @@ Optional<i32> parse_integer(Utf16View input)
     if (!RustFFI::rust_parse_svg_integer(ffi_svg_input(input), &value))
         return {};
     return value;
-}
-
-float NumberPercentage::resolve_relative_to(float length) const
-{
-    if (!m_is_percentage)
-        return m_value;
-    return m_value * length;
 }
 
 Optional<float> parse_number(Utf16View input)

@@ -60,6 +60,40 @@ async function waitForCondition(condition, attempts = 600, interval = 25) {
     return true;
 }
 
+// A page may read the clipboard only while the browser pastes it. So this pastes the clipboard into the focused navigable,
+// which must be target's, and calls read() from the paste event, which it cancels and hides from the page's listeners.
+// The read goes through the UI process, so it also waits for earlier clipboard writes to land.
+async function readClipboardFromPaste(target, read = clipboard => clipboard.read()) {
+    const targetWindow = target.ownerDocument.defaultView;
+    const { promise, resolve, reject } = Promise.withResolvers();
+    targetWindow.addEventListener(
+        "paste",
+        event => {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            read(targetWindow.navigator.clipboard).then(resolve, reject);
+        },
+        { capture: true, once: true }
+    );
+    internals.dispatchUserActivatedEvent(target, new Event("mousedown"));
+    internals.pasteFromClipboard();
+    return promise;
+}
+
+// Each round runs in a task of its own, so that pending tasks can drop their references and the objects that WeakRefs
+// kept alive for an earlier job are released.
+async function collectGarbageUntil(condition, rounds = 100) {
+    for (let round = 0; round < rounds; ++round) {
+        await timeout(0);
+        await internals.gcAsync();
+        if (condition()) return;
+    }
+}
+
+async function collectGarbageUntilCleared(weakRefs, rounds = 100) {
+    await collectGarbageUntil(() => weakRefs.every(weakRef => weakRef.deref() === undefined), rounds);
+}
+
 async function setSystemVisibilityState(state) {
     // Tests assume that the document reflects the UI process's system visibility state and that
     // no previous visibility state change is still pending.
@@ -146,12 +180,16 @@ function printInputTrace(trace, { stages } = {}) {
     }
 }
 
+// The offset has stopped once it holds for as long as five frames take at 60 Hz, however often frames come.
 async function scrollOffsetStopsChanging(readScrollOffset) {
-    let previousScrollOffset = null;
-    while (previousScrollOffset !== readScrollOffset()) {
-        previousScrollOffset = readScrollOffset();
-        for (let frame = 0; frame < 5; frame++) {
-            await animationFrame();
+    const settleDuration = (5 * 1000) / 60;
+    let scrollOffset = readScrollOffset();
+    let lastChangeTime = performance.now();
+    while (performance.now() - lastChangeTime < settleDuration) {
+        await animationFrame();
+        if (readScrollOffset() !== scrollOffset) {
+            scrollOffset = readScrollOffset();
+            lastChangeTime = performance.now();
         }
     }
 }
@@ -206,17 +244,21 @@ function asyncTest(f) {
     };
     document.addEventListener("DOMContentLoaded", () => {
         Promise.resolve(f(done)).catch(error => {
-            println(`Caught error while running async test: ${error}`);
+            println(`Caught error while running async test: ${String(error)}`);
             done();
         });
     });
 }
 
 function promiseTest(f) {
+    const done = () => {
+        __preventMultipleTestFunctions();
+        __finishTest();
+    };
     document.addEventListener("DOMContentLoaded", () => {
-        f().then(() => {
-            __preventMultipleTestFunctions();
-            __finishTest();
+        f().then(done, error => {
+            println(`Caught error while running promise test: ${String(error)}`);
+            done();
         });
     });
 }
@@ -253,11 +295,24 @@ class HTTPTestServer {
     recordedRequestHeadersURL(echoURL) {
         return `${this.baseURL}/recorded-request-headers${new URL(echoURL).pathname}`;
     }
+    recordedRequestCountURL(echoURL) {
+        return `${this.baseURL}/recorded-request-count${new URL(echoURL).pathname}`;
+    }
+    // Resolves once the echo server has seen a request for echoURL, query included.
+    async waitForRequest(echoURL) {
+        const url = new URL(echoURL);
+        const recordedURL = `${this.baseURL}/recorded-request-headers${url.pathname}${url.search}`;
+        for (;;) {
+            const response = await fetch(recordedURL).catch(() => null);
+            if (response?.ok) return;
+            await timeout(10);
+        }
+    }
     getStaticURL(path) {
         return `${this.baseURL}/static/${path}`;
     }
     #echoPath(path) {
-        const echoScope = this.echoScope ?? (__pageEchoScope ??= crypto.randomUUID());
+        const echoScope = this.echoScope ?? (__pageEchoScope ??= uniqueID());
         return `/echo/${echoScope}${path}`;
     }
 }
@@ -265,7 +320,10 @@ class HTTPTestServer {
 const __httpTestServer = (function () {
     if (globalThis.internals && globalThis.internals.getEchoServerPort) {
         const echoServerPort = internals.getEchoServerPort();
-        const isLoadedFromEchoServer = location.protocol === "http:" && location.port === String(echoServerPort);
+        const httpsEchoServerPort = internals.getHttpsEchoServerPort();
+        const isLoadedFromEchoServer =
+            (location.protocol === "http:" && location.port === String(echoServerPort)) ||
+            (location.protocol === "https:" && location.port === String(httpsEchoServerPort));
 
         // Tests loaded through the echo server should create echo URLs on their current origin,
         // so same-origin iframe/fetch checks keep working with unique localhost hostnames.
@@ -283,10 +341,20 @@ function httpTestServer() {
     return __httpTestServer;
 }
 
+// A random identifier that a page which is not a secure context can make too.
+function uniqueID() {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // Per-call unique loopback host, so tests that mutate global per-host state
 // (e.g. HSTS) don't collide under the parallel runner or --repeat clones.
 function uniqueLocalhostHostname(prefix) {
-    return `${prefix}-${crypto.randomUUID()}.localhost`;
+    return `${prefix}-${uniqueID()}.localhost`;
+}
+
+// Per-call unique loopback host whose http: origin is not potentially trustworthy.
+function uniqueTestHostname(prefix) {
+    return `${prefix}-${uniqueID()}.test`;
 }
 
 const remoteFrameCount = () => (internals.dumpSiteIsolationProcessTree().match(/remote/g) || []).length;

@@ -101,18 +101,21 @@ impl AsyncFunctionDriverWrapper {
         let generator_object = GeneratorObject::create(vm, realm, generating_function, context.copy());
         generator_object.set_generator_state(GeneratorState::SuspendedYield);
         // Note: The top_level_promise is also kept alive by this Wrapper
-        let wrapper = realm.create_object(
-            vm,
-            AsyncFunctionDriverWrapper {
-                base: Promise::new(vm, Self::CLASS, realm.intrinsics().promise_prototype(vm)),
-                generator_object: Cell::new(generator_object),
-                top_level_promise: Cell::new(top_level_promise),
-                current_promise: Cell::new(None),
-                suspended_execution_context: GcRefCell::new(None),
-                on_settled: Cell::new(None),
-                is_initial_execution: Cell::new(true),
-            },
-        );
+        let wrapper = realm.create_object(vm, |defer_gc| AsyncFunctionDriverWrapper {
+            base: Promise::new(
+                defer_gc,
+                vm,
+                realm,
+                Self::CLASS,
+                realm.intrinsics().promise_prototype(vm),
+            ),
+            generator_object: Cell::new(generator_object),
+            top_level_promise: Cell::new(top_level_promise),
+            current_promise: Cell::new(None),
+            suspended_execution_context: GcRefCell::new(None),
+            on_settled: Cell::new(None),
+            is_initial_execution: Cell::new(true),
+        });
         Self::run(wrapper, vm, Ok(IterationResult::new(value, false)));
 
         top_level_promise
@@ -139,7 +142,7 @@ impl AsyncFunctionDriverWrapper {
                 .running_execution_context_if_any()
                 .expect("an async function awaits in an execution context")
                 .copy_without_values();
-            *this.suspended_execution_context.borrow_mut() = Some(copy);
+            *this.suspended_execution_context.borrow_mut(vm) = Some(copy);
         }
 
         // OPTIMIZATION: Fast path for non-thenable values.
@@ -164,7 +167,7 @@ impl AsyncFunctionDriverWrapper {
             // Already-settled native Promises whose constructor is the intrinsic %Promise%.
             if is_settled_intrinsic_promise(vm, realm, &promise) {
                 Self::schedule_resume(this, vm, promise.result(), promise.state() == PromiseState::Fulfilled);
-                promise.set_is_handled();
+                promise.mark_handled(vm);
                 return Ok(());
             }
         }
@@ -201,7 +204,7 @@ impl AsyncFunctionDriverWrapper {
 
                     // b. Suspend prevContext.
                     // c. Push asyncContext onto the execution context stack; asyncContext is now the running execution context.
-                    vm.push_execution_context_checking_stack_space(this.suspended_execution_context())?;
+                    vm.push_resumed_execution_context_checking_stack_space(this.suspended_execution_context())?;
 
                     // 3.d. Resume the suspended evaluation of asyncContext using NormalCompletion(v) as the result of the operation that
                     //      suspended it.
@@ -245,7 +248,7 @@ impl AsyncFunctionDriverWrapper {
             vm,
             (this, value, is_fulfilled),
             |vm, &(this, value, is_fulfilled): &(Gc<AsyncFunctionDriverWrapper>, Value, bool)| {
-                vm.push_execution_context_checking_stack_space(this.suspended_execution_context())?;
+                vm.push_resumed_execution_context_checking_stack_space(this.suspended_execution_context())?;
                 Self::continue_async_execution(this, vm, value, is_fulfilled);
                 vm.pop_execution_context();
                 Ok(Value::UNDEFINED)
@@ -301,7 +304,7 @@ impl AsyncFunctionDriverWrapper {
                     && is_settled_intrinsic_promise(vm, realm, &promise)
                 {
                     let is_fulfilled = promise.state() == PromiseState::Fulfilled;
-                    promise.set_is_handled();
+                    promise.mark_handled(vm);
                     generator_result = if is_fulfilled {
                         generator_object.resume(vm, promise.result(), None)
                     } else {

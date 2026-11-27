@@ -13,18 +13,23 @@ use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
 
 use super::json::{JsonParser, JsonValue};
-use super::test_js_functions::{EXPOSED_GLOBAL_FUNCTIONS, RunFileHookResult, run_file};
+use super::test_js_functions::{
+    EXPOSED_GLOBAL_FUNCTIONS, RunFileHookResult, run_file, take_callbacks_after_moving_collection,
+};
 use super::test_runner::{
     COUNTS, Case, Modifier, Suite, TOP_LEVEL_TEST_NAME, TestResult, TestRunner, cleanup_and_exit, format_file_time,
     get_time_in_ms, iterate_directory_recursively, print_modifiers, set_currently_running_test,
 };
 use crate::gc::class::{GcCell, define_cell};
+use crate::gc::heap::Heap;
+use crate::gc::root::Root;
 use crate::hash_table::HashTable;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::parser_error::ParserError;
+use crate::runtime::abstract_operations::call;
 use crate::runtime::array::Array;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
 use crate::runtime::error::Error;
@@ -70,13 +75,10 @@ impl TestRunnerGlobalObject {
     /// realm->create<TestRunnerGlobalObject>(), which already runs initialize() once before InitializeHostDefinedRealm
     /// runs it again after SetDefaultGlobalBindings, so the properties it defines come before the default bindings.
     pub fn create(vm: &Vm, realm: Gc<Realm>, prints_test_timings: bool) -> Gc<TestRunnerGlobalObject> {
-        realm.create_object(
-            vm,
-            TestRunnerGlobalObject {
-                base: GlobalObject::new(vm, Self::CLASS, realm),
-                prints_test_timings: Cell::new(prints_test_timings),
-            },
-        )
+        realm.create_object(vm, |_| TestRunnerGlobalObject {
+            base: GlobalObject::new(vm, Self::CLASS, realm),
+            prints_test_timings: Cell::new(prints_test_timings),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -218,7 +220,8 @@ fn file_parser_error(errors: Vec<ParserError>, source_text: &[u16]) -> FileParse
 
 pub fn parse_script(vm: &Vm, path: &str, realm: Gc<Realm>) -> Result<Gc<Script>, FileParserError> {
     let source_text = source_text_of(path);
-    Script::parse_with_filename(vm, &source_text, realm, path).map_err(|errors| file_parser_error(errors, &source_text))
+    let source = Utf16String::from_utf16(&source_text);
+    Script::parse_with_filename(vm, &source, realm, path).map_err(|errors| file_parser_error(errors, &source_text))
 }
 
 pub fn parse_module(vm: &Vm, path: &str, realm: Gc<Realm>) -> Result<Gc<SourceTextModule>, FileParserError> {
@@ -322,8 +325,7 @@ impl TestRunner {
         };
         let root_execution_context = Realm::initialize_host_defined_realm(vm, Some(&create_global_object), None).must();
         let realm = root_execution_context
-            .realm
-            .get()
+            .realm()
             .expect("InitializeHostDefinedRealm sets the realm of its context");
         let global_execution_context = root_execution_context.as_non_null();
         vm.pop_execution_context();
@@ -376,6 +378,12 @@ impl TestRunner {
 
         vm.push_execution_context(global_execution_context);
         vm.run_script(test_script, None).must();
+        // NB: With LIBGC_MOVE_EVERYTHING, what test-common.js made moves before the test uses it. Nothing on the stack
+        //     holds a cell that the test needs, and the global execution context keeps the realm.
+        if Heap::moves_everything() {
+            // SAFETY: The runner holds no cell it uses after this but the realm, see above.
+            unsafe { vm.heap().collect_garbage_without_scanning_the_stack() };
+        }
         vm.pop_execution_context();
 
         let file_script = match parse_script(vm, test_path, realm) {
@@ -392,6 +400,40 @@ impl TestRunner {
         vm.push_execution_context(global_execution_context);
         let top_level_result = vm.run_script(file_script, None);
         vm.pop_execution_context();
+
+        // NB: With LIBGC_MOVE_EVERYTHING, the objects the test left behind move before their results are read. Nothing
+        //     on the stack holds a cell then but the error of the script, which this roots, and the realm, which the
+        //     global execution context keeps.
+        let mut top_level_error = top_level_result.err().map(|throw| Root::new(vm, throw.value()));
+        let mut callbacks_after_moving_collection = take_callbacks_after_moving_collection();
+        if Heap::moves_everything() || !callbacks_after_moving_collection.is_empty() {
+            vm.push_execution_context(global_execution_context);
+            // NB: The callbacks may ask for more, which run after another collection that moves cells.
+            loop {
+                vm.heap().set_moves_everything_for_testing(true);
+                // SAFETY: Every cell the runner holds is rooted, see above, and test-js holds none further up.
+                unsafe { vm.heap().collect_garbage_without_scanning_the_stack() };
+                vm.heap().set_moves_everything_for_testing(Heap::moves_everything());
+                for callback in &callbacks_after_moving_collection {
+                    // NB: A callback that throws fails the file as if its top level threw, and the others still run.
+                    if let Err(throw) = call(vm, Value::from_object(callback.cell()), Value::UNDEFINED, &[]) {
+                        if top_level_error.is_none() {
+                            top_level_error = Some(Root::new(vm, throw.value()));
+                            continue;
+                        }
+                        eprintln!(
+                            "{test_path}: a callback of runAfterMovingCollection() threw: {}",
+                            String::from_utf8_lossy(&wtf8_of(&throw.value().to_utf16_string_without_side_effects()))
+                        );
+                    }
+                }
+                callbacks_after_moving_collection = take_callbacks_after_moving_collection();
+                if callbacks_after_moving_collection.is_empty() {
+                    break;
+                }
+            }
+            vm.pop_execution_context();
+        }
 
         vm.push_execution_context(global_execution_context);
         let test_json = get_test_results(vm, realm);
@@ -494,7 +536,7 @@ impl TestRunner {
             file_result.suites.push(suite);
         }
 
-        if let Err(throw) = top_level_result {
+        if let Some(throw) = top_level_error {
             let mut suite = Suite::new(test_path, b"<top-level>".to_vec());
             suite.most_severe_test_result = TestResult::Crashed;
 

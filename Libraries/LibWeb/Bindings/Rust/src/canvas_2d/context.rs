@@ -10,25 +10,26 @@
 use core::cell::{Cell, Ref as CellRef, RefCell, RefMut};
 use core::marker::PhantomData;
 use core::ops::Deref;
-use core::ptr::NonNull;
 
 use ak::Utf16String;
+use ak::math;
 use libcompositing_rust::display_list::canvas_2d::{Compositing, Paint, Stroke};
 use libcompositing_rust::display_list::canvas_2d_recorder::{AlphaType, ColorSpace, Recorder};
 use libcompositing_rust::display_list::commands::{Canvas2DShadow, CanvasId};
+use libgfx_rust::image_frame::ImageFrameHandle;
 use libgfx_rust::path::Path;
 use libgfx_rust::{AffineTransform, Color, CompositingAndBlendingOperator, FloatRect, IntRect, IntSize, WindingRule};
-use libjs_rust::api::{ForeignCellSlot, Gc, Realm, Trace, Visitor, Vm};
+use libjs_rust::api::{DeferGc, ForeignCellSlot, Gc, GcRefCell, GcRefMut, Realm, Trace, Visitor, Vm};
 
 use super::canvas::{Canvas, FontMetricsSource, FontSelection, ResolvedFont, StyleValue, parse_color};
 use super::drawing_state::{CanvasColor, DrawingState, FillOrStrokeStyle};
-use super::host::{Bitmap, CppTransport, LentImageFrame};
+use super::host::CompositorTransport;
 use crate::bindings::interface::Wrappable;
 use crate::html::canvas_rendering_context2d::CanvasDirection;
 use crate::html::canvas_rendering_context2d_settings::CanvasRenderingContext2DSettings;
 use crate::html::predefined_color_space::PredefinedColorSpace;
 
-pub(crate) type CanvasRecorder = Recorder<CppTransport>;
+pub(crate) type CanvasRecorder = Recorder<CompositorTransport>;
 
 /// What tells the two kinds of 2D context apart: the canvas that each draws for, an HTMLCanvasElement or an
 /// OffscreenCanvas. Everything else they share.
@@ -50,7 +51,7 @@ pub(crate) struct RenderingContext2D<K: CanvasKind> {
 }
 
 impl<K: CanvasKind> RenderingContext2D<K> {
-    pub(crate) fn new(state: ContextState) -> Self {
+    pub(crate) fn new(_: &DeferGc<'_>, state: ContextState) -> Self {
         Self {
             state,
             kind: PhantomData,
@@ -74,7 +75,7 @@ unsafe impl<K: CanvasKind> Trace for RenderingContext2D<K> {
 }
 
 impl<K: CanvasKind> Wrappable for RenderingContext2D<K> {
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         self.state.canvas.relevant_realm()
     }
 
@@ -103,7 +104,7 @@ impl Drop for BackingStorage {
 /// A readback of the pixels of a rectangle of the canvas.
 #[derive(Clone)]
 struct CachedReadback {
-    pixels: Bitmap,
+    pixels: ImageFrameHandle,
     rect: IntRect,
     alpha_type: AlphaType,
     color_space: ColorSpace,
@@ -145,7 +146,7 @@ pub(crate) struct ContextState {
     #[gc(untraced)]
     context_lost: Cell<bool>,
     /// The drawing state stack, with the current drawing state last.
-    states: RefCell<Vec<DrawingState>>,
+    states: GcRefCell<Vec<DrawingState>>,
     /// The current default path, in the coordinates of the current transformation matrix.
     #[gc(untraced)]
     path: RefCell<Path>,
@@ -181,10 +182,7 @@ pub(crate) fn paint_of<'a>(
         // SAFETY: Nothing adds a stop to the gradient while the recorder records the paint.
         FillOrStrokeStyle::Gradient(gradient) => unsafe { gradient.paint_unguarded(color_space) },
         FillOrStrokeStyle::Pattern(pattern) => Paint::Pattern {
-            image: pattern.image().map(|frame| {
-                let frame = NonNull::new(frame.as_raw().cast_mut()).expect("an image frame has a frame");
-                recorder.add_image_frame(&LentImageFrame(frame))
-            }),
+            image: pattern.image().map(|frame| recorder.add_image_frame(frame)),
             repetition: pattern.repetition(),
             transform: pattern.transform(),
         },
@@ -192,7 +190,7 @@ pub(crate) fn paint_of<'a>(
 }
 
 impl ContextState {
-    pub(crate) fn new(parameters: ContextParameters) -> Self {
+    pub(crate) fn new(_: &DeferGc<'_>, parameters: ContextParameters) -> Self {
         let canvas_cell = ForeignCellSlot::empty();
         // SAFETY: The canvas is a live cell of the heap that the runtime allocates from.
         unsafe { canvas_cell.set(Some(parameters.canvas.cell)) };
@@ -203,7 +201,7 @@ impl ContextState {
             size: Cell::new(parameters.size),
             origin_clean: Cell::new(true),
             context_lost: Cell::new(false),
-            states: RefCell::new(vec![DrawingState::default()]),
+            states: GcRefCell::new(vec![DrawingState::default()]),
             path: RefCell::new(empty_path()),
             path_transform: Cell::new(AffineTransform::identity()),
             backing_storage: RefCell::new(None),
@@ -245,23 +243,23 @@ impl ContextState {
         })
     }
 
-    /// The current drawing state, to change it. Nothing may run script or collect garbage while the borrow lasts.
-    pub(crate) fn drawing_state_mut(&self) -> RefMut<'_, DrawingState> {
-        RefMut::map(self.states.borrow_mut(), |states| {
+    /// The current drawing state, to change it. Nothing may run script while the borrow lasts.
+    pub(crate) fn drawing_state_mut<'a>(&'a self, vm: &'a Vm) -> GcRefMut<'a, DrawingState> {
+        GcRefMut::map(self.states.borrow_mut(vm), |states| {
             states.last_mut().expect("a context has a current drawing state")
         })
     }
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-save
-    pub(crate) fn push_drawing_state(&self) {
-        let mut states = self.states.borrow_mut();
+    pub(crate) fn push_drawing_state(&self, vm: &Vm) {
+        let mut states = self.states.borrow_mut(vm);
         let current = states.last().expect("a context has a current drawing state").clone();
         states.push(current);
     }
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-restore
-    pub(crate) fn pop_drawing_state(&self) -> bool {
-        let mut states = self.states.borrow_mut();
+    pub(crate) fn pop_drawing_state(&self, vm: &Vm) -> bool {
+        let mut states = self.states.borrow_mut(vm);
         if states.len() == 1 {
             return false;
         }
@@ -422,7 +420,12 @@ impl ContextState {
 
     /// The pixels of the rectangle of the canvas, read back from the Compositor and converted to the color space.
     /// Unpremultiplied pixels come back as RGBA8888, and premultiplied pixels as BGRA8888.
-    pub(crate) fn read_pixels(&self, rect: IntRect, alpha_type: AlphaType, color_space: ColorSpace) -> Option<Bitmap> {
+    pub(crate) fn read_pixels(
+        &self,
+        rect: IntRect,
+        alpha_type: AlphaType,
+        color_space: ColorSpace,
+    ) -> Option<ImageFrameHandle> {
         if !self.has_backing_storage() {
             return None;
         }
@@ -572,6 +575,9 @@ impl ContextState {
             None => {
                 let resolved_color = match value.as_units() {
                     ak::Utf16StringUnits::Ascii(units) => libweb_rust::parse_simple_color_ascii(units),
+                    ak::Utf16StringUnits::Latin1(units) => libweb_rust::parse_simple_color_utf16(
+                        &units.iter().map(|&unit| u16::from(unit)).collect::<Vec<_>>(),
+                    ),
                     ak::Utf16StringUnits::Utf16(units) => libweb_rust::parse_simple_color_utf16(units),
                 }
                 .map(|srgb| {
@@ -626,10 +632,10 @@ impl ContextState {
     }
 
     /// Sets the font of the current drawing state, unless the value is not a CSS font.
-    pub(crate) fn assign_font(&self, font: &Utf16String) {
+    pub(crate) fn assign_font(&self, vm: &Vm, font: &Utf16String) {
         let font_selection = FontSelection::of(&self.drawing_state());
         if let Some(font) = self.canvas.resolve_font(font, font_selection) {
-            self.drawing_state_mut().font = Some(font);
+            self.drawing_state_mut(vm).font = Some(font);
         }
     }
 
@@ -653,10 +659,10 @@ impl ContextState {
 
     /// Resolves the font of the current drawing state again, after a change to the text drawing styles that select
     /// its fonts.
-    pub(crate) fn font_selection_did_change(&self) {
+    pub(crate) fn font_selection_did_change(&self, vm: &Vm) {
         let font = self.drawing_state().font.as_ref().map(|font| font.serialized.clone());
         if let Some(font) = font {
-            self.assign_font(&font);
+            self.assign_font(vm, &font);
         }
     }
 
@@ -673,10 +679,10 @@ impl ContextState {
 
     /// The font of the current drawing state, which is resolved the first time the context needs one, and again when
     /// the fonts that the canvas can use change.
-    pub(crate) fn current_font(&self) -> ResolvedFont {
+    pub(crate) fn current_font(&self, vm: &Vm) -> ResolvedFont {
         // When font style value is empty load default font
         if self.drawing_state().font.is_none() {
-            self.assign_font(&Utf16String::from_ascii(b"10px sans-serif"));
+            self.assign_font(vm, &Utf16String::from_ascii(b"10px sans-serif"));
         }
 
         // NB: Drawing states, including saved states, retain their cascades across font loads and font-display
@@ -688,7 +694,7 @@ impl ContextState {
             .clone()
             .expect("a context has a font once it is set");
         if font.environment_generation != self.canvas.font_environment_generation() {
-            self.assign_font(&font.serialized);
+            self.assign_font(vm, &font.serialized);
             return self
                 .drawing_state()
                 .font
@@ -847,6 +853,6 @@ pub(crate) fn multiply_transforms(transform: AffineTransform, other: AffineTrans
 
 /// The transform rotated by the angle in radians, as Gfx::AffineTransform::rotate_radians().
 pub(crate) fn rotated(transform: AffineTransform, radians: f32) -> AffineTransform {
-    let (sin, cos) = radians.sin_cos();
+    let (sin, cos) = math::sincos(radians);
     multiply_transforms(transform, AffineTransform::new(cos, sin, -sin, cos, 0.0, 0.0))
 }

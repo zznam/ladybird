@@ -13,10 +13,10 @@ namespace Media {
 
 class AudioDecoder;
 class AudioMixer;
+class AudioOutputFactory;
 class AudioPlaybackSink;
 class AudioProducer;
 class AudioSink;
-class ContainerNavigator;
 class DecodedAudioProducer;
 class DecodedVideoProducer;
 class Demuxer;
@@ -34,5 +34,13 @@ class Track;
 class VideoProducer;
 class VideoPresentationServerConnection;
 class VideoSink;
+
+}
+
+namespace Media::FFmpeg {
+
+class FFmpegAudioConverter;
+class FFmpegAudioDecoder;
+class FFmpegAudioEncoder;
 
 }

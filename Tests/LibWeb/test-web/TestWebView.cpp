@@ -11,6 +11,10 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
+#include <LibWebView/NotificationManager.h>
+#include <LibWebView/PermissionManager.h>
+#include <LibWebView/RecordingNotificationBackend.h>
+#include <LibWebView/WebContentPage.h>
 
 namespace TestWeb {
 
@@ -57,9 +61,26 @@ void TestWebView::reset_geolocation_emulated_position()
     geolocation_settings_changed();
 }
 
-NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_session_history()
+// Permissions live in the UI process, and outlive the test that changed them. Each test has an origin of its own, and
+// tests run concurrently, so only this test's origin is reset.
+void TestWebView::reset_permissions()
 {
-    return WebView::ViewImplementation::reset_session_history_for_testing();
+    session().permission_manager->reset_origin(url().origin());
+    reset_permission_prompts_for_testing();
+}
+
+// A test's notifications live in the UI process, keyed by a page id the next test in this view gets too, so they may
+// not reach the next test.
+void TestWebView::reset_notifications()
+{
+    WebView::NotificationManager::the().reset_page_for_testing(page());
+    if (auto* recording_backend = WebView::NotificationManager::the().backend().as_recording_backend())
+        recording_backend->forget_page(page().id());
+}
+
+NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_state_for_next_test()
+{
+    return WebView::ViewImplementation::reset_state_for_testing();
 }
 
 NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screenshot()

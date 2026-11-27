@@ -6,6 +6,7 @@
 
 #include <AK/Atomic.h>
 #include <AK/ByteBuffer.h>
+#include <AK/GenericShorthands.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
@@ -1299,10 +1300,17 @@ public:
         });
     }
 
-    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived on_complete) const override
+    virtual void evaluate_javascript(DevTools::TabDescription const&, String const& script, OnScriptEvaluationComplete on_complete) const override
+    {
+        last_evaluated_script = script;
+        on_complete(console_evaluation_result);
+    }
+
+    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, WebView::DebuggerObjectScope scope, OnDebuggerObjectPropertiesReceived on_complete) const override
     {
         ++retrieve_debugger_object_properties_call_count;
         last_debugger_object_id = object_id;
+        last_debugger_object_scope = scope;
         if (debugger_object_properties_error.has_value()) {
             on_complete(*debugger_object_properties_error);
             return;
@@ -1330,6 +1338,12 @@ public:
         title_property.enumerable = true;
         properties.properties.append(move(title_property));
         on_complete(move(properties));
+    }
+
+    virtual void complete_console_input(DevTools::TabDescription const&, String const& input, OnConsoleInputCompleted callback) const override
+    {
+        last_console_input_to_complete = input;
+        callback(console_input_completion);
     }
 
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Web::UniqueNodeID> node_id, String const& url, OnResolvedURLReceived callback) const override
@@ -1371,6 +1385,10 @@ public:
         if (!navigation_listeners.is_empty())
             navigation_listeners.take_first();
     }
+
+    virtual void start_sending_console_output(DevTools::TabDescription const&, bool messages, bool errors) const override { console_output_requests.append({ messages, errors }); }
+    virtual void listen_for_inspect_element_requests(DevTools::TabDescription const&, OnInspectElementRequest callback) const override { on_inspect_element_request = move(callback); }
+    virtual void stop_listening_for_inspect_element_requests(DevTools::TabDescription const&) const override { on_inspect_element_request = nullptr; }
     virtual void did_connect_devtools_client(DevTools::TabDescription const&) const override { ++did_connect_devtools_client_call_count; }
     virtual void did_disconnect_devtools_client(DevTools::TabDescription const&) const override { ++did_disconnect_devtools_client_call_count; }
 
@@ -1431,6 +1449,12 @@ public:
                 .stacktrace = {},
             },
         });
+    }
+
+    void emit_console_group_end() const
+    {
+        VERIFY(on_console_message);
+        on_console_message({ UnixDateTime::from_seconds_since_epoch(13), WebView::ConsoleGroupEnd {} });
     }
 
     void emit_console_trace() const
@@ -1534,6 +1558,12 @@ public:
         on_node_picker_event(move(event));
     }
 
+    void emit_inspect_element_request(Web::UniqueNodeID node_id) const
+    {
+        VERIFY(on_inspect_element_request);
+        on_inspect_element_request(node_id);
+    }
+
     void emit_cookie_change(Vector<HTTP::Cookie::Cookie> cookies) const
     {
         VERIFY(on_host_cookie_change);
@@ -1571,6 +1601,7 @@ public:
     mutable Function<void(u64, ByteBuffer)> on_network_response_body_received;
     mutable Function<void(DevToolsDelegate::NetworkRequestCompleteData)> on_network_request_finished;
     mutable Function<void(DevToolsDelegate::NodePickerEvent)> on_node_picker_event;
+    mutable Function<void(Web::UniqueNodeID)> on_inspect_element_request;
     mutable Function<void(Vector<HTTP::Cookie::Cookie>)> on_host_cookie_change;
     mutable HashMap<u64, Function<void(DevToolsDelegate::StorageChange)>> storage_change_listeners;
     String tab_url { "https://example.test/"_string };
@@ -1688,6 +1719,9 @@ public:
     mutable size_t retrieve_debugger_environments_call_count { 0 };
     mutable size_t evaluate_javascript_in_debugger_frame_call_count { 0 };
     mutable size_t retrieve_debugger_object_properties_call_count { 0 };
+    mutable Optional<WebView::DebuggerObjectScope> last_debugger_object_scope;
+    mutable Optional<String> last_evaluated_script;
+    WebView::DebuggerValue console_evaluation_result;
     mutable Optional<String> debugger_object_properties_error;
     mutable DevTools::DevToolsDelegate::OnDebuggerPaused on_debugger_paused;
     mutable DevTools::DevToolsDelegate::OnDebuggerResumed on_debugger_resumed;
@@ -1713,6 +1747,7 @@ public:
     mutable size_t listen_for_navigation_events_call_count { 0 };
     mutable size_t stop_listening_for_navigation_events_call_count { 0 };
     mutable size_t did_connect_devtools_client_call_count { 0 };
+    mutable Vector<Array<bool, 2>> console_output_requests;
     mutable size_t did_disconnect_devtools_client_call_count { 0 };
     mutable size_t navigate_tab_call_count { 0 };
     mutable size_t reload_tab_call_count { 0 };
@@ -1743,6 +1778,8 @@ public:
     mutable size_t last_attribute_count { 0 };
     mutable Optional<Web::UniqueNodeID> last_resolved_url_node;
     mutable Optional<String> last_url_to_resolve;
+    mutable Optional<String> last_console_input_to_complete;
+    DevToolsDelegate::ConsoleInputCompletion console_input_completion;
     mutable String resolved_dom_node_url { "https://example.test/scripts/app.js"_string };
     mutable Optional<String> last_navigated_url;
     mutable Optional<bool> last_reload_bypass_cache;
@@ -1898,12 +1935,10 @@ private:
 
     JsonObject read_message_now()
     {
-        MUST(m_socket->set_blocking(true));
-        auto restore_nonblocking = ScopeGuard([&] { MUST(m_socket->set_blocking(false)); });
-
         ByteBuffer length_buffer;
         while (true) {
-            auto byte = MUST(m_socket->read_value<u8>());
+            u8 byte = 0;
+            read_until_filled({ &byte, 1 });
             if (byte == ':')
                 break;
             length_buffer.append(byte);
@@ -1914,12 +1949,33 @@ private:
 
         ByteBuffer message_buffer;
         message_buffer.resize(*length);
-        MUST(m_socket->read_until_filled(message_buffer));
+        read_until_filled(message_buffer);
 
         auto value = JsonValue::from_string(message_buffer);
         VERIFY(!value.is_error());
         VERIFY(value.value().is_object());
         return value.release_value().as_object();
+    }
+
+    // The server writes a large packet from its event loop as the socket drains, so keep pumping it while reading.
+    void read_until_filled(Bytes buffer)
+    {
+        auto is_filled = [&] {
+            while (!buffer.is_empty()) {
+                auto result = m_socket->read_some(buffer);
+                if (result.is_error()) {
+                    VERIFY(first_is_one_of(result.error().code(), EAGAIN, EWOULDBLOCK));
+                    return false;
+                }
+                if (result.value().is_empty()) {
+                    VERIFY(!m_socket->is_eof());
+                    return false;
+                }
+                buffer = buffer.slice(result.value().size());
+            }
+            return true;
+        };
+        spin_until(m_loop, move(is_filled), 10000_ms);
     }
 
     Core::EventLoop& m_loop;
@@ -1976,6 +2032,40 @@ static size_t source_actor_count(DevTools::DevToolsServer const& server)
             ++count;
     }
     return count;
+}
+
+TEST_CASE(devtools_server_does_not_block_on_a_client_that_is_slow_to_read)
+{
+    auto session = create_session();
+    auto& connection = *session->server->connection();
+
+    // Far larger than the socket buffers, so most of it has to wait for the client to read.
+    auto payload = MUST(String::repeated('a', 16 * MiB));
+
+    JsonObject large_message;
+    large_message.set("from"sv, "test"sv);
+    large_message.set("payload"sv, payload);
+    connection.send_message(large_message);
+
+    JsonObject small_message;
+    small_message.set("from"sv, "test"sv);
+    small_message.set("payload"sv, "small"sv);
+    connection.send_message(small_message);
+
+    pump(session->loop);
+    EXPECT(session->server->has_active_connection());
+
+    auto read_test_message = [&] {
+        while (true) {
+            auto message = session->client->read_message();
+            if (message.get_string("from"sv) == "test"sv)
+                return message;
+        }
+    };
+
+    EXPECT_EQ(read_test_message().get_string("payload"sv), payload);
+    EXPECT_EQ(read_test_message().get_string("payload"sv), "small"sv);
+    EXPECT(session->server->has_active_connection());
 }
 
 TEST_CASE(devtools_server_reports_connection_state)
@@ -4581,6 +4671,244 @@ TEST_CASE(walker_node_picker)
     children.set("type"sv, "children"sv);
     children.set("node"sv, root_node_actor);
     EXPECT_EQ(client.request(move(children)).get_array("nodes"sv)->size(), 1u);
+}
+
+TEST_CASE(console_inspect_element)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto target = get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    auto console_actor = actor_from(target, "consoleActor"sv);
+
+    session->delegate.emit_inspect_element_request(Web::UniqueNodeID { 5 });
+
+    auto event = read_packet_with_type(client, "inspectObject"sv);
+    EXPECT_EQ(event.get_string("from"sv).value(), console_actor);
+    EXPECT_EQ(event.get_string("inspectFromAnnotation"sv).value(), "browser-context-menu"sv);
+
+    auto grip = event.get_object("objectActor"sv).release_value();
+    EXPECT_EQ(grip.get_object("preview"sv)->get_integer<u16>("nodeType"sv).value(), 1u);
+
+    auto content_dom_reference = grip.get_object("contentDomReference"sv).release_value();
+    EXPECT_EQ(content_dom_reference.get_integer<u64>("browsingContextId"sv).value(), target.get_integer<u64>("browsingContextID"sv).value());
+    EXPECT_EQ(content_dom_reference.get_integer<Web::UniqueNodeID::Type>("id"sv).value(), 5);
+
+    auto inspector_actor = actor_from(target, "inspectorActor"sv);
+    auto walker_actor = actor_from(get_walker(client, inspector_actor), "actor"sv);
+
+    auto resolve = [&](JsonObject reference) {
+        JsonObject request;
+        request.set("to"sv, walker_actor);
+        request.set("type"sv, "getNodeActorFromContentDomReference"sv);
+        request.set("contentDomReference"sv, move(reference));
+        return client.request(move(request));
+    };
+
+    // The reference names a text node, so the walker answers with its element: The DIV that contains it.
+    auto response = resolve(content_dom_reference);
+    auto node_front = response.get_object("nodeFront"sv).release_value();
+    auto node = node_front.get_object("node"sv).release_value();
+    EXPECT_EQ(node.get_string("nodeName"sv).value(), "DIV"sv);
+    EXPECT_EQ(node_front.get_array("newParents"sv)->size(), 2u);
+
+    JsonObject is_in_dom_tree;
+    is_in_dom_tree.set("to"sv, walker_actor);
+    is_in_dom_tree.set("type"sv, "isInDOMTree"sv);
+    is_in_dom_tree.set("node"sv, actor_from(node, "actor"sv));
+    EXPECT(client.request(move(is_in_dom_tree)).get_bool("attached"sv).value());
+
+    auto other_tab_reference = content_dom_reference;
+    other_tab_reference.set("browsingContextId"sv, 999);
+    EXPECT(resolve(move(other_tab_reference)).get("nodeFront"sv)->is_null());
+
+    auto unknown_node_reference = content_dom_reference;
+    unknown_node_reference.set("id"sv, 999);
+    EXPECT(resolve(move(unknown_node_reference)).get("nodeFront"sv)->is_null());
+}
+
+TEST_CASE(console_evaluation_result_object_grips)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto target = get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    auto console_actor = actor_from(target, "consoleActor"sv);
+
+    // WebContent names the objects inside a result's grip fields by ID; the server makes each one an object actor.
+    session->delegate.console_evaluation_result = {
+        .type = WebView::DebuggerValueType::Object,
+        .boolean_value = false,
+        .number_value = 0,
+        .text = {},
+        .object_id = 7,
+        .object_class = "NodeList"_string,
+        .grip_fields = MUST(JsonValue::from_string(R"~~~({"preview":{"kind":"ArrayLike","length":1,"items":[
+            {"type":"object","objectId":8,"class":"HTMLDivElement","contentDomReference":{"id":5},
+             "preview":{"kind":"DOMNode","nodeName":"div","attributes":{"class":"x"}}}]}})~~~"sv)),
+    };
+
+    JsonObject evaluate;
+    evaluate.set("to"sv, console_actor);
+    evaluate.set("type"sv, "evaluateJSAsync"sv);
+    evaluate.set("text"sv, "document.querySelectorAll('div')"sv);
+    auto result_id = client.request(move(evaluate)).get_string("resultID"sv).release_value();
+
+    auto evaluation = read_packet_with_type(client, "evaluationResult"sv);
+    EXPECT_EQ(evaluation.get_string("resultID"sv).value(), result_id);
+    auto result = evaluation.get_object("result"sv).release_value();
+    EXPECT_EQ(result.get_string("class"sv).value(), "NodeList"sv);
+    EXPECT(result.has_string("actor"sv));
+    EXPECT_EQ(result.get_object("preview"sv)->get_integer<u32>("length"sv).value(), 1u);
+
+    auto item = result.get_object("preview"sv)->get_array("items"sv)->at(0).as_object();
+    auto item_actor = actor_from(item, "actor"sv);
+    EXPECT_NE(item_actor, actor_from(result, "actor"sv));
+    EXPECT_EQ(item.get_string("class"sv).value(), "HTMLDivElement"sv);
+    EXPECT(!item.has("objectId"sv));
+    EXPECT_EQ(item.get_object("preview"sv)->get_object("attributes"sv)->get_string("class"sv).value(), "x"sv);
+    EXPECT_EQ(item.get_object("contentDomReference"sv)->get_integer<u64>("id"sv).value(), 5u);
+    EXPECT_EQ(item.get_object("contentDomReference"sv)->get_integer<u64>("browsingContextId"sv).value(), target.get_integer<u64>("browsingContextID"sv).value());
+
+    // Expanding an object of a console result asks for the properties of the console's object, not the debugger's.
+    auto properties = client.request(item_actor, "prototypeAndProperties"sv);
+    EXPECT_EQ(session->delegate.last_debugger_object_id.value(), 8u);
+    EXPECT_EQ(session->delegate.last_debugger_object_scope.value(), WebView::DebuggerObjectScope::Console);
+    EXPECT(properties.get_object("ownProperties"sv)->has("answer"sv));
+}
+
+TEST_CASE(console_log_object_grips)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    (void)get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+
+    // WebContent names a logged object by ID; the server makes it an object actor.
+    auto logged_object = MUST(JsonValue::from_string(R"~~~({"type":"object","objectId":9,"class":"Object",
+        "preview":{"kind":"Object","ownProperties":{"answer":42},"ownPropertiesLength":1}})~~~"sv));
+    session->delegate.emit_console_log(JS::ConsoleLogLevel::Log, { "label"_string, move(logged_object) });
+    auto arguments = read_resource(client, "console-message"sv).get_array("arguments"sv).release_value();
+    EXPECT_EQ(arguments.at(0).as_string(), "label"sv);
+    auto grip = arguments.at(1).as_object();
+    EXPECT_EQ(grip.get_string("class"sv).value(), "Object"sv);
+    EXPECT(!grip.has("objectId"sv));
+    EXPECT_EQ(grip.get_object("preview"sv)->get_object("ownProperties"sv)->get_integer<u32>("answer"sv).value(), 42u);
+
+    // Expanding a logged object asks for the properties of the console's object, not the debugger's.
+    auto properties = client.request(actor_from(grip, "actor"sv), "prototypeAndProperties"sv);
+    EXPECT_EQ(session->delegate.last_debugger_object_id.value(), 9u);
+    EXPECT_EQ(session->delegate.last_debugger_object_scope.value(), WebView::DebuggerObjectScope::Console);
+    EXPECT(properties.get_object("ownProperties"sv)->has("answer"sv));
+}
+
+TEST_CASE(console_output_is_requested_when_watched)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+    auto watch = [&](StringView resource_type) {
+        JsonObject watch_resources;
+        watch_resources.set("to"sv, watcher_actor);
+        watch_resources.set("type"sv, "watchResources"sv);
+        JsonArray resource_types;
+        resource_types.must_append(resource_type);
+        watch_resources.set("resourceTypes"sv, move(resource_types));
+        (void)client.request(move(watch_resources));
+    };
+
+    // Nothing listens for the page's output before there's a frame target, so the request waits for one.
+    watch("error-message"sv);
+    EXPECT(session->delegate.console_output_requests.is_empty());
+
+    JsonObject watch_targets;
+    watch_targets.set("to"sv, watcher_actor);
+    watch_targets.set("type"sv, "watchTargets"sv);
+    watch_targets.set("targetType"sv, "frame"sv);
+    client.send(move(watch_targets));
+    (void)read_packet_with_type(client, "target-available-form"sv);
+    EXPECT_EQ(session->delegate.console_output_requests.size(), 1u);
+    EXPECT_EQ(session->delegate.console_output_requests[0], (Array { false, true }));
+
+    // Watching messages later asks for those the page output before, which watching errors alone left out.
+    watch("console-message"sv);
+    EXPECT_EQ(session->delegate.console_output_requests.size(), 2u);
+    EXPECT_EQ(session->delegate.console_output_requests[1], (Array { true, false }));
+
+    watch("console-message"sv);
+    EXPECT_EQ(session->delegate.console_output_requests.size(), 2u);
+}
+
+TEST_CASE(console_message_levels)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    (void)get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+
+    // Every console method reaches the client as a level it knows. The console formats counts and times itself.
+    auto level_of = [&](JS::ConsoleLogLevel level) {
+        session->delegate.emit_console_log(level, { "text"_string });
+        return read_resource(client, "console-message"sv).get_string("level"sv).release_value();
+    };
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::Assert), "error"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::Count), "log"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::CountReset), "warn"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::Dir), "dir"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::DirXML), "dirxml"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::Group), "group"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::GroupCollapsed), "groupCollapsed"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::Table), "table"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::TimeEnd), "log"sv);
+    EXPECT_EQ(level_of(JS::ConsoleLogLevel::TimeLog), "log"sv);
+
+    session->delegate.emit_console_group_end();
+    auto group_end = read_resource(client, "console-message"sv);
+    EXPECT_EQ(group_end.get_string("level"sv).value(), "groupEnd"sv);
+    EXPECT(group_end.get_array("arguments"sv)->is_empty());
+}
+
+TEST_CASE(console_autocomplete)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto target = get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    auto console_actor = actor_from(target, "consoleActor"sv);
+
+    auto autocomplete = [&](StringView text, Optional<size_t> cursor) {
+        JsonObject request;
+        request.set("to"sv, console_actor);
+        request.set("type"sv, "autocomplete"sv);
+        request.set("text"sv, text);
+        if (cursor.has_value())
+            request.set("cursor"sv, *cursor);
+        return client.request(move(request));
+    };
+
+    session->delegate.console_input_completion = { .matches = Vector { "body"_string, "bodyText"_string }, .match_prop = "bo"_string };
+
+    auto response = autocomplete("document.bo"sv, {});
+    EXPECT_EQ(session->delegate.last_console_input_to_complete.value(), "document.bo"sv);
+    EXPECT_EQ(response.get_array("matches"sv)->size(), 2u);
+    EXPECT_EQ(response.get_array("matches"sv)->at(0).as_string(), "body"sv);
+    EXPECT_EQ(response.get_string("matchProp"sv).value(), "bo"sv);
+    EXPECT_EQ(response.get_bool("isElementAccess"sv).value(), false);
+
+    // Only the text before the cursor is completed.
+    (void)autocomplete("document.bo + 1"sv, 11);
+    EXPECT_EQ(session->delegate.last_console_input_to_complete.value(), "document.bo"sv);
+
+    session->delegate.console_input_completion = {};
+    EXPECT(autocomplete("f().x"sv, {}).get("matches"sv)->is_null());
 }
 
 TEST_CASE(inspector_walker_navigation_reloads_root)

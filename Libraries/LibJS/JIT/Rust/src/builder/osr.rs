@@ -15,10 +15,11 @@
 //! Each back edge gets an entry block without predecessors that loads the
 //! slots live into the back edge instruction from the frame and then runs the
 //! instruction itself, or jumps to its block where the instruction starts it
-//! (as the tests at the bottom of loops do). Where the instruction jumps to the
-//! update step of a for loop, which leads to the loop's header, the entry runs
-//! that step itself instead. Its edges are forward edges into the loop and the
-//! loop exit, so the values it loaded meet the other paths in phis.
+//! (as the tests at the bottom of loops do). Where the instruction jumps to a
+//! block that leads to the loop's header and nowhere else, like the body of a
+//! for loop whose test is a constant, the entry runs that block itself instead.
+//! Its edges are forward edges into the loop and the loop exit, so the values
+//! it loaded meet the other paths in phis.
 //!
 //! Generators and async functions resume the same way: a suspended frame holds
 //! every value live at the continuation it resumes at (see `build_suspend()`),
@@ -34,16 +35,16 @@
 //! state to the frame and running the `Catch` itself, or the interpreter
 //! after running the `Catch` (see `ARCHITECTURE.md`, section 4.2).
 
-use super::AbstractFrame;
 use super::Flow;
 use super::GraphBuilder;
 use crate::CompileFailure;
 use crate::bytecode::Instruction;
 use crate::bytecode::Label;
 use crate::bytecode::OpCode;
-use crate::bytecode::RESERVED_REGISTER_COUNT;
 use crate::bytecode::cfg::BlockIndex;
 use crate::bytecode::cfg::Loop;
+use crate::ir::BlockId;
+use ak::ZoneVec;
 
 /// Whether instructions with this opcode are loop back edges, which count
 /// loop iterations in the interpreter.
@@ -74,64 +75,58 @@ pub(crate) fn is_loop_back_edge(opcode: OpCode) -> bool {
     )
 }
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
+    /// Whether the instruction with the given index is a back edge that an on-stack replacement entry can be built at.
+    pub(super) fn can_build_osr_entry(&self, index: usize) -> bool {
+        let pc = self.function.instructions[index].pc;
+        // NB: Back edges in unreachable code lead to blocks that are
+        //     never built.
+        is_loop_back_edge(self.function.instructions[index].instruction.opcode())
+            && (self.has_run)(pc)
+            && self
+                .function
+                .cfg
+                .block_for_pc(pc)
+                .is_some_and(|block| self.function.cfg.blocks[block].rpo_number.is_some())
+    }
+
     /// Builds an entry block for every reachable loop back edge of the
     /// compiled function that ran, before any of its bytecode blocks is
     /// started.
     pub(super) fn build_osr_entries(&mut self) -> Result<(), CompileFailure> {
         debug_assert!(!self.function.is_virtual());
+        let mut targets = ZoneVec::new_in(self.work);
         for index in 0..self.function.instructions.len() {
             let pc = self.function.instructions[index].pc;
-            if !is_loop_back_edge(self.function.instructions[index].instruction.opcode())
-                || !(self.has_run)(pc)
-                || (self.snapshot.options.osr_pc != Some(pc) && !self.snapshot.options.stress.osr_at_every_loop)
+            if (self.snapshot.options.osr_pc != Some(pc) && !self.snapshot.options.stress.osr_at_every_loop)
+                || !self.can_build_osr_entry(index)
             {
                 continue;
             }
-            // NB: Back edges in unreachable code lead to blocks that are
-            //     never built.
-            let reachable = self
-                .function
-                .cfg
-                .block_for_pc(pc)
-                .is_some_and(|block| self.function.cfg.blocks[block].rpo_number.is_some());
-            if !reachable {
-                continue;
-            }
-            let block = self.start_new_block(Vec::new());
-            self.frame = AbstractFrame::in_memory(self.function.layout.tracked_slot_count());
-            self.function.instruction_index = index;
-            self.function.pc = pc;
-            self.function.eager_frame_state = None;
-            let live = self.function.liveness.live_in(index).clone();
-            for slot in live.iter() {
-                if slot >= RESERVED_REGISTER_COUNT as usize {
-                    let operand = self.function.layout.operand_for_tracked_index(slot);
-                    self.read_tracked(slot, operand);
-                }
-            }
+            let block = self.start_entry_block(index);
             // NB: A back edge that starts its block is entered through
             //     that block, so that loops with their test at the bottom
             //     are entered at their header like from the function entry.
             //     Unconditional back edges jump to their loop's header
             //     directly instead, since entering a block of the loop
             //     other than its header would make the loop irreducible.
-            //     Those of loops whose update step has a block of its own
-            //     (like for loops with a continue) jump to that step, which
-            //     the entry runs itself before it continues at the header.
+            //     Those that jump to a block leading to the header (like the
+            //     body of a for loop whose test is a constant, where the test
+            //     is the header) have the entry run that block itself before
+            //     it continues at the header.
             let opcode = self.function.instructions[index].instruction.opcode();
             let own_block = self
                 .function
                 .cfg
                 .block_for_pc(pc)
                 .filter(|block| opcode != OpCode::JumpLoop && self.function.cfg.blocks[*block].start_pc == pc);
-            let mut targets = Vec::new();
+            targets.clear();
             if let Some(own_block) = own_block {
                 self.end_with_jump(own_block)?;
                 targets.push(own_block);
-            } else if let Some(update_block) = self.update_block_of_back_edge(index) {
-                self.build_bytecode_block(update_block)?;
-                targets.extend(self.function.cfg.blocks[update_block].successors.iter().copied());
+            } else if let Some(block_before_header) = self.block_before_header_of_back_edge(index) {
+                self.build_bytecode_block(block_before_header)?;
+                targets.extend(self.function.cfg.blocks[block_before_header].successors.iter().copied());
             } else {
                 match self.build_instruction()? {
                     Flow::Ended => {}
@@ -237,23 +232,27 @@ impl GraphBuilder<'_> {
         if self.graph.osr_entries.iter().any(|(entry_pc, _)| *entry_pc == pc) {
             return Ok(());
         }
-        let block = self.start_new_block(Vec::new());
-        self.frame = AbstractFrame::in_memory(self.function.layout.tracked_slot_count());
-        let start = target_block.instructions.start;
-        self.function.instruction_index = start;
-        self.function.pc = pc;
-        self.function.eager_frame_state = None;
-        let live = self.function.liveness.live_in(start).clone();
-        for slot in live.iter() {
-            if slot >= RESERVED_REGISTER_COUNT as usize {
-                let operand = self.function.layout.operand_for_tracked_index(slot);
-                self.read_tracked(slot, operand);
-            }
-        }
+        let block = self.start_entry_block(target_block.instructions.start);
         self.end_with_jump(target)?;
         self.graph.osr_entries.push((pc, block));
         self.note_loops_entered_at(&[target]);
         Ok(())
+    }
+
+    /// Starts an entry block into a frame that is running at the instruction with the given index: a block without
+    /// predecessors that loads every slot live there from the frame, whose memory holds them all.
+    fn start_entry_block(&mut self, index: usize) -> BlockId {
+        let block = self.start_new_block(&[]);
+        self.frame = self.dead_frame();
+        self.function.instruction_index = index;
+        self.function.pc = self.function.instructions[index].pc;
+        self.function.eager_frame_state = None;
+        let live = self.live_in(index);
+        for slot in live.iter() {
+            self.load_slot(slot);
+        }
+        self.release_slot_set(live);
+        block
     }
 
     /// Notes the loops that an entry leads into other than at their header,
@@ -271,7 +270,7 @@ impl GraphBuilder<'_> {
 
     /// The block that the unconditional back edge at instruction `index` jumps
     /// to, if it is no loop header and leads to one and nowhere else.
-    fn update_block_of_back_edge(&self, index: usize) -> Option<BlockIndex> {
+    fn block_before_header_of_back_edge(&self, index: usize) -> Option<BlockIndex> {
         let instruction = &self.function.instructions[index].instruction;
         if instruction.opcode() != OpCode::JumpLoop {
             return None;
@@ -292,7 +291,7 @@ impl GraphBuilder<'_> {
     /// other back edges of the loops around that loop, from where a frame may
     /// reach the entry on a later iteration.
     fn record_osr_loop_back_edges(&mut self, pc: u32) {
-        let cfg = &self.function.cfg;
+        let cfg = self.function.cfg;
         let Some(back_edge_block) = cfg.block_for_pc(pc) else {
             return;
         };
@@ -307,14 +306,14 @@ impl GraphBuilder<'_> {
         else {
             return;
         };
-        let back_edges_in = |current_loop: &Loop| {
+        let instructions = self.function.instructions;
+        let back_edges_in = |current_loop: &'a Loop<'a>| {
             current_loop
                 .blocks
                 .iter()
-                .flat_map(|&block| &self.function.instructions[cfg.blocks[block].instructions.clone()])
+                .flat_map(|&block| &instructions[cfg.blocks[block].instructions.clone()])
                 .filter(|instruction| is_loop_back_edge(instruction.instruction.opcode()))
                 .map(|instruction| instruction.pc)
-                .collect::<Vec<_>>()
         };
         for back_edge_pc in back_edges_in(entered_loop) {
             if !self.graph.osr_loop_back_edges.contains(&back_edge_pc) {

@@ -11,12 +11,12 @@
 
 use super::LayoutNodeArena;
 use super::formatting_context::FfiLayoutHostCallbacks;
-use super::layout_node_arena::{ShellFactory, ShellStyleChangedHost};
+use super::layout_node_arena::{FfiStyleRecordHostCallbacks, ShellFactory};
 use super::node_data::{NodeKind, NodeSlotId};
 use super::trace::DescribeNode;
 use super::update_layout::FfiLayoutUpdateHostCallbacks;
 use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
-use crate::painting::host::FfiGeometryHostCallbacks;
+use crate::painting::host::{FfiGeometryHostCallbacks, FfiPaintPreparationHostCallbacks};
 use crate::painting::paintable_rows::ChromeStateCallback;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -36,10 +36,12 @@ pub(crate) struct HostTables {
     pub(super) layout_update_host: Cell<Option<FfiLayoutUpdateHostCallbacks>>,
     /// Makes the shell of an anonymous row the first time something asks for it.
     pub(super) shell_factory: Cell<Option<ShellFactory>>,
-    pub(super) shell_style_changed_host: Cell<Option<ShellStyleChangedHost>>,
+    pub(super) style_record_host: Cell<Option<FfiStyleRecordHostCallbacks>>,
     pub(crate) chrome_state_callback: Cell<Option<ChromeStateCallback>>,
     /// What the overflow pass tells the document once it has settled a box's scroll offset.
     pub(crate) geometry_host: Cell<Option<FfiGeometryHostCallbacks>>,
+    /// What preparing the paint and hit testing properties asks of the document, and tells it.
+    pub(crate) paint_preparation_host: Cell<Option<FfiPaintPreparationHostCallbacks>>,
     /// How the host names a node a layout trace mentions, set when tracing begins.
     pub(super) layout_trace_describe_node: Cell<Option<DescribeNode>>,
     /// The image provider each row whose image comes from its style owns, made for the row and
@@ -58,6 +60,8 @@ pub(crate) struct HostTables {
     pub(crate) shows_search_text: Cell<bool>,
     /// Whether the host gave the rows spelling-error highlights that it has not cleared since.
     pub(crate) shows_spelling_errors: Cell<bool>,
+    /// Whether the host gave the rows custom highlights that it has not cleared since.
+    pub(crate) shows_custom_highlights: Cell<bool>,
     /// The rows the host gave layer image paint facts, which the arena drops with the row.
     pub(crate) rows_with_layer_image_paint_facts: RefCell<HashSet<NodeSlotId>>,
     /// The image resources the tree builds of the rounds the host was paid for owe the rows they stamped, which the
@@ -70,9 +74,10 @@ impl HostTables {
         self.layout_host.set(None);
         self.layout_update_host.set(None);
         self.shell_factory.set(None);
-        self.shell_style_changed_host.set(None);
+        self.style_record_host.set(None);
         self.chrome_state_callback.set(None);
         self.geometry_host.set(None);
+        self.paint_preparation_host.set(None);
     }
 
     /// The layout node of the row `facts` describes, made by the shell factory the first time
@@ -85,7 +90,7 @@ impl HostTables {
             return std::ptr::null_mut();
         };
         assert!(
-            !crate::stage_thread::style_layout_thread().is_current(),
+            !crate::stage_thread::render_thread().is_current(),
             "a layout node is made on the main thread, whose heap it is allocated from"
         );
         // SAFETY: Registration and unregistration keep the factory context live. The factory's
@@ -146,7 +151,7 @@ impl HostTables {
 /// The arena of a document's render state, and the layout stage's scratch beside it.
 pub(crate) struct ArenaHandle {
     arena: LayoutNodeArena,
-    layout_scratch: super::run_records::LayoutScratch,
+    layout_scratch: super::run_state::LayoutScratch,
 }
 
 impl ArenaHandle {
@@ -165,17 +170,24 @@ impl ArenaHandle {
     pub(crate) fn fork(&self, engine: crate::css::style::StyleEngineHandle) -> Self {
         Self {
             arena: self.arena.fork(engine),
-            layout_scratch: Default::default(),
+            layout_scratch: self.layout_scratch.fork(),
         }
     }
 
     /// The layout stage's own scratch.
-    pub(crate) fn layout_scratch(&self) -> &super::run_records::LayoutScratch {
+    pub(crate) fn layout_scratch(&self) -> &super::run_state::LayoutScratch {
         &self.layout_scratch
     }
 
     pub(crate) fn arena_mut(&mut self) -> &mut LayoutNodeArena {
         &mut self.arena
+    }
+
+    /// The arena to write, beside the layout stage's scratch, which the stage maintains as it prepares and ends a pass.
+    pub(crate) fn arena_mut_and_layout_scratch(
+        &mut self,
+    ) -> (&mut LayoutNodeArena, &mut super::run_state::LayoutScratch) {
+        (&mut self.arena, &mut self.layout_scratch)
     }
 }
 
@@ -260,7 +272,7 @@ mod tests {
         // The walk can ask for the new row's layout node before the old one is destroyed.
         host_tables.attach_shell(reused, object(16));
 
-        work.resolve(&arena).pay(&main_thread);
+        work.resolve(&mut arena).pay(&main_thread);
         assert_eq!(
             host_tables.shells.borrow().get(&reused).map(|shell| shell.as_ptr()),
             Some(object(16))
@@ -315,7 +327,7 @@ mod tests {
         host_tables.replace_image_observers(freed, object(8));
 
         let host_calls = HostCalls(&work);
-        super::super::layout_node_arena::prepare_subtree_for_detach(host_calls, &arena, freed);
+        super::super::layout_node_arena::prepare_subtree_for_detach(host_calls, &mut arena, freed);
         host_calls.free_subtree(&mut arena, freed);
         // The walk owes the host the observers it let go of, so they stay until the walk is over.
         assert_eq!(host_tables.image_observers(freed), object(8));
@@ -325,7 +337,7 @@ mod tests {
         assert_eq!(reused.slot_index(), freed.slot_index());
         host_tables.replace_image_observers(reused, object(16));
 
-        work.resolve(&arena).pay(&main_thread);
+        work.resolve(&mut arena).pay(&main_thread);
         assert!(host_tables.image_observers(freed).is_null());
         assert_eq!(host_tables.image_observers(reused), object(16));
         host_tables.replace_image_observers(reused, std::ptr::null_mut());
@@ -356,10 +368,10 @@ mod tests {
         arena.queue_box_presence();
         super::super::layout_node_arena::prepare_subtree_for_detach(
             crate::layout::tree_mutation::HostCalls(&work),
-            &arena,
+            &mut arena,
             root,
         );
-        work.resolve(&arena).pay(&main_thread);
+        work.resolve(&mut arena).pay(&main_thread);
 
         assert!(host_tables.image_observers(root).is_null());
         assert_eq!(host_tables.image_observers(text), object(16));

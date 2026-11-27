@@ -25,7 +25,7 @@ use crate::ir::value;
 
 const SIGN_BIT: u64 = 1 << 63;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// `UnboxDouble`: the double of a tagged double, its bits.
     pub(in crate::codegen) fn emit_unbox_double(&mut self, node: NodeId) {
         let (input, output) = (self.input(node, 0), self.float_output(node));
@@ -39,7 +39,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let (input, output, scratch) = (self.input(node, 0), self.float_output(node), self.pinned.scratch);
         let (int32, double, done) = (self.masm.new_label(), self.masm.new_label(), self.masm.new_label());
         self.branch_on_tag(Condition::Equal, input, value::INT32_TAG, scratch, int32);
-        self.emit_double_test(input, double, exit);
+        // NB: The double test of emit_double_test(), on the tag branch_on_tag() left in the scratch register.
+        self.masm
+            .branch32_imm(Condition::Equal, scratch, i32::from(value::BASE_TAG), double);
+        self.masm.and32_imm(scratch, scratch, u32::from(value::BASE_TAG));
+        self.masm
+            .branch32_imm(Condition::Equal, scratch, i32::from(value::BASE_TAG), exit);
         self.masm.bind(double);
         self.masm.move_gpr_to_double(output, input);
         self.masm.jump(done);

@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibGfx/Path.h>
+#include <LibWeb/SVG/Path.h>
 #include <LibWeb/SVG/SVGAnimationElement.h>
 
 namespace Web::SVG {
@@ -25,10 +25,10 @@ private:
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     virtual Optional<CSS::PropertyID> target_property() const override;
-    virtual Vector<Animations::BaseKeyframe> keyframes(SVGElement const& target, CSS::PropertyID) const override;
-    Vector<Animations::BaseKeyframe> keyframes_along_motion_path(Gfx::Path const&, CSS::PropertyID) const;
+    virtual Vector<SVGKeyframe> keyframes(SVGElement const& target, CSS::PropertyID) const override;
+    Vector<SVGKeyframe> keyframes_along_motion_path(ReadonlySpan<PathVertex> motion_path_vertices, CSS::PropertyID) const;
 
-    Optional<Gfx::Path> m_referenced_motion_path;
+    Optional<Vector<PathVertex>> m_referenced_motion_path_vertices;
 };
 
 }

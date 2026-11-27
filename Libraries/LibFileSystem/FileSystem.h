@@ -15,9 +15,6 @@
 
 namespace FileSystem {
 
-#define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
-#define DEFAULT_PATH_SV "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"sv
-
 ErrorOr<ByteString> current_working_directory();
 ErrorOr<ByteString> absolute_path(StringView path);
 ErrorOr<ByteString> real_path(StringView path);
@@ -39,16 +36,6 @@ enum class RecursionMode {
     Disallowed
 };
 
-enum class LinkMode {
-    Allowed,
-    Disallowed
-};
-
-enum class AddDuplicateFileMarker {
-    Yes,
-    No,
-};
-
 enum class PreserveMode {
     Nothing = 0,
     Permissions = (1 << 0),
@@ -58,8 +45,6 @@ enum class PreserveMode {
 AK_ENUM_BITWISE_OPERATORS(PreserveMode);
 
 ErrorOr<void> copy_file(StringView destination_path, StringView source_path, struct stat const& source_stat, Core::File& source, PreserveMode = PreserveMode::Nothing);
-ErrorOr<void> copy_directory(StringView destination_path, StringView source_path, struct stat const& source_stat, LinkMode = LinkMode::Disallowed, PreserveMode = PreserveMode::Nothing);
-ErrorOr<void> copy_file_or_directory(StringView destination_path, StringView source_path, RecursionMode = RecursionMode::Allowed, LinkMode = LinkMode::Disallowed, AddDuplicateFileMarker = AddDuplicateFileMarker::Yes, PreserveMode = PreserveMode::Nothing);
 ErrorOr<void> move_file(StringView destination_path, StringView source_path, PreserveMode = PreserveMode::Nothing);
 // Renames a file within one file system, failing with EEXIST instead of replacing an existing destination. A file system
 // that cannot do that atomically gets a copy in a destination file created only if none exists. The file is at its

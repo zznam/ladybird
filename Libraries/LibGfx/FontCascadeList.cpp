@@ -18,6 +18,7 @@ void ladybird_gfx_frozen_font_list_release(void const* frozen);
 void const* ladybird_gfx_frozen_font_list_font_for_code_point(void const* frozen, u32 code_point, bool is_emoji, bool forced);
 size_t ladybird_gfx_request_wanted_pending_faces();
 bool ladybird_gfx_frozen_font_lists_equal(void const*, void const*);
+bool ladybird_gfx_font_cascade_list_fills_toward(void const*, void const*);
 }
 
 namespace Gfx {
@@ -83,7 +84,7 @@ FontCascadeList::~FontCascadeList()
         ladybird_gfx_frozen_font_list_release(m_frozen_list);
 }
 
-EmojiPresentationResult emoji_presentation_for_code_point(u32 code_point, Optional<u32> next_code_point)
+EmojiPresentationResult emoji_presentation_for_code_point(u32 code_point, Optional<u32> next_code_point, Optional<u32> code_point_after_next)
 {
     // VARIATION SELECTOR-16 (emoji)
     if (next_code_point == 0xFE0Fu)
@@ -91,6 +92,22 @@ EmojiPresentationResult emoji_presentation_for_code_point(u32 code_point, Option
     // VARIATION SELECTOR-15 (text)
     if (next_code_point == 0xFE0Eu)
         return { EmojiPresentation::Text, ForcedPresentation::Yes };
+
+    // https://www.unicode.org/reports/tr51/#Diversity
+    // "Emoji presentation selectors are neither needed nor recommended for emoji characters when they are followed by
+    //  emoji modifiers, and should not be used in newly generated emoji modifier sequences; the emoji modifier
+    //  automatically implies the emoji presentation style."
+    if (next_code_point.has_value() && *next_code_point >= 0x1F3FBu && *next_code_point <= 0x1F3FFu && Unicode::code_point_has_emoji_modifier_base_property(code_point))
+        return { EmojiPresentation::Emoji, ForcedPresentation::Yes };
+
+    // https://www.unicode.org/reports/tr51/#def_emoji_zwj_sequence
+    // NB: A ZERO WIDTH JOINER between two pictographic characters joins them into an emoji ZWJ sequence, which is one
+    //     emoji, so it takes emoji presentation even when the first character's own default is text, as in U+1F441
+    //     U+200D U+1F5E8. A joiner that no pictographic character follows joins nothing.
+    if (next_code_point == 0x200Du && code_point_after_next.has_value()
+        && Unicode::code_point_has_extended_pictographic_property(code_point)
+        && Unicode::code_point_has_extended_pictographic_property(*code_point_after_next))
+        return { EmojiPresentation::Emoji, ForcedPresentation::Yes };
 
     if (Unicode::code_point_has_emoji_presentation_property(code_point))
         return { EmojiPresentation::Emoji, ForcedPresentation::No };
@@ -308,7 +325,7 @@ Gfx::Font const& FontCascadeList::font_for_code_point(u32 code_point, EmojiPrese
     }
 
     if (m_system_font_fallback_callback) {
-        if (auto fallback = m_system_font_fallback_callback(code_point, emoji_presentation.presentation, first())) {
+        if (auto fallback = m_system_font_fallback_callback(code_point, emoji_presentation.presentation, m_system_fallback_request)) {
             if (presentation_matches(*fallback) || (!author_glyph_match && !fallback_glyph_match)) {
                 auto const& fallback_font = *fallback;
                 m_retained_system_fallback_fonts.set(fallback.release_nonnull());
@@ -403,6 +420,12 @@ bool FontCascadeList::equals(FontCascadeList const& other) const
     return true;
 }
 
+bool FontCascadeList::fills_toward(FontCascadeList const& resolved) const
+{
+    VERIFY(m_frozen_list && resolved.m_frozen_list);
+    return ladybird_gfx_font_cascade_list_fills_toward(this, &resolved);
+}
+
 }
 
 namespace Gfx::FFI {
@@ -419,6 +442,7 @@ struct FfiCascadeSnapshotHeader {
     u16 system_fallback_width;
     u8 system_fallback_slope;
     bool has_system_fallback;
+    size_t system_fallback_feature_count;
 };
 
 struct FfiCascadeSnapshotEntry {
@@ -443,11 +467,12 @@ void const* ladybird_gfx_font_cascade_list_first(void const*);
 void ladybird_gfx_font_cascade_list_ref(void const*);
 void ladybird_gfx_font_cascade_list_unref(void const*);
 bool ladybird_gfx_font_cascade_list_equals(void const*, void const*);
-u8 ladybird_gfx_emoji_presentation_for_code_point(u32, u32, bool);
+u8 ladybird_gfx_emoji_presentation_for_code_point(u32, u32, bool, u32, bool);
 void const* ladybird_gfx_font_cascade_list_frozen(void const*);
 void const* ladybird_gfx_cascade_snapshot_begin(void const*);
 void ladybird_gfx_cascade_snapshot_header(void const*, Gfx::FFI::FfiCascadeSnapshotHeader*);
 void ladybird_gfx_cascade_snapshot_fill(void const*, bool, Gfx::FFI::FfiCascadeSnapshotEntry*, Gfx::FFI::FfiCascadeSnapshotRange*);
+void ladybird_gfx_cascade_snapshot_system_fallback_features(void const*, Gfx::ShapeFeature*);
 void ladybird_gfx_cascade_snapshot_end(void const*);
 bool ladybird_gfx_resolve_pending_face(u64);
 }
@@ -487,10 +512,12 @@ extern "C" bool ladybird_gfx_font_cascade_list_equals(void const* list, void con
     return static_cast<Gfx::FontCascadeList const*>(list)->equals(*static_cast<Gfx::FontCascadeList const*>(other));
 }
 
-extern "C" u8 ladybird_gfx_emoji_presentation_for_code_point(u32 code_point, u32 next_code_point, bool has_next_code_point)
+extern "C" u8 ladybird_gfx_emoji_presentation_for_code_point(u32 code_point, u32 next_code_point, bool has_next_code_point, u32 code_point_after_next, bool has_code_point_after_next)
 {
     auto result = Gfx::emoji_presentation_for_code_point(
-        code_point, has_next_code_point ? Optional<u32> { next_code_point } : Optional<u32> {});
+        code_point,
+        has_next_code_point ? Optional<u32> { next_code_point } : Optional<u32> {},
+        has_code_point_after_next ? Optional<u32> { code_point_after_next } : Optional<u32> {});
     u8 encoded = 0;
     if (result.presentation == Gfx::EmojiPresentation::Emoji)
         encoded |= 1;
@@ -512,6 +539,7 @@ struct CascadeSnapshot {
     u16 system_fallback_weight { 0 };
     u16 system_fallback_width { 0 };
     u8 system_fallback_slope { 0 };
+    Gfx::ShapeFeatures system_fallback_features {};
 };
 
 size_t total_range_count(Vector<Gfx::FontCascadeList::SnapshotEntry> const& entries)
@@ -540,13 +568,14 @@ extern "C" void const* ladybird_gfx_cascade_snapshot_begin(void const* list)
         .last_resort_font = cascade_list.last_resort_font(),
         .has_system_fallback = cascade_list.has_system_font_fallback_callback(),
     };
-    if (snapshot->has_system_fallback && !cascade_list.is_empty()) {
-        // The system fallback matches against the cascade's first font, exactly as the lookup does.
-        auto const& reference_font = cascade_list.first();
-        snapshot->system_fallback_point_size = reference_font.point_size();
-        snapshot->system_fallback_weight = static_cast<u16>(reference_font.weight());
-        snapshot->system_fallback_width = reference_font.width();
-        snapshot->system_fallback_slope = static_cast<u8>(reference_font.slope());
+    if (snapshot->has_system_fallback) {
+        // The system fallback matches against the cascade's request, exactly as the lookup does.
+        auto const& request = cascade_list.system_fallback_request();
+        snapshot->system_fallback_point_size = request.point_size;
+        snapshot->system_fallback_weight = request.weight;
+        snapshot->system_fallback_width = request.width;
+        snapshot->system_fallback_slope = request.slope;
+        snapshot->system_fallback_features = request.shape_features;
     }
     return snapshot;
 }
@@ -567,7 +596,21 @@ extern "C" void ladybird_gfx_cascade_snapshot_header(void const* handle, Gfx::FF
         .system_fallback_width = snapshot.system_fallback_width,
         .system_fallback_slope = snapshot.system_fallback_slope,
         .has_system_fallback = snapshot.has_system_fallback,
+        .system_fallback_feature_count = snapshot.system_fallback_features.size(),
     };
+}
+
+// NB: Rust reads these as its FfiShapeFeature.
+static_assert(sizeof(Gfx::ShapeFeature) == 12);
+static_assert(offsetof(Gfx::ShapeFeature, value) == 4);
+static_assert(offsetof(Gfx::ShapeFeature, set_by_feature_settings) == 8);
+
+extern "C" void ladybird_gfx_cascade_snapshot_system_fallback_features(void const* handle, Gfx::ShapeFeature* out_features)
+{
+    VERIFY(handle);
+    auto const& features = static_cast<CascadeSnapshot const*>(handle)->system_fallback_features;
+    for (size_t index = 0; index < features.size(); ++index)
+        out_features[index] = features[index];
 }
 
 extern "C" void ladybird_gfx_cascade_snapshot_fill(void const* handle, bool fallback, Gfx::FFI::FfiCascadeSnapshotEntry* out_entries, Gfx::FFI::FfiCascadeSnapshotRange* out_ranges)

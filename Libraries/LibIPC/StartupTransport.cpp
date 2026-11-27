@@ -24,7 +24,7 @@ namespace IPC {
 ErrorOr<NonnullOwnPtr<Transport>> take_over_startup_transport(StringView mach_server_name)
 {
     auto ports = TRY(bootstrap_transport_from_mach_server(mach_server_name));
-    return make<Transport>(move(ports.receive_right), move(ports.send_right));
+    return Transport::create(move(ports.receive_right), move(ports.send_right));
 }
 
 #else
@@ -37,7 +37,7 @@ ErrorOr<NonnullOwnPtr<Transport>> take_over_startup_transport(StringView)
     return Transport::adopt_fd(TRY(Core::take_over_descriptor_from_system_server("ipc")));
 #    else
     auto socket = TRY(Core::take_over_socket_from_system_server("ipc"));
-    return make<Transport>(move(socket));
+    return Transport::from_socket(move(socket));
 #    endif
 }
 

@@ -37,13 +37,9 @@ def run_test(webdriver_binary):
         config = Path(directory) / "config"
         config.mkdir()
         (config / "Settings.json").write_text(json.dumps({"contentBlockers": {"enabled": True}}))
-        port = helpers["unused_port"]()
-        process = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory]
-        )
+        process, port = helpers["launch_webdriver"](webdriver_binary, "--headless", "--profile-path", directory)
         session = None
         try:
-            helpers["wait_for_port"](port)
             session = helpers["create_session"](port)
 
             def command(path, body):
@@ -96,9 +92,9 @@ def run_test(webdriver_binary):
                 document.querySelector('#dns-server').value = 'unfinished.example';
             """)
 
-            changes = change("setAppearance", {"showBookmarksBar": "never"})
+            changes = change("setAppearance", {"showBookmarksBar": "always"})
             assert set(changes) == {"appearance"}, changes
-            assert changes["appearance"]["showBookmarksBar"] == "never"
+            assert changes["appearance"]["showBookmarksBar"] == "always"
             assert script("""
                 return draftInput === document.getElementById(draftInput.id)
                     && draftInput === document.activeElement && draftInput.value === '999'
@@ -120,9 +116,8 @@ def run_test(webdriver_binary):
             ), "An update with no eligible lists left the button waiting for a notification"
 
             variable = script("""
-                const input = [...document.querySelectorAll('#config-list input[type=number]')]
-                    .find(input => input !== draftInput);
-                return {name: input.id, value: Number(input.value) + 1};
+                const input = document.querySelector('#config-list input[type=checkbox]');
+                return {name: input.id, value: !input.checked};
             """)
             changes = change("setConfigVariable", variable)
             assert set(changes) == {"configVariables", "configVariableDefinitions"}, changes
@@ -174,14 +169,14 @@ def run_test(webdriver_binary):
                 {
                     "script": """
                     const done = arguments[0];
-                    const button = document.querySelector('#start-browsing');
-                    if (!button.disabled) return done();
+                    const options = document.querySelector('#setup-options');
+                    if (!options.disabled) return done();
                     const observer = new MutationObserver(() => {
-                        if (button.disabled) return;
+                        if (options.disabled) return;
                         observer.disconnect();
                         done();
                     });
-                    observer.observe(button, {attributes: true, attributeFilter: ['disabled']});
+                    observer.observe(options, {attributes: true, attributeFilter: ['disabled']});
                 """,
                     "args": [],
                 },
@@ -189,8 +184,8 @@ def run_test(webdriver_binary):
             changes = change("setSearchEngineSettings", {"engine": "Google", "suggestions": True})
             assert set(changes) == {"searchEngine"}, changes
             assert script("""
-                return document.querySelector('#search-engine').value === 'Google'
-                    && document.querySelector('#search-suggestions-enabled').checked;
+                return document.querySelector('input[name="search-engine"]:checked')?.value === 'Google'
+                    && !document.querySelector('#start-browsing').disabled;
             """), "The welcome page did not apply a partial search setting"
             changes = change("setContentBlockerEnabled", False)
             assert set(changes) == {"contentBlockers"}, changes

@@ -11,6 +11,8 @@ use crate::geometry::{FloatPoint, FloatSize};
 use crate::matrix::AffineTransform;
 use crate::paint_enums::WindingRule;
 use geometry::PathGeometry;
+pub use geometry::PathVerb;
+pub use measure::PathVertex;
 
 mod arcs;
 mod curves;
@@ -36,7 +38,7 @@ unsafe extern "C" {
 /// A shaped run of glyphs in one font, as the path operations below take one.
 pub struct GlyphRun {
     pub font: crate::font::FontHandle,
-    pub glyphs: Vec<crate::text_layout::DrawGlyph>,
+    pub glyphs: crate::text_layout::GlyphBuffer,
 }
 
 struct GlyphOutlineSink<'a> {
@@ -94,7 +96,6 @@ pub struct StrokeStyle {
     pub dash_offset: f32,
 }
 
-/// A path, with the rules of `Gfx::Path` for each operation.
 pub struct Path {
     geometry: PathGeometry,
     // A process-unique, never-reused identity, so that consumers that hold a copied snapshot can
@@ -191,7 +192,7 @@ impl Path {
         self.geometry_mut().set_fill_rule(fill_rule);
     }
 
-    /// Whether the path has no current point, which Gfx::Path::is_empty() calls empty.
+    /// Whether the path has no current point.
     pub fn is_empty(&self) -> bool {
         self.geometry.is_empty()
     }
@@ -212,6 +213,11 @@ impl Path {
     pub fn point_at_length(&self, distance: f32) -> Option<[f32; 4]> {
         measure::point_at_length(&self.geometry, distance)
             .map(|(point, tangent)| [point.x, point.y, tangent.x, tangent.y])
+    }
+
+    /// The vertices of polylines through the path, with their distance along it (see [`measure::vertices`]).
+    pub fn vertices(&self) -> Vec<PathVertex> {
+        measure::vertices(&self.geometry)
     }
 
     pub fn contains(&self, x: f32, y: f32, winding_rule: WindingRule) -> bool {
@@ -264,7 +270,7 @@ impl Path {
             let ascent = run.font.facts().ascent;
             let transforms: Vec<_> = run
                 .glyphs
-                .iter()
+                .placed()
                 .map(|glyph| AffineTransform {
                     values: [1.0, 0.0, 0.0, 1.0, glyph.x, glyph.y + ascent],
                 })
@@ -275,9 +281,11 @@ impl Path {
         Self::from_geometry(geometry)
     }
 
-    /// The outlines of the given glyphs, laid along the first subpath of this path that has length. Each glyph has
-    /// its origin at the distance of its x position plus the offset, and its baseline along the direction of the
-    /// path there. The glyphs stop at the first one whose middle would go past the end.
+    /// The outlines of the given glyphs, laid along the first subpath of this path that has length, as SVG lays out
+    /// text on a path: Each glyph is centered on the point at the distance of the middle of its advance (its x position
+    /// plus the offset, plus half its advance), turned to the direction of the path there, and moved off the path, at
+    /// a right angle to it, by as much as its baseline is shifted. A glyph whose middle is off either end isn't drawn.
+    /// https://svgwg.org/svg2-draft/text.html#TextLayoutPath
     pub fn place_glyph_runs_along(&self, runs: &[GlyphRun], offset: f32) -> Path {
         let mut geometry = PathGeometry::new();
         let Some(contour) = measure::ContourMeasure::contours_of(&self.geometry).next() else {
@@ -288,24 +296,52 @@ impl Path {
             if run.font.is_invisible() {
                 continue;
             }
+            let ascent = run.font.facts().ascent;
+            let mut glyphs = Vec::with_capacity(run.glyphs.len());
             let mut transforms = Vec::with_capacity(run.glyphs.len());
-            for glyph in &run.glyphs {
-                let glyph_distance = offset + glyph.x;
-                if glyph_distance + (glyph.glyph_width / 2.0) > path_length {
-                    break;
+            for placed in run.glyphs.placed() {
+                let half_advance = placed.glyph.advance / 2.0;
+                let midpoint_distance = offset + placed.x + half_advance;
+                // "Glyphs whose midpoint-on-the-path are off the path are not rendered."
+                if !(0.0..=path_length).contains(&midpoint_distance) {
+                    continue;
                 }
-                let (point, tangent) = contour.position_and_tangent(glyph_distance);
+                // AD-HOC: The spec turns each glyph to the line through the start and the end of its advance on the
+                //         path. Like other engines, this turns it to the direction of the path at its midpoint.
+                let (midpoint, tangent) = contour.position_and_tangent(midpoint_distance);
+                // A glyph's y is the top of its em box, an ascent above its baseline.
+                let baseline_shift = placed.y + ascent;
+                let normal = (-tangent.y, tangent.x);
                 transforms.push(AffineTransform {
-                    values: [tangent.x, tangent.y, -tangent.y, tangent.x, point.x, point.y],
+                    values: [
+                        tangent.x,
+                        tangent.y,
+                        normal.0,
+                        normal.1,
+                        midpoint.x - tangent.x * half_advance + normal.0 * baseline_shift,
+                        midpoint.y - tangent.y * half_advance + normal.1 * baseline_shift,
+                    ],
                 });
+                glyphs.push(placed.glyph);
             }
-            append_glyph_outlines(&mut geometry, &run.font, &run.glyphs[..transforms.len()], &transforms);
-            if transforms.len() < run.glyphs.len() {
-                break;
-            }
+            append_glyph_outlines(&mut geometry, &run.font, &glyphs, &transforms);
         }
         geometry.update_state_from_contours();
         Self::from_geometry(geometry)
+    }
+
+    /// The verbs of the contours of the path, each of which takes as many of the points as it stores.
+    pub fn verbs(&self) -> &[PathVerb] {
+        self.geometry.verbs()
+    }
+
+    pub fn points(&self) -> &[FloatPoint] {
+        self.geometry.points()
+    }
+
+    /// The weight of each conic of the contours, in order.
+    pub fn conic_weights(&self) -> &[f32] {
+        self.geometry.conic_weights()
     }
 
     /// The contours of the path, as C++ reads them, valid until the path changes or is dropped.
@@ -329,3 +365,194 @@ impl PartialEq for Path {
 
 // The contours are compared bit for bit, which is reflexive even for NaN.
 impl Eq for Path {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ak::math;
+
+    fn point(x: f32, y: f32) -> FloatPoint {
+        FloatPoint { x, y }
+    }
+
+    fn assert_approximately(actual: f32, expected: f32, tolerance: f32) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual} is not within {tolerance} of {expected}"
+        );
+    }
+
+    fn assert_point_along_path(path: &Path, distance: f32, expected_point: FloatPoint, expected_tangent: FloatPoint) {
+        let [x, y, tangent_x, tangent_y] = path
+            .point_at_length(distance)
+            .expect("a path with a point has a point at every distance");
+        for (actual, expected) in [
+            (x, expected_point.x),
+            (y, expected_point.y),
+            (tangent_x, expected_tangent.x),
+            (tangent_y, expected_tangent.y),
+        ] {
+            assert_approximately(actual, expected, 0.000_000_5);
+        }
+    }
+
+    #[test]
+    fn point_at_length_along_a_line() {
+        let mut path = Path::new();
+        path.move_to(point(0.0, 0.0));
+        path.line_to(point(100.0, 0.0));
+
+        assert_point_along_path(&path, 25.0, point(25.0, 0.0), point(1.0, 0.0));
+        assert_point_along_path(&path, -10.0, point(0.0, 0.0), point(1.0, 0.0));
+        assert_point_along_path(&path, 1000.0, point(100.0, 0.0), point(1.0, 0.0));
+    }
+
+    #[test]
+    fn point_at_length_skips_the_gaps_between_subpaths() {
+        let mut path = Path::new();
+        path.move_to(point(0.0, 0.0));
+        path.line_to(point(10.0, 0.0));
+        path.move_to(point(50.0, 50.0));
+        path.move_to(point(100.0, 100.0));
+        path.line_to(point(100.0, 110.0));
+
+        assert_point_along_path(&path, 5.0, point(5.0, 0.0), point(1.0, 0.0));
+        assert_point_along_path(&path, 15.0, point(100.0, 105.0), point(0.0, 1.0));
+        assert_point_along_path(&path, 25.0, point(100.0, 110.0), point(0.0, 1.0));
+    }
+
+    #[test]
+    fn point_at_length_along_a_closed_path() {
+        let mut path = Path::new();
+        path.move_to(point(0.0, 0.0));
+        path.line_to(point(10.0, 0.0));
+        path.line_to(point(10.0, 10.0));
+        path.line_to(point(0.0, 10.0));
+        path.close();
+
+        assert_point_along_path(&path, 15.0, point(10.0, 5.0), point(0.0, 1.0));
+        assert_point_along_path(&path, 35.0, point(0.0, 5.0), point(0.0, -1.0));
+    }
+
+    #[test]
+    fn point_at_length_of_a_path_without_length() {
+        let mut path = Path::new();
+        path.move_to(point(10.0, 20.0));
+        assert_point_along_path(&path, 5.0, point(10.0, 20.0), point(0.0, 0.0));
+
+        assert!(Path::new().point_at_length(0.0).is_none());
+    }
+
+    fn vertex(x: f32, y: f32, distance: f32, direction_x: f32, direction_y: f32) -> PathVertex {
+        PathVertex {
+            point: point(x, y),
+            distance,
+            direction: point(direction_x, direction_y),
+        }
+    }
+
+    fn assert_vertices(path: &Path, expected_vertices: &[PathVertex]) {
+        let vertices = path.vertices();
+        assert_eq!(vertices.len(), expected_vertices.len());
+        for (actual, expected) in vertices.iter().zip(expected_vertices) {
+            for (actual, expected) in [
+                (actual.point.x, expected.point.x),
+                (actual.point.y, expected.point.y),
+                (actual.distance, expected.distance),
+                (actual.direction.x, expected.direction.x),
+                (actual.direction.y, expected.direction.y),
+            ] {
+                assert_approximately(actual, expected, 0.0001);
+            }
+        }
+    }
+
+    #[test]
+    fn vertices_of_subpaths_of_lines() {
+        let mut path = Path::new();
+        path.move_to(point(0.0, 0.0));
+        path.line_to(point(10.0, 0.0));
+        path.line_to(point(10.0, 10.0));
+        path.close();
+        path.move_to(point(50.0, 50.0));
+        path.line_to(point(60.0, 50.0));
+
+        let diagonal = 200.0_f32.sqrt();
+        let inverse_sqrt_2 = 1.0 / 2.0_f32.sqrt();
+        assert_vertices(
+            &path,
+            &[
+                vertex(0.0, 0.0, 0.0, 1.0, 0.0),
+                vertex(10.0, 0.0, 10.0, 1.0, 0.0),
+                vertex(10.0, 0.0, 10.0, 0.0, 1.0),
+                vertex(10.0, 10.0, 20.0, 0.0, 1.0),
+                vertex(10.0, 10.0, 20.0, -inverse_sqrt_2, -inverse_sqrt_2),
+                vertex(0.0, 0.0, 20.0 + diagonal, -inverse_sqrt_2, -inverse_sqrt_2),
+                vertex(50.0, 50.0, 20.0 + diagonal, 1.0, 0.0),
+                vertex(60.0, 50.0, 30.0 + diagonal, 1.0, 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn vertices_along_curves() {
+        let mut path = Path::new();
+        path.move_to(point(0.0, 0.0));
+        path.quadratic_bezier_curve_to(point(50.0, 0.0), point(100.0, 0.0));
+        assert_vertices(
+            &path,
+            &[vertex(0.0, 0.0, 0.0, 1.0, 0.0), vertex(100.0, 0.0, 100.0, 1.0, 0.0)],
+        );
+
+        let mut long_path = Path::new();
+        long_path.move_to(point(0.0, 0.0));
+        long_path.quadratic_bezier_curve_to(point(10_000_000.0, 0.0), point(20_000_000.0, 0.0));
+        assert_vertices(
+            &long_path,
+            &[
+                vertex(0.0, 0.0, 0.0, 1.0, 0.0),
+                vertex(20_000_000.0, 0.0, 20_000_000.0, 1.0, 0.0),
+            ],
+        );
+
+        let mut circle = Path::new();
+        circle.move_to(point(10.0, 0.0));
+        circle.arc_to(point(-10.0, 0.0), 10.0, false, true);
+        circle.arc_to(point(10.0, 0.0), 10.0, false, true);
+        let vertices = circle.vertices();
+        assert!(vertices.len() > 40);
+        for vertex in &vertices {
+            assert_approximately(math::hypot(vertex.point.x, vertex.point.y), 10.0, 0.001);
+            assert_approximately(math::hypot(vertex.direction.x, vertex.direction.y), 1.0, 0.001);
+            assert_approximately(
+                vertex.direction.x * vertex.point.x + vertex.direction.y * vertex.point.y,
+                0.0,
+                0.01,
+            );
+        }
+        for pair in vertices.windows(2) {
+            let midpoint = point(
+                (pair[0].point.x + pair[1].point.x) / 2.0,
+                (pair[0].point.y + pair[1].point.y) / 2.0,
+            );
+            assert!(math::hypot(midpoint.x, midpoint.y) > 10.0 - 0.5 / 16.0);
+        }
+        assert_approximately(vertices.first().unwrap().point.x, 10.0, 0.000_000_5);
+        assert_approximately(vertices.last().unwrap().point.x, 10.0, 0.000_000_5);
+        assert_approximately(vertices.last().unwrap().distance, 20.0 * std::f32::consts::PI, 0.05);
+    }
+
+    #[test]
+    fn vertices_of_a_path_without_length() {
+        let mut path = Path::new();
+        path.move_to(point(10.0, 20.0));
+        assert_vertices(&path, &[vertex(10.0, 20.0, 0.0, 0.0, 0.0)]);
+
+        let mut zero_length_line = Path::new();
+        zero_length_line.move_to(point(10.0, 20.0));
+        zero_length_line.line_to(point(10.0, 20.0));
+        assert_vertices(&zero_length_line, &[vertex(10.0, 20.0, 0.0, 0.0, 0.0)]);
+
+        assert_vertices(&Path::new(), &[]);
+    }
+}

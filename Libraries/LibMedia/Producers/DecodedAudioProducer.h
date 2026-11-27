@@ -52,7 +52,6 @@ public:
     ~DecodedAudioProducer();
 
     void set_error_handler(ErrorHandler&&);
-    void set_read_blocked_change_handler(ReadBlockedChangeHandler);
     virtual ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification) override;
 
     virtual void start() override;
@@ -60,6 +59,12 @@ public:
     virtual AudioProducerOutput peek() override;
     virtual void consume() override;
     virtual void set_wake_handler(PipelineWakeHandler) override;
+
+    // Called once a blocked read is able to continue, after the producer has stopped reporting Blocked. It runs on the
+    // thread that delivered the data, under the demuxer's lock, so it must not block or take other locks.
+    void set_read_unblocked_handler(Function<void()>);
+    // Callable from any thread.
+    void set_checkpoint(PipelineCheckpoint);
 
     virtual void seek(AK::Duration timestamp) override;
 
@@ -70,7 +75,6 @@ private:
         ~ThreadData();
 
         void set_error_handler(ErrorHandler&&);
-        void set_read_blocked_change_handler(ReadBlockedChangeHandler);
         ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification);
         void set_wake_handler(PipelineWakeHandler);
 
@@ -82,6 +86,7 @@ private:
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&);
         DecoderErrorOr<bool> replace_drained_decoder();
         bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
+        void wait_for_another_seek_or_exit(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -108,6 +113,8 @@ private:
         void consume();
 
         void seek(AK::Duration timestamp);
+        void set_read_unblocked_handler(Function<void()>);
+        void set_checkpoint(PipelineCheckpoint);
 
         [[nodiscard]] MutexLocker<Mutex> take_lock() const { return MutexLocker(m_mutex); }
         void wake() const { m_wait_condition.broadcast(); }
@@ -115,6 +122,7 @@ private:
         AudioDecoder const& decoder() const { return *m_decoder; }
 
         void dispatch_wake_if_needed_while_locked();
+        void dispatch_wake_later();
 
         void enter_halting_state(PipelineStatus, Optional<DecoderError>);
 
@@ -131,7 +139,6 @@ private:
             ExitDecodeLoop,
         };
         WaitResult wait_for_queue_space_while_locked();
-        void dispatch_read_blocked_change(ReadBlocked blocked);
 
         Core::EventLoop& m_main_thread_event_loop;
 
@@ -146,16 +153,19 @@ private:
         AudioDecoderSelection m_decoder_selection;
         AudioDecoderSelection m_decoder_that_failed_due_to_missing_features;
         Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
+        bool m_decoder_is_draining_before_unavailable_data { false };
         OwnPtr<AudioDecoder> m_decoder;
         NonnullOwnPtr<Audio::AudioConverter> m_converter;
         i64 m_last_output_frame { NumericLimits<i64>::min() };
 
         size_t m_queue_max_size { 8 };
         AudioQueue m_queue;
-        AK::Duration m_earliest_available_timestamp;
+        AK::Duration m_consumed_media_time_end;
         ErrorHandler m_error_handler;
-        ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
+        // Set by the demuxer under its own lock, which may be taken while ours is held.
+        Atomic<bool> m_demuxer_read_is_blocked { false };
+        Atomic<PipelineCheckpoint> m_checkpoint { 0 };
 
         enum class SeekReason : u8 {
             Normal,

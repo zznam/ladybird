@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::OnceCell;
 use core::ops::Deref;
 
 use ak::{ScopeGuard, Utf16FlyString};
@@ -64,8 +63,8 @@ where
 #[derive(Trace)]
 pub struct SyntheticModule {
     base: Module,
-    export_names: Vec<Utf16FlyString>,                    // [[ExportNames]]
-    evaluation_steps: OnceCell<Box<dyn EvaluationSteps>>, // [[EvaluationSteps]]
+    export_names: Vec<Utf16FlyString>,          // [[ExportNames]]
+    evaluation_steps: Box<dyn EvaluationSteps>, // [[EvaluationSteps]]
 }
 
 define_cell!(SyntheticModule, Other, extends: [Module]);
@@ -115,21 +114,14 @@ impl SyntheticModule {
                 "the evaluation steps capture their state through their captures"
             );
         };
-        let module = vm.heap().allocate(SyntheticModule {
+        vm.heap().allocate(|_| SyntheticModule {
             base: Module::new(Self::CLASS, realm, filename, ForeignCellSlot::empty()),
             export_names,
-            evaluation_steps: OnceCell::new(),
-        });
-        // The captures stay on the stack, where the collector finds them, until the module that keeps them alive
-        // exists. Nothing allocates from the heap between allocating the module and storing them in it.
-        let steps: Box<dyn EvaluationSteps> = Box::new(CapturingEvaluationSteps {
-            captures,
-            steps: evaluation_steps,
-        });
-        if module.evaluation_steps.set(steps).is_err() {
-            unreachable!("the evaluation steps are stored once");
-        }
-        module
+            evaluation_steps: Box::new(CapturingEvaluationSteps {
+                captures,
+                steps: evaluation_steps,
+            }),
+        })
     }
 
     // 16.2.1.8.1 CreateDefaultExportSyntheticModule ( defaultExport ), https://tc39.es/ecma262/#sec-create-default-export-synthetic-module
@@ -265,16 +257,14 @@ impl SyntheticModule {
         let module_context_ref = unsafe { module_context.as_ref() };
 
         // 3. Set the Realm of moduleContext to module.[[Realm]].
-        module_context_ref.realm.set(Some(realm));
+        module_context_ref.set_realm(Some(realm));
 
         // 4. Set the ScriptOrModule of moduleContext to module.
-        module_context_ref
-            .script_or_module
-            .set(ScriptOrModule::Module(self.as_gc()));
+        module_context_ref.set_script_or_module(ScriptOrModule::Module(self.as_gc()));
 
         // 5. Set the VariableEnvironment of moduleContext to module.[[Environment]].
         let environment = self.environment().map(Gc::upcast);
-        module_context_ref.variable_environment.set(environment);
+        module_context_ref.set_variable_environment(environment);
 
         // 6. Set the LexicalEnvironment of moduleContext to module.[[Environment]].
         module_context_ref.lexical_environment.set(environment);
@@ -286,11 +276,7 @@ impl SyntheticModule {
         // 9. Let steps be module.[[EvaluationSteps]].
         // 10. Let result be Completion(steps(module)).
         let module = self.as_synthetic_module_gc();
-        let result = module
-            .evaluation_steps
-            .get()
-            .expect("a synthetic module has its evaluation steps")
-            .call(vm, &module);
+        let result = module.evaluation_steps.call(vm, &module);
 
         // 11. Suspend moduleContext and remove it from the execution context stack.
         // 12. Resume the context that is now on the top of the execution context stack as the running execution context.

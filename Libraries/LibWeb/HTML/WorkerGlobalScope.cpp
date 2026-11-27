@@ -9,7 +9,7 @@
 #include <LibGC/Heap.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/HTMLIntegration.h>
 #include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
@@ -30,6 +30,28 @@
 
 namespace Web::HTML {
 
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#dedicated-and-shared-requests
+URL::Origin WorkerGlobalScope::site_for_cookies() const
+{
+    // 1. Let site be worker's origin.
+    auto site = relevant_settings_object(*this).origin();
+
+    // 2. For each document in worker's Documents:
+    // NB: A worker owner represents the sites for cookies of its own Documents.
+    for (auto const& owner : owner_set()) {
+        // 1. Let document-site be document's "site for cookies" (as defined in Section 5.2.1).
+        auto const* document = owner.get_pointer<SerializedDocument>();
+        auto const& document_site = document ? document->site_for_cookies : owner.get<SerializedWorkerGlobalScope>().site_for_cookies;
+
+        // 2. If document-site is not same-site with site, return an origin set to an opaque origin.
+        if (!document_site.is_same_site(site))
+            return URL::Origin::create_opaque();
+    }
+
+    // 3. Return site.
+    return site;
+}
+
 GC_DEFINE_ALLOCATOR(WorkerGlobalScope);
 
 WorkerGlobalScope::WorkerGlobalScope(GC::Ref<Web::Page> page)
@@ -47,8 +69,6 @@ JS::Realm& WorkerGlobalScope::realm() const
 
 void WorkerGlobalScope::initialize_web_interfaces_impl()
 {
-    WindowOrWorkerGlobalScopeMixin::initialize();
-
     m_navigator = WorkerNavigator::create(*this);
 }
 
@@ -63,7 +83,6 @@ void WorkerGlobalScope::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_page);
     visitor.visit(m_fonts);
     visitor.visit(m_font_computer);
-    visitor.visit(m_policy_container);
 }
 
 void WorkerGlobalScope::finalize()
@@ -75,20 +94,39 @@ void WorkerGlobalScope::finalize()
 void WorkerGlobalScope::set_internal_port(GC::Ref<MessagePort> port)
 {
     m_internal_port = port;
-    m_internal_port->set_worker_event_target(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#close-a-worker
 void WorkerGlobalScope::close_a_worker()
 {
     // 1. Discard any tasks that have been added to workerGlobal's relevant agent's event loop's task queues.
-    relevant_settings_object(*this).responsible_event_loop().task_queue().remove_tasks_matching([](HTML::Task const& task) {
-        // NOTE: We don't discard tasks with the PostedMessage source, as the spec expects PostMessage() to act as if it is invoked immediately
-        return task.source() != HTML::Task::Source::PostedMessage;
+    relevant_settings_object(*this).responsible_event_loop().task_queue().remove_tasks_matching([](HTML::Task const&) {
+        return true;
     });
 
     // 2. Set workerGlobal's closing flag to true. (This prevents any further tasks from being queued.)
     m_closing = true;
+    relevant_settings_object(*this).responsible_event_loop().task_queue().discard_further_tasks();
+
+    // NB: The event loop is destroyed once it has no more to do after the closing flag is set.
+    relevant_settings_object(*this).responsible_event_loop().destroy_once_script_has_finished();
+}
+
+// https://html.spec.whatwg.org/multipage/workers.html#terminate-a-worker
+void WorkerGlobalScope::terminate_a_worker()
+{
+    // 1. Set the worker's WorkerGlobalScope object's closing flag to true.
+    // 2. If there are any tasks queued in the WorkerGlobalScope object's relevant agent's event loop's task queues,
+    //    discard them without processing them.
+    close_a_worker();
+
+    // 3. Abort the script currently running in the worker.
+    relevant_realm(*this).vm().request_interrupt();
+
+    // 4. If the worker's WorkerGlobalScope object is actually a DedicatedWorkerGlobalScope object (i.e. the worker is
+    //    a dedicated worker), then empty the port message queue of the port that the worker's implicit port is
+    //    entangled with.
+    // NB: That port is in the owner, whose Worker::terminate() empties its queue.
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#importing-scripts-and-libraries
@@ -98,7 +136,9 @@ WebIDL::ExceptionOr<void> WorkerGlobalScope::import_scripts(Vector<Utf16String> 
     // which if provided will be used when invoking fetch a classic worker-imported script.
     // NOTE: Service Workers is an example of a specification that runs this algorithm with its own options for the perform the fetch hook.
 
-    // FIXME: 1. If worker global scope's type is "module", throw a TypeError exception.
+    // 1. If worker global scope's type is "module", throw a TypeError exception.
+    if (m_type == WorkerType::Module)
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "importScripts() is not allowed in module workers"_utf16 };
 
     // 2. Let settings object be the current settings object.
     auto& settings_object = HTML::current_settings_object();
@@ -186,16 +226,16 @@ CSS::FontComputer& WorkerGlobalScope::font_computer()
     return *m_font_computer;
 }
 
-GC::Ref<PolicyContainer> WorkerGlobalScope::policy_container() const
+NonnullRefPtr<PolicyContainer> WorkerGlobalScope::policy_container() const
 {
     if (!m_policy_container) {
-        m_policy_container = GC::Heap::the().allocate<PolicyContainer>(GC::Heap::the());
+        m_policy_container = PolicyContainer::create();
     }
     return *m_policy_container;
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#initialize-worker-policy-container
-void WorkerGlobalScope::initialize_policy_container(GC::Ref<Fetch::Infrastructure::Response const> response, GC::Ref<EnvironmentSettingsObject> environment)
+void WorkerGlobalScope::initialize_policy_container(GC::Ref<Fetch::Infrastructure::ResponseView const> response, GC::Ref<EnvironmentSettingsObject> environment)
 {
     // 1. If workerGlobalScope's url is local but its scheme is not "blob":
     if (m_url.has_value() && Fetch::Infrastructure::is_local_url(m_url.value()) && m_url->scheme() != "blob"sv) {
@@ -214,11 +254,20 @@ void WorkerGlobalScope::initialize_policy_container(GC::Ref<Fetch::Infrastructur
     // 2. Otherwise, set workerGlobalScope's policy container to the result of creating a policy container from a fetch
     //    response given response and environment.
     m_policy_container = create_a_policy_container_from_a_fetch_response(response, environment);
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#nesting
+    // AD-HOC: Upgrade Insecure Requests has a worker inherit the insecure requests policy of its inherited responsible
+    //         browsing context, which HTML no longer has. It inherits that of owner set[0]'s relevant settings object,
+    //         which is outside settings, here instead. The clone in step 1 holds it already.
+    auto const& owner_serialized_policy_container = m_owner_set.first().visit([](auto const& owner) -> SerializedPolicyContainer const& {
+        return owner.relevant_settings_object_policy_container;
+    });
+    m_policy_container->inherit_insecure_requests_policy(owner_serialized_policy_container.insecure_requests_policy, owner_serialized_policy_container.upgrade_insecure_navigations_set);
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#check-a-global-object's-embedder-policy
-// NB: response is only used for violation reports, which are not queued.
-bool WorkerGlobalScope::check_embedder_policy(EnvironmentSettingsObject const& owner) const
+// NB: response is only used for violation reports, which are not queued. owner is given as its embedder policy.
+bool WorkerGlobalScope::check_embedder_policy(EmbedderPolicy const& owner_policy) const
 {
     // 1. If workerGlobalScope is not a DedicatedWorkerGlobalScope object, then return true.
     if (!is<DedicatedWorkerGlobalScope>(*this))
@@ -230,7 +279,6 @@ bool WorkerGlobalScope::check_embedder_policy(EnvironmentSettingsObject const& o
     auto const& policy = policy_container()->embedder_policy;
 
     // 3. Let ownerPolicy be owner's policy container's embedder policy.
-    auto const& owner_policy = owner.policy_container()->embedder_policy;
 
     // FIXME: 4. If ownerPolicy's report-only value is compatible with cross-origin isolation and policy's value is
     //           not, then queue a cross-origin embedder policy inheritance violation with response, "worker
@@ -255,12 +303,12 @@ ContentSecurityPolicy::Directives::Directive::Result WorkerGlobalScope::run_csp_
     auto result = ContentSecurityPolicy::Directives::Directive::Result::Allowed;
 
     // 2. For each policy of global’s CSP list:
-    for (auto policy : policy_container()->csp_list->policies()) {
+    for (auto const& policy : policy_container()->csp_list.policies()) {
         // 1. For each directive of policy:
-        for (auto directive : policy->directives()) {
+        for (auto const& directive : policy->directives()) {
             // 1. Execute directive’s initialization algorithm on global. If its returned value is "Blocked", then set
             //    result to "Blocked".
-            auto directive_result = directive->initialization(GC::Ref { *this }, policy);
+            auto directive_result = ContentSecurityPolicy::Directives::initialization(directive, GC::Ref { *this }, policy);
             if (directive_result == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
                 result = ContentSecurityPolicy::Directives::Directive::Result::Blocked;
             }

@@ -5,9 +5,10 @@
  */
 
 use super::scroll_state::{NO_SCROLL_STATE_SLOT, ScrollState, ScrollStateSlot};
-use super::{SpatialData, StickyData, VisualContextTree};
+use super::{SpatialData, StickyData, UniqueNodeId, VisualContextTree};
 use crate::css::computed_value_types::ComputedLengthPercentageOrAuto;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize, CssPixels};
+use crate::layout::geometry::{Frame, Side};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::paintable_data::FfiPixelBox;
@@ -51,6 +52,7 @@ fn resolve_sticky_insets_in_css_pixels(
     layout_arena: &impl PaintableRowsRead,
     slot: NodeSlotId,
     scrollport_size: CssPixelSize,
+    border_box_size: CssPixelSize,
 ) -> ResolvedStickyInsets {
     let Some(style) = layout_arena.node_style_if_live(slot) else {
         return ResolvedStickyInsets::default();
@@ -59,11 +61,46 @@ fn resolve_sticky_insets_in_css_pixels(
         (!side.is_auto()).then(|| side.to_px(scrollport_extent))
     };
     let inset = &style.surround().inset;
+    let mut insets = [
+        resolve_side(&inset.top, scrollport_size.height),
+        resolve_side(&inset.right, scrollport_size.width),
+        resolve_side(&inset.bottom, scrollport_size.height),
+        resolve_side(&inset.left, scrollport_size.width),
+    ];
+    // https://drafts.csswg.org/css-position-3/#sticky-pos
+    // If this results in a sticky view rectangle size in any axis less than the size of the border box of the sticky
+    // box in that axis, then the effective end-edge inset in the affected axis is reduced (possibly becoming negative)
+    // to bring the sticky view rectangle’s size up to the size of the border box in that axis (where end is
+    // interpreted relative to the writing mode of the containing block).
+    let containing_block = layout_arena.paintable_data(slot).containing_block;
+    let containing_style = layout_arena.node_style_if_live(containing_block);
+    let frame = containing_style.map_or(Frame::PHYSICAL, |style| Frame::of(style.writing_mode()));
+    let inline_end = if containing_style.is_some_and(|style| style.direction() == crate::css::css_enums::direction::RTL)
+    {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    for end in [frame.physical_side(inline_end), frame.physical_side(Side::Bottom)] {
+        let (first, second, extent, border_extent) = match end {
+            Side::Top | Side::Bottom => (Side::Top, Side::Bottom, scrollport_size.height, border_box_size.height),
+            Side::Left | Side::Right => (Side::Left, Side::Right, scrollport_size.width, border_box_size.width),
+        };
+        // AD-HOC: Preserve a lone specified inset when its opposite side is auto. Although the rule above treats auto
+        //         as zero, reducing that inset would detach an oversized box from the edge the page specified.
+        let (Some(first_inset), Some(second_inset)) = (insets[first as usize], insets[second as usize]) else {
+            continue;
+        };
+        let view_extent = extent - first_inset - second_inset;
+        if let Some(inset) = insets[end as usize].as_mut() {
+            *inset -= (border_extent - view_extent).max(CssPixels::default());
+        }
+    }
     ResolvedStickyInsets {
-        top: resolve_side(&inset.top, scrollport_size.height),
-        right: resolve_side(&inset.right, scrollport_size.width),
-        bottom: resolve_side(&inset.bottom, scrollport_size.height),
-        left: resolve_side(&inset.left, scrollport_size.width),
+        top: insets[Side::Top as usize],
+        right: insets[Side::Right as usize],
+        bottom: insets[Side::Bottom as usize],
+        left: insets[Side::Left as usize],
     }
 }
 
@@ -137,7 +174,6 @@ pub(crate) fn compute_sticky_data(
         parent_sticky,
         sticky_slot,
         paintable,
-        scroll_state.node_index_for_slot(sticky_state.parent_slot),
     );
     if scroller_slot == NO_SCROLL_STATE_SLOT {
         return data;
@@ -146,10 +182,12 @@ pub(crate) fn compute_sticky_data(
     if !layout_arena.paintable_row_is_populated(paintable) || !layout_arena.paintable_row_is_populated(scroller) {
         return data;
     }
+    data.box_node_id = UniqueNodeId(layout_arena.unique_node_ids().id(paintable));
+    data.box_pseudo_element_type = layout_arena.node_generated_for(paintable).saturating_sub(1);
 
-    // NB: Only scroll containers with scrollable overflow get a scroll node. When the nearest scroll container has
-    //     none, it sits inside the scroller of the scroll node, and its scrollport never moves. The box sticks to
-    //     that scrollport instead.
+    // NB: Only scroll containers with scrollable overflow, or that keep their scrolls, get a scroll node. When the
+    //     nearest scroll container has none, it sits inside the scroller of the scroll node, and its scrollport never
+    //     moves. The box sticks to that scrollport instead.
     if let Some(scroll_container) = nearest_scroll_container_along_containing_blocks(layout_arena, paintable)
         && scroll_container != scroller
         && is_containing_block_descendant_of(layout_arena, scroll_container, scroller)
@@ -159,7 +197,18 @@ pub(crate) fn compute_sticky_data(
     }
 
     let sticky_border_box_rect = paintable_geometry::absolute_border_box_rect(layout_arena, paintable);
-    let containing_block = layout_arena.paintable_data(paintable).containing_block;
+    let mut containing_block = layout_arena.paintable_data(paintable).containing_block;
+    // https://drafts.csswg.org/css2/#anonymous-block-level
+    // Anonymous flow wrappers group inline content, but their bounds don't constrain sticky movement.
+    while style_queries::is_anonymous(layout_arena, containing_block)
+        && style_queries::display(layout_arena, containing_block).is_flow_inside()
+        && !layout_arena.node_is_generated_for_pseudo_element(containing_block)
+    {
+        containing_block = layout_arena.paintable_data(containing_block).containing_block;
+        if !layout_arena.paintable_row_is_populated(containing_block) {
+            return data;
+        }
+    }
     let scroller_rect = paintable_geometry::absolute_rect(layout_arena, scroller);
     // NB: The box moves within the content box of its containing block, less its own margins. For the scroll
     //     container itself, that is its scrollable overflow rectangle less its padding. This matches other engines.
@@ -187,7 +236,12 @@ pub(crate) fn compute_sticky_data(
         height: size.height.to_float() * scale,
     };
     let device_inset = |inset: Option<CssPixels>| inset.map(|inset| inset.to_float() * scale);
-    let insets = resolve_sticky_insets_in_css_pixels(layout_arena, paintable, scroller_rect.size());
+    let insets = resolve_sticky_insets_in_css_pixels(
+        layout_arena,
+        paintable,
+        scroller_rect.size(),
+        sticky_border_box_rect.size(),
+    );
     let region_location = device_point(containing_block_region.location());
     let region_size = device_size(containing_block_region.size());
 
@@ -195,6 +249,7 @@ pub(crate) fn compute_sticky_data(
         sticky_border_box_rect.x - scroller_rect.x,
         sticky_border_box_rect.y - scroller_rect.y,
     ));
+    data.border_box_origin = device_point(sticky_border_box_rect.location());
     data.border_box_size = device_size(sticky_border_box_rect.size());
     data.scrollport_size = device_size(scroller_rect.size());
     data.containing_block_region = FloatRect {

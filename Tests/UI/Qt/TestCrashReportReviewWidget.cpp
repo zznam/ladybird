@@ -12,12 +12,15 @@
 #include <LibCore/StandardPaths.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
+#include <LibWebView/Settings.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/Theme.h>
 
 #include <QAbstractButton>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -93,7 +96,57 @@ TEST_CASE(a_crash_screen_offers_the_website_without_including_it)
 
     child<QPushButton>(widget, "CrashReportDeclineButton").click();
     EXPECT_EQ(status_title(widget), "Report not sent");
-    EXPECT(!child<QPushButton>(widget, "CrashReportNextButton").isVisible());
+}
+
+// The offscreen platform keeps Qt's light palette whatever color scheme is asked for, as some platform themes do.
+TEST_CASE(the_details_of_a_report_take_the_dark_interface_theme_where_qt_keeps_a_light_palette)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Dark);
+    ScopeGuard restore_theme = [] { Ladybird::Theme::set_interface_theme(WebView::ThemePreference::System); };
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    CrashReportReviewWidget widget { QStringLiteral("Reload page"), nullptr, store };
+    MUST(widget.open_report(name));
+    widget.show();
+
+    QLabel* process = nullptr;
+    for (auto* label : widget.findChildren<QLabel*>()) {
+        if (label->text() == QStringLiteral("WebContent"))
+            process = label;
+    }
+    VERIFY(process);
+    EXPECT(process->palette().color(process->foregroundRole()).lightness() > 128);
+}
+
+// A disclosure button has a style sheet of its own, which keeps Qt's cached palette for it through the review's restyle.
+TEST_CASE(the_disclosure_follows_a_switch_to_the_dark_interface_theme)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Light);
+    ScopeGuard restore_theme = [] { Ladybird::Theme::set_interface_theme(WebView::ThemePreference::System); };
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    CrashReportReviewWidget widget { QStringLiteral("Reload page"), nullptr, store };
+    MUST(widget.open_report(name));
+    widget.show();
+
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Dark);
+    QEvent palette_change(QEvent::PaletteChange);
+    QCoreApplication::sendEvent(&widget, &palette_change);
+
+    size_t disclosures = 0;
+    for (auto* button : widget.findChildren<QPushButton*>()) {
+        if (button->styleSheet().isEmpty())
+            continue;
+        ++disclosures;
+        EXPECT(button->palette().color(QPalette::ButtonText).lightness() > 128);
+    }
+    EXPECT(disclosures > 0);
 }
 
 TEST_CASE(the_review_offers_to_exit_before_and_after_answering)
@@ -182,38 +235,18 @@ TEST_CASE(a_choice_that_cannot_be_sent_is_explained_in_place)
     EXPECT(child<QPushButton>(widget, "CrashReportSendButton").isVisible());
 }
 
-TEST_CASE(the_review_walks_through_every_waiting_report)
+TEST_CASE(without_a_website_there_is_nothing_to_include)
 {
     cleanup();
     ScopeGuard guard = cleanup;
 
-    write_report("2026-10-01T12-00-00Z"sv);
-    write_report("2026-10-01T13-00-00Z"sv);
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
     WebView::CrashReportStore store { test_directory() };
     CrashReportReviewWidget widget { QStringLiteral("Continue"), nullptr, store };
-    auto exited = false;
-    widget.on_exit = [&] { exited = true; };
-    MUST(widget.open_report());
+    MUST(widget.open_report(name));
     widget.show();
 
-    // Without a website to offer, there is nothing to include.
     EXPECT(!child<QCheckBox>(widget, "CrashReportIncludeWebsite").isVisible());
-
-    child<QPushButton>(widget, "CrashReportDeclineButton").click();
-    auto& next = child<QPushButton>(widget, "CrashReportNextButton");
-    EXPECT(next.isVisible());
-
-    next.click();
-    EXPECT(child<QPushButton>(widget, "CrashReportSendButton").isVisible());
-    EXPECT(!store.has_pending_reports());
-
-    child<QPushButton>(widget, "CrashReportDeclineButton").click();
-    EXPECT(!next.isVisible());
-    auto& exit_button = child<QPushButton>(widget, "CrashReportExitButton");
-    EXPECT(exit_button.isVisible());
-
-    exit_button.click();
-    EXPECT(exited);
 }
 
 TEST_CASE(sending_shows_its_progress_and_outcome)
@@ -379,4 +412,25 @@ TEST_CASE(answering_the_report_is_announced_once_the_choice_is_made)
 
     child<QPushButton>(widget, "CrashReportDeclineButton").click();
     EXPECT_EQ(answers, 1);
+}
+
+TEST_CASE(a_report_that_cannot_be_declined_stays_unanswered)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    CrashReportReviewWidget widget { QStringLiteral("Reload page"), nullptr, store };
+    auto answers = 0;
+    widget.on_answered = [&] { ++answers; };
+    MUST(widget.open_report(name));
+    widget.show();
+
+    // The list of crash reports can answer a report while its review is open.
+    MUST(store.remove_report(name));
+    child<QPushButton>(widget, "CrashReportDeclineButton").click();
+    EXPECT_EQ(answers, 0);
+    EXPECT(child<QLabel>(widget, "CrashReportValidation").isVisible());
+    EXPECT(child<QPushButton>(widget, "CrashReportSendButton").isVisible());
 }

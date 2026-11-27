@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, OnceCell};
 use core::ops::{ControlFlow, Deref};
 use core::ptr::NonNull;
 use std::rc::Rc;
@@ -14,6 +14,7 @@ use libjs_runtime_macros::Trace;
 
 use crate::bytecode::executable::Executable;
 use crate::gc::class::{Extends, GcCell, cast_ref, define_cell};
+use crate::gc::defer_gc::{DeferGc, Deferred};
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
@@ -22,13 +23,12 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::environment::{Environment, PrivateEnvironment};
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
-pub use crate::layout::function_object::EcmascriptFunctionObject;
+pub use crate::layout::function_object::{EcmascriptFunctionObject, EcmascriptFunctionObjectWithRareData};
+use crate::layout::function_object::{RawNativeFunction, ecmascript_function_flags};
+use crate::layout::member::NullableMember;
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
-use crate::layout_forward::FlyStringSlot;
-use crate::runtime::abstract_operations::{
-    create_unmapped_arguments_object, get_prototype_from_constructor, new_function_environment,
-};
+use crate::runtime::abstract_operations::{create_unmapped_arguments_object, new_call_environment};
 use crate::runtime::async_function_driver_wrapper::AsyncFunctionDriverWrapper;
 use crate::runtime::async_generator::AsyncGenerator;
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition};
@@ -37,8 +37,8 @@ use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_environment::FunctionEnvironment;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
+use crate::runtime::function_prototype::FunctionPrototype;
 use crate::runtime::generator_object::{GeneratingFunction, GeneratorObject};
-use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::object::{
     MayInterfereWithIndexedPropertyAccess, ObjectMethods, PrivateElement, StackFrameInfo, allocate_object,
 };
@@ -47,8 +47,10 @@ use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
+use crate::runtime::reflect_object::ReflectObject;
+use crate::runtime::shape::Shape;
 use crate::runtime::shared_function_instance_data::{
-    ClassFieldInitializerName, ConstructorKind, FunctionKind, SharedFunctionInstanceData, ThisMode,
+    ClassFieldInitializerName, ClosureCount, ConstructorKind, FunctionKind, SharedFunctionInstanceData, ThisMode,
 };
 use crate::source_code::SourceCode;
 use crate::utf16::to_utf16_fly_string;
@@ -57,23 +59,45 @@ use crate::utf16::to_utf16_fly_string;
 struct ClassData {
     fields: Vec<ClassFieldDefinition>,    // [[Fields]]
     private_methods: Vec<PrivateElement>, // [[PrivateMethods]]
+    /// The [[ClassFieldInitializerName]] of an initializer of a field whose key is computed.
+    class_field_initializer_name: ClassFieldInitializerName,
+    /// The shape of the objects InitializeInstanceElements initialized for this derived constructor, while it was
+    /// always the same one (see record_instance_elements_shape()).
+    instance_elements_shape: Option<Gc<Shape>>,
+    instance_elements_shape_varies: bool,
 }
 
-/// The parts of an ECMAScript function object the interpreter does not read.
-#[derive(Default, Trace)]
+/// The parts of a class constructor, or of a field initializer, that the interpreter does not read.
+#[derive(Default)]
 pub struct EcmascriptFunctionObjectStorage {
-    class_data: GcRefCell<Option<Box<ClassData>>>,
-    may_need_lazy_prototype_instantiation: Cell<bool>,
-    is_method: Cell<bool>,
+    class_data: OnceCell<Box<GcRefCell<ClassData>>>,
+}
+
+// NB: Every ECMAScript function has these bytes, so keep what only some functions need in the rare data.
+const _: () = assert!(size_of::<EcmascriptFunctionObject>() == 32);
+
+// SAFETY: Visits the cells of the class data, if there is any.
+unsafe impl Trace for EcmascriptFunctionObjectStorage {
+    fn trace(&self, visitor: &mut Visitor) {
+        if let Some(class_data) = self.class_data.get() {
+            class_data.trace(visitor);
+        }
+    }
 }
 
 pub static ECMASCRIPT_FUNCTION_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     internal_get_own_property: EcmascriptFunctionObject::internal_get_own_property,
-    // NB: Functions answer for "prototype" before instantiating it lazily, and for "caller" and "arguments" if they
-    //     support the legacy properties, whatever their shape holds. They answer for other names like ordinary
-    //     objects.
+    // NB: Functions answer for "length", "name" and "prototype" before creating them lazily, whatever their shape
+    //     holds. They answer for other names like ordinary objects.
     is_cacheable_for_absence_of: |_, vm, property_key| {
-        *property_key != vm.names.prototype && *property_key != vm.names.caller && *property_key != vm.names.arguments
+        *property_key != vm.names.prototype && *property_key != vm.names.length && *property_key != vm.names.name
+    },
+    // NB: The non-enumerable lazy properties shadow enumerable ones of the prototype chain.
+    eligible_for_own_property_enumeration_fast_path: |object| {
+        !as_ecmascript_function(object).has_flag(
+            ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME
+                | ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION,
+        )
     },
     internal_own_property_keys: EcmascriptFunctionObject::internal_own_property_keys,
     internal_call: Some(EcmascriptFunctionObject::internal_call),
@@ -97,17 +121,33 @@ define_cell!(
 unsafe impl Trace for EcmascriptFunctionObject {
     fn trace(&self, visitor: &mut Visitor) {
         self.base.trace(visitor);
-        self.environment.trace(visitor);
+        self.fields().environment.trace(visitor);
+        visitor.visit_nullable_member(&self.fields().shared_data);
+    }
+}
+
+define_cell!(
+    EcmascriptFunctionObjectWithRareData,
+    Object,
+    extends: [EcmascriptFunctionObject, FunctionObject, Object],
+    methods: ECMASCRIPT_FUNCTION_OBJECT_METHODS
+);
+
+// SAFETY: Visits every cell the rare data of an ECMAScript function object holds, besides those of the function.
+unsafe impl Trace for EcmascriptFunctionObjectWithRareData {
+    fn trace(&self, visitor: &mut Visitor) {
+        self.base.trace(visitor);
         self.private_environment.trace(visitor);
         self.home_object.trace(visitor);
-        self.name_string.trace(visitor);
-        self.shared_data.trace(visitor);
         self.storage.trace(visitor);
-        match self.script_or_module.get() {
-            ScriptOrModule::Empty => {}
-            ScriptOrModule::Script(script) => script.trace(visitor),
-            ScriptOrModule::Module(module) => module.trace(visitor),
-        }
+    }
+}
+
+impl Deref for EcmascriptFunctionObjectWithRareData {
+    type Target = EcmascriptFunctionObject;
+
+    fn deref(&self) -> &EcmascriptFunctionObject {
+        &self.base
     }
 }
 
@@ -137,6 +177,15 @@ pub fn value_as_ecmascript_function_object(value: Value) -> Option<Gc<Ecmascript
     as_ecmascript_function_object(value.as_object())
 }
 
+fn performs_prepare_for_tail_call(vm: &Vm, function: Gc<FunctionObject>) -> bool {
+    let Some(function) = function.upcast::<Object>().downcast::<RawNativeFunction>() else {
+        return false;
+    };
+    FunctionPrototype::is_call_function(vm, &function)
+        || FunctionPrototype::is_apply_function(vm, &function)
+        || ReflectObject::is_apply_function(vm, &function)
+}
+
 fn prototype_for_function_kind(realm: Gc<Realm>, kind: FunctionKind) -> Gc<Object> {
     match kind {
         FunctionKind::Normal => realm.function_prototype(),
@@ -155,13 +204,100 @@ impl EcmascriptFunctionObject {
         private_environment: Option<Gc<PrivateEnvironment>>,
         prototype: Gc<Object>,
     ) -> Gc<EcmascriptFunctionObject> {
-        shared_data.note_closure_created();
-        let function = allocate_object(
+        Self::create(
             vm,
-            Self::new(vm, shared_data, parent_environment, private_environment, prototype),
-        );
+            realm,
+            shared_data,
+            parent_environment,
+            private_environment,
+            None,
+            prototype,
+        )
+    }
+
+    /// A function that is a method of `home_object` (see make_method()).
+    pub fn create_method(
+        vm: &Vm,
+        realm: Gc<Realm>,
+        shared_data: Gc<SharedFunctionInstanceData>,
+        parent_environment: Option<Gc<Environment>>,
+        private_environment: Option<Gc<PrivateEnvironment>>,
+        home_object: Gc<Object>,
+        prototype: Gc<Object>,
+    ) -> Gc<EcmascriptFunctionObject> {
+        Self::create(
+            vm,
+            realm,
+            shared_data,
+            parent_environment,
+            private_environment,
+            Some(home_object),
+            prototype,
+        )
+    }
+
+    fn create(
+        vm: &Vm,
+        realm: Gc<Realm>,
+        shared_data: Gc<SharedFunctionInstanceData>,
+        parent_environment: Option<Gc<Environment>>,
+        private_environment: Option<Gc<PrivateEnvironment>>,
+        home_object: Option<Gc<Object>>,
+        prototype: Gc<Object>,
+    ) -> Gc<EcmascriptFunctionObject> {
+        // 15. Set F.[[ScriptOrModule]] to GetActiveScriptOrModule().
+        // OPTIMIZATION: Every function with the same shared data keeps the one of the first: the code that creates a
+        //               function belongs to the script or module of the function. Only code with no script or module
+        //               of its own, like an event handler, could see different ones.
+        if shared_data.closure_count() == ClosureCount::None {
+            shared_data.script_or_module.set(vm.get_active_script_or_module());
+        }
+        shared_data.note_closure_created();
+        let is_method = home_object.is_some();
+        let function = if private_environment.is_some() || is_method || shared_data.is_class_constructor() {
+            let function = allocate_object(vm, |defer_gc| EcmascriptFunctionObjectWithRareData {
+                base: Self::new(
+                    defer_gc,
+                    vm,
+                    realm,
+                    shared_data,
+                    parent_environment,
+                    prototype,
+                    is_method,
+                ),
+                private_environment: NullableMember::new(private_environment),
+                home_object: NullableMember::new(home_object),
+                storage: EcmascriptFunctionObjectStorage::default(),
+            });
+            function.set_flag(ecmascript_function_flags::HAS_RARE_DATA, true);
+            function.upcast()
+        } else {
+            allocate_object(vm, |defer_gc| {
+                Self::new(
+                    defer_gc,
+                    vm,
+                    realm,
+                    shared_data,
+                    parent_environment,
+                    prototype,
+                    is_method,
+                )
+            })
+        };
         function.initialize(vm, realm);
+        if is_method {
+            function.make_method();
+        }
         function
+    }
+
+    /// The function's rare data, if it is a function that has any.
+    fn with_rare_data(&self) -> Option<&EcmascriptFunctionObjectWithRareData> {
+        if !self.has_flag(ecmascript_function_flags::HAS_RARE_DATA) {
+            return None;
+        }
+        // SAFETY: Only an EcmascriptFunctionObjectWithRareData has this flag.
+        Some(unsafe { &*core::ptr::from_ref(self).cast::<EcmascriptFunctionObjectWithRareData>() })
     }
 
     pub fn create_from_function_data(
@@ -183,46 +319,45 @@ impl EcmascriptFunctionObject {
     }
 
     fn new(
+        _: &DeferGc<'_>,
         vm: &Vm,
+        realm: Gc<Realm>,
         shared_data: Gc<SharedFunctionInstanceData>,
         parent_environment: Option<Gc<Environment>>,
-        private_environment: Option<Gc<PrivateEnvironment>>,
         prototype: Gc<Object>,
+        is_method: bool,
     ) -> Self {
-        let base =
-            FunctionObject::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No);
+        // OPTIMIZATION: Start from a premade shape: normal and async functions create their properties lazily, and
+        //               the other kinds already have theirs in spec order.
+        let mut shape = Self::premade_shape(realm, shared_data, is_method);
+        // NB: The function's [[Realm]] is the realm of its shape, so the shape comes from the function's realm even when
+        //     the prototype belongs to another one.
+        if shape.prototype() != Some(prototype) {
+            shape = shape.create_prototype_transition(vm, Some(prototype));
+        }
+        let base = FunctionObject::new_with_shape(Self::CLASS, shape, MayInterfereWithIndexedPropertyAccess::No);
         base.set_is_ecmascript_function_object();
+        base.class_bits.set(ecmascript_function_flags::IS_ECMASCRIPT_FUNCTION);
 
-        // OPTIMIZATION: Start from a premade shape that already has this function kind's own properties in spec order.
-        //               Arrow functions use the same shape as other functions of their kind, but never get a lazy prototype.
-        let realm = base.shape().realm();
-        let function_shape = match shared_data.kind() {
+        let function = Self { base };
+        function.fields().shared_data.set(Some(shared_data));
+        function.fields().environment.set(parent_environment);
+        function
+    }
+
+    /// The premade shape that functions with `shared_data` start from. Normal functions that are constructors have a
+    /// "prototype" property, which most of them make lazily, so they start from a shape of their own: property lookup
+    /// caches must not apply what they saw on an arrow function or a method, which has no "prototype" property, to
+    /// them.
+    fn premade_shape(realm: Gc<Realm>, shared_data: Gc<SharedFunctionInstanceData>, is_method: bool) -> Gc<Shape> {
+        match shared_data.kind() {
+            FunctionKind::Normal if Self::has_constructor_for(shared_data, is_method) => {
+                realm.normal_constructor_function_shape()
+            }
             FunctionKind::Normal => realm.normal_function_shape(),
             FunctionKind::Generator => realm.generator_function_shape(),
             FunctionKind::Async => realm.async_function_shape(),
             FunctionKind::AsyncGenerator => realm.async_generator_function_shape(),
-        };
-        // NB: unsafe_set_shape(); the named storage gets room for the shape's properties when the function is allocated.
-        if function_shape.prototype() == Some(prototype) {
-            base.shape.set(function_shape);
-        } else {
-            base.shape
-                .set(function_shape.create_prototype_transition(vm, Some(prototype)));
-        }
-
-        // 15. Set F.[[ScriptOrModule]] to GetActiveScriptOrModule().
-        let script_or_module = vm.get_active_script_or_module();
-
-        Self {
-            base,
-            shared_data: Cell::new(shared_data),
-            name: FlyStringSlot::new(None),
-            name_string: Cell::new(None),
-            environment: Cell::new(parent_environment),
-            private_environment: Cell::new(private_environment),
-            script_or_module: Cell::new(script_or_module),
-            home_object: Cell::new(None),
-            storage: EcmascriptFunctionObjectStorage::default(),
         }
     }
 
@@ -233,24 +368,16 @@ impl EcmascriptFunctionObject {
         //       which must give the properties in chronological order which in this case is the order they
         //       are defined in the spec.
 
-        let name_string = PrimitiveString::create_from_fly_string(vm, &self.name());
-        self.name_string.set(Some(name_string));
-
-        // NOTE: The constructor gave us a premade shape with "length" and "name" (and "prototype" for generator kinds) at
-        //       these offsets, with the attributes the spec requires, so we only have to store the values.
-        self.initialize_direct(
-            realm.normal_function_length_offset(),
-            Value::from_i32(self.function_length()),
-        );
-        self.initialize_direct(realm.normal_function_name_offset(), Value::from_string(name_string));
-
         match self.kind() {
             FunctionKind::Normal => {
-                if !self.is_arrow_function() {
-                    self.storage.may_need_lazy_prototype_instantiation.set(true);
+                self.make_length_and_name_lazy();
+                // NB: Class constructors get their "prototype" property from ClassDefinitionEvaluation.
+                if !self.is_arrow_function() && !self.is_class_constructor() {
+                    self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, true);
                 }
             }
             FunctionKind::Generator => {
+                self.initialize_length_and_name(vm, realm);
                 // prototype is "g1.prototype" in figure-2 (https://tc39.es/ecma262/img/figure-2.png)
                 self.initialize_direct(
                     realm.generator_function_prototype_property_offset(),
@@ -264,8 +391,10 @@ impl EcmascriptFunctionObject {
             FunctionKind::Async => {
                 // 27.7.4 AsyncFunction Instances, https://tc39.es/ecma262/#sec-async-function-instances
                 // AsyncFunction instances do not have a prototype property as they are not constructible.
+                self.make_length_and_name_lazy();
             }
             FunctionKind::AsyncGenerator => {
+                self.initialize_length_and_name(vm, realm);
                 self.initialize_direct(
                     realm.generator_function_prototype_property_offset(),
                     Value::from_object(Object::create_prototype(
@@ -278,34 +407,246 @@ impl EcmascriptFunctionObject {
         }
     }
 
+    /// NOTE: The constructor gave us a premade shape with "length" and "name" (and "prototype" for generator kinds) at
+    ///       these offsets, with the attributes the spec requires, so we only have to store the values.
+    fn initialize_length_and_name(&self, vm: &Vm, realm: Gc<Realm>) {
+        let name_string = PrimitiveString::create_from_fly_string(vm, &self.name());
+        self.initialize_direct(
+            realm.generator_function_length_offset(),
+            Value::from_i32(self.function_length()),
+        );
+        self.initialize_direct(realm.generator_function_name_offset(), Value::from_string(name_string));
+    }
+
+    /// OPTIMIZATION: Few functions ever have their "length" or "name" looked at, so they make them when that happens.
+    fn make_length_and_name_lazy(&self) {
+        self.set_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME, true);
+    }
+
+    /// Gives the function its "length" and "name" properties if it does not have them yet, as its first properties,
+    /// since property keys come in the order they were added.
+    #[inline(always)]
+    pub(crate) fn reify_length_and_name(&self, vm: &Vm) {
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME) {
+            self.reify_lazy_length_and_name(vm);
+        }
+    }
+
+    #[cold]
+    fn reify_lazy_length_and_name(&self, vm: &Vm) {
+        let name_string = PrimitiveString::create_from_fly_string(vm, &self.name());
+        self.reify_lazy_length_and_name_with_name(vm, name_string);
+    }
+
+    fn reify_lazy_length_and_name_with_name(&self, vm: &Vm, name_string: Gc<PrimitiveString>) {
+        self.set_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME, false);
+
+        let attributes = PropertyAttributes::new(Attribute::CONFIGURABLE);
+        self.insert_properties(
+            vm,
+            0,
+            &[(&vm.names.length, attributes), (&vm.names.name, attributes)],
+            &[Value::from_i32(self.function_length()), Value::from_string(name_string)],
+        );
+    }
+
+    /// OPTIMIZATION: Few normal functions are ever used as constructors, so they make their "prototype" property when
+    ///               something looks for it.
+    ///
+    /// Gives the function its "prototype" property if it may not have it yet, right after "length" and "name", where
+    /// the spec creates it.
+    #[inline(always)]
+    fn instantiate_lazy_prototype_if_needed(&self, vm: &Vm) {
+        if self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION) {
+            self.instantiate_lazy_prototype(vm);
+        }
+    }
+
+    fn instantiate_lazy_prototype(&self, vm: &Vm) {
+        self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
+
+        let prototype = self.create_prototype_object(vm);
+        let attributes = PropertyAttributes::new(Attribute::WRITABLE);
+        // NB: Lazy "length" and "name" are put in front of all other properties when they are made.
+        let index = if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME) {
+            0
+        } else {
+            let shape = self.shape();
+            debug_assert!(
+                shape
+                    .lookup(&vm.names.length)
+                    .is_some_and(|metadata| metadata.offset == 0)
+                    && shape
+                        .lookup(&vm.names.name)
+                        .is_some_and(|metadata| metadata.offset == 1),
+                "a function with a lazy prototype has its length and name first"
+            );
+            2
+        };
+        if self.shape().property_count() == index {
+            self.define_direct_property(vm, &vm.names.prototype, Value::from_object(prototype), attributes);
+            return;
+        }
+        self.insert_properties(
+            vm,
+            index,
+            &[(&vm.names.prototype, attributes)],
+            &[Value::from_object(prototype)],
+        );
+    }
+
+    /// Whether the function has the property `property_key` without having made it yet, which looking it up makes.
+    #[cfg(feature = "jit")]
+    pub(crate) fn has_lazy_property(&self, vm: &Vm, property_key: &PropertyKey) -> bool {
+        (self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && (*property_key == vm.names.length || *property_key == vm.names.name))
+            || (self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+                && *property_key == vm.names.prototype)
+    }
+
+    pub(crate) fn reify_lazy_property(&self, vm: &Vm, property_key: &PropertyKey) {
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && (*property_key == vm.names.length || *property_key == vm.names.name)
+        {
+            self.reify_lazy_length_and_name(vm);
+        }
+
+        if self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+            && *property_key == vm.names.prototype
+        {
+            self.instantiate_lazy_prototype(vm);
+        }
+    }
+
+    /// Gives the function all of the properties it makes lazily. This must happen before its shape changes in a way that
+    /// insert_properties() cannot rebuild.
+    pub(crate) fn reify_lazy_properties(&self, vm: &Vm) {
+        // OPTIMIZATION: When "length", "name" and "prototype" are all lazy, one rebuild of the shape makes them.
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+        {
+            self.set_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME, false);
+            self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
+            let name_string = PrimitiveString::create_from_fly_string(vm, &self.name());
+            let prototype = self.create_prototype_object(vm);
+            let length_and_name_attributes = PropertyAttributes::new(Attribute::CONFIGURABLE);
+            self.insert_properties(
+                vm,
+                0,
+                &[
+                    (&vm.names.length, length_and_name_attributes),
+                    (&vm.names.name, length_and_name_attributes),
+                    (&vm.names.prototype, PropertyAttributes::new(Attribute::WRITABLE)),
+                ],
+                &[
+                    Value::from_i32(self.function_length()),
+                    Value::from_string(name_string),
+                    Value::from_object(prototype),
+                ],
+            );
+            return;
+        }
+        self.reify_length_and_name(vm);
+        self.instantiate_lazy_prototype_if_needed(vm);
+    }
+
+    /// The object a lazy "prototype" property holds, made as MakeConstructor would make it.
+    fn create_prototype_object(&self, vm: &Vm) -> Gc<Object> {
+        debug_assert!(
+            self.shape().lookup(&vm.names.prototype).is_none(),
+            "a function with a lazy prototype does not have one yet"
+        );
+        let realm = self.realm().expect("an ECMAScript function has a realm");
+        let prototype = Object::create_with_premade_shape(vm, realm.normal_function_prototype_shape());
+        prototype.initialize_direct(
+            realm.normal_function_prototype_constructor_offset(),
+            Value::from_object(self.as_function_object_gc()),
+        );
+        prototype
+    }
+
+    /// Rebuilds the shape from the premade shape of the function's kind with the given properties in front of the one
+    /// at `index` in insertion order, and gives them the given values.
+    fn insert_properties(
+        &self,
+        vm: &Vm,
+        index: u32,
+        properties: &[(&PropertyKey, PropertyAttributes)],
+        values: &[Value],
+    ) {
+        debug_assert_eq!(properties.len(), values.len());
+        let old_shape = self.shape();
+        // NB: Rebuilding the shape bypasses transitions away from the old one and moves existing property offsets.
+        old_shape.mark_unstable(vm);
+        let realm = old_shape.realm();
+        let mut shape = match self.kind() {
+            FunctionKind::Generator | FunctionKind::AsyncGenerator => {
+                unreachable!("generator functions have all of their properties from the start")
+            }
+            FunctionKind::Normal | FunctionKind::Async => Self::premade_shape(
+                realm,
+                self.shared_data(),
+                self.has_flag(ecmascript_function_flags::IS_METHOD),
+            ),
+        };
+        if shape.prototype() != old_shape.prototype() {
+            shape = shape.create_prototype_transition(vm, old_shape.prototype());
+        }
+        // NB: Adding the transitions can allocate, which must not happen while the shape is borrowed, so the properties
+        //     are read out first.
+        let property_count = old_shape.property_count() as usize;
+        let property_keys = MarkedVec::with_capacity(vm, property_count);
+        let mut property_attributes = Vec::with_capacity(property_count);
+        old_shape.for_each_property_in_insertion_order(|property_key, metadata| {
+            property_keys.push(property_key.clone());
+            property_attributes.push(metadata.attributes);
+            ControlFlow::Continue(())
+        });
+        for (position, attributes) in property_attributes.into_iter().enumerate() {
+            if position == index as usize {
+                for (inserted_key, inserted_attributes) in properties {
+                    shape = shape.create_put_transition(vm, inserted_key, *inserted_attributes);
+                }
+            }
+            let property_key = property_keys.get(position).expect("the position is in bounds");
+            shape = shape.create_put_transition(vm, &property_key, attributes);
+        }
+        if index as usize == property_count {
+            for (inserted_key, inserted_attributes) in properties {
+                shape = shape.create_put_transition(vm, inserted_key, *inserted_attributes);
+            }
+        }
+
+        self.insert_named_properties(shape, index, values);
+    }
+
     pub fn as_ecmascript_function_gc(&self) -> Gc<EcmascriptFunctionObject> {
         Gc::from_ref(self)
     }
 
     /// The function's executable, compiled first if the function never ran.
-    pub fn compiled_executable(&self, vm: &Vm) -> Gc<Executable> {
+    pub fn compiled_executable(&self, vm: &Vm) -> ThrowCompletionOr<Gc<Executable>> {
         let shared_data = self.shared_data();
         if let Some(executable) = shared_data.executable() {
-            return executable;
+            return Ok(executable);
         }
-        let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, false)
-            .expect("an ECMAScript function compiles to an executable");
+        let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, false)?;
         shared_data.set_executable(Some(rust_executable));
         rust_executable.set_name(self.name());
         if should_dump_bytecode() {
             rust_executable.dump();
         }
-        shared_data.clear_compile_inputs();
-        rust_executable
+        Ok(rust_executable)
     }
 
-    fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) {
+    fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) -> ThrowCompletionOr<()> {
         let function = as_ecmascript_function(object);
-        let executable = function.compiled_executable(vm);
+        let executable = function.compiled_executable(vm)?;
         stack_frame_info.registers_and_locals_count = executable.registers_and_locals_count();
         stack_frame_info.constant_count =
             u32::try_from(executable.constants().len()).expect("the constant count fits in u32");
         stack_frame_info.argument_count = stack_frame_info.argument_count.max(function.formal_parameter_count());
+        Ok(())
     }
 
     // 10.2.1 [[Call]] ( thisArgument, argumentsList ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-call-thisargument-argumentslist
@@ -316,8 +657,6 @@ impl EcmascriptFunctionObject {
         this_argument: Value,
     ) -> ThrowCompletionOr<Value> {
         let function = as_ecmascript_function(object);
-
-        debug_assert!(function.bytecode_executable().is_some());
 
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
@@ -371,8 +710,6 @@ impl EcmascriptFunctionObject {
     ) -> ThrowCompletionOr<Gc<Object>> {
         let function = as_ecmascript_function(object);
 
-        debug_assert!(function.bytecode_executable().is_some());
-
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
 
@@ -385,8 +722,11 @@ impl EcmascriptFunctionObject {
         if kind == ConstructorKind::Base {
             // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
             // NB: With room for the properties the constructor is known to add.
-            let prototype = get_prototype_from_constructor(vm, new_target, Intrinsics::object_prototype)?;
-            this_argument = Some(Object::create_for_construct(vm, prototype, function.shared_data()));
+            this_argument = Some(Object::create_from_constructor_for_construct(
+                vm,
+                new_target,
+                function.shared_data(),
+            )?);
         }
 
         // 4. Let calleeContext be PrepareForOrdinaryCall(F, newTarget).
@@ -454,9 +794,19 @@ impl EcmascriptFunctionObject {
         }
 
         // 15. Let thisBinding be ? constructorEnv.GetThisBinding().
-        let this_binding = constructor_env
-            .expect("a constructor runs in an environment")
-            .get_this_binding(vm)?;
+        // OPTIMIZATION: The frame answers for an environment without a this binding, with its this value, which is
+        //               empty while it is not initialized.
+        let this_binding = if function.shared_data().function_environment_has_this_binding() {
+            constructor_env
+                .expect("a constructor runs in an environment")
+                .get_this_binding(vm)?
+        } else {
+            let this_value = callee_context.this_value.get();
+            if this_value.is_empty() {
+                return vm.throw_completion(ErrorKind::ReferenceError, ErrorType::ThisHasNotBeenInitialized, &[]);
+            }
+            this_value
+        };
 
         // 16. Assert: Type(thisBinding) is Object.
         debug_assert!(this_binding.is_object());
@@ -466,11 +816,11 @@ impl EcmascriptFunctionObject {
     }
 
     // 10.2.7 MakeMethod ( F, homeObject ), https://tc39.es/ecma262/#sec-makemethod
-    pub fn make_method(&self, home_object: Gc<Object>) {
+    fn make_method(&self) {
         // 1. Set F.[[HomeObject]] to homeObject.
-        self.home_object.set(Some(home_object));
-        self.storage.is_method.set(true);
-        self.storage.may_need_lazy_prototype_instantiation.set(false);
+        // NB: create() did.
+        self.set_flag(ecmascript_function_flags::IS_METHOD, true);
+        self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
 
         // 2. Return unused.
     }
@@ -490,14 +840,20 @@ impl EcmascriptFunctionObject {
 
         // 4. Let calleeRealm be F.[[Realm]].
         // 5. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(self.realm());
+        // NB: The context gets its realm from its function.
 
         // 6. Set the ScriptOrModule of calleeContext to F.[[ScriptOrModule]].
-        callee_context.script_or_module.set(self.script_or_module.get());
+        // NB: The context gets its ScriptOrModule from its function.
+
+        // NB: Frames of functions whose environment has no this binding answer for new.target themselves.
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
 
         if self.function_environment_needed() {
             // 7. Let localEnv be NewFunctionEnvironment(F, newTarget).
-            let local_environment = new_function_environment(vm, self.as_ecmascript_function_gc(), new_target);
+            // NB: Or what the function's code needs of one.
+            let local_environment = new_call_environment(vm, self.as_ecmascript_function_gc(), new_target);
             let shared_data = self.shared_data();
             let function_environment_bindings_count = shared_data.function_environment_bindings_count();
             local_environment.set_environment_shape_cache(
@@ -510,23 +866,24 @@ impl EcmascriptFunctionObject {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
+            // NB: ExecutionContext::variable_environment() reads it from the function, and the code sets it in frames
+            //     that keep their own.
             callee_context.lexical_environment.set(self.environment());
-            callee_context.variable_environment.set(self.environment());
         }
 
         // 10. Set the PrivateEnvironment of calleeContext to F.[[PrivateEnvironment]].
-        callee_context.private_environment.set(self.private_environment.get());
+        // NB: ExecutionContext::private_environment() reads it from F, and the code sets it in frames that keep their
+        //     own.
 
         // 11. If callerContext is not already suspended, suspend callerContext.
         // 12. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
 
         // NOTE: We don't check for stack overflow here. The bytecode interpreter will do it anyway
         //       when entering the function we're about to call.
-        vm.push_execution_context(NonNull::from(callee_context));
+        // NB: The realm of the context is F.[[Realm]] (see step 5).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(self.shape().realm()));
 
         // 13. NOTE: Any exception objects produced after this point are associated with calleeRealm.
         // 14. Return calleeContext.
@@ -590,7 +947,7 @@ impl EcmascriptFunctionObject {
         // 7. Assert: localEnv is a function Environment Record.
         // 8. Assert: The next step never returns an abrupt completion because localEnv.[[ThisBindingStatus]] is not initialized.
         // 9. Perform ! localEnv.BindThisValue(thisValue).
-        if self.function_environment_needed() {
+        if self.shared_data().function_environment_has_this_binding() {
             local_env
                 .and_then(|environment| environment.downcast::<FunctionEnvironment>())
                 .expect("the lexical environment of the call is a function environment")
@@ -609,7 +966,7 @@ impl EcmascriptFunctionObject {
         if !self.function_environment_needed() {
             return self.environment();
         }
-        let local_environment = new_function_environment(vm, self.as_ecmascript_function_gc(), new_target);
+        let local_environment = new_call_environment(vm, self.as_ecmascript_function_gc(), new_target);
         let shared_data = self.shared_data();
         let function_environment_bindings_count = shared_data.function_environment_bindings_count();
         local_environment.set_environment_shape_cache(
@@ -633,9 +990,9 @@ impl EcmascriptFunctionObject {
     // 10.2.1.4 OrdinaryCallEvaluateBody ( F, argumentsList ), https://tc39.es/ecma262/#sec-ordinarycallevaluatebody
     // 15.8.4 Runtime Semantics: EvaluateAsyncFunctionBody, https://tc39.es/ecma262/#sec-runtime-semantics-evaluatefunctionbody
     fn ordinary_call_evaluate_body(&self, vm: &Vm, context: &ExecutionContext) -> ThrowCompletionOr<Value> {
-        let executable = self
-            .bytecode_executable()
-            .expect("a function is compiled before it is called");
+        // NB: The function was compiled before the call, but its code may have been flushed since (see
+        //     `bytecode::flushing`), as nothing held it while the call allocated.
+        let executable = self.compiled_executable(vm)?;
         let result = vm.run_executable(NonNull::from(context), executable, 0);
 
         // NOTE: Running the bytecode should eventually return a completion.
@@ -644,10 +1001,12 @@ impl EcmascriptFunctionObject {
             return result.map_err(Throw::new);
         }
 
+        // NB: The context is the running one, so its realm is the current realm.
+        let realm = vm.current_realm().expect("a function runs in a realm");
         if self.kind() == FunctionKind::Async {
             return Ok(Value::from_object(AsyncFunctionDriverWrapper::start(
                 vm,
-                context.realm.get().expect("a function runs in a realm"),
+                realm,
                 GeneratingFunction::Ecmascript(self.as_ecmascript_function_gc()),
                 context,
                 result,
@@ -655,7 +1014,6 @@ impl EcmascriptFunctionObject {
         }
         result.map_err(Throw::new)?;
 
-        let realm = context.realm.get().expect("a function runs in a realm");
         if self.kind() == FunctionKind::AsyncGenerator {
             return Ok(Value::from_object(AsyncGenerator::create(
                 vm,
@@ -675,9 +1033,12 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn set_name(&self, vm: &Vm, name: &Utf16FlyString) {
-        self.name.set(Some(name.clone()));
+        self.set_flag(ecmascript_function_flags::HAS_CUSTOM_NAME, true);
         let name_string = PrimitiveString::create_from_fly_string(vm, name);
-        self.name_string.set(Some(name_string));
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME) {
+            self.reify_lazy_length_and_name_with_name(vm, name_string);
+            return;
+        }
         let mut descriptor = PropertyDescriptor {
             value: Some(Value::from_string(name_string)),
             writable: Some(false),
@@ -695,100 +1056,122 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn name_for_call_stack(&self) -> Utf16String {
-        self.name_string
-            .get()
-            .expect("an ECMAScript function has its name string once initialized")
-            .utf16_string()
+        Utf16String::from(self.name())
     }
 
     /// Whether a copy of the function's bytes is a function of its own: it has no name of its own, no class data,
     /// nothing outside the heap as an object, and no property storage outside its cell.
     pub fn can_be_copied(&self) -> bool {
         let object = &self.base.base;
-        self.name.get().is_none()
-            && self.storage.class_data.borrow().is_none()
+        !self.has_flag(ecmascript_function_flags::HAS_CUSTOM_NAME)
+            && !self.has_flag(ecmascript_function_flags::HAS_RARE_DATA)
             && object.owns_nothing_outside_the_heap()
             && object.named_storage_is_inline()
             && object.indexed_storage_kind() == IndexedStorageKind::None
     }
 
     pub fn name(&self) -> Utf16FlyString {
-        self.name.get().unwrap_or_else(|| self.shared_data().name())
+        if self.has_flag(ecmascript_function_flags::HAS_CUSTOM_NAME)
+            && let Some(metadata) = self.shape().lookup(&Vm::of_cell(self).names.name)
+        {
+            let name = self.get_direct(metadata.offset);
+            if name.is_string() {
+                return to_utf16_fly_string(&name.as_string().utf16_string());
+            }
+        }
+        self.shared_data().name()
     }
 
-    fn ensure_class_data(&self) {
-        let mut class_data = self.storage.class_data.borrow_mut();
-        if class_data.is_none() {
-            *class_data = Some(Box::default());
+    fn has_flag(&self, flag: u8) -> bool {
+        self.class_bits.get() & flag != 0
+    }
+
+    fn set_flag(&self, flag: u8, value: bool) {
+        let flags = self.class_bits.get();
+        self.class_bits.set(if value { flags | flag } else { flags & !flag });
+    }
+
+    fn class_data(&self) -> Option<&GcRefCell<ClassData>> {
+        self.with_rare_data()?.storage.class_data.get().map(Box::as_ref)
+    }
+
+    fn class_data_to_add_to(&self) -> &GcRefCell<ClassData> {
+        self.with_rare_data()
+            .expect("a class constructor or a field initializer has rare data")
+            .storage
+            .class_data
+            .get_or_init(Box::default)
+    }
+
+    /// Remembers that InitializeInstanceElements for this derived constructor initializes an object of `shape`, which
+    /// JIT code can rely on while it is always the same one (see instance_elements_shape()).
+    pub fn record_instance_elements_shape(&self, vm: &Vm, shape: Gc<Shape>) {
+        let Some(class_data) = self.class_data() else {
+            return;
+        };
+        {
+            let class_data = class_data.borrow();
+            if class_data.instance_elements_shape_varies || class_data.instance_elements_shape == Some(shape) {
+                return;
+            }
+        }
+        let mut class_data = class_data.borrow_mut(vm);
+        if class_data.instance_elements_shape.is_some() {
+            class_data.instance_elements_shape = None;
+            class_data.instance_elements_shape_varies = true;
+        } else {
+            class_data.instance_elements_shape = Some(shape);
         }
     }
 
+    /// The shape of every object InitializeInstanceElements initialized for this derived constructor so far, if there
+    /// was one and it was always the same.
+    pub fn instance_elements_shape(&self) -> Option<Gc<Shape>> {
+        self.class_data()?.borrow().instance_elements_shape
+    }
+
     pub fn has_class_data(&self) -> bool {
-        self.storage.class_data.borrow().is_some()
+        self.class_data().is_some_and(|class_data| {
+            let class_data = class_data.borrow();
+            !class_data.fields.is_empty() || !class_data.private_methods.is_empty()
+        })
     }
 
     pub fn fields_count(&self) -> usize {
-        self.storage
-            .class_data
-            .borrow()
-            .as_ref()
-            .map_or(0, |class_data| class_data.fields.len())
+        self.class_data()
+            .map_or(0, |class_data| class_data.borrow().fields.len())
     }
 
     /// A copy of the field record at `index` of [[Fields]].
     pub fn field(&self, index: usize) -> ClassFieldDefinition {
-        self.storage
-            .class_data
-            .borrow()
-            .as_ref()
-            .expect("the function has class data")
-            .fields[index]
-            .clone()
+        self.class_data().expect("the function has class data").borrow().fields[index].clone()
     }
 
-    pub fn add_field(&self, field: ClassFieldDefinition) {
-        self.ensure_class_data();
-        self.storage
-            .class_data
-            .borrow_mut()
-            .as_mut()
-            .expect("the function has class data")
-            .fields
-            .push(field);
+    pub fn add_field(&self, vm: &Vm, field: ClassFieldDefinition) {
+        self.class_data_to_add_to().borrow_mut(vm).fields.push(field);
     }
 
     pub fn private_methods_count(&self) -> usize {
-        self.storage
-            .class_data
-            .borrow()
-            .as_ref()
-            .map_or(0, |class_data| class_data.private_methods.len())
+        self.class_data()
+            .map_or(0, |class_data| class_data.borrow().private_methods.len())
     }
 
     /// A copy of the element at `index` of [[PrivateMethods]].
     pub fn private_method(&self, index: usize) -> PrivateElement {
-        self.storage
-            .class_data
-            .borrow()
-            .as_ref()
+        self.class_data()
             .expect("the function has class data")
+            .borrow()
             .private_methods[index]
             .clone()
     }
 
-    pub fn add_private_method(&self, method: PrivateElement) {
-        self.ensure_class_data();
-        self.storage
-            .class_data
-            .borrow_mut()
-            .as_mut()
-            .expect("the function has class data")
-            .private_methods
-            .push(method);
+    pub fn add_private_method(&self, vm: &Vm, method: PrivateElement) {
+        self.class_data_to_add_to().borrow_mut(vm).private_methods.push(method);
     }
 
     pub fn shared_data(&self) -> Gc<SharedFunctionInstanceData> {
-        self.shared_data.get()
+        // SAFETY: An ECMAScript function object gets its shared data when it is created, and keeps it.
+        unsafe { self.fields().shared_data.get_unchecked() }
     }
 
     pub fn is_module_wrapper(&self) -> bool {
@@ -812,10 +1195,6 @@ impl EcmascriptFunctionObject {
         self.shared_data().parameter_binding_names()
     }
 
-    pub fn set_is_class_constructor(&self) {
-        self.shared_data().set_is_class_constructor();
-    }
-
     pub fn bytecode_executable(&self) -> Option<Gc<Executable>> {
         self.shared_data().executable()
     }
@@ -832,15 +1211,15 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn environment(&self) -> Option<Gc<Environment>> {
-        self.environment.get()
+        self.fields().environment.get()
     }
 
     pub fn private_environment(&self) -> Option<Gc<PrivateEnvironment>> {
-        self.private_environment.get()
+        self.with_rare_data()?.private_environment.get()
     }
 
     pub fn script_or_module(&self) -> ScriptOrModule {
-        self.script_or_module.get()
+        self.shared_data().script_or_module.get()
     }
 
     pub fn constructor_kind(&self) -> ConstructorKind {
@@ -876,11 +1255,15 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn home_object(&self) -> Option<Gc<Object>> {
-        self.home_object.get()
+        self.with_rare_data()?.home_object.get()
     }
 
-    pub fn set_home_object(&self, home_object: Option<Gc<Object>>) {
-        self.home_object.set(home_object);
+    /// Gives a class constructor its home object, which it was created without.
+    pub fn set_home_object_of_class_constructor(&self, home_object: Gc<Object>) {
+        self.with_rare_data()
+            .expect("a class constructor has rare data")
+            .home_object
+            .set(Some(home_object));
     }
 
     pub fn source_text(&self) -> Utf16String {
@@ -908,7 +1291,12 @@ impl EcmascriptFunctionObject {
 
     // Equivalent to absence of [[Construct]]
     pub fn has_constructor(&self) -> bool {
-        self.kind() == FunctionKind::Normal && !self.is_arrow_function() && !self.storage.is_method.get()
+        Self::has_constructor_for(self.shared_data(), self.has_flag(ecmascript_function_flags::IS_METHOD))
+    }
+
+    /// Whether a function with `shared_data` has a [[Construct]] internal method.
+    fn has_constructor_for(shared_data: Gc<SharedFunctionInstanceData>, is_method: bool) -> bool {
+        shared_data.kind() == FunctionKind::Normal && !shared_data.is_arrow_function() && !is_method
     }
 
     pub fn kind(&self) -> FunctionKind {
@@ -917,12 +1305,24 @@ impl EcmascriptFunctionObject {
 
     // This is used by LibWeb to disassociate event handler attribute callback functions from the nearest script on the call stack.
     // https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler Step 3.11
+    // NB: This applies to every function with the same shared data, which such a callback function has to itself.
     pub fn set_script_or_module(&self, script_or_module: ScriptOrModule) {
-        self.script_or_module.set(script_or_module);
+        self.shared_data().script_or_module.set(script_or_module);
     }
 
     pub fn class_field_initializer_name(&self) -> ClassFieldInitializerName {
+        // NB: The shared data has the name of a field whose key is not computed.
+        if let Some(class_data) = self.class_data() {
+            let name = class_data.borrow().class_field_initializer_name.clone();
+            if !matches!(name, ClassFieldInitializerName::Empty) {
+                return name;
+            }
+        }
         self.shared_data().class_field_initializer_name()
+    }
+
+    pub fn set_class_field_initializer_name(&self, vm: &Vm, name: ClassFieldInitializerName) {
+        self.class_data_to_add_to().borrow_mut(vm).class_field_initializer_name = name;
     }
 
     pub fn allocates_function_environment(&self) -> bool {
@@ -934,25 +1334,16 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn supports_legacy_caller_or_arguments(&self) -> bool {
-        // https://tc39.es/ecma262/#sec-forbidden-extensions
-        //
-        // ECMAScript function objects defined using syntactic constructors in strict mode code must not be created with own
-        // properties named *"caller"* or *"arguments"*. Such own properties also must not be created for function objects
-        // defined using an |ArrowFunction|, |MethodDefinition|, |GeneratorDeclaration|, |GeneratorExpression|,
-        // |AsyncGeneratorDeclaration|, |AsyncGeneratorExpression|, |ClassDeclaration|, |ClassExpression|,
-        // |AsyncFunctionDeclaration|, |AsyncFunctionExpression|, or |AsyncArrowFunction| regardless of whether the definition
-        // is contained in strict mode code.
-        // Built-in functions, strict functions created using the Function constructor, generator functions created using
-        // the Generator constructor, async functions created using the AsyncFunction constructor, and functions created
-        // using the `bind` method also must not be created with such own properties.
+        // NB: These are the functions that the "caller" and "arguments" accessors of %Function.prototype% accept. The
+        //     others are the functions that https://tc39.es/ecma262/#sec-forbidden-extensions keeps from exposing them.
         self.kind() == FunctionKind::Normal
             && !self.is_arrow_function()
             && !self.is_class_constructor()
-            && !self.storage.is_method.get()
+            && !self.has_flag(ecmascript_function_flags::IS_METHOD)
             && !self.is_strict_mode()
     }
 
-    fn legacy_caller(&self, vm: &Vm) -> Value {
+    pub fn legacy_caller(&self, vm: &Vm) -> Value {
         let this_function = self.as_function_object_gc();
         let mut caller: Option<Gc<EcmascriptFunctionObject>> = None;
         let mut found_this_function = false;
@@ -969,28 +1360,33 @@ impl EcmascriptFunctionObject {
                 return ControlFlow::Continue(());
             };
 
+            // NB: The spec has these built-ins perform PrepareForTailCall(), which discards their execution context
+            //     before they call this function. We don't implement it, so skip the frames we keep for them.
+            if performs_prepare_for_tail_call(vm, function) {
+                return ControlFlow::Continue(());
+            }
+
             caller = as_ecmascript_function_object(function);
             ControlFlow::Break(())
         });
 
-        // https://tc39.es/ecma262/#sec-forbidden-extensions
-        //
-        // If an implementation extends any function object with an own property named *"caller"* the value of that property,
-        // as observed using [[Get]] or [[GetOwnProperty]], must not be a strict function object. If it is an accessor
-        // property, the function that is the value of the property's [[Get]] attribute must never return a strict function
-        // when called.
+        // NB: https://tc39.es/ecma262/#sec-forbidden-extensions keeps own "caller" properties from exposing strict
+        //     functions. The accessor on %Function.prototype% holds to the same rule, and also hides generator and
+        //     async functions.
         match caller {
-            Some(caller) if caller.supports_legacy_caller_or_arguments() => Value::from_object(caller),
+            Some(caller) if caller.kind() == FunctionKind::Normal && !caller.is_strict_mode() => {
+                Value::from_object(caller)
+            }
             _ => Value::NULL,
         }
     }
 
-    fn legacy_arguments(&self, vm: &Vm) -> Value {
+    pub fn legacy_arguments(&self, vm: &Vm) -> Value {
         let this_function = self.as_function_object_gc();
         // NB: The arguments of a frame of an inlined call may be objects JIT code never created, which only the
         //     arguments object holds once it exists.
-        let _defer_gc = crate::jit::DeferGc::new(vm);
-        let mut passed_arguments: Option<Vec<Cell<Value>>> = None;
+        let defer_gc = DeferGc::new(vm);
+        let mut passed_arguments: Option<Deferred<'_, Vec<Cell<Value>>>> = None;
 
         vm.for_each_stack_frame_top_to_bottom(|frame| {
             if frame.function != Some(this_function) {
@@ -998,28 +1394,32 @@ impl EcmascriptFunctionObject {
             }
 
             // NB: The frame of a call that JIT code inlined has its arguments in the JIT frame.
-            passed_arguments = Some(match frame.inlined_call {
-                Some(inlined_call) => crate::jit::translate::call_site_frame_arguments(
-                    vm,
-                    frame.execution_context,
-                    inlined_call.site,
-                    inlined_call.frame_pointer,
-                    inlined_call.frame_state,
-                )
-                .into_iter()
-                .map(Cell::new)
-                .collect(),
-                None => {
-                    let context = frame.execution_context;
-                    // NB: The frame of an inlined call that JIT code published or materialized for a call it made has
-                    //     markers for the objects among its arguments that the code never allocated.
-                    crate::jit::translate::resolve_deferred_arguments(vm, context);
-                    context.arguments()[..context.passed_argument_count.get() as usize]
-                        .iter()
-                        .map(|argument| Cell::new(argument.get()))
-                        .collect()
-                }
-            });
+            passed_arguments = Some(
+                defer_gc.cover(match frame.inlined_call {
+                    Some(inlined_call) => crate::jit::translate::call_site_frame_arguments(
+                        vm,
+                        frame.execution_context,
+                        inlined_call.site,
+                        inlined_call.frame_pointer,
+                        inlined_call.frame_state,
+                        &defer_gc,
+                    )
+                    .into_inner()
+                    .into_iter()
+                    .map(Cell::new)
+                    .collect(),
+                    None => {
+                        let context = frame.execution_context;
+                        // NB: The frame of an inlined call that JIT code published or materialized for a call it made has
+                        //     markers for the objects among its arguments that the code never allocated.
+                        crate::jit::translate::resolve_deferred_arguments(vm, context);
+                        context.arguments()[..context.passed_argument_count.get() as usize]
+                            .iter()
+                            .map(|argument| Cell::new(argument.get()))
+                            .collect()
+                    }
+                }),
+            );
             ControlFlow::Break(())
         });
 
@@ -1044,95 +1444,15 @@ impl EcmascriptFunctionObject {
         vm: &Vm,
         property_key: &PropertyKey,
     ) -> ThrowCompletionOr<Option<PropertyDescriptor>> {
-        let function = as_ecmascript_function(object);
-
-        if function.supports_legacy_caller_or_arguments() {
-            let descriptor = object.ordinary_get_own_property(vm, property_key)?;
-            if descriptor.is_some() {
-                return Ok(descriptor);
-            }
-
-            if *property_key == vm.names.caller {
-                return Ok(Some(PropertyDescriptor {
-                    value: Some(function.legacy_caller(vm)),
-                    writable: Some(false),
-                    enumerable: Some(false),
-                    configurable: Some(false),
-                    ..Default::default()
-                }));
-            }
-            if *property_key == vm.names.arguments {
-                return Ok(Some(PropertyDescriptor {
-                    value: Some(function.legacy_arguments(vm)),
-                    writable: Some(false),
-                    enumerable: Some(false),
-                    configurable: Some(false),
-                    ..Default::default()
-                }));
-            }
-        }
-
-        if function.storage.may_need_lazy_prototype_instantiation.get() && *property_key == vm.names.prototype {
-            let realm = function.realm().expect("an ECMAScript function has a realm");
-            let metadata = object.shape().lookup(property_key);
-            if metadata.is_none() {
-                let prototype = Object::create_with_premade_shape(vm, realm.normal_function_prototype_shape());
-                prototype.initialize_direct(
-                    realm.normal_function_prototype_constructor_offset(),
-                    Value::from_object(function.as_function_object_gc()),
-                );
-                object.define_direct_property(
-                    vm,
-                    &vm.names.prototype,
-                    Value::from_object(prototype),
-                    PropertyAttributes::new(Attribute::WRITABLE),
-                );
-            }
-            function.storage.may_need_lazy_prototype_instantiation.set(false);
-        }
-
+        as_ecmascript_function(object).reify_lazy_property(vm, property_key);
         object.ordinary_get_own_property(vm, property_key)
     }
 
     fn internal_own_property_keys<'vm>(object: &Object, vm: &'vm Vm) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
         let function = as_ecmascript_function(object);
 
-        if function.storage.may_need_lazy_prototype_instantiation.get() {
-            Self::internal_get_own_property(object, vm, &vm.names.prototype)?;
-        }
+        function.reify_lazy_properties(vm);
 
-        let keys = object.ordinary_own_property_keys(vm)?;
-        if !function.supports_legacy_caller_or_arguments() {
-            return Ok(keys);
-        }
-
-        let mut insertion_index = keys.len();
-        let name = Utf16String::from(vm.names.name.as_string());
-        for index in 0..keys.len() {
-            let key = keys.get(index).expect("the index is in bounds");
-            if key.is_string() && key.as_string().utf16_string() == name {
-                insertion_index = index + 1;
-                break;
-            }
-        }
-
-        if object.ordinary_get_own_property(vm, &vm.names.arguments)?.is_none() {
-            keys.insert(
-                insertion_index,
-                Value::from_string(PrimitiveString::create_from_fly_string(
-                    vm,
-                    vm.names.arguments.as_string(),
-                )),
-            );
-            insertion_index += 1;
-        }
-        if object.ordinary_get_own_property(vm, &vm.names.caller)?.is_none() {
-            keys.insert(
-                insertion_index,
-                Value::from_string(PrimitiveString::create_from_fly_string(vm, vm.names.caller.as_string())),
-            );
-        }
-
-        Ok(keys)
+        object.ordinary_own_property_keys(vm)
     }
 }

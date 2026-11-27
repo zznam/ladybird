@@ -11,13 +11,19 @@
 namespace Gfx {
 
 #define ENUMERATE_EXPORT_FORMATS(X) \
-    X(Gray8)                        \
+    X(Luminance8)                   \
+    X(LuminanceAlpha88)             \
     X(Alpha8)                       \
     X(RGB565)                       \
     X(RGBA5551)                     \
     X(RGBA4444)                     \
     X(RGB888)                       \
-    X(RGBA8888)
+    X(RGBA8888)                     \
+    X(Luminance32F)                 \
+    X(LuminanceAlpha32F)            \
+    X(Alpha32F)                     \
+    X(RGB32F)                       \
+    X(RGBA32F)
 
 enum class ExportFormat : u8 {
 #define ENUMERATE_EXPORT_FORMAT(format) format,

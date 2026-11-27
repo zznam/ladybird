@@ -98,13 +98,10 @@ impl NativeJavaScriptBackedFunction {
         // 7. Set func.[[Extensible]] to true.
         // 8. Set func.[[Realm]] to realm.
         // 9. Set func.[[InitialName]] to null.
-        let function = realm.create_object(
-            vm,
-            NativeJavaScriptBackedFunction {
-                base: NativeFunction::new_with_name(vm, Self::CLASS, shared_data.name(), prototype),
-                shared_function_instance_data: Cell::new(shared_data),
-            },
-        );
+        let function = realm.create_object(vm, |_| NativeJavaScriptBackedFunction {
+            base: NativeFunction::new_with_prototype(vm, Self::CLASS, realm, prototype, Some(shared_data.name())),
+            shared_function_instance_data: Cell::new(shared_data),
+        });
 
         function.unsafe_set_shape(realm.native_function_shape());
 
@@ -126,9 +123,9 @@ impl NativeJavaScriptBackedFunction {
         Gc::from_ref(self)
     }
 
-    fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) {
+    fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) -> ThrowCompletionOr<()> {
         let function = as_native_javascript_backed_function(object);
-        let bytecode_executable = function.bytecode_executable(vm);
+        let bytecode_executable = function.bytecode_executable(vm)?;
         stack_frame_info.registers_and_locals_count = bytecode_executable.registers_and_locals_count();
         stack_frame_info.constant_count =
             u32::try_from(bytecode_executable.constants().len()).expect("the constant count fits in u32");
@@ -137,6 +134,7 @@ impl NativeJavaScriptBackedFunction {
         let function_length =
             u32::try_from(function.shared_data().function_length()).expect("a builtin's length is not negative");
         stack_frame_info.argument_count = stack_frame_info.argument_count.max(function_length);
+        Ok(())
     }
 
     fn call(function: &NativeFunction, vm: &Vm) -> ThrowCompletionOr<Value> {
@@ -145,7 +143,7 @@ impl NativeJavaScriptBackedFunction {
         let running_execution_context = vm
             .running_execution_context()
             .expect("a NativeJavaScriptBackedFunction runs in its own execution context");
-        let result = vm.run_executable(running_execution_context, function.bytecode_executable(vm), 0);
+        let result = vm.run_executable(running_execution_context, function.bytecode_executable(vm)?, 0);
 
         let kind = function.kind();
         if kind == FunctionKind::Normal {
@@ -188,29 +186,26 @@ impl NativeJavaScriptBackedFunction {
         )))
     }
 
-    pub fn bytecode_executable(&self, vm: &Vm) -> Gc<Executable> {
+    pub fn bytecode_executable(&self, vm: &Vm) -> ThrowCompletionOr<Gc<Executable>> {
         let shared_data = self.shared_data();
         if let Some(executable) = shared_data.executable() {
-            return executable;
+            return Ok(executable);
         }
 
         // NB: The abstract operations a builtin file calls are functions of the realm that is current while its
         //     executable is compiled, and ArraySpeciesCreate depends on its realm. The builtin may first be called from
         //     another realm, so it is compiled in its own.
-        let running_execution_context = vm.running_execution_context_if_any();
-        let caller_realm = running_execution_context.and_then(|context| context.realm.replace(Some(self.realm())));
-        let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, true)
-            .expect("a builtin written in JavaScript compiles to an executable");
-        if let Some(context) = running_execution_context {
-            context.realm.set(caller_realm);
-        }
+        let caller_realm = vm.head.current_realm.replace(Some(self.realm()));
+        let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, true);
+        vm.head.current_realm.set(caller_realm);
+        let rust_executable = rust_executable?;
         shared_data.set_executable(Some(rust_executable));
         rust_executable.set_name(shared_data.name());
         if should_dump_bytecode() {
             rust_executable.dump();
         }
         shared_data.clear_compile_inputs();
-        rust_executable
+        Ok(rust_executable)
     }
 
     /// The executable an inline call of this builtin runs, if the interpreter can call it inline: it is a normal
@@ -219,7 +214,7 @@ impl NativeJavaScriptBackedFunction {
         if self.kind() != FunctionKind::Normal || self.function_environment_needed() {
             return None;
         }
-        Some(self.bytecode_executable(vm))
+        self.bytecode_executable(vm).ok()
     }
 
     pub fn shared_data(&self) -> Gc<SharedFunctionInstanceData> {

@@ -12,11 +12,14 @@
 //! flat strings (whose ASCII bytes are in their storage word) find them in
 //! the VM's cache of fly strings if both strings are short. Everything else
 //! results in the empty value, for the slow path, which also fills that
-//! cache.
+//! cache. A concatenation that is the key of a property access looks for the
+//! string that it made before in the VM's cache of such concatenations
+//! first.
 
 use super::Codegen;
 use super::allocation::AllocationCall;
-use super::call::ConstantField;
+use super::allocation::stored_fields_fit;
+use super::allocation::template_fields;
 use crate::asm::Address;
 use crate::asm::Condition;
 use crate::asm::Gpr;
@@ -25,14 +28,14 @@ use crate::asm::PortableMacroAssembler;
 use crate::asm::Scale;
 use crate::ir::NodeId;
 use crate::ir::value;
+use crate::snapshot::RopeAllocationInfo;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// `ConcatenateStrings`: the concatenation of two strings, or the empty
-    /// value. Needs three temps.
-    pub(in crate::codegen) fn emit_concatenate_strings(&mut self, node: NodeId) {
+    /// value, as the key of a property access if `key`. Needs three temps.
+    pub(in crate::codegen) fn emit_concatenate_strings(&mut self, node: NodeId, key: bool) {
         let (lhs, rhs, output) = (self.input(node, 0), self.input(node, 1), self.output(node));
-        let temps = &self.allocation.node(node).temps;
-        let temps = [Gpr(temps[0]), Gpr(temps[1]), Gpr(temps[2])];
+        let temps = [self.temp(node, 0), self.temp(node, 1), self.temp(node, 2)];
         let (slow, done) = (self.masm.new_label(), self.masm.new_label());
         let mut resume = None;
         if self.runtime.rope_allocation.allocator != 0 && self.rope_template_fits() {
@@ -43,7 +46,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             } else {
                 slow
             };
-            self.emit_concatenation_of_strings(node, [lhs, rhs], temps, no_free_cell, slow, done);
+            self.emit_concatenation_of_strings(node, [lhs, rhs], temps, key, no_free_cell, slow, done);
         }
         self.masm.bind(slow);
         self.masm.move_imm64(output, value::EMPTY);
@@ -124,28 +127,29 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let rope = &self.runtime.rope_allocation;
         let bytes = 8 * rope.template.len() as u64;
         bytes <= u64::from(rope.cell_size)
-            && [rope.lhs_offset, rope.rhs_offset]
-                .iter()
-                .all(|offset| offset.is_multiple_of(8) && u64::from(*offset) + 8 <= bytes)
+            && stored_fields_fit(&rope_stored_fields(rope), bytes)
             && u64::from(rope.length_offset) + 4 <= bytes
     }
 
     /// The concatenation of the strings `lhs` and `rhs` into the node's
     /// output, continuing at `done`, with the temps `cell`, `other` and
-    /// `length`. Branches to `no_free_cell` where the rope string's cell
-    /// cannot be allocated inline.
+    /// `length`, as the key of a property access if `key`. Branches to
+    /// `no_free_cell` where the rope string's cell cannot be allocated
+    /// inline.
+    #[allow(clippy::too_many_arguments)]
     fn emit_concatenation_of_strings(
         &mut self,
         node: NodeId,
         [lhs, rhs]: [Gpr; 2],
         [cell, other, length]: [Gpr; 3],
+        key: bool,
         no_free_cell: Label,
         slow: Label,
         done: Label,
     ) {
         let scratch = self.pinned.scratch;
         let output = self.output(node);
-        let rope = self.runtime.rope_allocation.clone();
+        let rope = self.runtime.rope_allocation;
         let string_length = |string: Gpr| Address::new(string, rope.length_offset as i32);
         let at = |base: Gpr, offset: u32| Address::new(base, offset as i32);
 
@@ -173,6 +177,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let short = self.masm.new_label();
         self.masm
             .branch64_imm(Condition::Below, length, i64::from(rope.min_length), short);
+        if key {
+            self.emit_key_concatenation_cache_lookup(node, [lhs, rhs], [cell, other], done);
+        }
         self.masm.add64_imm(scratch, length, 1);
         self.masm.shr64_imm(scratch, scratch, 32);
         self.masm.branch_test64(Condition::NonZero, scratch, u64::MAX, slow);
@@ -182,23 +189,60 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_pop_free_list(rope.allocator, cell, other, no_free_cell);
         self.emit_count_allocation(rope.cell_size, rope.cell_size, other, false);
 
-        let mut fields: Vec<ConstantField> = (0u32..)
-            .zip(&rope.template)
-            .map(|(index, word)| (8 * index, 8, *word))
-            .filter(|(offset, _, _)| *offset != rope.lhs_offset && *offset != rope.rhs_offset)
-            .collect();
+        let mut fields = self.spare_fields.take();
+        template_fields(&self.snapshot[rope.template], &rope_stored_fields(&rope), &mut fields);
         self.emit_constant_fields(cell, other, &mut fields)
             .expect("rope string fields are near the cell");
+        self.spare_fields = fields;
         self.masm.store32(&string_length(cell), length);
-        self.emit_unbox_cell(other, lhs);
-        self.masm.store64(&at(cell, rope.lhs_offset), other);
-        self.emit_unbox_cell(other, rhs);
-        self.masm.store64(&at(cell, rope.rhs_offset), other);
+        // NB: The halves are compressed from their string values, whose tag
+        //     the 32-bit stores drop.
+        self.emit_store_compressed_cell(&at(cell, rope.lhs_offset), lhs, other);
+        self.emit_store_compressed_cell(&at(cell, rope.rhs_offset), rhs, other);
         self.box_cell_with_tag(output, cell, value::STRING_TAG);
         self.masm.jump(done);
 
         self.masm.bind(short);
         self.emit_short_string_concatenation(node, [lhs, rhs], [cell, other, length], slow, done);
+    }
+
+    /// The string that the concatenation of the strings `lhs` and `rhs` made
+    /// when it became a property key, into the node's output if the VM's
+    /// cache of such concatenations has it (see
+    /// `RuntimeLayout::key_concatenation_cache`), continuing at `done`; falls
+    /// through otherwise. Uses `entry` and `other`.
+    fn emit_key_concatenation_cache_lookup(
+        &mut self,
+        node: NodeId,
+        [lhs, rhs]: [Gpr; 2],
+        [entry, other]: [Gpr; 2],
+        done: Label,
+    ) {
+        let layout = self.runtime.layout;
+        let entry_size = layout.key_concatenation_cache_entry_size;
+        if layout.key_concatenation_cache == 0 || !entry_size.is_power_of_two() {
+            return;
+        }
+        let output = self.output(node);
+        let miss = self.masm.new_label();
+        // The index, ((lhs >> 4) ^ ((rhs >> 4) * 33)) & mask.
+        self.masm.shr64_imm(entry, rhs, 4);
+        self.masm.shl64_imm(other, entry, 5);
+        self.masm.add64(entry, entry, other);
+        self.masm.shr64_imm(other, lhs, 4);
+        self.masm.xor64(entry, entry, other);
+        self.masm.and32_imm(entry, entry, layout.key_concatenation_cache_mask);
+        self.masm.shl64_imm(entry, entry, entry_size.trailing_zeros() as u8);
+        self.masm.move_imm64(other, layout.key_concatenation_cache);
+        self.masm.add64(entry, entry, other);
+        let entry_lhs = Address::new(entry, layout.key_concatenation_cache_lhs as i32);
+        let entry_rhs = Address::new(entry, layout.key_concatenation_cache_rhs as i32);
+        let entry_string = Address::new(entry, layout.key_concatenation_cache_string as i32);
+        self.masm.branch64_memory(Condition::NotEqual, &entry_lhs, lhs, miss);
+        self.masm.branch64_memory(Condition::NotEqual, &entry_rhs, rhs, miss);
+        self.masm.load64(output, &entry_string);
+        self.masm.jump(done);
+        self.masm.bind(miss);
     }
 
     /// The concatenation of the non-empty strings `lhs` and `rhs`, whose
@@ -268,4 +312,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.box_cell_with_tag(output, other, value::STRING_TAG);
         self.masm.jump(done);
     }
+}
+
+/// The fields JIT code stores into a new rope string itself: its compressed
+/// halves.
+fn rope_stored_fields(rope: &RopeAllocationInfo) -> [(u32, u32); 2] {
+    [(rope.lhs_offset, 4), (rope.rhs_offset, 4)]
 }

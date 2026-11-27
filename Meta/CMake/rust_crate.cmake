@@ -1,5 +1,26 @@
 set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
 
+# Detect the Rust toolchain.
+find_program(RUST_CARGO cargo REQUIRED)
+find_program(RUST_RUSTC rustc REQUIRED)
+
+if (NOT DEFINED RUSTC_WRAPPER)
+    set(RUSTC_WRAPPER "$ENV{RUSTC_WRAPPER}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache")
+endif()
+if (NOT RUSTC_WRAPPER)
+    find_program(SCCACHE_PROGRAM sccache)
+    if (SCCACHE_PROGRAM)
+        set(RUSTC_WRAPPER "${SCCACHE_PROGRAM}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache" FORCE)
+    endif()
+endif()
+
+if (NOT DEFINED CACHE{RUST_TARGET_TRIPLE})
+    execute_process(COMMAND "${RUST_RUSTC}" -vV OUTPUT_VARIABLE rustc_verbose)
+    string(REGEX MATCH "host: ([^\n]+)" _ "${rustc_verbose}")
+    string(STRIP "${CMAKE_MATCH_1}" host_triple)
+    set(RUST_TARGET_TRIPLE "${host_triple}" CACHE INTERNAL "Rust target triple")
+endif()
+
 # Compiler flags shared by Rust libraries, binaries, and tests.
 set(RUSTC_TARGET_FLAGS -Dwarnings ${RUSTC_TARGET_CPU_FLAGS} ${RUSTC_TARGET_FRAME_POINTER_FLAGS})
 list(JOIN RUSTC_TARGET_FLAGS " " RUSTC_TARGET_FLAGS)
@@ -97,8 +118,7 @@ function(import_rust_crate)
     _rust_crate_link_runtime_libraries(${ARG_CRATE_NAME})
 
     # The archive on its own, without the initializer and the kept symbols of the library that imports the crate, for a
-    # target that takes a crate the archive bundles out of it, as the JavaScript tools take the LibJS runtime out of
-    # LibWeb's crate.
+    # target that takes a crate the archive bundles out of it.
     add_library(${ARG_CRATE_NAME}_archive STATIC IMPORTED GLOBAL)
     set_target_properties(${ARG_CRATE_NAME}_archive PROPERTIES IMPORTED_LOCATION "${output_lib}")
     add_dependencies(${ARG_CRATE_NAME}_archive ${ARG_CRATE_NAME}-build)
@@ -136,8 +156,7 @@ endfunction()
 #
 # Defines the object library <crate>_init, whose one object sets up the panic hook and the demangler of the crate in
 # whatever links the object. import_rust_crate() defines it for the crate it imports; a target that takes a crate out
-# of the archive of another import, as the JavaScript tools take the LibJS runtime out of LibWeb's crate, defines it for
-# that crate.
+# of the archive of another import defines it for that crate.
 function(add_rust_crate_initializer crate)
     set(RUST_CRATE_NAME ${crate})
     configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RustCrateInit.cpp.in"
@@ -314,6 +333,10 @@ function(test_rust_crate)
         TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/tests/${ARG_CRATE_NAME}"
     )
     list(APPEND cargo_env ${ARG_ENVIRONMENT})
+    # Test binaries link OpenSSL themselves where libcrypto_rust is asked to; see its build script.
+    if (OPENSSL_CRYPTO_LIBRARY)
+        list(APPEND cargo_env "LADYBIRD_OPENSSL_CRYPTO_LIBRARY=${OPENSSL_CRYPTO_LIBRARY}")
+    endif()
     # cargo test accepts harness arguments after --, not rustc arguments.
     list(FIND cargo_common_flags "--" rustc_flags_start)
     list(SUBLIST cargo_common_flags 0 ${rustc_flags_start} cargo_test_flags)
@@ -339,25 +362,6 @@ function(_rust_crate_common_setup)
     while(NOT EXISTS "${workspace_dir}/Cargo.lock")
         get_filename_component(workspace_dir "${workspace_dir}" DIRECTORY)
     endwhile()
-
-    # Detect the Rust toolchain.
-    find_program(RUST_CARGO cargo REQUIRED)
-    find_program(RUST_RUSTC rustc REQUIRED)
-    if (NOT DEFINED RUSTC_WRAPPER)
-        set(RUSTC_WRAPPER "$ENV{RUSTC_WRAPPER}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache")
-    endif()
-    if (NOT RUSTC_WRAPPER)
-        find_program(SCCACHE_PROGRAM sccache)
-        if (SCCACHE_PROGRAM)
-            set(RUSTC_WRAPPER "${SCCACHE_PROGRAM}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache" FORCE)
-        endif()
-    endif()
-    if (NOT DEFINED CACHE{RUST_TARGET_TRIPLE})
-        execute_process(COMMAND "${RUST_RUSTC}" -vV OUTPUT_VARIABLE rustc_verbose)
-        string(REGEX MATCH "host: ([^\n]+)" _ "${rustc_verbose}")
-        string(STRIP "${CMAKE_MATCH_1}" host_triple)
-        set(RUST_TARGET_TRIPLE "${host_triple}" CACHE INTERNAL "Rust target triple")
-    endif()
 
     # Build the uppercased and underscored variants of the target triple.
     string(REPLACE "-" "_" target_underscore "${RUST_TARGET_TRIPLE}")
@@ -395,6 +399,10 @@ function(_rust_crate_common_setup)
         list(APPEND cargo_env "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true")
     endif()
 
+    if (LADYBIRD_GENERATE_SYMBOL_FILES)
+        list(APPEND cargo_env "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only")
+    endif()
+
     if (RUSTC_WRAPPER)
         list(APPEND cargo_env
             "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
@@ -405,6 +413,13 @@ function(_rust_crate_common_setup)
     if (ARG_FFI_OUTPUT_DIR)
         list(APPEND cargo_env "FFI_OUTPUT_DIR=${ARG_FFI_OUTPUT_DIR}")
     endif()
+
+    # The crates of the shared target directory link into libraries that link AK, so the ak crate leaves the math
+    # functions to AK rather than compiling a copy of its own.
+    if (NOT ARG_TARGET_DIR)
+        list(APPEND cargo_env "LADYBIRD_LINKS_AK=1")
+    endif()
+    list(APPEND cargo_env "LLVM_LIBC_INCLUDE_DIR=${LLVM_LIBC_INCLUDE_DIR}/llvm-libc")
 
     # On Windows, rustc invokes the linker directly with MSVC-style flags, so we must not override it with a
     # compiler driver like clang-cl.
@@ -417,6 +432,9 @@ function(_rust_crate_common_setup)
 
     if (APPLE AND CMAKE_OSX_SYSROOT)
         list(APPEND cargo_env "SDKROOT=${CMAKE_OSX_SYSROOT}")
+    endif()
+    if (APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
+        list(APPEND cargo_env "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
     endif()
 
     set(cargo_common_flags
@@ -431,8 +449,6 @@ function(_rust_crate_common_setup)
     )
 
     # Populate the variable names used by the public helpers below.
-    set(RUST_CARGO "${RUST_CARGO}" PARENT_SCOPE)
-
     set(cargo_common_flags "${cargo_common_flags}" PARENT_SCOPE)
     set(cargo_env "${cargo_env}" PARENT_SCOPE)
     set(cargo_output_dir "${cargo_output_dir}" PARENT_SCOPE)

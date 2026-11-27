@@ -22,19 +22,16 @@ pub(crate) struct OESVertexArrayObject {
 }
 
 impl Wrappable for OESVertexArrayObject {
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         self.context.state().canvas().relevant_realm()
     }
 }
 
 impl OESVertexArrayObject {
     pub(crate) fn create(vm: &Vm, context: &ContextState) -> Ref<Self> {
-        allocate(
-            vm,
-            Self {
-                context: context.context_ref(),
-            },
-        )
+        allocate(vm, |_| Self {
+            context: context.context_ref(),
+        })
     }
 
     fn is_bound(&self, array_object: Ref<WebGLVertexArrayObjectOES>) -> bool {

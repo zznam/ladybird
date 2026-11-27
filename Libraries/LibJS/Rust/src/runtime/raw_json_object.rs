@@ -21,30 +21,32 @@ pub struct RawJSONObject {
 }
 
 define_object_class!(RawJSONObject, extends: [Object], methods: {
+    // NB: The [[IsRawJSON]] internal slot holds nothing, so the object has no field for it.
+    has_internal_slots: Some(true),
     ..ORDINARY_OBJECT_METHODS
 });
 
 impl RawJSONObject {
     pub fn create(vm: &Vm, realm: Gc<Realm>, prototype: Option<Gc<Object>>) -> Gc<RawJSONObject> {
         let Some(prototype) = prototype else {
-            return realm.create_object(
-                vm,
-                RawJSONObject {
-                    base: Object::new_with_shape(
-                        Self::CLASS,
-                        realm.empty_object_shape(),
-                        MayInterfereWithIndexedPropertyAccess::No,
-                    ),
-                },
-            );
+            return realm.create_object(vm, |_| RawJSONObject {
+                base: Object::new_with_shape(
+                    Self::CLASS,
+                    realm.empty_object_shape(),
+                    MayInterfereWithIndexedPropertyAccess::No,
+                ),
+            });
         };
 
-        realm.create_object(
-            vm,
-            RawJSONObject {
-                base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-            },
-        )
+        realm.create_object(vm, |_| RawJSONObject {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 }
 

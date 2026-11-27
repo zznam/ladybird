@@ -8,7 +8,6 @@
 
 namespace Gfx {
 
-class PainterSkia;
 class PaintingSurface;
 class SkiaBackendContext;
 
@@ -16,6 +15,7 @@ class SkiaBackendContext;
 
 namespace Compositor {
 
+class CanvasHost;
 class CanvasSurfaceRegistry;
 class ConnectionFromClient;
 class ConnectionFromPresentation;

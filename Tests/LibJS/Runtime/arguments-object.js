@@ -138,6 +138,24 @@ test("arguments of the enclosing function in arrow functions", () => {
     expect(writeThroughArrow(1, 2)).toBe("written");
 });
 
+test("catch parameter named arguments does not take the place of the arguments object", () => {
+    function local() {
+        try {
+            throw 1;
+        } catch (arguments) {}
+        return arguments.length;
+    }
+    expect(local(1, 2)).toBe(2);
+
+    function captured() {
+        try {
+            throw 1;
+        } catch (arguments) {}
+        return (() => arguments.length)();
+    }
+    expect(captured(1, 2)).toBe(2);
+});
+
 test("functions whose arguments object is never used", () => {
     const add = new Function("a", "b", "return a + b;");
     expect(add(1, 2)).toBe(3);
@@ -165,4 +183,290 @@ test("block-level function named arguments with arguments object reached through
         return [before, (() => eval("typeof arguments"))()];
     }
     expect(g(1, 2)).toEqual([2, "function"]);
+});
+
+test("var named arguments shares the binding of the arguments object", () => {
+    function capturedBeforeDeclaration() {
+        const length = (() => arguments.length)();
+        var arguments;
+        return [length, arguments.length];
+    }
+    expect(capturedBeforeDeclaration(1, 2)).toEqual([2, 2]);
+
+    function capturedAfterDeclaration() {
+        var arguments;
+        return (() => arguments.length)();
+    }
+    expect(capturedAfterDeclaration(1, 2)).toBe(2);
+
+    function assignedThroughArrowFunction() {
+        var arguments;
+        const assign = () => {
+            arguments = "assigned";
+        };
+        assign();
+        return arguments;
+    }
+    expect(assignedThroughArrowFunction()).toBe("assigned");
+
+    function capturedFunctionDeclaration() {
+        const type = (() => typeof arguments)();
+        function arguments() {}
+        return type;
+    }
+    expect(capturedFunctionDeclaration()).toBe("function");
+
+    function capturedBlockFunction() {
+        const before = (() => typeof arguments)();
+        {
+            function arguments() {}
+        }
+        return [before, typeof arguments];
+    }
+    expect(capturedBlockFunction()).toEqual(["object", "function"]);
+
+    function blockFunctionWithParameterExpression(first = 1) {
+        const before = (() => typeof arguments)();
+        {
+            function arguments() {}
+        }
+        return [before, typeof arguments];
+    }
+    expect(blockFunctionWithParameterExpression()).toEqual(["object", "function"]);
+
+    function laterBindingsKeepTheirPlaces() {
+        var arguments;
+        var first = 1;
+        var second = 2;
+        const read = () => [first, second];
+        first++;
+        return read();
+    }
+    expect(laterBindingsKeepTheirPlaces()).toEqual([2, 2]);
+});
+
+test("var named arguments before its first use keeps the parameters mapped", () => {
+    function writeThroughArguments(a) {
+        var arguments;
+        arguments[0] = 2;
+        return a;
+    }
+    expect(writeThroughArguments(1)).toBe(2);
+    expect(Object.hasOwn(globalThis, "a")).toBeFalse();
+
+    function writeThroughParameter(b) {
+        var arguments;
+        b = 3;
+        return arguments[0];
+    }
+    expect(writeThroughParameter(1)).toBe(3);
+
+    function declaredInBlock(c) {
+        {
+            var arguments;
+        }
+        arguments[0] = 4;
+        return c;
+    }
+    expect(declaredInBlock(1)).toBe(4);
+
+    function outer() {
+        var d = "outer";
+        const keep = () => d;
+        function inner(d) {
+            var arguments;
+            const before = arguments[0];
+            arguments[0] = "inner";
+            return [before, d];
+        }
+        return [...inner(1), d];
+    }
+    expect(outer()).toEqual([1, "inner", "outer"]);
+
+    function outerWithoutTheName() {
+        var unrelated = 1;
+        const keep = () => unrelated;
+        function inner(e) {
+            var arguments;
+            return arguments[0];
+        }
+        return inner(5);
+    }
+    expect(outerWithoutTheName()).toBe(5);
+
+    const object = {
+        method(f) {
+            var arguments;
+            arguments[0] = 6;
+            return f;
+        },
+    };
+    expect(object.method(1)).toBe(6);
+
+    function* generator(g) {
+        var arguments;
+        arguments[0] = 7;
+        yield g;
+    }
+    expect(generator(1).next().value).toBe(7);
+
+    function arrowFunctionVar(h) {
+        return (() => {
+            var arguments;
+            return typeof arguments;
+        })();
+    }
+    expect(arrowFunctionVar(1)).toBe("undefined");
+
+    function generatorDeclaration(i) {
+        function* arguments() {}
+        return typeof arguments;
+    }
+    expect(generatorDeclaration(1)).toBe("function");
+});
+
+test("lexical declaration named arguments takes the place of the arguments object", () => {
+    function captured() {
+        const before = (() => {
+            try {
+                return arguments;
+            } catch (error) {
+                return error.name;
+            }
+        })();
+        let arguments = 1;
+        return [before, arguments];
+    }
+    expect(captured(1)).toEqual(["ReferenceError", 1]);
+
+    function reachedThroughDirectEval() {
+        const before = (() => {
+            try {
+                return eval("typeof arguments");
+            } catch (error) {
+                return error.name;
+            }
+        })();
+        let arguments = 1;
+        return [before, (() => arguments)()];
+    }
+    expect(reachedThroughDirectEval()).toEqual(["ReferenceError", 1]);
+
+    function laterBindingsStayDeclared() {
+        const before = (() => {
+            try {
+                return arguments;
+            } catch (error) {
+                return error.name;
+            }
+        })();
+        let arguments = 1;
+        var other = 2;
+        const read = () => other;
+        return [before, read()];
+    }
+    expect(laterBindingsStayDeclared()).toEqual(["ReferenceError", 2]);
+});
+
+test("lexical declaration named arguments is uninitialized until it is declared", () => {
+    function letDeclaration() {
+        arguments;
+        let arguments;
+    }
+    function constDeclaration() {
+        arguments;
+        const arguments = 1;
+    }
+    function destructuringDeclaration() {
+        arguments;
+        let [arguments] = [];
+    }
+    function usingDeclaration() {
+        arguments;
+        using arguments = null;
+    }
+
+    expect(letDeclaration).toThrow(ReferenceError);
+    expect(constDeclaration).toThrow(ReferenceError);
+    expect(destructuringDeclaration).toThrow(ReferenceError);
+    expect(usingDeclaration).toThrow(ReferenceError);
+});
+
+test("mapped arguments object in the strict code of a class", () => {
+    function computedKey(first) {
+        class C {
+            [arguments[0]]() {}
+        }
+        return Object.getOwnPropertyNames(C.prototype);
+    }
+
+    function heritage(first) {
+        const C = class extends arguments[0] {};
+        return Object.getPrototypeOf(C) === first;
+    }
+
+    function assignment(first) {
+        class C {
+            [(arguments[0] = "assigned")]() {}
+        }
+        return first;
+    }
+
+    function arrowInKey(first) {
+        class C {
+            [(() => arguments[0])()]() {}
+        }
+        return Object.getOwnPropertyNames(C.prototype);
+    }
+
+    function withEnvironment(first) {
+        const capture = () => this;
+        class C {
+            [arguments[0]]() {}
+        }
+        return Object.getOwnPropertyNames(C.prototype);
+    }
+
+    expect(computedKey("key")).toEqual(["constructor", "key"]);
+    expect(heritage(Object)).toBeTrue();
+    expect(assignment("original")).toBe("assigned");
+    expect(arrowInKey("key")).toEqual(["constructor", "key"]);
+    expect(withEnvironment("key")).toEqual(["constructor", "key"]);
+});
+
+test("mapped arguments used only in an arrow function with a use strict directive", () => {
+    function read(a) {
+        return (() => {
+            "use strict";
+            return arguments[0];
+        })();
+    }
+    expect(read(1)).toBe(1);
+
+    function write(a) {
+        (() => {
+            "use strict";
+            arguments[0] = 9;
+        })();
+        return a;
+    }
+    expect(write(1)).toBe(9);
+
+    function writeParameter(a) {
+        a = 5;
+        return (() => {
+            "use strict";
+            return (() => [...arguments])();
+        })();
+    }
+    expect(writeParameter(1, 2)).toEqual([5, 2]);
+
+    function* generator(a) {
+        yield (() => {
+            "use strict";
+            return delete arguments[0];
+        })();
+        yield a;
+    }
+    expect([...generator(1)]).toEqual([true, 1]);
 });

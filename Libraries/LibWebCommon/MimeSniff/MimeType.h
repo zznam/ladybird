@@ -12,6 +12,7 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Forward.h>
 #include <LibWebCommon/Export.h>
 
 namespace Web::FFI {
@@ -55,8 +56,6 @@ public:
 
     String const& essence() const;
     [[nodiscard]] String serialized() const;
-    [[nodiscard]] Utf16String serialized_as_utf16() const;
-
     static MimeType from_ffi(FFI::FfiMimeType const&);
     void lend_to_ffi(Function<void(FFI::FfiMimeType const&)> const&) const;
 
@@ -79,6 +78,8 @@ private:
     String m_cached_essence;
 };
 
-WEBCOMMON_API String minimise_a_supported_mime_type(MimeType const&);
+WEBCOMMON_API String minimise_a_supported_mime_type(MimeType const&, bool is_supported_by_the_user_agent);
 
 }
+
+GC_UNTRACED_CAPTURE(Web::MimeSniff::MimeType);

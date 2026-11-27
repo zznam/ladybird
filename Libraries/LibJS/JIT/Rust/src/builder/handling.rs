@@ -90,12 +90,11 @@ pub fn handling(opcode: OpCode) -> Handling {
     match opcode {
         // Control flow, moves and frame setup.
         O::Enter
+        | O::EnterCoercingThis
         | O::Mov
-        | O::Mov2
-        | O::Mov3
+        | O::MovWide
+        | O::WideNameIndices
         | O::MovSrcUndefined
-        | O::MovUndefined2
-        | O::MovUndefined3
         | O::Jump
         | O::JumpIf
         | O::JumpTrue
@@ -119,6 +118,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         O::GetLexicalEnvironment
         | O::SetLexicalEnvironment
         | O::LeavePrivateEnvironment
+        | O::EnterWithOwnEnvironments
         | O::IsCallable
         | O::GetArgumentCount => Handling::Native,
 
@@ -132,10 +132,14 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::CallConstruct
         | O::CallWithArgumentArray
         | O::CallConstructWithArgumentArray
-        | O::SuperCallWithArgumentArray => GENERIC_CALL,
-        O::CallDirectEval | O::CallDirectEvalWithArgumentArray => GENERIC_CALL_READS_WHOLE_FRAME,
+        | O::SuperCallWithArgumentArray
+        | O::SuperCall => GENERIC_CALL,
+        O::BindThisFromSuperCall => GENERIC,
+        O::CallDirectEval | O::CallDirectEvalWithArgumentArray | O::SuperCallWithForwardedArguments => {
+            GENERIC_CALL_READS_WHOLE_FRAME
+        }
 
-        O::CreateArguments | O::CreateRestParams | O::Debugger => GENERIC_READS_WHOLE_FRAME,
+        O::CreateArguments | O::CreateRestParams | O::GetArgument | O::Debugger => GENERIC_READS_WHOLE_FRAME,
 
         // Slow paths that only allocate or inspect values.
         O::NewObject
@@ -143,6 +147,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::NewArray
         | O::NewPrimitiveArray
         | O::NewFunction
+        | O::NewFunctionWide
         | O::NewReferenceError
         | O::NewTypeError
         | O::CreateLexicalEnvironment
@@ -273,9 +278,9 @@ pub fn handling(opcode: OpCode) -> Handling {
         // has no return method for it.
         O::IteratorClose => EXPANDED,
 
-        // Conversions that change nothing for objects, and for lengths that
-        // are int32 values already.
-        O::ToObject | O::ToLength => EXPANDED,
+        // Conversions that change nothing for objects, for lengths that are
+        // int32 values already, and for primitives.
+        O::ToObject | O::ToLength | O::ToPrimitiveWithStringHint => EXPANDED,
 
         // Concatenations of strings, and of a string and an integer.
         O::ConcatString => EXPANDED,
@@ -286,6 +291,8 @@ pub fn handling(opcode: OpCode) -> Handling {
         O::Exp
         | O::CopyObjectExcludingProperties
         | O::ImportCall
+        | O::GetClassFieldInitializerName
+        | O::GetClassProtoParent
         | O::NewClass
         | O::GetImportMeta
         | O::GetImport
@@ -299,6 +306,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::ResolveBinding
         | O::ResolveGlobalBinding
         | O::ResolveSuperBase
+        | O::GetResolvedBinding
         | O::SetResolvedBinding
         | O::TypeofBinding
         | O::DynamicTypeofBinding
@@ -313,7 +321,6 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::ThrowNotAFunction
         | O::Throw
         | O::ToString
-        | O::ToPrimitiveWithStringHint
         | O::DynamicGetCalleeAndThisFromEnvironment
         | O::GetByIdWithThis
         | O::PutByIdWithThis
@@ -324,6 +331,8 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::GetMethod
         | O::GetObjectPropertyIterator
         | O::IteratorNext
+        | O::IteratorStep
+        | O::SetVariableBindingOfBlockFunction
         | O::IteratorToArray
         | O::CacheObjectShape
         | O::InitObjectLiteralProperty

@@ -6,17 +6,22 @@
 
 #pragma once
 
-#include <AK/ByteString.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
-#include <LibCore/ImmutableBytes.h>
+#include <LibGC/Forward.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Position.h>
+
+namespace JS::FFI {
+
+struct WeakSourceCode;
+
+}
 
 namespace JS {
 
@@ -28,25 +33,39 @@ class JS_API SourceCode {
     AK_MAKE_NONMOVABLE(SourceCode);
 
 public:
-    static NonnullRefPtr<SourceCode const> create(Utf16String filename, Utf16String code);
+    GC_HOLDS_NO_CELL_EDGES;
 
-    // This decodes the bytes right away rather than when the code is first needed.
-    static NonnullRefPtr<SourceCode const> create(Utf16String filename, size_t length_in_code_units, ByteString source_encoding, Core::ImmutableBytes source_bytes);
+    static NonnullRefPtr<SourceCode const> create(Utf16String filename, Utf16String code);
+    // Source code under another filename that shares the code of the given source code, parked or not.
+    static NonnullRefPtr<SourceCode const> create_sharing_code(Utf16String filename, SourceCode const&);
 
     Utf16String const& filename() const;
-    Utf16String const& code() const;
+    // NB: The runtime may hold the code compressed, so this is a string of its own, not a reference to one.
+    Utf16String code() const;
     size_t length_in_code_units() const;
-
-    // The code as UTF-16 code units, which stay valid while the source code lives, so another thread may read them.
-    u16 const* utf16_data() const;
-
-    Utf16String source_text_from_offsets(size_t start_offset, size_t length) const;
 
     void ref() const;
     void unref() const;
 
     SourceCode() = delete;
     ~SourceCode() = delete;
+};
+
+// A weak reference to source code, which tells whether anything still holds it. Only the VM's thread may use it.
+class JS_API WeakSourceCode {
+    AK_MAKE_NONCOPYABLE(WeakSourceCode);
+
+public:
+    explicit WeakSourceCode(SourceCode const&);
+    WeakSourceCode(WeakSourceCode&&);
+    WeakSourceCode& operator=(WeakSourceCode&&);
+    ~WeakSourceCode();
+
+    bool is_alive() const;
+    RefPtr<SourceCode const> strong_ref() const;
+
+private:
+    FFI::WeakSourceCode* m_weak { nullptr };
 };
 
 }

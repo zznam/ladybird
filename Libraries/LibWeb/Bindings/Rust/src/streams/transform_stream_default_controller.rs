@@ -12,7 +12,7 @@ use core::cell::Cell;
 use libjs_rust::api::{GcRefCell, Throw, Trace, Value};
 
 use crate::bindings::interface::{Ref, Wrappable, allocate};
-use crate::bindings::promise::{WebIdlPromise, exception_value, upon_rejection};
+use crate::bindings::promise::{WebIdlPromise, create_resolved_promise, exception_value, upon_rejection};
 use crate::bindings::{CallContext, Exception, WebIdlResult};
 use crate::streams::algorithms::{CancelAlgorithm, FlushAlgorithm, TransformAlgorithm};
 use crate::streams::readable_stream_default_controller::{
@@ -77,7 +77,7 @@ impl TransformStreamDefaultController {
     }
 
     pub(crate) fn set_cancel_algorithm(&self, algorithm: Option<CancelAlgorithm>) {
-        *self.cancel_algorithm.borrow_mut() = algorithm;
+        self.cancel_algorithm.replace(algorithm);
     }
 
     pub(crate) fn flush_algorithm(&self) -> Option<FlushAlgorithm> {
@@ -85,7 +85,7 @@ impl TransformStreamDefaultController {
     }
 
     pub(crate) fn set_flush_algorithm(&self, algorithm: Option<FlushAlgorithm>) {
-        *self.flush_algorithm.borrow_mut() = algorithm;
+        self.flush_algorithm.replace(algorithm);
     }
 
     pub(crate) fn transform_algorithm(&self) -> Option<TransformAlgorithm> {
@@ -93,7 +93,7 @@ impl TransformStreamDefaultController {
     }
 
     pub(crate) fn set_transform_algorithm(&self, algorithm: Option<TransformAlgorithm>) {
-        *self.transform_algorithm.borrow_mut() = algorithm;
+        self.transform_algorithm.replace(algorithm);
     }
 
     // https://streams.spec.whatwg.org/#ts-default-controller-desired-size
@@ -168,7 +168,7 @@ pub(crate) fn set_up_transform_stream_default_controller_from_transformer(
     transformer_dict: Transformer,
 ) {
     // 1. Let controller be a new TransformStreamDefaultController.
-    let controller = allocate(cx.vm(), TransformStreamDefaultController::new());
+    let controller = allocate(cx.vm(), |_| TransformStreamDefaultController::new());
 
     // 2. Let transformAlgorithm be the following steps, taking a chunk argument:
     let mut transform_algorithm = TransformAlgorithm::Enqueue(controller);
@@ -306,10 +306,12 @@ pub(crate) fn transform_stream_default_controller_perform_transform(
     let vm = cx.vm();
 
     // 1. Let transformPromise be the result of performing controller.[[transformAlgorithm]], passing chunk.
-    let transform_algorithm = controller
-        .transform_algorithm()
-        .expect("the controller's algorithms are not cleared");
-    let transform_promise = transform_algorithm.run(&controller.stream().context(vm), chunk);
+    // AD-HOC: A write that waited for backpressure to go away can get here after terminate() or an error cleared the
+    //         algorithms. There is nothing left to run then.
+    let transform_promise = match controller.transform_algorithm() {
+        Some(transform_algorithm) => transform_algorithm.run(&controller.stream().context(vm), chunk),
+        None => create_resolved_promise(vm, cx.realm(), Value::UNDEFINED),
+    };
 
     // 2. Return the result of reacting to transformPromise with the following rejection steps given the argument r:
     upon_rejection(vm, transform_promise, controller, |cx, controller, reason| {

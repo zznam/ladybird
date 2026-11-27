@@ -48,7 +48,7 @@ pub struct Reference {
     strict: Strict,
 }
 
-// SAFETY: Visits the base, the property key and the this value, as Reference::visit_edges does.
+// SAFETY: Visits the base, the name and the this value, as Reference::visit_edges does.
 unsafe impl Trace for Reference {
     fn trace(&self, visitor: &mut Visitor) {
         match self.base_type {
@@ -58,8 +58,7 @@ unsafe impl Trace for Reference {
         }
         match &self.name {
             ReferencedName::PropertyKey(key) => key.trace(visitor),
-            // No GC pointers.
-            ReferencedName::PrivateName(_) => {}
+            ReferencedName::PrivateName(name) => name.trace(visitor),
         }
         self.this_value.trace(visitor);
     }
@@ -454,7 +453,7 @@ pub fn make_private_reference(vm: &Vm, base_value: Value, private_identifier: &U
         .expect("MakePrivateReference runs in an execution context");
 
     // 1. Let privEnv be the running execution context's PrivateEnvironment.
-    let private_environment = context.private_environment.get();
+    let private_environment = context.private_environment();
 
     // 2. Assert: privEnv is not null.
     let private_environment = private_environment.expect("there is a private environment");

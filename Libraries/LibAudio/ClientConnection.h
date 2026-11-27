@@ -17,8 +17,11 @@
 #include <LibAudio/AudioDevices.h>
 #include <LibAudio/AudioServerEndpoint.h>
 #include <LibAudio/Export.h>
+#include <LibAudio/OutputSession.h>
+#include <LibAudio/PlaybackGroupId.h>
 #include <LibAudio/PlaybackStream.h>
 #include <LibAudio/RecordStream.h>
+#include <LibAudio/RecordStreamFailure.h>
 #include <LibAudio/SharedAudioFrameRing.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Promise.h>
@@ -43,14 +46,20 @@ public:
     static bool has_transport_factory();
     // The process's connection, established on first use and replaced after it dies.
     static ErrorOr<NonnullRefPtr<ClientConnection>> acquire();
+    // Whether a capture waits on the server for its device, which another capture of the same device would join.
+    static bool capture_is_pending_for_testing();
+    static size_t capture_stream_count_for_testing();
 
     explicit ClientConnection(NonnullOwnPtr<IPC::Transport>);
     virtual ~ClientConnection() override;
 
     Core::EventLoop& event_loop() { return m_event_loop; }
 
-    // Resolves once the server reports the device format; rejects if it cannot open a device or dies first.
-    NonnullRefPtr<PlaybackStream::CreatePromise> create_stream(OutputState, u32 target_latency_ms, PlaybackStream::AudioDataRequestCallback);
+    // Resolves once the server reports the device format; rejects if it cannot open a device or dies first. The stream
+    // keeps its session, as does its creation until then.
+    NonnullRefPtr<PlaybackStream::CreatePromise> create_stream(OutputState, u32 target_latency_ms, NonnullRefPtr<OutputSession>, PlaybackStream::AudioDataRequestCallback);
+    void session_rebound(Badge<OutputSession>, u64 session_id, PlaybackGroupId);
+    void session_destroyed(Badge<OutputSession>, u64 session_id);
 
     enum class StreamRequest : u8 {
         Resume,
@@ -75,7 +84,7 @@ public:
     // Resolves with a RemoteRecordStream carrying the device's frames in the device's own format. Streams on one
     // device share the server's capture stream and one ring. Rejects if the server cannot open the device or the
     // connection dies first.
-    NonnullRefPtr<RecordStream::CreatePromise> create_record_stream(StringView device_id, RecordStream::RecordCallback);
+    NonnullRefPtr<RecordStream::CreatePromise> create_record_stream(StringView device_id, PlaybackGroupId, RecordStream::RecordCallback);
     void record_stream_unsubscribed(Badge<RemoteRecordStream>, u64 stream_id);
     void register_record_stream(Badge<RemoteRecordStream>, RemoteRecordStream&);
     void unregister_record_stream(Badge<RemoteRecordStream>, RemoteRecordStream&);
@@ -88,7 +97,7 @@ private:
     virtual void stream_request_completed(u64 stream_id, u64 request_id) override;
     virtual void devices_changed(Vector<AudioDeviceInfo> inputs, Vector<AudioDeviceInfo> outputs) override;
     virtual void record_stream_created(u64 stream_id, SharedAudioFrameRing ring) override;
-    virtual void record_stream_creation_failed(u64 stream_id) override;
+    virtual void record_stream_creation_failed(u64 stream_id, RecordStreamFailure) override;
     virtual void record_stream_closed(u64 stream_id) override;
 
     void pump_thread_main();
@@ -102,6 +111,7 @@ private:
 
     struct PendingStream {
         NonnullRefPtr<PlaybackStream::CreatePromise> promise;
+        NonnullRefPtr<OutputSession> session;
         PlaybackStream::AudioDataRequestCallback callback;
         OutputState initial_state { OutputState::Suspended };
         u32 target_latency_ms { 0 };
@@ -115,6 +125,7 @@ private:
     // One per device this process records from, under the id of the server-side stream.
     struct CaptureSource {
         ByteString device_id;
+        PlaybackGroupId group;
         // Unset until the server hands over the ring.
         Optional<SampleSpecification> specification;
         Vector<PendingRecordStream> pending;

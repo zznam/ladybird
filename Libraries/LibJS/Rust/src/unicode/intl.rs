@@ -19,23 +19,26 @@ use crate::utf16::{Utf16StringBuilder, Utf16View};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct UnicodeIntlText {
-    ascii: *const u8,
+    latin1: *const u8,
     utf16: *const u16,
     length: usize,
+    is_ascii: bool,
 }
 
 impl UnicodeIntlText {
     pub(crate) fn of(view: Utf16View<'_>) -> Self {
         match view {
-            Utf16View::Ascii(units) => Self {
-                ascii: units.as_ptr(),
+            Utf16View::Ascii(units) | Utf16View::Latin1(units) => Self {
+                latin1: units.as_ptr(),
                 utf16: core::ptr::null(),
                 length: units.len(),
+                is_ascii: view.has_ascii_storage(),
             },
             Utf16View::Utf16(units) => Self {
-                ascii: core::ptr::null(),
+                latin1: core::ptr::null(),
                 utf16: units.as_ptr(),
                 length: units.len(),
+                is_ascii: false,
             },
         }
     }
@@ -68,7 +71,7 @@ unsafe extern "C" {
     fn unicode_is_locale_available(locale: UnicodeIntlText) -> bool;
     fn unicode_add_likely_subtags(locale: UnicodeIntlText, output: UnicodeTextMappingOutput) -> bool;
     fn unicode_remove_likely_subtags(locale: UnicodeIntlText, output: UnicodeTextMappingOutput) -> bool;
-    fn unicode_is_locale_character_ordering_right_to_left(locale: UnicodeIntlText) -> bool;
+    fn unicode_is_script_right_to_left(script: UnicodeIntlText, right_to_left: *mut bool) -> bool;
     fn unicode_default_locale(output: UnicodeTextMappingOutput);
 
     fn unicode_available_keyword_values(
@@ -581,10 +584,12 @@ pub fn remove_likely_subtags(locale: Utf16View<'_>) -> Option<Utf16String> {
     optional_text_output(|output| unsafe { unicode_remove_likely_subtags(UnicodeIntlText::of(locale), output) })
 }
 
-/// Unicode::is_locale_character_ordering_right_to_left.
-pub fn is_locale_character_ordering_right_to_left(locale: Utf16View<'_>) -> bool {
-    // SAFETY: The locale is valid for its length.
-    unsafe { unicode_is_locale_character_ordering_right_to_left(UnicodeIntlText::of(locale)) }
+/// Unicode::is_script_right_to_left.
+pub fn is_script_right_to_left(script: Utf16View<'_>) -> Option<bool> {
+    let mut right_to_left = false;
+    // SAFETY: The script is valid for its length, and the output points to a live bool.
+    let has_direction = unsafe { unicode_is_script_right_to_left(UnicodeIntlText::of(script), &raw mut right_to_left) };
+    has_direction.then_some(right_to_left)
 }
 
 /// Unicode::available_keyword_values.

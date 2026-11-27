@@ -6,11 +6,12 @@
 
 #pragma once
 
-#include <AK/Array.h>
 #include <AK/LexicalPath.h>
 #include <AK/StringView.h>
 #include <AK/Time.h>
 #include <AK/Types.h>
+#include <LibHTTP/Cache/CacheKey.h>
+#include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Forward.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibURL/Forward.h>
@@ -27,35 +28,19 @@ constexpr inline u64 DEFAULT_MAXIMUM_DISK_CACHE_SIZE = 5 * GiB;
 constexpr inline size_t MAXIMUM_VARY_FIELD_COUNT = 32;
 constexpr inline size_t MAXIMUM_CACHE_ENTRY_VARIANT_COUNT = 16;
 
-enum class CacheEntryAssociatedData {
-    JavaScriptBytecode,
-};
-constexpr inline Array CACHE_ENTRY_ASSOCIATED_DATA_TYPES {
-    CacheEntryAssociatedData::JavaScriptBytecode,
-};
-
 i64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache_size = DEFAULT_MAXIMUM_DISK_CACHE_SIZE);
 i64 compute_maximum_disk_cache_entry_size(i64 maximum_disk_cache_size);
 
 String serialize_url_for_cache_storage(URL::URL const&);
-u64 create_cache_key(Utf16View const& partition, StringView url, StringView method);
-
-// For a cache that is itself one partition, such as a memory cache of one partition.
-u64 create_cache_key(StringView url, StringView method);
+CacheDigest create_cache_key(Utf16View const& partition, StringView url, StringView method);
+CacheKey create_cache_key(StringView url, StringView method);
 Optional<Vector<ByteString>> vary_field_names(HeaderList const& response_headers);
-Optional<u64> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers);
-LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key);
-LexicalPath path_for_cache_entry_associated_data(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key, CacheEntryAssociatedData);
-
-struct CacheEntryData {
-    u64 cache_key { 0 };
-    u64 vary_key { 0 };
-    Optional<CacheEntryAssociatedData> associated_data;
-};
-Optional<CacheEntryData> cache_entry_data_for_file(LexicalPath const&);
+Optional<CacheDigest> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers);
+LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, CacheDigest const& cache_key, CacheDigest const& vary_key);
 
 bool is_cacheable(StringView method, HeaderList const&);
 bool has_preconditions(HeaderList const& request_headers);
+bool request_permits_stale_responses(CacheMode, HeaderList const& request_headers);
 bool is_cacheable(u32 status_code, HeaderList const&);
 bool is_header_exempted_from_storage(StringView name);
 NonnullRefPtr<HeaderList> remove_connection_specific_fields(HeaderList const&);

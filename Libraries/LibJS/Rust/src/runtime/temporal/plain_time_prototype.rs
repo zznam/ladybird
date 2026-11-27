@@ -63,17 +63,15 @@ fn string_value(vm: &Vm, string: &str) -> Value {
 
 impl PlainTimePrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<PlainTimePrototype> {
-        realm.create_object(
-            vm,
-            PlainTimePrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| PlainTimePrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {

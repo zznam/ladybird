@@ -15,12 +15,16 @@ use super::host::{
 use super::image_map_areas::{AreaCoverage, AreaShape, PublishedImageMapArea};
 use super::layer_image_paint_facts::{LayerImagePaintFacts, LayerImagePaintFactsEntry};
 use super::paint_read::GeometryRead;
-use super::paintable_data::{FfiSearchTextRange, FfiSelectionEntry, FfiSpellingError, PaintableFlag};
-use super::record::damage::PaintDamage;
+use super::paintable_data::{
+    FfiCustomHighlightReplacedEntry, FfiCustomHighlightTextEntry, FfiSearchTextRange, FfiSelectionEntry,
+    FfiSpellingError, PaintableFlag,
+};
+use super::record::change_ticks::RowPaintChange;
 use super::replaced_paint_facts::{ImagePaintFacts, ReplacedPaintFacts, VideoPaintFacts};
 use super::selection::HighlightStyleRecords;
 use super::visual_context::dirty::VisualContextBoxDirtyKind;
 use crate::css::css_pixels::{CssPixelPoint, FfiCssPixelPoint};
+use crate::css::style::index::StyleAtomID;
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
@@ -57,6 +61,17 @@ pub(crate) enum PaintChange {
     },
     /// No text is flagged as misspelled.
     ClearSpellingErrors,
+    /// The registered custom highlights and what of the document they cover.
+    ApplyCustomHighlights {
+        viewport: NodeSlotId,
+        layers: Box<[StyleAtomID]>,
+        text_entries: Box<[FfiCustomHighlightTextEntry]>,
+        replaced_entries: Box<[FfiCustomHighlightReplacedEntry]>,
+    },
+    /// No custom highlight covers anything.
+    ClearCustomHighlights,
+    /// Whether a registered custom highlight holds a range.
+    SetHasRegisteredCustomHighlightRanges(bool),
     /// The element's style changed: the rows that paint text under it take what `style_records`, the `::selection`,
     /// `::search-text` and `::spelling-error` records the host holds for it (zero for none), say highlighted text
     /// paints with.
@@ -64,11 +79,10 @@ pub(crate) enum PaintChange {
         element: StyleNodeID,
         style_records: HighlightStyleRecords,
     },
-    /// Whether the scrollbar of the row in `direction` is drawn enlarged, as it is while the user hovers or drags it.
-    SetScrollbarEnlarged {
-        node: NodeSlotId,
-        direction: ScrollDirection,
-        enlarged: bool,
+    /// The element's style changed. The rows that paint text under it take its `::highlight()` records by name.
+    SyncCustomHighlightPseudoStyles {
+        element: StyleNodeID,
+        style_records: Box<[(StyleAtomID, u64)]>,
     },
     /// Whether the overlay scrollbar of the row in `direction` has faded out, so that it takes no pointer input.
     SetScrollbarHidden {
@@ -99,18 +113,17 @@ pub(crate) enum PaintChange {
         node: NodeSlotId,
         kind: VisualContextBoxDirtyKind,
     },
-    /// Every row paints again.
-    InvalidateAllPaintCaches,
     /// The visual context tree is built again whole before it is published next.
     RequestFullVisualContextRebuild(super::visual_context::dirty::VisualContextUpdateScope),
     /// The SVG paint resources the rows enrolled may have changed: they are synced again before they are painted next.
     SvgPaintResourcesChanged,
     /// Whether the document's recordings are traced.
     SetRecordingTraceEnabled(bool),
+    /// The updates of the document's visual context tree are traced from now on.
+    BeginVisualContextTrace,
     /// The host published the recording `output` and takes it in as the document's last.
     TakeInRecording {
         output: Arc<super::record::RecordingOutput>,
-        hit_test_list_changed: bool,
         publishes_recording: bool,
     },
 }
@@ -142,7 +155,7 @@ impl PaintChange {
                 }
                 let selection =
                     super::selection::apply(&mut arena.paintable_rows_mut(), &entries, start_offset, end_offset);
-                arena.paint_state().borrow_mut().selection = Some(Arc::new(selection));
+                arena.paint_state_mut().selection = Some(Arc::new(selection));
             }
             Self::ClearSelection { viewport } => {
                 if arena.paintable_row_is_populated(viewport) {
@@ -165,27 +178,30 @@ impl PaintChange {
                 }
             }
             Self::ClearSpellingErrors => super::selection::clear_spelling_errors(&mut arena.paintable_rows_mut()),
+            Self::ApplyCustomHighlights {
+                viewport,
+                layers,
+                text_entries,
+                replaced_entries,
+            } => {
+                if arena.paintable_row_is_populated(viewport) {
+                    super::selection::apply_custom_highlights(
+                        &mut arena.paintable_rows_mut(),
+                        &layers,
+                        &text_entries,
+                        &replaced_entries,
+                    );
+                }
+            }
+            Self::ClearCustomHighlights => super::selection::clear_custom_highlights(&mut arena.paintable_rows_mut()),
+            Self::SetHasRegisteredCustomHighlightRanges(has_ranges) => {
+                arena.paint_state_mut().has_registered_custom_highlight_ranges = has_ranges;
+            }
             Self::SyncHighlightPseudoStyles { element, style_records } => {
                 super::selection::sync_highlight_pseudo_styles(arena, element, style_records);
             }
-            Self::SetScrollbarEnlarged {
-                node,
-                direction,
-                enlarged,
-            } => {
-                let mut rows = arena.paintable_rows_mut();
-                if !rows.paintable_row_is_populated(node) {
-                    return;
-                }
-                let flag = match direction {
-                    ScrollDirection::Horizontal => PaintableFlag::HorizontalScrollbarEnlarged,
-                    ScrollDirection::Vertical => PaintableFlag::VerticalScrollbarEnlarged,
-                };
-                if rows.paintable_data(node).has_flag(flag) == enlarged {
-                    return;
-                }
-                rows.paintable_data_mut(node).set_flag(flag, enlarged);
-                rows.push_paint_damage(node, PaintDamage::DRAW_OVERLAY | PaintDamage::HIT_OVERLAY);
+            Self::SyncCustomHighlightPseudoStyles { element, style_records } => {
+                super::selection::sync_custom_highlight_pseudo_styles(arena, element, &style_records);
             }
             Self::SetScrollbarHidden {
                 node,
@@ -204,31 +220,32 @@ impl PaintChange {
                     return;
                 }
                 rows.paintable_data_mut(node).set_flag(flag, hidden);
-                rows.push_paint_damage(node, PaintDamage::HIT_OVERLAY);
+                rows.note_paint_change(node, RowPaintChange::HIT_TESTING);
             }
             Self::SetLayerImagePaintFacts { node, entries } => {
                 arena.set_layer_image_paint_facts(node, entries);
             }
             Self::SetReplacedPaintFacts { target, facts } => arena.set_replaced_paint_facts(target, facts),
             Self::SupersededReplacedPaintFacts => {}
-            Self::PublishImageMapAreas { node, areas } => arena.image_map_areas().publish(node, areas),
+            Self::PublishImageMapAreas { node, areas } => arena.image_map_areas_mut().publish(node, areas),
             Self::NoteVisualContextBoxDirty { node, kind } => {
                 if arena.paintable_row_is_populated(node) {
                     arena.note_visual_context_box_dirty(node, kind);
                 }
             }
-            Self::InvalidateAllPaintCaches => arena.push_all_paint_damage(),
             Self::RequestFullVisualContextRebuild(scope) => arena.request_full_visual_context_rebuild(scope),
             Self::SvgPaintResourcesChanged => {
-                arena.svg_paint_resources().note_changed();
+                arena.svg_paint_resources_mut().note_changed();
             }
-            Self::SetRecordingTraceEnabled(enabled) => arena.paint_state().borrow_mut().trace_recordings = enabled,
+            Self::SetRecordingTraceEnabled(enabled) => arena.paint_state_mut().trace_recordings = enabled,
+            Self::BeginVisualContextTrace => {
+                arena.paint_state_mut().visual_context.trace = Some(Default::default());
+            }
             Self::TakeInRecording {
                 output,
-                hit_test_list_changed,
                 publishes_recording,
             } => {
-                super::record::publish::take_in_recording(arena, output, hit_test_list_changed, publishes_recording);
+                super::record::publish::take_in_recording(arena, output, publishes_recording);
             }
         }
     }
@@ -314,6 +331,73 @@ pub extern "C" fn render_state_clear_spelling_errors(host: &DocumentHost) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn render_state_apply_custom_highlights(
+    host: &DocumentHost,
+    viewport: NodeSlotId,
+    layers: ak::Span<'_, u32>,
+    text_entries: ak::Span<'_, FfiCustomHighlightTextEntry>,
+    replaced_entries: ak::Span<'_, FfiCustomHighlightReplacedEntry>,
+) {
+    let tables = host.host_tables();
+    tables
+        .shows_custom_highlights
+        .set(!text_entries.as_slice().is_empty() || !replaced_entries.as_slice().is_empty());
+    let change = PaintChange::ApplyCustomHighlights {
+        viewport,
+        layers: layers.as_slice().iter().copied().map(StyleAtomID).collect(),
+        text_entries: text_entries.as_slice().into(),
+        replaced_entries: replaced_entries.as_slice().into(),
+    };
+    queue(host, change);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_clear_custom_highlights(host: &DocumentHost) {
+    // Rows that show no custom highlights have none to clear.
+    if !host.host_tables().shows_custom_highlights.replace(false) {
+        return;
+    }
+    queue(host, PaintChange::ClearCustomHighlights);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_has_registered_custom_highlight_ranges(host: &DocumentHost, has_ranges: bool) {
+    queue(host, PaintChange::SetHasRegisteredCustomHighlightRanges(has_ranges));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_custom_highlight_row_generation(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+) -> u64 {
+    super::ffi::read_arena(host, read, (), |arena, ()| {
+        arena.paint_state().custom_highlight_row_generation
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_sync_custom_highlight_pseudo_styles(
+    host: &DocumentHost,
+    element: u32,
+    names: ak::Span<'_, u32>,
+    style_records: ak::Span<'_, u64>,
+) {
+    let Some(element) = StyleNodeID::from_raw(element) else {
+        return;
+    };
+    let style_records = names
+        .as_slice()
+        .iter()
+        .zip(style_records.as_slice())
+        .map(|(&name, &record)| (StyleAtomID(name), record))
+        .collect();
+    queue(
+        host,
+        PaintChange::SyncCustomHighlightPseudoStyles { element, style_records },
+    );
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn render_state_sync_highlight_pseudo_styles(
     host: &DocumentHost,
     element: u32,
@@ -333,21 +417,6 @@ pub extern "C" fn render_state_sync_highlight_pseudo_styles(
             search_text_current_style_record,
             spelling_error_style_record,
         ],
-    };
-    queue(host, change);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_set_scrollbar_enlarged(
-    host: &DocumentHost,
-    node: NodeSlotId,
-    direction: ScrollDirection,
-    enlarged: bool,
-) {
-    let change = PaintChange::SetScrollbarEnlarged {
-        node,
-        direction,
-        enlarged,
     };
     queue(host, change);
 }
@@ -537,11 +606,6 @@ pub extern "C" fn render_state_note_visual_context_style_change(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_invalidate_all_paint_caches(host: &DocumentHost) {
-    queue(host, PaintChange::InvalidateAllPaintCaches);
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn render_state_visual_context_request_full_rebuild(
     host: &DocumentHost,
     scope: crate::painting::visual_context::dirty::VisualContextUpdateScope,
@@ -552,4 +616,49 @@ pub extern "C" fn render_state_visual_context_request_full_rebuild(
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_set_recording_trace_enabled(host: &DocumentHost, enabled: bool) {
     queue(host, PaintChange::SetRecordingTraceEnabled(enabled));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_begin_visual_context_trace(host: &DocumentHost) {
+    queue(host, PaintChange::BeginVisualContextTrace);
+}
+
+/// Hands `append_line` each line of what the updates of the visual context tree of `host`'s document did since the
+/// trace began, and stops tracing: whether the line is indented, the element of the box it is about or zero, the name
+/// of a box without an element, and the rest of the line.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, and `append_line` must copy the bytes synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_take_visual_context_trace(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+    context: *mut std::ffi::c_void,
+    append_line: unsafe extern "C" fn(*mut std::ffi::c_void, bool, u32, *const u8, usize, *const u8, usize),
+) {
+    let lines = crate::layout::shell_reads::read_arena(host, read, (), |arena, ()| {
+        arena
+            .paint_state_mut()
+            .visual_context
+            .trace
+            .take()
+            .map(|trace| trace.lines)
+            .unwrap_or_default()
+    });
+    for line in lines {
+        let name = line.name_without_element;
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            append_line(
+                context,
+                line.indented,
+                line.element.map_or(0, |element| element.raw()),
+                name.as_ptr(),
+                name.len(),
+                line.text.as_ptr(),
+                line.text.len(),
+            );
+        };
+    }
 }

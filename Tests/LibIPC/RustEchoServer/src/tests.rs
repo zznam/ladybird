@@ -99,7 +99,7 @@ fn generated_utf8_validation_matches_cpp() {
                 encoded.encode(&bytes).unwrap();
                 assert!(matches!(
                     Message::decode(&encoded.finish().0, vec![]),
-                    Err(DecodeError::InvalidUtf8)
+                    Err(DecodeError::InvalidValue("UTF-8"))
                 ));
                 let mut encoder = Encoder::new();
                 let (borrowed, owned) = if response {
@@ -157,9 +157,9 @@ fn server_flushes_posted_replies_before_returning_on_errors() {
         .0,
     ] {
         let (server, handle) = Transport::create_paired().unwrap();
-        #[cfg(target_vendor = "apple")]
+        #[cfg(unix)]
         let client = Transport::from_handle(handle).unwrap();
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(windows)]
         let client = Transport::new(handle).unwrap();
         let thread = std::thread::spawn(move || serve(server));
         for number in 0..100u32 {

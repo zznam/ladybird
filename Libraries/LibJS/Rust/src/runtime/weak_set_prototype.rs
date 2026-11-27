@@ -11,7 +11,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::can_be_held_weakly;
+use crate::runtime::abstract_operations::{can_be_held_weakly, preserve_identity_of_value_held_weakly};
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
@@ -42,17 +42,15 @@ fn typed_this_weak_set(vm: &Vm) -> ThrowCompletionOr<Gc<WeakSet>> {
 
 impl WeakSetPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<WeakSetPrototype> {
-        realm.create_object(
-            vm,
-            WeakSetPrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| WeakSetPrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -92,6 +90,7 @@ impl WeakSetPrototype {
         //     a. If e is not empty and SameValue(e, value) is true, then
         //         i. Return S.
         // 5. Append value to S.[[WeakSetData]].
+        preserve_identity_of_value_held_weakly(value);
         weak_set.weak_set_add(vm, value.as_cell());
 
         // 6. Return S.
@@ -116,7 +115,7 @@ impl WeakSetPrototype {
         //         i. Replace the element of S.[[WeakSetData]] whose value is e with an element whose value is empty.
         //         ii. Return true.
         // 5. Return false.
-        Ok(Value::from_bool(weak_set.weak_set_remove(value.as_cell())))
+        Ok(Value::from_bool(weak_set.weak_set_remove(vm, value.as_cell())))
     }
 
     // 24.4.3.4 WeakSet.prototype.has ( value ), https://tc39.es/ecma262/#sec-weakset.prototype.has

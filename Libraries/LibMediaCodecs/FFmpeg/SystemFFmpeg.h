@@ -20,6 +20,10 @@ class MEDIACODECS_API SystemFFmpeg {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
+    // The library's dependencies make syscalls that sandboxes do not allow, so a process loads it before sandboxing
+    // itself. Only the first call loads it.
+    static void load();
+    // The library that load() found, or null if it found none or the process never loaded it.
     static SystemFFmpeg const* the();
     static DecoderErrorOr<NonnullOwnPtr<SystemFFmpeg>> try_load(ByteString const& library_path);
 
@@ -27,12 +31,10 @@ public:
     ~SystemFFmpeg();
 
     FFmpegFunctions const& functions() const { return *m_functions; }
+    void* library_handle() const { return m_library_handle; }
     unsigned major() const { return m_major; }
     bool has_decoder(CodecID) const;
     bool provides_decoder_missing_from_bundle() const;
-    // Within a major, FFmpeg only appends to its structs, so code built against the bundled headers can reach into this
-    // library's structs when both of its majors match the bundled ones.
-    bool shares_bundled_struct_layouts() const;
 
 private:
     void* m_library_handle;

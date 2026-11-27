@@ -14,6 +14,7 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMapElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
+#include <LibWeb/HTML/ImageBitmapRenderingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
@@ -62,13 +63,27 @@ void push_form_control_paint_facts(HTML::HTMLInputElement& input)
 
 static void queue_canvas_paint_facts(HTML::HTMLCanvasElement const& canvas)
 {
+    // NB: The output bitmap of an ImageBitmapRenderingContext is painted as the image of the canvas.
+    if (auto const* bitmap_renderer = canvas.canvas_bitmap_renderer_context()) {
+        Layout::RustFFI::FfiReplacedImagePaintFacts image_facts {};
+        image_facts.natural.width = CSSPixels(canvas.width());
+        image_facts.natural.height = CSSPixels(canvas.height());
+        if (auto const* frame = bitmap_renderer->frame()) {
+            image_facts.content.kind = Layout::RustFFI::FfiImageContentKind::Raster;
+            image_facts.content.frame = frame;
+        }
+        queue_element_paint_facts(canvas, [&](auto* host, u32 element) {
+            Layout::RustFFI::render_state_set_element_image_paint_facts(host, element, image_facts);
+        });
+        return;
+    }
+
     Layout::RustFFI::FfiCanvasPaintFacts facts {};
     if (auto content_size = canvas.canvas_surface_content_size(); content_size.has_value()) {
         facts.has_content = true;
         facts.content_width = content_size->width();
         facts.content_height = content_size->height();
         facts.canvas_id = canvas.canvas_id().value().value();
-        facts.content_generation = canvas.content_generation();
     }
     // Where the facts changed, the canvas's paint cache goes with them.
     queue_element_paint_facts(canvas, [&](auto* host, u32 element) {
@@ -182,13 +197,16 @@ static GC::Ptr<HTML::DecodedImageData> decoded_image_data_of(Layout::NodeWithSty
     return observer->decoded_image_data();
 }
 
+// NB: This reads the images the node's observers hold rather than its style: it also runs as an image decodes beside a
+//     frame in flight, which may have swept the record the node's style points to.
 static void push_layer_image_paint_facts_onto(Layout::NodeWithStyle const& layout_node)
 {
-    auto background_images = layout_node.background_images();
-    auto mask_images = layout_node.mask_images();
+    auto const* observers = layout_node.image_observers();
+    if (!observers)
+        return;
     Vector<Layout::RustFFI::FfiLayerImagePaintFactsEntry> entries;
     Vector<Optional<Gfx::DecodedImageFrame>> current_frames;
-    current_frames.ensure_capacity(background_images.size() + mask_images.size() + 1);
+    current_frames.ensure_capacity(observers->background_images.size() + observers->mask_images.size() + 2);
     auto append_entry = [&](Layout::RustFFI::FfiLayerImageList list, size_t computed_index, CSS::AbstractImageStyleValue const* image, Layout::NodeWithStyle::ImageObserver const* observer) {
         if (!image)
             return;
@@ -199,11 +217,12 @@ static void push_layer_image_paint_facts_onto(Layout::NodeWithStyle const& layou
             .facts = layer_image_paint_facts_for(*image, decoded_image_data_of(observer), current_frames.last()),
         });
     };
-    for (size_t layer_index = 0; layer_index < background_images.size(); ++layer_index)
-        append_entry(Layout::RustFFI::FfiLayerImageList::Background, layer_index, background_images[layer_index].ptr(), layout_node.background_image_observer(layer_index));
-    for (size_t layer_index = 0; layer_index < mask_images.size(); ++layer_index)
-        append_entry(Layout::RustFFI::FfiLayerImageList::Mask, layer_index, mask_images[layer_index].ptr(), layout_node.mask_image_observer(layer_index));
-    append_entry(Layout::RustFFI::FfiLayerImageList::BorderImageSource, 0, layout_node.border_image_source(), layout_node.border_image_source_observer());
+    for (size_t layer_index = 0; layer_index < observers->background_images.size(); ++layer_index)
+        append_entry(Layout::RustFFI::FfiLayerImageList::Background, layer_index, observers->background_images[layer_index].ptr(), observers->background_layers[layer_index].ptr());
+    for (size_t layer_index = 0; layer_index < observers->mask_images.size(); ++layer_index)
+        append_entry(Layout::RustFFI::FfiLayerImageList::Mask, layer_index, observers->mask_images[layer_index].ptr(), observers->mask_layers[layer_index].ptr());
+    append_entry(Layout::RustFFI::FfiLayerImageList::BorderImageSource, 0, observers->border_image_source_value.ptr(), observers->border_image_source.ptr());
+    append_entry(Layout::RustFFI::FfiLayerImageList::MaskBorderSource, 0, observers->mask_border_source_value.ptr(), observers->mask_border_source.ptr());
     Layout::RustFFI::render_state_set_layer_image_paint_facts(layout_node.document_host(), Layout::Node::slot_id(&layout_node), entries.data(), entries.size());
 }
 
@@ -212,9 +231,12 @@ template<typename Queue>
 static void with_replaced_image_paint_facts(Layout::ImageProvider const& image_provider, Queue queue)
 {
     Optional<Gfx::DecodedImageFrame> current_frame;
+    auto preserve_aspect_ratio = image_provider.preserve_aspect_ratio();
     Layout::RustFFI::FfiReplacedImagePaintFacts facts {
         .natural = natural_size_facts(image_provider.intrinsic_width(), image_provider.intrinsic_height(), image_provider.intrinsic_aspect_ratio()),
         .content = image_content_facts(image_provider.decoded_image_data(), current_frame),
+        .preserve_aspect_ratio_align = static_cast<u8>(to_underlying(preserve_aspect_ratio.align)),
+        .preserve_aspect_ratio_meet_or_slice = static_cast<u8>(to_underlying(preserve_aspect_ratio.meet_or_slice)),
     };
     queue(facts);
 }
@@ -242,7 +264,6 @@ static void queue_video_paint_facts(HTML::HTMLVideoElement const& element)
             auto src_size = video_element.natural_media_size()->to_type<int>();
             facts.video_src_width = src_size.width();
             facts.video_src_height = src_size.height();
-            facts.video_sink_resource_id = video_element.video_sink_resource_id().value().value();
             facts.video_sink_handle = sink_handle->value();
         }
         break;

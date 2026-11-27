@@ -9,16 +9,20 @@ import gzip
 import http.client
 import http.server
 import json
-import socket
+import runpy
 import subprocess
 import tempfile
 import threading
 import time
 
+from pathlib import Path
 from typing import cast
 
-EVENT_TIMEOUT_SECONDS = 30
 WEBDRIVER_REQUEST_TIMEOUT_SECONDS = 60
+
+webdriver_helpers = runpy.run_path(
+    str(Path(__file__).parent.parent / "LibWebView" / "test-webdriver-delete-session.py")
+)
 
 
 class TestPageServer(http.server.ThreadingHTTPServer):
@@ -94,23 +98,6 @@ class TestPageHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def unused_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_for_port(port):
-    deadline = time.monotonic() + EVENT_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Timed out waiting for port {port}")
-
-
 def request(webdriver_port, method, path, body=None):
     encoded_body = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -150,7 +137,8 @@ def check_responses(webdriver_port, session_id, page_port):
         expect(script("return [document.URL, window.origin, document.body.innerText];"), [url, origin, text])
 
     def expect_error(url, status):
-        state = script("return [document.URL, window.origin, document.body.innerText];")
+        # NB: The failed URL is in the error page's details, which are collapsed, so it isn't part of innerText.
+        state = script("return [document.URL, window.origin, document.body.textContent];")
         if state[:2] != ["about:error", "null"] or f"HTTP error: {status}" not in state[2] or url not in state[2]:
             raise AssertionError(f"Expected an HTTP {status} error document for {url}, got {state!r}")
 
@@ -243,16 +231,12 @@ def check_responses(webdriver_port, session_id, page_port):
 def run_test(webdriver_binary):
     page_server = TestPageServer()
     threading.Thread(target=page_server.serve_forever, daemon=True).start()
-    webdriver_port = unused_port()
     with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryFile(mode="w+") as log:
-        webdriver = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(webdriver_port), "--profile-path", profile],
-            stdout=log,
-            stderr=log,
+        webdriver, webdriver_port = webdriver_helpers["launch_webdriver"](
+            webdriver_binary, "--headless", "--profile-path", profile, output=log, stderr=log
         )
         session_id = None
         try:
-            wait_for_port(webdriver_port)
             session = request(
                 webdriver_port, "POST", "/session", {"capabilities": {"alwaysMatch": {"ladybird:headless": True}}}
             )

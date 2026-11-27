@@ -45,14 +45,17 @@ pub mod ranges;
 
 use crate::abi::{
     EntryRecord, ExecutionContext, FRAME_HEADER_SIZE, FUNCTION_KIND_HOST, FUNCTION_KIND_WASM,
-    FUNCTION_KIND_WASM_VECTOR, FunctionHeader, InstanceData, SPILL_AREA_SIZE, Segment, TableData,
+    FUNCTION_KIND_WASM_VECTOR, FunctionHeader, InstanceData, MemoryData, SPILL_AREA_SIZE, STACK_LIMIT_INTERRUPTED,
+    Segment, TableData,
 };
 use crate::module::{DataMode, ElementItems, ElementMode, ExternalKind, ImportDescription, Module};
 use crate::types::{FuncType, GlobalType, HeapType, RefType, TableType, TypeCanonicalizer, ValType};
+use ak::waiter_list::AgentWaiter;
 use memory::MemoryInstance;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A value as the runtime's API sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +334,8 @@ pub struct Instance {
     pub functions: Vec<FunctionAddress>,
     pub tables: Vec<TableAddress>,
     pub memories: Vec<MemoryAddress>,
+    /// The data of each memory. The interpreter sees them through `memories` of the instance's data.
+    memory_data: Vec<*const MemoryData>,
     pub globals: Vec<GlobalAddress>,
     pub tags: Vec<TagAddress>,
     pub exports: HashMap<String, ExternValue>,
@@ -351,6 +356,8 @@ impl Instance {
         self.exports.get(name).copied()
     }
 }
+
+const MEMORY_ALLOCATION_FAILED: &str = "cannot allocate memory";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstantiationError {
@@ -382,11 +389,14 @@ pub struct Store {
     /// The module `module_type_identities_of()` was last asked about, and its identities. An embedder asks about
     /// one module many times in a row while it links its imports.
     last_module_identities: Option<(std::sync::Weak<Module>, Rc<[u32]>)>,
-    /// What runs after `memory.grow` grows a memory.
+    /// What runs after `memory.grow` grows a memory that is not shared.
     pub memory_grow_callback: Option<Rc<dyn Fn(MemoryAddress)>>,
     /// Whether the agent the store runs code for may block, its [[CanBlock]]: `memory.atomic.wait` traps where it
     /// may not. The embedder decides (a browser's window agents may not block).
     pub can_block: bool,
+    /// What lets another thread end a `memory.atomic.wait` of this store's code. The embedder sets this, along with
+    /// whatever makes it stop the store.
+    pub agent_waiter: Option<Arc<AgentWaiter>>,
     /// The store's compiled code, once it has some.
     jit: Option<jit::StoreJit>,
 }
@@ -422,7 +432,7 @@ impl Store {
         interpreter::install_fault_handler();
         Self {
             context: Box::new(ExecutionContext {
-                stack_limit: 0,
+                stack_limit: AtomicU64::new(0),
                 entry_fp: 0,
                 entry_record: std::ptr::null_mut(),
                 store: std::ptr::null_mut(),
@@ -441,8 +451,15 @@ impl Store {
             rtt_pointers: Vec::new(),
             memory_grow_callback: None,
             can_block: true,
+            agent_waiter: None,
             jit: None,
         }
+    }
+
+    /// What another thread stores `STACK_LIMIT_INTERRUPTED` to, to stop the code of this store for good. It stays where
+    /// it is for as long as the store lives.
+    pub fn stack_limit_word(&self) -> *const AtomicU64 {
+        &raw const self.context.stack_limit
     }
 
     /// Have the heap keep the runtime types for as long as the store lives. The store must not move after this.
@@ -632,8 +649,42 @@ impl Store {
     }
 
     pub fn allocate_memory(&mut self, ty: crate::types::MemoryType) -> Option<MemoryAddress> {
-        let memory = MemoryInstance::new(ty, &self.heap)?;
+        let memory = match MemoryInstance::new(ty, &self.heap) {
+            Some(memory) => memory,
+            None => {
+                // NB: Collections are deferred while a module instantiates, which retries once they are not.
+                if !self.release_reservations_of_dead_memories() {
+                    return None;
+                }
+                MemoryInstance::new(ty, &self.heap)?
+            }
+        };
         Some(entity::allocate(&self.heap, memory))
+    }
+
+    /// A memory of this store over a shared memory, which another agent of the process may have made.
+    pub fn allocate_memory_sharing(&mut self, shared: Arc<memory::SharedMemory>) -> MemoryAddress {
+        entity::allocate(&self.heap, MemoryInstance::sharing(shared))
+    }
+
+    /// Collects garbage so that the memories that died release their reservations, before failing to allocate one.
+    /// Each memory reserves gigabytes of address space, which a memory that died keeps until a collection sweeps it, and
+    /// nothing counts the reservations towards a collection. So a page that makes memories in a loop runs out of address
+    /// space with most of them dead. Returns whether it collected.
+    fn release_reservations_of_dead_memories(&self) -> bool {
+        let Some(gc) = self.heap.gc() else {
+            return false;
+        };
+        if self.heap.is_gc_deferred() {
+            return false;
+        }
+        // NB: A collection leaves the sweep of what it found dead to later. The next one finishes that sweep first,
+        //     which releases the reservations.
+        for _ in 0..2 {
+            // SAFETY: The heap is live, and allocating memory is a point where garbage may be collected.
+            unsafe { (gc.interface.gc_heap_collect_garbage)(gc.interface.heap, 0, false) };
+        }
+        true
     }
 
     /// Add a table of `ty.limits.min` elements set to `initial`. Returns None if it would be too large.
@@ -662,15 +713,33 @@ impl Store {
     ) -> Result<InstanceAddress, InstantiationError> {
         // Instantiation keeps references in places the collector does not look, like the values of constant
         // expressions on their way into globals and segments. The start function runs once they are in place.
-        self.heap.defer_gc();
-        let instance = self.instantiate_without_starting(module, imports);
-        self.heap.undefer_gc();
+        let mut instance = self.instantiate_deferring_gc(&module, imports);
+        if matches!(&instance, Err(InstantiationError::Link(message)) if message == MEMORY_ALLOCATION_FAILED)
+            && self.release_reservations_of_dead_memories()
+        {
+            // NB: Nothing the failed attempt did is visible yet: a module's memories are allocated before any segment
+            //     is written to what it imports.
+            instance = self.instantiate_deferring_gc(&module, imports);
+        }
         let (instance, start) = instance?;
         jit::instantiated(self, instance);
         if let Some(start) = start {
             self.invoke(start, &[]).map_err(InstantiationError::Trap)?;
         }
         Ok(instance)
+    }
+
+    fn instantiate_deferring_gc(
+        &mut self,
+        module: &Arc<Module>,
+        imports: &[ExternValue],
+    ) -> Result<(InstanceAddress, Option<FunctionAddress>), InstantiationError> {
+        // Instantiation keeps references in places the collector does not look, like the values of constant
+        // expressions on their way into globals and segments. The start function runs once they are in place.
+        self.heap.defer_gc();
+        let instance = self.instantiate_without_starting(Arc::clone(module), imports);
+        self.heap.undefer_gc();
+        instance
     }
 
     fn instantiate_without_starting(
@@ -775,6 +844,7 @@ impl Store {
                 functions: Vec::new(),
                 tables: Vec::new(),
                 memories: Vec::new(),
+                memory_data: Vec::new(),
                 globals: Vec::new(),
                 exports: HashMap::new(),
                 type_identities: type_identities.clone(),
@@ -885,7 +955,7 @@ impl Store {
         for memory in &module.memories {
             let address = self
                 .allocate_memory(*memory)
-                .ok_or_else(|| InstantiationError::Link("cannot allocate memory".to_string()))?;
+                .ok_or_else(|| InstantiationError::Link(MEMORY_ALLOCATION_FAILED.to_string()))?;
             memories.push(address);
         }
         instance.memories = memories;
@@ -1042,7 +1112,7 @@ impl Store {
                 if end.is_none_or(|end| end > memory.size() as u64) {
                     return Err(InstantiationError::Trap(Trap::MemoryOutOfBounds));
                 }
-                memory.bytes_mut()[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+                memory.write(offset as usize, bytes);
                 unsafe { instance_address.get_mut() }.data_segments[index].length = 0;
             }
         }
@@ -1123,6 +1193,22 @@ impl Store {
         unsafe { TagAddress::from_ptr(identity as *const TagInstance) }
     }
 
+    /// How the collector follows a value of a type of this store, as one of the TRACE_* kinds of heap.rs.
+    pub fn trace_of(&self, ty: ValType) -> u8 {
+        gc::trace_of(ty, &self.types)
+    }
+
+    /// Whether a type is one of this store, which a concrete type is if it names an identity of the store.
+    pub fn knows_type(&self, ty: ValType) -> bool {
+        match ty {
+            ValType::Ref(RefType {
+                heap: HeapType::Concrete(identity),
+                ..
+            }) => (identity as usize) < self.types.len(),
+            _ => true,
+        }
+    }
+
     pub fn function_reference(&self, address: FunctionAddress) -> u64 {
         address.as_ptr() as u64
     }
@@ -1177,7 +1263,16 @@ impl Store {
         let header: *const FunctionHeader = &raw const function.header;
         let is_outermost = self.context.entry_record.is_null();
         if is_outermost {
-            self.context.stack_limit = interpreter::stack_limit(STACK_RESERVE);
+            // NB: The limit is the one thing another thread writes, and an interrupt must stick.
+            let limit = self.context.stack_limit.load(Ordering::Relaxed);
+            if limit != STACK_LIMIT_INTERRUPTED {
+                let _ = self.context.stack_limit.compare_exchange(
+                    limit,
+                    interpreter::stack_limit(STACK_RESERVE),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
         }
         let large_images = jit::large_images_in_use();
         self.context.store = (self as *mut Store).cast();
@@ -1232,13 +1327,22 @@ impl Store {
         let function = unsafe { address.get() };
         let parameter_slots = function.header.param_slots as usize;
         let slots = unsafe { ak::slice_from_raw_parts(arguments, parameter_slots) };
-        let mut values = Vec::with_capacity(function.ty.params.len());
+        // Host calls are frequent in code that uses JavaScript wrappers for exception handling. Most have only a
+        // few arguments, so keep those on the stack instead of allocating a vector for each call.
+        let mut small_values = [Value::I32(0); 8];
+        let mut large_values = Vec::new();
+        let values = if function.ty.params.len() <= small_values.len() {
+            &mut small_values[..function.ty.params.len()]
+        } else {
+            large_values.resize(function.ty.params.len(), Value::I32(0));
+            &mut large_values
+        };
         let mut slot = parameter_slots;
-        for &ty in &function.ty.params {
+        for (value, &ty) in values.iter_mut().zip(&function.ty.params) {
             slot -= ty.slot_count() as usize;
-            values.push(Value::from_slots(ty, &slots[slot..]));
+            *value = Value::from_slots(ty, &slots[slot..]);
         }
-        let values = self.call_host(address, &values)?;
+        let values = self.call_host(address, values)?;
         let mut next = results;
         for value in values.iter().rev() {
             let (value, count) = value.to_slots();
@@ -1252,7 +1356,7 @@ impl Store {
 }
 
 /// Point the instance's interpreter-visible data at its current contents. The interpreter's view of each entity is at
-/// its handle.
+/// its handle, except for that of a memory, which is elsewhere if the memory is shared.
 fn refresh_instance_data(instance: &mut Instance) {
     // NB: A handle is the address of its entity's interpreter view (see entity.rs), so the instance's vectors of
     //     handles are the arrays of views the interpreter indexes.
@@ -1261,19 +1365,23 @@ fn refresh_instance_data(instance: &mut Instance) {
         assert!(core::mem::offset_of!(FunctionInstance, header) == 0);
         assert!(core::mem::offset_of!(GlobalInstance, value) == 0);
         assert!(core::mem::offset_of!(TableInstance, data) == 0);
-        assert!(core::mem::offset_of!(memory::MemoryInstance, data) == 0);
     };
+    instance.memory_data = instance
+        .memories
+        .iter()
+        .map(|address| MemoryInstance::data(*address))
+        .collect();
     let data = &mut instance.data;
     data.functions = instance.functions.as_ptr().cast();
     data.function_count = instance.functions.len() as u32;
     data.globals = instance.globals.as_ptr().cast();
     data.tables = instance.tables.as_ptr().cast();
-    data.memories = instance.memories.as_ptr().cast();
-    data.memory_count = instance.memories.len() as u32;
+    data.memories = instance.memory_data.as_ptr().cast();
+    data.memory_count = instance.memory_data.len() as u32;
     data.memory0_base = instance
-        .memories
+        .memory_data
         .first()
-        .map_or(std::ptr::null_mut(), |address| unsafe { address.get() }.data.base);
+        .map_or(std::ptr::null_mut(), |&data| unsafe { &*data }.base);
     data.type_identities = instance.type_identities.as_ptr();
     data.tags = instance.tags.as_ptr().cast();
 }

@@ -26,7 +26,7 @@ use crate::painting::layer_image_paint_facts::{LayerImagePaintFacts, layer_image
 use crate::painting::paint_order_plan::PaintOrderInputs;
 use crate::painting::paintable_data::{CommittedSideData, PaintableData};
 use crate::painting::published_frame::{PublishedFrame, PublishedRows};
-use crate::painting::record::damage::PaintDamage;
+use crate::painting::record::change_ticks::PaintChangeStamps;
 use crate::painting::record::recorder_state::AbsoluteRectMemo;
 use crate::painting::replaced_paint_facts::ReplacedPaintFacts;
 use crate::painting::stacking_context::entries::StackingContextEntries;
@@ -120,6 +120,19 @@ fn link(link: NodeSlotId) -> Option<NodeSlotId> {
 }
 
 pub(crate) trait GeometryRead: Sized {
+    fn ink_overflow_stamp(&self) -> u64;
+    fn hit_test_items_stamp(&self) -> u64;
+    fn stored_ink_overflow(&self, id: NodeSlotId) -> crate::painting::ink_overflow::InkOverflow;
+
+    fn absolute_ink_overflow_rect(&self, id: NodeSlotId) -> Option<CssPixelRect> {
+        let ink = self.stored_ink_overflow(id);
+        (!ink.unbounded).then(|| {
+            ink.rect.translated_by(
+                crate::painting::paintable_geometry::first_fragment_padding_box_rect(self, id).location(),
+            )
+        })
+    }
+
     fn paintable_data(&self, id: NodeSlotId) -> &PaintableData;
     fn paintable_row_is_populated(&self, id: NodeSlotId) -> bool;
     /// Reads the fragment link a populated row committed.
@@ -216,6 +229,8 @@ pub(crate) trait PaintRead: GeometryRead {
 
     /// The rows a text node is painted in: its first-letter row, if any, then its own.
     fn text_fragments(&self, primary: NodeSlotId) -> TextFragments;
+    /// Whether a text row is the slice in front of a writing suggestion, whose end is where the caret is.
+    fn text_precedes_writing_suggestion(&self, id: NodeSlotId) -> bool;
     fn replaced_paint_facts(&self, id: NodeSlotId) -> Option<ReplacedPaintFacts>;
     fn layer_image_paint_facts(
         &self,
@@ -234,10 +249,10 @@ pub(crate) trait PaintRead: GeometryRead {
     }
     fn stacking_context_entries(&self, root: NodeSlotId) -> Option<impl Deref<Target = StackingContextEntries> + '_>;
 
-    /// The box whose content box a node is laid out against: an in-flow node's is its nearest
-    /// ancestor that forms a containing block for its children, and a positioned box's its nearest
-    /// ancestor box that establishes one for its position, or the root for a fixed-position box
-    /// without one. Layout and painting both walk to it with this.
+    /// The box whose content box supplies a node's layout coordinate space. An in-flow node uses the nearest ancestor
+    /// that forms a containing block for its children. An absolutely positioned node uses its positioning containing
+    /// block, or that inline's in-flow containing block when the positioning containing block is inline. A fixed-position
+    /// node uses the nearest ancestor that establishes a fixed-position containing block, or the root if there isn't one.
     fn node_containing_block_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
         use crate::css::css_enums::positioning;
         let mut row = self.node(id)?;
@@ -265,9 +280,13 @@ pub(crate) trait PaintRead: GeometryRead {
             let Some(ancestor_row) = self.node(ancestor) else {
                 break;
             };
-            if node_facts::kind_is_box(ancestor_row.kind()) && ancestor_row.flags() & establishes_containing_block != 0
-            {
-                return Some(current);
+            if ancestor_row.flags() & establishes_containing_block != 0 {
+                if node_facts::kind_is_box(ancestor_row.kind()) {
+                    return Some(current);
+                }
+                if ancestor_row.kind() == NodeKind::InlineNode {
+                    return self.node_containing_block_if_live(current);
+                }
             }
             row = ancestor_row;
         }
@@ -354,13 +373,77 @@ impl AsRef<LayoutNodeArena> for LayoutNodeArena {
     }
 }
 
+/// Where a live read keeps the absolute rects it computed. A view of the rows keeps its own, each valid for the
+/// geometry epoch of the arena it was computed at; the bare arena keeps none, as a shared borrow of it writes nothing.
+pub(crate) trait LiveAbsoluteRects {
+    fn memoized_live_absolute_rect(&self, id: NodeSlotId) -> Option<CssPixelRect>;
+    fn memoize_live_absolute_rect(&self, id: NodeSlotId, rect: CssPixelRect);
+}
+
+impl LiveAbsoluteRects for LayoutNodeArena {
+    fn memoized_live_absolute_rect(&self, _: NodeSlotId) -> Option<CssPixelRect> {
+        None
+    }
+
+    fn memoize_live_absolute_rect(&self, _: NodeSlotId, _: CssPixelRect) {}
+}
+
+impl<Arena: Deref<Target = LayoutNodeArena>> LiveAbsoluteRects
+    for crate::painting::paintable_rows::PaintableRows<Arena>
+{
+    fn memoized_live_absolute_rect(&self, id: NodeSlotId) -> Option<CssPixelRect> {
+        self.memoized_absolute_rect_of_view(id)
+    }
+
+    fn memoize_live_absolute_rect(&self, id: NodeSlotId, rect: CssPixelRect) {
+        self.memoize_absolute_rect_of_view(id, rect);
+    }
+}
+
+impl<Reader: LiveAbsoluteRects + ?Sized> LiveAbsoluteRects for &Reader {
+    fn memoized_live_absolute_rect(&self, id: NodeSlotId) -> Option<CssPixelRect> {
+        (**self).memoized_live_absolute_rect(id)
+    }
+
+    fn memoize_live_absolute_rect(&self, id: NodeSlotId, rect: CssPixelRect) {
+        (**self).memoize_live_absolute_rect(id, rect);
+    }
+}
+
+impl<Reader: LiveAbsoluteRects + ?Sized> LiveAbsoluteRects for &mut Reader {
+    fn memoized_live_absolute_rect(&self, id: NodeSlotId) -> Option<CssPixelRect> {
+        (**self).memoized_live_absolute_rect(id)
+    }
+
+    fn memoize_live_absolute_rect(&self, id: NodeSlotId, rect: CssPixelRect) {
+        (**self).memoize_live_absolute_rect(id, rect);
+    }
+}
+
 // The live arena, and every view that borrows it, answers each read with the arena's own method of
 // the same name.
-impl<Live: AsRef<LayoutNodeArena>> GeometryRead for Live {
+impl<Live: AsRef<LayoutNodeArena> + LiveAbsoluteRects> GeometryRead for Live {
     type Row<'a>
         = crate::layout::LiveRow<'a>
     where
         Self: 'a;
+
+    fn ink_overflow_stamp(&self) -> u64 {
+        self.as_ref().paintable_rows.ink_overflow_stamp
+    }
+
+    fn hit_test_items_stamp(&self) -> u64 {
+        self.as_ref().paintable_rows.hit_test_items_stamp
+    }
+
+    fn stored_ink_overflow(&self, id: NodeSlotId) -> crate::painting::ink_overflow::InkOverflow {
+        self.as_ref()
+            .paintable_rows
+            .ink_overflow
+            .get(id.slot_index() as usize)
+            .copied()
+            .unwrap_or_default()
+    }
 
     fn node(&self, id: NodeSlotId) -> Option<Self::Row<'_>> {
         self.as_ref().live_row(id)
@@ -383,15 +466,15 @@ impl<Live: AsRef<LayoutNodeArena>> GeometryRead for Live {
     }
 
     fn memoized_absolute_rect(&self, id: NodeSlotId) -> Option<CssPixelRect> {
-        self.as_ref().memoized_absolute_rect(id)
+        self.memoized_live_absolute_rect(id)
     }
 
     fn memoize_absolute_rect(&self, id: NodeSlotId, rect: CssPixelRect) {
-        self.as_ref().memoize_absolute_rect(id, rect);
+        self.memoize_live_absolute_rect(id, rect);
     }
 }
 
-impl<Live: AsRef<LayoutNodeArena>> PaintRead for Live {
+impl<Live: AsRef<LayoutNodeArena> + LiveAbsoluteRects> PaintRead for Live {
     fn rendered_text(&self, id: NodeSlotId) -> Option<&RenderedText> {
         self.as_ref().text_content(id).map(|content| &**content)
     }
@@ -399,11 +482,15 @@ impl<Live: AsRef<LayoutNodeArena>> PaintRead for Live {
     fn with_grapheme_segmenter<R>(&self, id: NodeSlotId, read: impl FnOnce(&GraphemeSegmenter) -> R) -> Option<R> {
         self.as_ref()
             .text_content(id)
-            .map(|content| read(content.grapheme_segmenter()))
+            .map(|content| read(&GraphemeSegmenter::new(&content.text)))
     }
 
     fn text_fragments(&self, primary: NodeSlotId) -> TextFragments {
         self.as_ref().text_fragments(primary)
+    }
+
+    fn text_precedes_writing_suggestion(&self, id: NodeSlotId) -> bool {
+        self.as_ref().text_precedes_writing_suggestion(id)
     }
 
     fn published_svg_filter(&self, slot: NodeSlotId, kind: SvgPaintResourceKind) -> Option<Arc<PublishedSvgFilter>> {
@@ -480,16 +567,30 @@ impl<'a> PaintSource<'a> {
         self.frame.expect("only a recording reads a frame")
     }
 
+    /// The shape of an `<area>` of the map of the image whose paintable row is `image` (see
+    /// [`crate::painting::image_map_areas::area_shape_path`]).
+    pub(crate) fn image_map_area_shape_path(
+        &self,
+        image: NodeSlotId,
+        area: u32,
+        width: f32,
+        height: f32,
+    ) -> Option<libgfx_rust::path::Path> {
+        crate::painting::image_map_areas::area_shape_path(
+            &self.rows().paint_facts.image_maps,
+            image,
+            area,
+            width,
+            height,
+        )
+    }
+
     fn rows(&self) -> &'a PublishedRows {
         self.rows
     }
 
-    pub(crate) fn paint_damage_of_row(&self, row: NodeSlotId) -> PaintDamage {
-        self.frame().damage().of_row(row)
-    }
-
-    pub(crate) fn damaged_paint_rows(&self) -> impl Iterator<Item = NodeSlotId> + 'a {
-        self.frame().damage().rows()
+    pub(crate) fn paint_change_stamps(&self, row: NodeSlotId) -> PaintChangeStamps {
+        self.rows.paint_change_stamps(row)
     }
 }
 
@@ -498,6 +599,22 @@ impl GeometryRead for PaintSource<'_> {
         = &'a PaintNode
     where
         Self: 'a;
+
+    fn ink_overflow_stamp(&self) -> u64 {
+        self.rows().ink_overflow_stamp
+    }
+
+    fn hit_test_items_stamp(&self) -> u64 {
+        self.rows().hit_test_items_stamp
+    }
+
+    fn stored_ink_overflow(&self, id: NodeSlotId) -> crate::painting::ink_overflow::InkOverflow {
+        self.rows()
+            .ink_overflow
+            .get(id.slot_index() as usize)
+            .copied()
+            .unwrap_or_default()
+    }
 
     fn node(&self, id: NodeSlotId) -> Option<&PaintNode> {
         self.rows().node(id)
@@ -569,6 +686,12 @@ impl PaintRead for PaintSource<'_> {
         fragments.nodes[fragments.length] = primary;
         fragments.length += 1;
         fragments
+    }
+
+    fn text_precedes_writing_suggestion(&self, id: NodeSlotId) -> bool {
+        self.rows()
+            .text(id)
+            .is_some_and(|text| text.precedes_writing_suggestion)
     }
 
     fn published_svg_filter(&self, slot: NodeSlotId, kind: SvgPaintResourceKind) -> Option<Arc<PublishedSvgFilter>> {

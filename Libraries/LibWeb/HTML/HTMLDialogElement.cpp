@@ -78,19 +78,14 @@ void HTMLDialogElement::queue_a_dialog_toggle_event_task(Utf16FlyString old_stat
     }
 
     // 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
-    auto task_id = queue_an_element_task(Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state), source]() {
+    auto task_id = queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, old_state, move(new_state), source), [](auto& self, auto& old_state, auto& new_state, auto& source) {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
-        ToggleEventInit event_init {};
-        event_init.old_state = move(old_state);
-        event_init.new_state = move(new_state);
-        event_init.source = source;
-
-        dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+        self.dispatch_event(create_toggle_event(relevant_realm(self), HTML::EventNames::toggle, {}, old_state, new_state, source));
 
         // 2. Set element's dialog toggle task tracker to null.
-        m_dialog_toggle_task_tracker = {};
-    });
+        self.m_dialog_toggle_task_tracker = {};
+    }));
 
     // 3. Set element's dialog toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
     m_dialog_toggle_task_tracker = ToggleTaskTracker {
@@ -113,12 +108,7 @@ WebIDL::ExceptionOr<void> HTMLDialogElement::show()
     // 3. If the result of firing an event named beforetoggle, using ToggleEvent,
     //    with the cancelable attribute initialized to true, the oldState attribute initialized to "closed",
     //    and the newState attribute initialized to "open" at this is false, then return.
-    ToggleEventInit event_init {};
-    event_init.cancelable = true;
-    event_init.old_state = "closed"_utf16_fly_string;
-    event_init.new_state = "open"_utf16_fly_string;
-
-    auto beforetoggle_result = dispatch_event(ToggleEvent::create(HTML::EventNames::beforetoggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+    auto beforetoggle_result = dispatch_event(create_toggle_event(relevant_realm(*this), HTML::EventNames::beforetoggle, { .cancelable = true }, "closed"_utf16_fly_string, "open"_utf16_fly_string, nullptr));
     if (!beforetoggle_result)
         return {};
 
@@ -136,7 +126,7 @@ WebIDL::ExceptionOr<void> HTMLDialogElement::show()
     m_previously_focused_element = document().focused_area();
 
     // 8. Let document be this's node document.
-    auto document = m_document;
+    GC::Ptr<DOM::Document> document = m_document;
 
     // 9. Let hideUntil be the result of running topmost popover ancestor given this, document's showing hint popover
     //    list, null, and false.
@@ -194,13 +184,7 @@ WebIDL::ExceptionOr<void> HTMLDialogElement::show_a_modal_dialog(HTMLDialogEleme
     //    with the cancelable attribute initialized to true, the oldState attribute initialized to "closed",
     //    the newState attribute initialized to "open", and the source attribute initialized to source at subject is
     //    false, then return.
-    ToggleEventInit event_init {};
-    event_init.cancelable = true;
-    event_init.old_state = "closed"_utf16_fly_string;
-    event_init.new_state = "open"_utf16_fly_string;
-    event_init.source = source;
-
-    auto beforetoggle_result = subject.dispatch_event(ToggleEvent::create(EventNames::beforetoggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(subject))));
+    auto beforetoggle_result = subject.dispatch_event(create_toggle_event(relevant_realm(subject), EventNames::beforetoggle, { .cancelable = true }, "closed"_utf16_fly_string, "open"_utf16_fly_string, source));
     if (!beforetoggle_result)
         return {};
 
@@ -332,12 +316,7 @@ void HTMLDialogElement::close_the_dialog(Optional<Utf16String> result, GC::Ptr<D
 
     // 2. Fire an event named beforetoggle, using ToggleEvent, with the oldState attribute initialized to "open", the
     //    newState attribute initialized to "closed", and the source attribute initialized to source at subject.
-    ToggleEventInit event_init {};
-    event_init.old_state = "open"_utf16_fly_string;
-    event_init.new_state = "closed"_utf16_fly_string;
-    event_init.source = source;
-
-    dispatch_event(ToggleEvent::create(HTML::EventNames::beforetoggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+    dispatch_event(create_toggle_event(relevant_realm(*this), HTML::EventNames::beforetoggle, {}, "open"_utf16_fly_string, "closed"_utf16_fly_string, source));
 
     // 3. If subject does not have an open attribute, then return.
     if (!has_attribute(AttributeNames::open))
@@ -388,10 +367,10 @@ void HTMLDialogElement::close_the_dialog(Optional<Utf16String> result, GC::Ptr<D
 
     // 13. Queue an element task on the user interaction task source given the subject element to fire an event named
     //     close at subject.
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this] {
-        auto close_event = DOM::Event::create(HTML::EventNames::close, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-        dispatch_event(close_event);
-    });
+    queue_an_element_task(HTML::Task::Source::UserInteraction, GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        auto close_event = DOM::Event::create(HTML::EventNames::close, HighResolutionTime::current_high_resolution_time(relevant_global_object(self)));
+        self.dispatch_event(close_event);
+    }));
 }
 
 enum class ClosedByState : u8 {
@@ -443,33 +422,33 @@ void HTMLDialogElement::set_close_watcher()
     //    - cancelAction given canPreventClose being to return the result of firing an event named cancel at dialog,
     //      with the cancelable attribute initialized to canPreventClose.
     auto cancel_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM& vm) {
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM& vm) {
             auto* event = Bindings::event_from_callback_argument(vm);
             VERIFY(event);
             bool can_prevent_close = event->cancelable();
-            auto should_continue = dispatch_event(DOM::Event::create(HTML::EventNames::cancel, { .cancelable = can_prevent_close }, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+            auto should_continue = self.dispatch_event(DOM::Event::create(HTML::EventNames::cancel, { .cancelable = can_prevent_close }, HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
             if (!should_continue)
                 event->prevent_default();
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto cancel_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*cancel_callback_function, HTML::relevant_realm(*this));
     //    - closeAction being to close the dialog given dialog, dialog's request close return value, and dialog's
     //      request close source element.
     auto close_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM&) {
-            close_the_dialog(m_request_close_return_value, m_request_close_source_element);
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+            self.close_the_dialog(self.m_request_close_return_value, self.m_request_close_source_element);
 
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto close_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*close_callback_function, HTML::relevant_realm(*this));
     //    - getEnabledState being to return true if dialog's enable close watcher for request close is true or dialog's
     //      computed closed-by state is not None; otherwise false.
-    auto get_enabled_state = GC::create_function(GC::Heap::the(), [dialog = this] {
-        if (dialog->m_enable_close_watcher_for_request_close)
+    auto get_enabled_state = GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& dialog) {
+        if (dialog.m_enable_close_watcher_for_request_close)
             return true;
-        return computed_closed_by_state(*dialog) != ClosedByState::None;
+        return computed_closed_by_state(dialog) != ClosedByState::None;
     });
 
     m_close_watcher = CloseWatcher::establish(*document().window(), move(get_enabled_state));
@@ -538,12 +517,24 @@ void HTMLDialogElement::run_dialog_focusing_steps()
     run_focusing_steps(control);
 
     // 7. Let topDocument be control's node navigable's top-level traversable's active document.
+    // NB: A focus event handler can move control into a document without a navigable.
+    auto navigable = control->navigable();
+    if (!navigable)
+        return;
+    auto* top_level_traversable = as_if<LocalNavigable>(*navigable->top_level_traversable());
+    if (!top_level_traversable)
+        return;
+    auto top_document = top_level_traversable->active_document();
+
     // 8. If control's node document's origin is not the same as the origin of topDocument, then return.
-    if (!control->document().origin().is_same_origin(*control->navigable()->top_level_traversable()->active_document_origin()))
+    if (!top_document || !control->document().origin().is_same_origin(top_document->origin()))
         return;
 
-    // FIXME: 9. Empty topDocument's autofocus candidates.
-    // FIXME: 10. Set topDocument's autofocus processed flag to true.
+    // 9. Empty topDocument's autofocus candidates.
+    top_document->autofocus_candidates().clear();
+
+    // 10. Set topDocument's autofocus processed flag to true.
+    top_document->set_autofocus_processed_flag(true);
 }
 
 void HTMLDialogElement::set_is_modal(bool is_modal)

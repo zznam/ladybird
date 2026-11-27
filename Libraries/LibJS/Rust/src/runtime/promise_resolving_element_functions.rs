@@ -42,7 +42,7 @@ define_cell!(RemainingElements, Other);
 
 impl RemainingElements {
     pub fn create(vm: &Vm, initial_value: u64) -> Gc<RemainingElements> {
-        vm.heap().allocate(RemainingElements {
+        vm.heap().allocate(|_| RemainingElements {
             header: CellHeader::for_class(Self::CLASS),
             value: Cell::new(initial_value),
         })
@@ -81,22 +81,22 @@ impl Finalize for PromiseValueList {
 
 impl PromiseValueList {
     pub fn create(vm: &Vm) -> Gc<PromiseValueList> {
-        vm.heap().allocate(PromiseValueList {
+        vm.heap().allocate(|_| PromiseValueList {
             header: CellHeader::for_class(Self::CLASS),
             values: GcRefCell::new(Vec::new()),
         })
     }
 
-    pub fn append(&self, value: Value) {
-        self.values.borrow_mut().push(value);
+    pub fn append(&self, vm: &Vm, value: Value) {
+        self.values.borrow_mut(vm).push(value);
     }
 
     pub fn get(&self, index: usize) -> Value {
         self.values.borrow()[index]
     }
 
-    pub fn set(&self, index: usize, value: Value) {
-        self.values.borrow_mut()[index] = value;
+    pub fn set(&self, vm: &Vm, index: usize, value: Value) {
+        self.values.borrow_mut(vm)[index] = value;
     }
 
     /// Array::create_from(realm, values.values()): CreateArrayFromList of the values.
@@ -156,6 +156,7 @@ impl PromiseResolvingElementFunction {
     #[allow(clippy::too_many_arguments)]
     fn new(
         vm: &Vm,
+        realm: Gc<Realm>,
         class: &'static Class,
         index: usize,
         values: Gc<PromiseValueList>,
@@ -165,7 +166,7 @@ impl PromiseResolvingElementFunction {
         resolve_element: ResolveElement,
     ) -> PromiseResolvingElementFunction {
         PromiseResolvingElementFunction {
-            base: NativeFunction::new_with_prototype(vm, class, prototype),
+            base: NativeFunction::new_with_prototype(vm, class, realm, prototype, None),
             index: Cell::new(index),
             values: Cell::new(values),
             capability: Cell::new(capability),
@@ -249,9 +250,9 @@ macro_rules! define_promise_resolving_element_function {
             ) -> Gc<$type> {
                 realm.create_object(
                     vm,
-                    $type {
+                    |_| $type {
                         base: PromiseResolvingElementFunction::new(
-                            vm,
+                            vm, realm,
                             Self::CLASS,
                             index,
                             values,
@@ -274,7 +275,7 @@ fn promise_all_resolve_element(function: &PromiseResolvingElementFunction, vm: &
     let realm = vm.current_realm().expect("there is a current realm");
 
     // 8. Set values[index] to x.
-    function.values().set(function.index(), vm.argument(0));
+    function.values().set(vm, function.index(), vm.argument(0));
 
     // 9. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 10. If remainingElementsCount.[[Value]] is 0, then
@@ -333,7 +334,7 @@ fn promise_all_settled_resolve_element(
         .must();
 
     // 12. Set values[index] to obj.
-    function.values().set(function.index(), Value::from_object(object));
+    function.values().set(vm, function.index(), Value::from_object(object));
 
     // 13. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 14. If remainingElementsCount.[[Value]] is 0, then
@@ -389,7 +390,7 @@ fn promise_all_settled_reject_element(function: &PromiseResolvingElementFunction
         .must();
 
     // 12. Set values[index] to obj.
-    function.values().set(function.index(), Value::from_object(object));
+    function.values().set(vm, function.index(), Value::from_object(object));
 
     // 13. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 14. If remainingElementsCount.[[Value]] is 0, then
@@ -417,7 +418,7 @@ fn promise_any_reject_element(function: &PromiseResolvingElementFunction, vm: &V
     let realm = vm.current_realm().expect("there is a current realm");
 
     // 8. Set errors[index] to x.
-    function.values().set(function.index(), vm.argument(0));
+    function.values().set(vm, function.index(), vm.argument(0));
 
     // 9. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 10. If remainingElementsCount.[[Value]] is 0, then

@@ -11,7 +11,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::can_be_held_weakly;
+use crate::runtime::abstract_operations::{can_be_held_weakly, preserve_identity_of_value_held_weakly};
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
@@ -43,17 +43,15 @@ fn typed_this_finalization_registry(vm: &Vm) -> ThrowCompletionOr<Gc<Finalizatio
 
 impl FinalizationRegistryPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<FinalizationRegistryPrototype> {
-        realm.create_object(
-            vm,
-            FinalizationRegistryPrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| FinalizationRegistryPrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(realm.object_prototype()),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -128,7 +126,10 @@ impl FinalizationRegistryPrototype {
 
         // 6. Let cell be the Record { [[WeakRefTarget]]: target, [[HeldValue]]: heldValue, [[UnregisterToken]]: unregisterToken }.
         // 7. Append cell to finalizationRegistry.[[Cells]].
+        preserve_identity_of_value_held_weakly(target);
+        preserve_identity_of_value_held_weakly(unregister_token);
         finalization_registry.add_finalization_record(
+            vm,
             target.as_cell(),
             held_value,
             (!unregister_token.is_undefined()).then(|| unregister_token.as_cell()),
@@ -157,7 +158,7 @@ impl FinalizationRegistryPrototype {
 
         // 4-6.
         Ok(Value::from_bool(
-            finalization_registry.remove_by_token(unregister_token.as_cell()),
+            finalization_registry.remove_by_token(vm, unregister_token.as_cell()),
         ))
     }
 }

@@ -7,13 +7,14 @@
 //! Promises as implementations hold them, https://webidl.spec.whatwg.org/#idl-promise: the PromiseCapability records
 //! that LibWeb's C++ code calls WebIDL::Promise.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use libjs_rust::api::{
     Array, EmbedderCell, EmbedderClass, EmbedderValue, Gc, Must, NativeFunction, Object, Promise, PromiseCapability,
     PromiseState, PropertyKey, Realm, RejectionOperation, Trace, Value, Visitor, Vm, call, new_promise_capability,
+    safe_promise_resolve,
 };
 
 use crate::bindings::interface::{with_temporary_execution_context, with_temporary_execution_context_and_callbacks};
@@ -26,6 +27,82 @@ unsafe extern "C" {
     /// Queues a microtask that calls the function, a native function with no arguments, while an execution context of
     /// the realm is on the stack, as HTML::queue_a_microtask() queues one without a document.
     fn web_bindings_queue_a_microtask(realm: *mut c_void, function: *mut c_void);
+
+    fn web_bindings_deferred_invoke(cell: *mut c_void, steps: unsafe extern "C" fn(*mut c_void, *mut c_void));
+
+    /// Calls the steps with the VM and the cell in parallel: later, outside of any task, while an execution context of
+    /// the realm is on the stack. The cell lives until then.
+    fn web_bindings_run_in_parallel(
+        realm: *mut c_void,
+        cell: *mut c_void,
+        steps: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    );
+
+    /// Queues a task on the task source, an HTML::Task::Source, that calls the steps with the VM and the cell, as
+    /// HTML::queue_a_task() queues one without a document. The cell lives until then.
+    fn web_bindings_queue_a_task(
+        task_source: u8,
+        cell: *mut c_void,
+        steps: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    );
+
+    /// Queues a global task on the task source, an HTML::Task::Source, with the global object, that calls the steps with
+    /// the VM and the cell, as HTML::queue_global_task() queues one. The cell lives until then. Returns the task's
+    /// HTML::TaskID.
+    fn web_bindings_queue_a_global_task(
+        global_object: *mut c_void,
+        task_source: u8,
+        cell: *mut c_void,
+        steps: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    ) -> u64;
+
+    /// Removes the tasks with the HTML::TaskIDs from the task queue of the event loop of the realm's agent.
+    fn web_bindings_remove_tasks(realm: *mut c_void, task_ids: ak::Span<'_, u64>);
+
+    /// The HTML::TaskID of the task that the event loop of the realm's agent is running.
+    fn web_bindings_currently_running_task(realm: *mut c_void) -> u64;
+
+    /// Spins the event loop until the promise, a Promise, is no longer pending.
+    fn web_bindings_spin_until_promise_is_settled(promise: *mut c_void);
+}
+
+/// The task sources of HTML::Task::Source that the bindings queue tasks on.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum TaskSource {
+    Unspecified = 0,
+    DOMManipulation = 1,
+    UserInteraction = 2,
+    Networking = 3,
+    PostedMessage = 6,
+    TimerTask = 8,
+    Geolocation = 10,
+    FileReading = 13,
+    PerformanceTimeline = 15,
+    Clipboard = 17,
+    Permissions = 18,
+    FontLoading = 19,
+    RemoteEvent = 20,
+    Gamepad = 25,
+    WebGL = 26,
+    Crypto = 27,
+    Storage = 29,
+}
+
+// SAFETY: A task source holds no cells.
+unsafe impl Trace for TaskSource {
+    fn trace(&self, _: &mut Visitor) {}
+}
+
+/// A task that queue_a_global_task() queued, an HTML::TaskID.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskId(u64);
+
+impl TaskId {
+    /// The HTML::TaskID of the task.
+    pub(crate) fn host_id(self) -> u64 {
+        self.0
+    }
 }
 
 /// The promise that LibWeb's C++ code returns, a WebIDL::Promise.
@@ -98,13 +175,9 @@ pub(crate) fn resolve_promise(vm: &Vm, promise: WebIdlPromise, value: Value) {
     // 1. If x is not given, then let it be the undefined value.
     // 2. Let value be the result of converting x to an ECMAScript value.
     // 3. Perform ! Call(p.[[Resolve]], undefined, « value »).
-    call(
-        vm,
-        Value::from_object(promise.resolve().upcast::<Object>()),
-        Value::UNDEFINED,
-        &[value],
-    )
-    .must();
+    // AD-HOC: We perform SafePromiseResolve instead, which never runs script.
+    //         See https://github.com/whatwg/webidl/pull/1645
+    safe_promise_resolve(vm, promise, value).must();
 }
 
 /// Rejects the promise with the reason, https://webidl.spec.whatwg.org/#reject
@@ -349,17 +422,14 @@ fn wait_for_all(vm: &Vm, realm: Gc<Realm>, promises: &[WebIdlPromise], promise: 
     // 8. Let result be a list containing total null values.
     let total = promises.len();
     let result = Array::create_from(vm, realm, &vec![Value::NULL; total]);
-    let state = WAIT_FOR_ALL_CLASS.allocate(
-        vm,
-        WaitForAll {
-            promise,
-            realm,
-            rejected: Cell::new(false),
-            result,
-            total,
-            fulfilled_count: Cell::new(0),
-        },
-    );
+    let state = WAIT_FOR_ALL_CLASS.allocate(vm, |_| WaitForAll {
+        promise,
+        realm,
+        rejected: Cell::new(false),
+        result,
+        total,
+        fulfilled_count: Cell::new(0),
+    });
 
     // 3. Let rejectionHandlerSteps be the following steps given arg:
     let rejection_handler_steps = |vm: &Vm, state: &Gc<EmbedderCell<WaitForAll>>| {
@@ -457,6 +527,134 @@ pub(crate) fn queue_a_microtask<C: Trace + Copy + 'static>(vm: &Vm, realm: Gc<Re
     );
     // SAFETY: The realm and the function are live.
     unsafe { web_bindings_queue_a_microtask(realm.as_ptr().cast(), function.as_ptr().cast()) };
+}
+
+/// Steps with what they capture, which run once, later, from a task or in parallel. They run as C++ code would, with
+/// no function of their own on the stack.
+trait DeferredSteps: Trace {
+    fn run(&self, vm: &Vm);
+}
+
+struct CapturedSteps<C> {
+    captures: C,
+    steps: fn(&Vm, C),
+}
+
+// SAFETY: The steps are a plain function, which holds no cells.
+unsafe impl<C: Trace> Trace for CapturedSteps<C> {
+    fn trace(&self, visitor: &mut Visitor) {
+        self.captures.trace(visitor);
+    }
+}
+
+impl<C: Trace + Clone + 'static> DeferredSteps for CapturedSteps<C> {
+    fn run(&self, vm: &Vm) {
+        (self.steps)(vm, self.captures.clone());
+    }
+}
+
+/// The cell that keeps deferred steps and what they capture alive until they run.
+struct PendingSteps(RefCell<Option<Box<dyn DeferredSteps>>>);
+
+// SAFETY: The steps that have not run are all the cells this reaches.
+unsafe impl Trace for PendingSteps {
+    fn trace(&self, visitor: &mut Visitor) {
+        if let Some(steps) = &*self.0.borrow() {
+            steps.trace(visitor);
+        }
+    }
+}
+
+static PENDING_STEPS_CLASS: EmbedderClass<PendingSteps> = EmbedderClass::new("PendingSteps");
+
+impl EmbedderValue for PendingSteps {
+    const CLASS: &'static EmbedderClass<Self> = &PENDING_STEPS_CLASS;
+}
+
+pub(crate) fn pending_steps<C: Trace + Clone + 'static>(vm: &Vm, captures: C, steps: fn(&Vm, C)) -> *mut c_void {
+    PENDING_STEPS_CLASS
+        .allocate(vm, |_| {
+            let steps: Box<dyn DeferredSteps> = Box::new(CapturedSteps { captures, steps });
+            PendingSteps(RefCell::new(Some(steps)))
+        })
+        .as_ptr()
+        .cast()
+}
+
+pub(crate) unsafe extern "C" fn run_pending_steps(vm: *mut c_void, cell: *mut c_void) {
+    // SAFETY: LibWeb passes the VM and the cell that pending_steps() made, which it kept alive.
+    let (vm, cell) = unsafe {
+        (
+            &*vm.cast::<Vm>(),
+            Gc::from_non_null(NonNull::new_unchecked(cell.cast::<EmbedderCell<PendingSteps>>())),
+        )
+    };
+    // NB: The cell keeps what the steps capture alive while they run, and lets go of it once they have.
+    cell.0.borrow().as_ref().expect("deferred steps run once").run(vm);
+    cell.0.take();
+}
+
+/// Defers steps to the event loop without pushing an execution context.
+pub(crate) fn deferred_invoke<C: Trace + Clone + 'static>(vm: &Vm, captures: C, steps: fn(&Vm, C)) {
+    let cell = pending_steps(vm, captures, steps);
+    // SAFETY: The cell is live.
+    unsafe { web_bindings_deferred_invoke(cell, run_pending_steps) };
+}
+
+/// Performs the steps with the captures in parallel, https://html.spec.whatwg.org/multipage/infrastructure.html#in-parallel,
+/// with an execution context of the realm on the stack.
+pub(crate) fn in_parallel<C: Trace + Copy + 'static>(vm: &Vm, realm: Gc<Realm>, captures: C, steps: fn(&Vm, C)) {
+    let cell = pending_steps(vm, captures, steps);
+    // SAFETY: The realm and the cell are live.
+    unsafe { web_bindings_run_in_parallel(realm.as_ptr().cast(), cell, run_pending_steps) };
+}
+
+/// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task
+pub(crate) fn queue_a_task<C: Trace + Clone + 'static>(
+    vm: &Vm,
+    task_source: TaskSource,
+    captures: C,
+    steps: fn(&Vm, C),
+) {
+    let cell = pending_steps(vm, captures, steps);
+    // SAFETY: The cell is live.
+    unsafe { web_bindings_queue_a_task(task_source as u8, cell, run_pending_steps) };
+}
+
+/// Queues a global task on the task source, given the global object, that performs the steps with the captures,
+/// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task. As with queue_a_task(), the steps run
+/// with no execution context of their own on the stack.
+pub(crate) fn queue_a_global_task<C: Trace + Clone + 'static>(
+    vm: &Vm,
+    global: Gc<Object>,
+    task_source: TaskSource,
+    captures: C,
+    steps: fn(&Vm, C),
+) -> TaskId {
+    let cell = pending_steps(vm, captures, steps);
+    // SAFETY: The global object and the cell are live.
+    TaskId(unsafe {
+        web_bindings_queue_a_global_task(global.as_ptr().cast(), task_source as u8, cell, run_pending_steps)
+    })
+}
+
+/// Removes the tasks from the task queue of the event loop of the realm's agent.
+pub(crate) fn remove_tasks(realm: Gc<Realm>, tasks: &[TaskId]) {
+    let task_ids: Vec<u64> = tasks.iter().map(|task| task.0).collect();
+    // SAFETY: The realm is live, and the task IDs are lent for the call.
+    unsafe { web_bindings_remove_tasks(realm.as_ptr().cast(), ak::Span::new(&task_ids)) };
+}
+
+/// The task that the event loop of the realm's agent is running.
+pub(crate) fn currently_running_task(realm: Gc<Realm>) -> TaskId {
+    // SAFETY: The realm is live.
+    TaskId(unsafe { web_bindings_currently_running_task(realm.as_ptr().cast()) })
+}
+
+/// Spins the event loop until the promise is fulfilled or rejected.
+pub(crate) fn spin_until_promise_is_settled(promise: WebIdlPromise) {
+    // SAFETY: The promise is live.
+    unsafe { web_bindings_spin_until_promise_is_settled(promise_object(promise).as_ptr().cast()) };
 }
 
 /// The [[Promise]] of a promise capability that LibWeb created, which is a Promise.

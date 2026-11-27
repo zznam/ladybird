@@ -14,7 +14,6 @@ use num_traits::Zero;
 use crate::build_configuration::HEAP_REGION_OFFSET_MASK;
 use crate::bytecode::executable::{PropertyLookupCache, StaticPropertyLookupCacheSite};
 use crate::bytecode::property_access::{GetByIdMode, get_by_id};
-use crate::gc::capi::js_heap_region_base;
 use crate::gc::class_id::ClassId;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
@@ -22,6 +21,7 @@ use crate::layout::function_object::FunctionObject;
 use crate::layout::object::Object;
 use crate::layout::primitive_string::PrimitiveString;
 use crate::layout::value::Value;
+use crate::layout_forward::heap_region_base;
 use crate::runtime::abstract_operations::{call, call_function_object};
 use crate::runtime::accessor::Accessor;
 use crate::runtime::array::Array;
@@ -51,8 +51,8 @@ use libjs_abi::value as nan_box;
 /// compiler could otherwise keep instead of the value or the address while either is held across an allocation.
 #[inline(always)]
 fn decode_cell_address(encoded: u64) -> usize {
-    // SAFETY: Cell values are offsets into the heap region, whose base LibGC fixed before any cell existed.
-    let base = unsafe { js_heap_region_base } as u64;
+    // NB: Cell values are offsets into the heap region, whose base was fixed before any cell existed.
+    let base = heap_region_base() as u64;
     let mut address = base + (encoded & HEAP_REGION_OFFSET_MASK);
     // SAFETY: The assembly is empty: it only has the compiler put `encoded` and `address` in registers here.
     unsafe {
@@ -72,7 +72,7 @@ impl Value {
     }
 
     pub const fn from_i32(value: i32) -> Self {
-        Self(nan_box::SHIFTED_INT32_TAG | value as u32 as u64)
+        Self::from_bits(nan_box::SHIFTED_INT32_TAG | value as u32 as u64)
     }
 
     /// Integral doubles that fit in an i32, other than negative zero, are stored as Int32, and every NaN becomes the
@@ -83,9 +83,9 @@ impl Value {
             return Self::from_i32(value as i32);
         }
         if value.is_nan() {
-            return Self(nan_box::CANON_NAN_BITS);
+            return Self::from_bits(nan_box::CANON_NAN_BITS);
         }
-        Self(value.to_bits())
+        Self::from_bits(value.to_bits())
     }
 
     pub const fn tag(self) -> u64 {
@@ -186,7 +186,7 @@ impl Value {
 
     pub(crate) fn with_cell_tag<T>(tag: u64, cell: Gc<T>) -> Self {
         let address = cell.as_ptr() as usize as u64;
-        Self((tag << nan_box::TAG_SHIFT) | (address & HEAP_REGION_OFFSET_MASK))
+        Self::from_bits((tag << nan_box::TAG_SHIFT) | (address & HEAP_REGION_OFFSET_MASK))
     }
 
     /// # Safety
@@ -1766,7 +1766,7 @@ pub fn r#in(vm: &Vm, lhs: Value, rhs: Value) -> ThrowCompletionOr<Value> {
 /// Whether a function is the native function the realm installs as %Function.prototype%[@@hasInstance]. Only
 /// NativeFunction gives a function a builtin, so the builtin alone identifies it.
 fn is_ordinary_has_instance_builtin(function: Gc<FunctionObject>) -> bool {
-    function.has_builtin.get() && Builtin::from_u8(function.builtin.get()) == Some(Builtin::OrdinaryHasInstance)
+    function.builtin() == Some(Builtin::OrdinaryHasInstance)
 }
 
 /// BoundFunction::bound_target_function() of a function that is a bound function exotic object.
@@ -1826,6 +1826,9 @@ pub fn ordinary_has_instance(vm: &Vm, lhs: Value, rhs: Value) -> ThrowCompletion
     if let Some(bound_target) = bound_target_function(rhs_function) {
         // a. Let BC be C.[[BoundTargetFunction]].
         // b. Return ? InstanceofOperator(O, BC).
+        if vm.did_reach_stack_space_limit() {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
         return instance_of(vm, lhs, Value::from_object(bound_target));
     }
 

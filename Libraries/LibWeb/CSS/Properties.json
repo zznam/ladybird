@@ -41,6 +41,9 @@
   "-webkit-appearance": {
     "legacy-alias-for": "appearance"
   },
+  "-webkit-backface-visibility": {
+    "legacy-alias-for": "backface-visibility"
+  },
   "-webkit-background-clip": {
     "legacy-alias-for": "background-clip"
   },
@@ -50,14 +53,50 @@
   "-webkit-background-size": {
     "legacy-alias-for": "background-size"
   },
+  "-webkit-border-after-color": {
+    "legacy-alias-for": "border-block-end-color"
+  },
+  "-webkit-border-after-style": {
+    "legacy-alias-for": "border-block-end-style"
+  },
+  "-webkit-border-after-width": {
+    "legacy-alias-for": "border-block-end-width"
+  },
+  "-webkit-border-before-color": {
+    "legacy-alias-for": "border-block-start-color"
+  },
+  "-webkit-border-before-style": {
+    "legacy-alias-for": "border-block-start-style"
+  },
+  "-webkit-border-before-width": {
+    "legacy-alias-for": "border-block-start-width"
+  },
   "-webkit-border-bottom-left-radius": {
     "legacy-alias-for": "border-bottom-left-radius"
   },
   "-webkit-border-bottom-right-radius": {
     "legacy-alias-for": "border-bottom-right-radius"
   },
+  "-webkit-border-end-color": {
+    "legacy-alias-for": "border-inline-end-color"
+  },
+  "-webkit-border-end-style": {
+    "legacy-alias-for": "border-inline-end-style"
+  },
+  "-webkit-border-end-width": {
+    "legacy-alias-for": "border-inline-end-width"
+  },
   "-webkit-border-radius": {
     "legacy-alias-for": "border-radius"
+  },
+  "-webkit-border-start-color": {
+    "legacy-alias-for": "border-inline-start-color"
+  },
+  "-webkit-border-start-style": {
+    "legacy-alias-for": "border-inline-start-style"
+  },
+  "-webkit-border-start-width": {
+    "legacy-alias-for": "border-inline-start-width"
   },
   "-webkit-border-top-left-radius": {
     "legacy-alias-for": "border-top-left-radius"
@@ -66,13 +105,35 @@
     "legacy-alias-for": "border-top-right-radius"
   },
   "-webkit-box-align": {
-    "legacy-alias-for": "align-items"
+    "style-group": "AlignmentValues",
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "stretch",
+    "requires-computation": "never",
+    "valid-types": [
+      "webkit-box-align"
+    ]
   },
   "-webkit-box-flex": {
-    "legacy-alias-for": "flex-grow"
+    "style-group": "AlignmentValues",
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "number [-∞,∞]"
+    ]
   },
   "-webkit-box-ordinal-group": {
-    "legacy-alias-for": "order"
+    "style-group": "AlignmentValues",
+    "affects-stacking-context": true,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "1",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "integer [1,∞]"
+    ]
   },
   "-webkit-box-orient": {
     "style-group": "AlignmentValues",
@@ -86,13 +147,23 @@
     ]
   },
   "-webkit-box-pack": {
-    "legacy-alias-for": "justify-content"
+    "style-group": "AlignmentValues",
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "start",
+    "requires-computation": "never",
+    "valid-types": [
+      "webkit-box-pack"
+    ]
   },
   "-webkit-box-shadow": {
     "legacy-alias-for": "box-shadow"
   },
   "-webkit-box-sizing": {
     "legacy-alias-for": "box-sizing"
+  },
+  "-webkit-clip-path": {
+    "legacy-alias-for": "clip-path"
   },
   "-webkit-filter": {
     "legacy-alias-for": "filter"
@@ -118,6 +189,9 @@
   "-webkit-flex-wrap": {
     "legacy-alias-for": "flex-wrap"
   },
+  "-webkit-font-feature-settings": {
+    "legacy-alias-for": "font-feature-settings"
+  },
   "-webkit-font-smoothing": {
     "style-group": "InheritedTextValues",
     "affects-layout": false,
@@ -141,8 +215,51 @@
       "continue"
     ]
   },
+  "-webkit-logical-height": {
+    "legacy-alias-for": "block-size"
+  },
+  "-webkit-logical-width": {
+    "legacy-alias-for": "inline-size"
+  },
+  "-webkit-margin-after": {
+    "legacy-alias-for": "margin-block-end"
+  },
+  "-webkit-margin-before": {
+    "legacy-alias-for": "margin-block-start"
+  },
+  "-webkit-margin-end": {
+    "legacy-alias-for": "margin-inline-end"
+  },
+  "-webkit-margin-start": {
+    "legacy-alias-for": "margin-inline-start"
+  },
   "-webkit-mask": {
     "legacy-alias-for": "mask"
+  },
+  "-webkit-mask-box-image": {
+    "initial": "none",
+    "longhands": [
+      "mask-border-source",
+      "mask-border-slice",
+      "mask-border-width",
+      "mask-border-outset",
+      "mask-border-repeat"
+    ]
+  },
+  "-webkit-mask-box-image-outset": {
+    "legacy-alias-for": "mask-border-outset"
+  },
+  "-webkit-mask-box-image-repeat": {
+    "legacy-alias-for": "mask-border-repeat"
+  },
+  "-webkit-mask-box-image-slice": {
+    "legacy-alias-for": "mask-border-slice"
+  },
+  "-webkit-mask-box-image-source": {
+    "legacy-alias-for": "mask-border-source"
+  },
+  "-webkit-mask-box-image-width": {
+    "legacy-alias-for": "mask-border-width"
   },
   "-webkit-mask-clip": {
     "legacy-alias-for": "mask-clip"
@@ -165,8 +282,32 @@
   "-webkit-mask-size": {
     "legacy-alias-for": "mask-size"
   },
+  "-webkit-max-logical-height": {
+    "legacy-alias-for": "max-block-size"
+  },
+  "-webkit-max-logical-width": {
+    "legacy-alias-for": "max-inline-size"
+  },
+  "-webkit-min-logical-height": {
+    "legacy-alias-for": "min-block-size"
+  },
+  "-webkit-min-logical-width": {
+    "legacy-alias-for": "min-inline-size"
+  },
   "-webkit-order": {
     "legacy-alias-for": "order"
+  },
+  "-webkit-padding-after": {
+    "legacy-alias-for": "padding-block-end"
+  },
+  "-webkit-padding-before": {
+    "legacy-alias-for": "padding-block-start"
+  },
+  "-webkit-padding-end": {
+    "legacy-alias-for": "padding-inline-end"
+  },
+  "-webkit-padding-start": {
+    "legacy-alias-for": "padding-inline-start"
   },
   "-webkit-perspective": {
     "legacy-alias-for": "perspective"
@@ -184,6 +325,51 @@
     "requires-computation": "cascaded-value",
     "valid-types": [
       "color"
+    ]
+  },
+  "-webkit-text-security": {
+    "style-group": "InheritedTextValues",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "none",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "none",
+      "disc",
+      "circle",
+      "square"
+    ]
+  },
+  "-webkit-text-stroke": {
+    "affects-layout": false,
+    "initial": "0 currentColor",
+    "longhands": [
+      "-webkit-text-stroke-width",
+      "-webkit-text-stroke-color"
+    ]
+  },
+  "-webkit-text-stroke-color": {
+    "style-group": "InheritedTextValues",
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": true,
+    "initial": "currentColor",
+    "needs-layout-node-for-resolved-value": true,
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "color"
+    ]
+  },
+  "-webkit-text-stroke-width": {
+    "style-group": "InheritedTextValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "0",
+    "requires-computation": "non-inherited-value",
+    "valid-types": [
+      "length [0,∞]",
+      "line-width"
     ]
   },
   "-webkit-transform": {
@@ -258,6 +444,7 @@
     ]
   },
   "alignment-baseline": {
+    "style-group": "SVGResetValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "baseline",
@@ -266,7 +453,9 @@
       "baseline-metric"
     ],
     "valid-identifiers": [
-      "baseline"
+      "baseline",
+      "text-after-edge>text-bottom",
+      "text-before-edge>text-top"
     ]
   },
   "all": {
@@ -495,7 +684,7 @@
     ]
   },
   "appearance": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "none",
@@ -529,6 +718,7 @@
     "needs-layout-node-for-resolved-value": true,
     "__comment": "FIXME: List `filter-value-list` as a valid-type once it's generically supported.",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "cascaded-value",
     "valid-identifiers": [
       "none"
@@ -752,6 +942,8 @@
     ]
   },
   "baseline-source": {
+    "style-group": "BoxValues",
+    "affects-layout": true,
     "animation-type": "discrete",
     "inherited": false,
     "initial": "auto",
@@ -986,7 +1178,6 @@
     "needs-layout-node-for-resolved-value": true
   },
   "border-collapse": {
-    "style-group": "InheritedTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "separate",
@@ -1335,7 +1526,7 @@
     "requires-computation": "cascaded-value"
   },
   "border-spacing": {
-    "style-group": "InheritedTableValues",
+    "style-group": "InheritedListTableValues",
     "_comment": "Follows the newer definition from: https://drafts.csswg.org/css-tables-3/#border-spacing-property",
     "animation-type": "by-computed-value",
     "inherited": true,
@@ -1494,7 +1685,7 @@
     "needs-layout-for-getcomputedstyle": true
   },
   "box-decoration-break": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "slice",
@@ -1527,7 +1718,7 @@
     ]
   },
   "break-after": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "auto",
@@ -1537,7 +1728,7 @@
     ]
   },
   "break-before": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "auto",
@@ -1547,7 +1738,7 @@
     ]
   },
   "break-inside": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "auto",
@@ -1557,7 +1748,6 @@
     ]
   },
   "caption-side": {
-    "style-group": "InheritedTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "top",
@@ -1703,7 +1893,7 @@
     ]
   },
   "column-fill": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "balance",
@@ -1728,7 +1918,7 @@
     "percentages-resolve-to": "length"
   },
   "column-height": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "auto",
@@ -1749,8 +1939,20 @@
       "column-rule-color"
     ]
   },
+  "column-rule-break": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "none",
+      "normal",
+      "intersection"
+    ]
+  },
   "column-rule-color": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -1761,19 +1963,129 @@
       "color"
     ]
   },
+  "column-rule-inset": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-cap-end",
+      "column-rule-inset-junction-start",
+      "column-rule-inset-junction-end"
+    ]
+  },
+  "column-rule-inset-cap": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-cap-end"
+    ]
+  },
+  "column-rule-inset-cap-end": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "column-rule-inset-cap-start": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "column-rule-inset-end": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-end",
+      "column-rule-inset-junction-end"
+    ]
+  },
+  "column-rule-inset-junction": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-junction-start",
+      "column-rule-inset-junction-end"
+    ]
+  },
+  "column-rule-inset-junction-end": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "column-rule-inset-junction-start": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "column-rule-inset-start": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-junction-start"
+    ]
+  },
   "column-rule-style": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
     "initial": "none",
-    "requires-computation": "never",
+    "requires-computation": "cascaded-value",
     "valid-types": [
       "line-style"
     ]
   },
+  "column-rule-visibility-items": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "all",
+      "around",
+      "between",
+      "normal"
+    ]
+  },
   "column-rule-width": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -1785,7 +2097,7 @@
     ]
   },
   "column-span": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "discrete",
     "inherited": false,
     "initial": "none",
@@ -1841,7 +2153,10 @@
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "none",
-    "requires-computation": "cascaded-value"
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]"
+    ]
   },
   "contain-intrinsic-inline-size": {
     "logical-alias-for": {
@@ -1865,7 +2180,10 @@
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "none",
-    "requires-computation": "cascaded-value"
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]"
+    ]
   },
   "container": {
     "initial": "none",
@@ -1881,6 +2199,7 @@
     "inherited": false,
     "initial": "none",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![none,and,not,or]"
@@ -1925,7 +2244,7 @@
     ]
   },
   "content-visibility": {
-    "style-group": "InheritedBoxValues",
+    "style-group": "MiscLayoutValues",
     "affects-stacking-context": true,
     "animation-type": "custom",
     "inherited": false,
@@ -2209,7 +2528,6 @@
     "requires-computation": "never"
   },
   "direction": {
-    "style-group": "InheritedBoxValues",
     "animation-type": "none",
     "inherited": true,
     "initial": "ltr",
@@ -2246,11 +2564,12 @@
       "baseline-metric"
     ],
     "valid-identifiers": [
-      "auto"
+      "auto",
+      "text-after-edge>text-bottom",
+      "text-before-edge>text-top"
     ]
   },
   "empty-cells": {
-    "style-group": "InheritedTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "show",
@@ -2315,10 +2634,27 @@
     "needs-layout-node-for-resolved-value": true,
     "__comment": "FIXME: List `filter-value-list` as a valid-type once it's generically supported.",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "cascaded-value",
     "valid-identifiers": [
       "none"
     ]
+  },
+  "fit-tolerance": {
+    "style-group": "GridValues",
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]",
+      "percentage [0,∞]"
+    ],
+    "valid-identifiers": [
+      "normal",
+      "infinite"
+    ],
+    "percentages-resolve-to": "length"
   },
   "flex": {
     "initial": "0 1 auto",
@@ -2506,6 +2842,22 @@
       "font-optical-sizing"
     ]
   },
+  "font-palette": {
+    "__comment": "FIXME: Select the COLR palette when the font API supports palette selection. INTEROP: Animate discretely until palette-mix() is supported by multiple engines.",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-types": [
+      "dashed-ident"
+    ],
+    "valid-identifiers": [
+      "normal",
+      "light",
+      "dark"
+    ]
+  },
   "font-size": {
     "style-group": "FontValues",
     "animation-type": "by-computed-value",
@@ -2549,6 +2901,18 @@
     "requires-computation": "cascaded-value",
     "valid-types": [
       "font-style"
+    ]
+  },
+  "font-synthesis": {
+    "initial": "weight style small-caps position",
+    "longhands": [
+      "font-synthesis-position",
+      "font-synthesis-small-caps",
+      "font-synthesis-style",
+      "font-synthesis-weight"
+    ],
+    "valid-types": [
+      "string"
     ]
   },
   "font-synthesis-position": {
@@ -2753,7 +3117,7 @@
     ]
   },
   "grid": {
-    "initial": "auto",
+    "initial": "none",
     "valid-identifiers": [
       "auto"
     ],
@@ -2797,6 +3161,7 @@
       "auto"
     ],
     "valid-types": [
+      "flex [0,∞]",
       "length [0,∞]",
       "percentage [0,∞]",
       "string"
@@ -2820,6 +3185,7 @@
       "auto"
     ],
     "valid-types": [
+      "flex [0,∞]",
       "length [0,∞]",
       "percentage [0,∞]",
       "string"
@@ -2914,7 +3280,7 @@
     ]
   },
   "grid-template": {
-    "initial": "auto",
+    "initial": "none",
     "valid-identifiers": [
       "auto"
     ],
@@ -3004,8 +3370,30 @@
     ],
     "needs-layout-for-getcomputedstyle": true
   },
+  "hyphenate-character": {
+    "__comment": "FIXME: Use this string, not just its auto hyphen, at a hyphenation opportunity.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "string"
+    ],
+    "valid-identifiers": [
+      "auto"
+    ]
+  },
+  "hyphens": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "manual",
+    "requires-computation": "never",
+    "valid-types": [
+      "hyphens"
+    ]
+  },
   "image-rendering": {
-    "style-group": "InheritedBoxValues",
+    "style-group": "InheritedUIValues",
     "animation-type": "discrete",
     "affects-layout": false,
     "inherited": true,
@@ -3200,6 +3588,20 @@
       "unitless-length"
     ]
   },
+  "line-break": {
+    "style-group": "InheritedTextValues",
+    "animation-type": "discrete",
+    "initial": "auto",
+    "inherited": true,
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "anywhere",
+      "auto",
+      "loose",
+      "normal",
+      "strict"
+    ]
+  },
   "line-clamp": {
     "affects-layout": true,
     "initial": "none",
@@ -3236,7 +3638,7 @@
     ]
   },
   "list-style-image": {
-    "style-group": "InheritedListValues",
+    "style-group": "InheritedListTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "none",
@@ -3249,7 +3651,6 @@
     ]
   },
   "list-style-position": {
-    "style-group": "InheritedListValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "outside",
@@ -3259,7 +3660,7 @@
     ]
   },
   "list-style-type": {
-    "style-group": "InheritedListValues",
+    "style-group": "InheritedListTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "disc",
@@ -3433,7 +3834,6 @@
     "needs-layout-for-getcomputedstyle": true
   },
   "mask": {
-    "__comment": "FIXME: reset mask-border",
     "affects-layout": false,
     "initial": "none",
     "multiplicity": "coordinating-list",
@@ -3445,8 +3845,108 @@
       "mask-origin",
       "mask-position",
       "mask-repeat",
-      "mask-size"
+      "mask-size",
+      "mask-border"
     ]
+  },
+  "mask-border": {
+    "initial": "none",
+    "longhands": [
+      "mask-border-source",
+      "mask-border-slice",
+      "mask-border-width",
+      "mask-border-outset",
+      "mask-border-repeat",
+      "mask-border-mode"
+    ]
+  },
+  "mask-border-mode": {
+    "style-group": "MaskValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "alpha",
+    "requires-computation": "never",
+    "valid-types": [
+      "mask-type"
+    ]
+  },
+  "mask-border-outset": {
+    "style-group": "MaskValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "max-values": 4,
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]",
+      "number [0,∞]"
+    ]
+  },
+  "mask-border-repeat": {
+    "style-group": "MaskValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "stretch",
+    "max-values": 2,
+    "requires-computation": "never",
+    "valid-types": [
+      "border-image-repeat"
+    ]
+  },
+  "mask-border-slice": {
+    "style-group": "MaskValues",
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-identifiers": [
+      "fill"
+    ],
+    "valid-types": [
+      "number [0,∞]",
+      "percentage [0,∞]"
+    ],
+    "needs-layout-for-getcomputedstyle": true
+  },
+  "mask-border-source": {
+    "style-group": "MaskValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-stacking-context": true,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "none",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "image"
+    ],
+    "valid-identifiers": [
+      "none"
+    ]
+  },
+  "mask-border-width": {
+    "style-group": "MaskValues",
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "auto",
+    "max-values": 4,
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]",
+      "percentage [0,∞]",
+      "number [0,∞]"
+    ],
+    "valid-identifiers": [
+      "auto"
+    ],
+    "percentages-resolve-to": "length",
+    "needs-layout-for-getcomputedstyle": true
   },
   "mask-clip": {
     "style-group": "MaskValues",
@@ -3581,7 +4081,7 @@
     "initial": "luminance"
   },
   "math-depth": {
-    "animation-type": "none",
+    "animation-type": "by-computed-value",
     "inherited": true,
     "initial": "0",
     "needs-layout-node-for-resolved-value": true,
@@ -3595,7 +4095,7 @@
     ]
   },
   "math-shift": {
-    "animation-type": "none",
+    "animation-type": "discrete",
     "inherited": true,
     "initial": "normal",
     "requires-computation": "never",
@@ -3604,7 +4104,7 @@
     ]
   },
   "math-style": {
-    "animation-type": "none",
+    "animation-type": "discrete",
     "inherited": true,
     "initial": "normal",
     "requires-computation": "never",
@@ -3760,7 +4260,7 @@
     ]
   },
   "object-fit": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -3771,7 +4271,7 @@
     ]
   },
   "object-position": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "repeatable-list",
     "affects-layout": false,
@@ -3890,6 +4390,7 @@
   },
   "order": {
     "style-group": "AlignmentValues",
+    "affects-stacking-context": true,
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0",
@@ -3918,7 +4419,7 @@
     ]
   },
   "outline-color": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -3931,7 +4432,7 @@
     ]
   },
   "outline-offset": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -3942,7 +4443,7 @@
     ]
   },
   "outline-style": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -3953,7 +4454,7 @@
     ]
   },
   "outline-width": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -4019,7 +4520,7 @@
     }
   },
   "overflow-clip-margin-bottom": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0px",
@@ -4051,7 +4552,7 @@
     }
   },
   "overflow-clip-margin-left": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0px",
@@ -4061,7 +4562,7 @@
     "requires-computation": "cascaded-value"
   },
   "overflow-clip-margin-right": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0px",
@@ -4071,7 +4572,7 @@
     "requires-computation": "cascaded-value"
   },
   "overflow-clip-margin-top": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0px",
@@ -4100,6 +4601,7 @@
   },
   "overflow-x": {
     "style-group": "BoxValues",
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "initial": "visible",
@@ -4113,6 +4615,7 @@
   },
   "overflow-y": {
     "style-group": "BoxValues",
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "initial": "visible",
@@ -4149,7 +4652,7 @@
   },
   "overscroll-behavior-x": {
     "affects-hit-testing": true,
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -4161,7 +4664,7 @@
   },
   "overscroll-behavior-y": {
     "affects-hit-testing": true,
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -4395,7 +4898,6 @@
   },
   "pointer-events": {
     "affects-hit-testing": true,
-    "style-group": "InheritedUIValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": true,
@@ -4492,11 +4994,12 @@
     ]
   },
   "quotes": {
-    "style-group": "InheritedListValues",
+    "style-group": "InheritedListTableValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "auto",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "string"
@@ -4525,7 +5028,7 @@
   "resize": {
     "affects-hit-testing": true,
     "style-group": "BoxValues",
-    "animation-type": "none",
+    "animation-type": "discrete",
     "inherited": false,
     "affects-layout": false,
     "initial": "none",
@@ -4580,6 +5083,276 @@
     ],
     "percentages-resolve-to": "length"
   },
+  "row-rule": {
+    "affects-layout": false,
+    "initial": "medium none currentColor",
+    "longhands": [
+      "row-rule-width",
+      "row-rule-style",
+      "row-rule-color"
+    ]
+  },
+  "row-rule-break": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "none",
+      "normal",
+      "intersection"
+    ]
+  },
+  "row-rule-color": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "currentColor",
+    "needs-layout-node-for-resolved-value": true,
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "color"
+    ]
+  },
+  "row-rule-inset": {
+    "initial": "0",
+    "longhands": [
+      "row-rule-inset-cap-start",
+      "row-rule-inset-cap-end",
+      "row-rule-inset-junction-start",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "row-rule-inset-cap": {
+    "initial": "0",
+    "longhands": [
+      "row-rule-inset-cap-start",
+      "row-rule-inset-cap-end"
+    ]
+  },
+  "row-rule-inset-cap-end": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "row-rule-inset-cap-start": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "row-rule-inset-end": {
+    "initial": "0",
+    "longhands": [
+      "row-rule-inset-cap-end",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "row-rule-inset-junction": {
+    "initial": "0",
+    "longhands": [
+      "row-rule-inset-junction-start",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "row-rule-inset-junction-end": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "row-rule-inset-junction-start": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "overlap-join"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "row-rule-inset-start": {
+    "initial": "0",
+    "longhands": [
+      "row-rule-inset-cap-start",
+      "row-rule-inset-junction-start"
+    ]
+  },
+  "row-rule-style": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "none",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "line-style"
+    ]
+  },
+  "row-rule-visibility-items": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "all",
+      "around",
+      "between",
+      "normal"
+    ]
+  },
+  "row-rule-width": {
+    "affects-layout": false,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "medium",
+    "requires-computation": "non-inherited-value",
+    "valid-types": [
+      "length [0,∞]",
+      "line-width"
+    ]
+  },
+  "rule": {
+    "affects-layout": false,
+    "initial": "medium none currentColor",
+    "longhands": [
+      "column-rule-width",
+      "column-rule-style",
+      "column-rule-color",
+      "row-rule-width",
+      "row-rule-style",
+      "row-rule-color"
+    ]
+  },
+  "rule-break": {
+    "initial": "normal",
+    "longhands": [
+      "column-rule-break",
+      "row-rule-break"
+    ]
+  },
+  "rule-color": {
+    "initial": "currentColor",
+    "longhands": [
+      "column-rule-color",
+      "row-rule-color"
+    ]
+  },
+  "rule-inset": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-cap-end",
+      "column-rule-inset-junction-start",
+      "column-rule-inset-junction-end",
+      "row-rule-inset-cap-start",
+      "row-rule-inset-cap-end",
+      "row-rule-inset-junction-start",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "rule-inset-cap": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-cap-end",
+      "row-rule-inset-cap-start",
+      "row-rule-inset-cap-end"
+    ]
+  },
+  "rule-inset-end": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-end",
+      "column-rule-inset-junction-end",
+      "row-rule-inset-cap-end",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "rule-inset-junction": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-junction-start",
+      "column-rule-inset-junction-end",
+      "row-rule-inset-junction-start",
+      "row-rule-inset-junction-end"
+    ]
+  },
+  "rule-inset-start": {
+    "initial": "0",
+    "longhands": [
+      "column-rule-inset-cap-start",
+      "column-rule-inset-junction-start",
+      "row-rule-inset-cap-start",
+      "row-rule-inset-junction-start"
+    ]
+  },
+  "rule-overlap": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "row-over-column",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "row-over-column",
+      "column-over-row"
+    ]
+  },
+  "rule-style": {
+    "initial": "none",
+    "longhands": [
+      "column-rule-style",
+      "row-rule-style"
+    ]
+  },
+  "rule-visibility-items": {
+    "initial": "normal",
+    "longhands": [
+      "column-rule-visibility-items",
+      "row-rule-visibility-items"
+    ]
+  },
+  "rule-width": {
+    "initial": "medium",
+    "longhands": [
+      "column-rule-width",
+      "row-rule-width"
+    ]
+  },
   "rx": {
     "style-group": "SVGResetValues",
     "__comment": "This is an SVG 2 geometry property, see: https://www.w3.org/TR/SVG/geometry.html#RX.",
@@ -4630,11 +5403,12 @@
     "requires-computation": "cascaded-value"
   },
   "scroll-behavior": {
-    "style-group": "MiscResetValues",
+    "__comment": "INTEROP: The spec says 'not animatable', but we animate it discretely, matching other engines. See https://github.com/w3c/csswg-drafts/issues/14706",
+    "style-group": "MiscInteractionValues",
     "initial": "auto",
     "inherited": false,
     "affects-layout": false,
-    "animation-type": "none",
+    "animation-type": "discrete",
     "requires-computation": "never",
     "valid-identifiers": [
       "auto",
@@ -4678,7 +5452,7 @@
     }
   },
   "scroll-margin-bottom": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "initial": "0",
     "inherited": false,
@@ -4711,7 +5485,7 @@
     }
   },
   "scroll-margin-left": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0",
@@ -4721,7 +5495,7 @@
     ]
   },
   "scroll-margin-right": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0",
@@ -4731,7 +5505,7 @@
     ]
   },
   "scroll-margin-top": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0",
@@ -4787,7 +5561,7 @@
     }
   },
   "scroll-padding-bottom": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "initial": "auto",
     "inherited": false,
@@ -4830,7 +5604,7 @@
     }
   },
   "scroll-padding-left": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "auto",
@@ -4845,7 +5619,7 @@
     "percentages-resolve-to": "length"
   },
   "scroll-padding-right": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "auto",
@@ -4860,7 +5634,7 @@
     "percentages-resolve-to": "length"
   },
   "scroll-padding-top": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "auto",
@@ -4875,7 +5649,7 @@
     "percentages-resolve-to": "length"
   },
   "scroll-snap-align": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -4887,7 +5661,7 @@
     ]
   },
   "scroll-snap-stop": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -4898,7 +5672,7 @@
     ]
   },
   "scroll-snap-type": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -4950,7 +5724,7 @@
     "requires-computation": "cascaded-value"
   },
   "scrollbar-gutter": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "__comment": "This property should affect layout per-spec, but ladybird always uses overlay scrollbars so it doesn't in practice.",
@@ -4959,7 +5733,7 @@
     "requires-computation": "never"
   },
   "scrollbar-width": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -4975,7 +5749,7 @@
     ]
   },
   "shape-image-threshold": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": false,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -4986,7 +5760,7 @@
     ]
   },
   "shape-margin": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "0",
@@ -4998,7 +5772,7 @@
     "percentages-resolve-to": "length"
   },
   "shape-outside": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscLayoutValues",
     "affects-layout": true,
     "animation-type": "by-computed-value",
     "inherited": false,
@@ -5152,13 +5926,17 @@
     ]
   },
   "text-align": {
-    "style-group": "InheritedTextValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "start",
     "requires-computation": "never",
     "valid-types": [
       "text-align"
+    ],
+    "valid-identifiers": [
+      "-libweb-center>-webkit-center",
+      "-libweb-left>-webkit-left",
+      "-libweb-right>-webkit-right"
     ]
   },
   "text-align-last": {
@@ -5259,6 +6037,19 @@
     ],
     "percentages-resolve-to": "length"
   },
+  "text-emphasis-position": {
+    "__comment": "FIXME: Use this position when text emphasis rendering is implemented.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "over right",
+    "requires-computation": "non-inherited-value",
+    "valid-identifiers": [
+      "over",
+      "under",
+      "left",
+      "right"
+    ]
+  },
   "text-indent": {
     "style-group": "InheritedTextValues",
     "animation-type": "by-computed-value",
@@ -5292,7 +6083,6 @@
     ]
   },
   "text-orientation": {
-    "style-group": "InheritedBoxValues",
     "animation-type": "none",
     "inherited": true,
     "initial": "mixed",
@@ -5381,7 +6171,6 @@
     ]
   },
   "text-wrap-mode": {
-    "style-group": "InheritedTextValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "wrap",
@@ -5429,7 +6218,7 @@
     "needs-layout-for-getcomputedstyle": true
   },
   "touch-action": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -5564,6 +6353,7 @@
     "inherited": false,
     "initial": "all",
     "multiplicity": "coordinating-list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![none]"
@@ -5612,7 +6402,7 @@
     ]
   },
   "user-select": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -5700,7 +6490,7 @@
     "multiplicity": "coordinating-list"
   },
   "view-transition-class": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -5715,7 +6505,7 @@
     ]
   },
   "view-transition-name": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "affects-stacking-context": true,
     "animation-type": "discrete",
@@ -5731,7 +6521,6 @@
   },
   "visibility": {
     "affects-hit-testing": true,
-    "style-group": "InheritedBoxValues",
     "animation-type": "custom",
     "inherited": true,
     "initial": "visible",
@@ -5752,10 +6541,10 @@
     ]
   },
   "white-space-collapse": {
-    "style-group": "InheritedTextValues",
     "animation-type": "discrete",
     "inherited": true,
     "initial": "collapse",
+    "__comment": "AD-HOC: The spec also defines a `discard` value. It is not parsed, matching other engines.",
     "requires-computation": "never",
     "valid-types": [
       "white-space-collapse"
@@ -5809,13 +6598,14 @@
     "needs-layout-for-getcomputedstyle": true
   },
   "will-change": {
-    "style-group": "MiscResetValues",
+    "style-group": "MiscInteractionValues",
     "affects-layout": false,
     "affects-stacking-context": true,
     "animation-type": "none",
     "inherited": false,
     "initial": "auto",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![all,auto,contents,none,scroll-position,will-change]"
@@ -5827,7 +6617,6 @@
     ]
   },
   "word-break": {
-    "style-group": "InheritedTextValues",
     "animation-type": "discrete",
     "initial": "normal",
     "inherited": true,
@@ -5861,13 +6650,20 @@
     "legacy-alias-for": "overflow-wrap"
   },
   "writing-mode": {
-    "style-group": "InheritedBoxValues",
     "animation-type": "none",
     "inherited": true,
     "initial": "horizontal-tb",
     "requires-computation": "never",
     "valid-types": [
       "writing-mode"
+    ],
+    "valid-identifiers": [
+      "lr",
+      "lr-tb",
+      "rl",
+      "rl-tb",
+      "tb",
+      "tb-rl"
     ]
   },
   "x": {
@@ -5915,6 +6711,19 @@
     ],
     "valid-identifiers": [
       "auto"
+    ]
+  },
+  "zoom": {
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "1",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "number [0,∞]",
+      "percentage [0,∞]"
+    ],
+    "valid-identifiers": [
+      "normal"
     ]
   }
 }

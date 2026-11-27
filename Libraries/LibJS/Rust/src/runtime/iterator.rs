@@ -36,7 +36,7 @@ use crate::runtime::realm_watchpoints;
 pub use libjs_abi::IteratorHint;
 
 /// The hint of a GetIterator instruction, as the bytecode encodes it.
-pub fn iterator_hint_from_bytecode(encoded: u32) -> IteratorHint {
+pub fn iterator_hint_from_bytecode(encoded: u8) -> IteratorHint {
     match encoded {
         0 => IteratorHint::Sync,
         1 => IteratorHint::Async,
@@ -100,7 +100,7 @@ impl Deref for IteratorRecord {
 
 impl IteratorRecord {
     pub fn create(vm: &Vm, iterator: Option<Gc<Object>>, next_method: Value, done: bool) -> Gc<IteratorRecord> {
-        vm.heap().allocate(IteratorRecord {
+        vm.heap().allocate(|_| IteratorRecord {
             header: CellHeader::for_class(Self::CLASS),
             record: IteratorRecordImpl::new(iterator, next_method, done),
         })
@@ -134,14 +134,17 @@ impl Deref for Iterator {
 }
 
 impl Iterator {
-    pub fn create(vm: &Vm, prototype: Gc<Object>, iterated: Gc<IteratorRecord>) -> Gc<Iterator> {
-        allocate_object(
-            vm,
-            Iterator {
-                base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
-                iterated: Cell::new(iterated),
-            },
-        )
+    pub fn create(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>, iterated: Gc<IteratorRecord>) -> Gc<Iterator> {
+        allocate_object(vm, |_| Iterator {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+            iterated: Cell::new(iterated),
+        })
     }
 
     pub fn iterated(&self) -> Gc<IteratorRecord> {

@@ -7,9 +7,9 @@
 import argparse
 import http.client
 import http.server
+import importlib
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -17,6 +17,8 @@ import threading
 import time
 
 from typing import cast
+
+webdriver_helpers = importlib.import_module("test-webdriver-delete-session")
 
 BLOCKED_RESPONSE_TIMEOUT_SECONDS = 30
 EVENT_TIMEOUT_SECONDS = 30
@@ -88,6 +90,13 @@ class TestPageServer(http.server.ThreadingHTTPServer):
 
 
 class TestPageHandler(http.server.BaseHTTPRequestHandler):
+    def end_headers(self):
+        # The tests count and block the requests that history traversals make, so each of them must reach this server.
+        # A history traversal loads a document with the "force-cache" cache mode, which uses any stored response.
+        if b"Cache-Control:" not in b"".join(getattr(self, "_headers_buffer", [])):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self):
         server = cast(TestPageServer, self.server)
         server_port = server.server_port
@@ -823,23 +832,6 @@ window.initialNavigationCurrentIndex = navigation.currentEntry.index;
 
     def log_message(self, format, *args):
         pass
-
-
-def unused_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_for_port(port, timeout=EVENT_TIMEOUT_SECONDS):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Timed out waiting for port {port}")
 
 
 def wait_for_event(event, label, timeout=EVENT_TIMEOUT_SECONDS):
@@ -2110,6 +2102,30 @@ def run_failed_redirected_navigation_shows_failed_url_test(webdriver_port, page_
     request(webdriver_port, "DELETE", f"/session/{session_id}")
 
 
+def run_back_to_reloaded_initial_about_blank_test(webdriver_port, url_a):
+    # Reloading the initial about:blank leaves a document that isn't initial, so the navigation from it adds an entry
+    # rather than replacing it, and going back traverses to the entry the reload populated.
+    session_id = create_session(webdriver_port)
+    try:
+        log = [f"reloaded initial about:blank: {current_url(webdriver_port, session_id)}"]
+        execute_script(webdriver_port, session_id, "window.beforeReload = true; return null;")
+        refresh(webdriver_port, session_id)
+        wait_for_script_result(
+            webdriver_port,
+            session_id,
+            "reloaded initial about:blank",
+            "return [window.beforeReload === undefined, document.readyState];",
+            lambda result: result == [True, "complete"],
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after leaving the reloaded about:blank", url_a, log)
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "back to the reloaded about:blank", "about:blank", log)
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
 def run_self_contained_navigation_tests(webdriver_port, page_port, url_a):
     run_webdriver_fragment_navigation_test(webdriver_port, url_a)
     run_webdriver_intercepted_navigation_click_test(
@@ -2999,7 +3015,6 @@ def run_test(webdriver_binary):
     page_server_thread = threading.Thread(target=page_server.serve_forever, daemon=True)
     page_server_thread.start()
 
-    webdriver_port = unused_port()
     env = os.environ.copy()
     env["LADYBIRD_SESSION_HISTORY_DEBUG"] = "1"
 
@@ -3008,19 +3023,13 @@ def run_test(webdriver_binary):
     expect_reload_pending_history_log = False
     expect_no_entry_history_log = False
 
-    webdriver = subprocess.Popen(
-        [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(webdriver_port)],
-        stdout=webdriver_stdout,
-        stderr=webdriver_stderr,
-        text=True,
-        env=env,
+    webdriver, webdriver_port = webdriver_helpers.launch_webdriver(
+        webdriver_binary, "--headless", output=webdriver_stdout, stderr=webdriver_stderr, env=env
     )
 
     session_id = None
     failed = False
     try:
-        wait_for_port(webdriver_port)
-
         baseline_open_fds = count_open_fds(webdriver.pid)
         page_port = page_server.server_port
         url_a = f"http://localhost:{page_port}/a"
@@ -3091,6 +3100,8 @@ def run_test(webdriver_binary):
         )
         request(webdriver_port, "DELETE", f"/session/{session_id}")
         session_id = None
+
+        run_back_to_reloaded_initial_about_blank_test(webdriver_port, url_a)
 
         session_id = create_session(webdriver_port)
         log = [f"first-entry replace initial: {current_url(webdriver_port, session_id)}"]
@@ -5104,7 +5115,7 @@ return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.heigh
         )
         page_server.release_blocked_reload.set()
         wait_for_event(page_server.reload_blocked_document_ran, "reload document after crash recovery")
-        expect_url(webdriver_port, session_id, "after blocked reload crash recovery", url_reload_blocked, log)
+        wait_for_url(webdriver_port, session_id, "after blocked reload crash recovery", url_reload_blocked, log)
         wait_for_session_history(
             webdriver_port,
             session_id,

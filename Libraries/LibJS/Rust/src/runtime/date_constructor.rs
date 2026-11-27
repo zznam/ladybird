@@ -62,17 +62,15 @@ fn argument_or(vm: &Vm, index: usize, fallback: f64) -> ThrowCompletionOr<f64> {
 
 impl DateConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<DateConstructor> {
-        realm.create_object(
-            vm,
-            DateConstructor {
-                base: NativeFunction::new_with_name(
-                    vm,
-                    Self::CLASS,
-                    vm.names.Date.as_string().clone(),
-                    realm.function_prototype(),
-                ),
-            },
-        )
+        realm.create_object(vm, |_| DateConstructor {
+            base: NativeFunction::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                Some(vm.names.Date.as_string().clone()),
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -201,8 +199,8 @@ impl DateConstructor {
         // 7. Set O.[[DateValue]] to dv.
         // 8. Return O.
         Ok(
-            ordinary_create_from_constructor_of(vm, realm, new_target, Intrinsics::date_prototype, |prototype| {
-                Date::new(vm, date_value, prototype)
+            ordinary_create_from_constructor_of(vm, realm, new_target, Intrinsics::date_prototype, |_, prototype| {
+                Date::new(vm, realm, date_value, prototype)
             })?
             .upcast(),
         )

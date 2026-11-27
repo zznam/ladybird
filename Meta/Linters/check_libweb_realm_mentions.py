@@ -35,53 +35,117 @@ CHECKED_SUFFIXES = {
 # This is intentionally exact. If a component goes down, tighten the baseline in
 # the same change. If it goes up, justify the architecture change here.
 ALLOWED_REALM_MENTIONS = {
-    "Animations": (5, 14, "animation callbacks/events and CSS value materialization still pass spec-selected realms"),
-    "CSS": (9, 24, "CSS Typed OM, parser-facing reification, style-value JS materialization, and setlike/maplike glue"),
-    "Clipboard": (4, 16, "clipboard item/data callbacks still materialize JS values in caller-selected realms"),
-    "ContentSecurityPolicy": (4, 14, "CSP violation/report objects and callbacks still materialize JS-facing values"),
-    "CookieStore": (2, 19, "cookie-store async callbacks and promise/value materialization still thread realms"),
-    "Crypto": (8, 383, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
-    "DOM": (10, 33, "DOM abort plumbing and node helpers still have callback/materialization realm use"),
+    "Animations": (
+        2,
+        4,
+        "host callbacks of the Rust animation code take the realm it selects to read the current high resolution time, "
+        "find an animation's relevant global object and wrap elements",
+    ),
+    "CSS": (
+        7,
+        11,
+        "CSS Typed OM, parser-facing reification, style-value JS materialization, setlike/maplike glue, and wrappers of declaration blocks owned by Rust objects",
+    ),
+    "Clipboard": (4, 6, "the C++ facades create the Rust objects in a given realm"),
+    "ContentSecurityPolicy": (
+        6,
+        13,
+        "CSP violation/report objects and callbacks still materialize JS-facing values; "
+        "the C++ glue of the Rust SecurityPolicyViolationEvent creates it in a given realm",
+    ),
+    "CookieStore": (2, 3, "the C++ facade creates the Rust CookieStore in a given realm"),
+    "DOM": (
+        11,
+        35,
+        "The AbortSignal and AbortController facades and node helpers use callback/materialization realms; "
+        "the C++ glue of the Rust CustomEvent creates it in a given realm",
+    ),
     "Fetch": (
         22,
-        62,
-        "Fetch bodies, headers, requests, responses, and controllers still materialize JS values/streams; the body receiver's delivery and close tasks carry the realm its stream is enqueued and closed in",
+        65,
+        "Fetch bodies, headers, requests, responses, response views, and controllers still materialize JS values/streams; "
+        "a fetch controller keeps the realm that started its fetch, in which its agent runs the rest of a response's "
+        "handover; BodyStreamPullSource creates body streams and materializes their pulls and errors on the consumer side, "
+        "each in its stream's realm; Body.textStream() creates its empty stream or streaming decoder in the receiver's "
+        "realm; the Rust XMLHttpRequest extracts bodies and aborts fetch controllers in its relevant realm",
     ),
-    "FileAPI": (4, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
+    "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
-        64,
-        200,
-        "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage",
+        86,
+        210,
+        "HTML algorithms still contain structured serialization, including canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; window postMessage glue supplies principal realms and routes remote messages; "
+        "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm; "
+        "the C++ glue of the Rust Storage and of the Rust events creates them in a given realm, "
+        "and the C++ glue of the Rust DataTransfer wraps its item list in a given realm",
     ),
     "IndexedDB": (
-        14,
-        92,
-        "IndexedDB requests/cursors/records still materialize structured-clone values in selected realms",
+        4,
+        10,
+        "the C++ glue of the Rust IndexedDB creates the factory in a global's realm and wraps values in a given realm",
     ),
     "Infra": (2, 13, "JSON parse/serialization helpers still expose JS values in selected realms"),
-    "Internals": (3, 3, "test-only internals still expose JS-facing helper objects and promises"),
-    "SVG": (2, 8, "SVG length objects still store/use realms for detached/reflected JS/CSS materialization"),
+    "Internals": (1, 1, "test-only internals still expose JS-facing helper objects and promises"),
+    "MediaCapture": (
+        2,
+        5,
+        "the C++ glue of the Rust MediaStreamTrackEvent creates it and wraps tracks in a given realm",
+    ),
+    "MediaSession": (
+        4,
+        10,
+        "MediaMetadata and ChapterInformation build the frozen arrays their [SameObject] FrozenArray attributes return, "
+        "freezing the elements too, which the generated conversion doesn't do",
+    ),
+    "PictureInPicture": (
+        2,
+        5,
+        "the C++ glue of the Rust PictureInPictureEvent creates it and wraps windows in a given realm",
+    ),
+    "SVG": (
+        4,
+        11,
+        "SVG length objects still store/use realms for detached/reflected JS/CSS materialization; the C++ glue of the "
+        "Rust TimeEvent creates it in a given realm",
+    ),
     "ServiceWorker": (
         6,
         41,
         "service worker jobs, caches, and container promises still materialize results in selected realms",
     ),
-    "Streams": (5, 14, "the C++ facade of the Rust streams creates streams and promises in caller-selected realms"),
-    "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
+    "StorageAPI": (2, 3, "the C++ glue of the Rust StorageManager creates one in a realm"),
+    "Streams": (7, 17, "the C++ facade of the Rust streams creates streams and promises in caller-selected realms"),
+    "TrustedTypes": (
+        4,
+        8,
+        "policy creation reports CSP violations in the caller's realm, and the Rust factory is created for its global's realm",
+    ),
     "WebAssembly": (
-        15,
-        89,
-        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
+        2,
+        8,
+        "the C++ glue of the Rust WebAssembly JS API creates errors and module records in a given realm, and reads "
+        "the agent cluster of one",
     ),
     "WebAudio": (
-        8,
-        19,
-        "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
+        7,
+        27,
+        "the Worklet, event loop, and media services still wrap C++ values or report exceptions in the caller's realm; "
+        "the port passes that realm explicitly across the Rust boundary",
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
-    "WebGL": (4, 9, "WebGL contexts are created in the realm of their canvas, and their events and promises in it"),
-    "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
-    "XHR": (4, 7, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
+    "WebGL": (4, 8, "WebGL contexts are created in the realm of their canvas, and their events in it"),
+    "WebLocks": (2, 4, "the C++ glue creates a Rust LockManager and schedules Rust steps in selected realms"),
+    "WebRTC": (
+        13,
+        22,
+        "peer connections, data channels and senders resolve promises and fire events in their relevant realm, encoded "
+        "frames are constructed and deserialized in the worker's realm, and the stats report's maplike glue",
+    ),
+    "XHR": (
+        3,
+        7,
+        "XHR/FormData/FileReader-style paths still materialize JS values and events; the Rust XMLHttpRequest creates "
+        "its request, its body and its fetch in its relevant realm",
+    ),
 }
 
 

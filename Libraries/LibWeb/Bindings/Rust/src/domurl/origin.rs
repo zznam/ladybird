@@ -17,6 +17,7 @@ use crate::bindings::conversions::to_dom_string;
 use crate::bindings::interface::{Interface, Ref, Wrappable, allocate, implementation_of};
 use crate::bindings::services::web_bindings_extract_an_origin;
 use crate::bindings::{CallContext, Exception, WebIdlResult};
+use crate::html::message_event::MessageEvent;
 
 #[derive(Trace)]
 #[gc(crate = libjs_rust)]
@@ -44,7 +45,7 @@ impl Origin {
         //     1. Let origin be the result of executing value's extract an origin operation.
         //     2. If origin is not null, then return a new Origin object whose origin is origin.
         if let Some(origin) = extract_an_origin(value) {
-            return Ok(allocate(cx.vm(), Self { origin }));
+            return Ok(allocate(cx.vm(), |_| Self { origin }));
         }
 
         // 2. If value is a string:
@@ -57,7 +58,7 @@ impl Origin {
             //    origin.
             if let Some(parsed_url) = parsed_url {
                 let origin = parsed_url.origin();
-                return Ok(allocate(cx.vm(), Self { origin }));
+                return Ok(allocate(cx.vm(), |_| Self { origin }));
             }
         }
 
@@ -101,6 +102,9 @@ fn extract_an_origin(value: Value) -> Option<OriginValue> {
     }
     if is_host_instance_of(&object, URL::wrapper_class()) {
         return Some(implementation_of::<URL>(object).extract_an_origin());
+    }
+    if is_host_instance_of(&object, MessageEvent::wrapper_class()) {
+        return implementation_of::<MessageEvent>(object).extract_an_origin();
     }
 
     unsafe extern "C" fn on_origin(ctx: *mut core::ffi::c_void, ffi_origin: *const FfiOrigin) {

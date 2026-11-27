@@ -6,7 +6,7 @@
 
 #include <AK/Hex.h>
 #include <LibCore/ImmutableBytes.h>
-#include <LibCrypto/Hash/SHA2.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibWebView/CrashReportDiagnostics.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/CrashReportSubmission.h>
@@ -18,7 +18,7 @@ static constexpr auto diagnostics_name = "crash-diagnostics.txt"sv;
 
 static ByteString sha256_hex(ReadonlyBytes bytes)
 {
-    return encode_hex(Crypto::Hash::SHA256::hash(bytes).bytes());
+    return encode_hex(Crypto::Hash::digest(Crypto::Hash::HashKind::SHA256, bytes).bytes());
 }
 
 static ReportSubmission::Contents describe_report(CrashReportSubmission::Options const& options, StringView text)
@@ -30,10 +30,8 @@ static ReportSubmission::Contents describe_report(CrashReportSubmission::Options
 
     contents.add_text("stack"sv, "stack_trace"sv, diagnostics.stack);
     contents.add_text("process"sv, "text"sv, diagnostics.header("Process"sv));
-    contents.add_text("platform"sv, "text"sv, diagnostics.header("Platform"sv));
-    contents.add_text("architecture"sv, "text"sv, diagnostics.header("Architecture"sv));
-    contents.add_text("git_commit"sv, "text"sv, diagnostics.header("Git commit"sv));
-    contents.add_text("build_configuration"sv, "text"sv, diagnostics.header("Build configuration"sv));
+    contents.add_build_information(diagnostics.header("Platform"sv), diagnostics.header("Architecture"sv),
+        diagnostics.header("Git commit"sv), diagnostics.header("Build configuration"sv));
     contents.add_text("cpp_compiler"sv, "text"sv, diagnostics.header("C++ compiler"sv));
     for (auto label : { "Verification failed"sv, "Assertion failed"sv, "Rust panic"sv }) {
         auto value = diagnostics.header(label);
@@ -48,6 +46,7 @@ static ReportSubmission::Contents describe_report(CrashReportSubmission::Options
         contents.add("signal_number"sv, "number"sv, *diagnostics.signal.number);
     contents.add_text("description"sv, "multiline"sv, options.description);
     contents.add_text("url"sv, "text"sv, options.url);
+    contents.add_platform_features(text);
 
     auto version = diagnostics.header("Version"sv);
     auto build = diagnostics.header("Build configuration"sv);
@@ -98,7 +97,7 @@ ErrorOr<ReportSubmission::Payload, String> CrashReportSubmission::prepare()
 
 void CrashReportSubmission::did_send()
 {
-    if (auto result = m_store.remove_sent_report(m_options.report_name); result.is_error())
+    if (auto result = m_store.remove_report(m_options.report_name); result.is_error())
         warnln("Could not remove the sent crash report: {}", result.error());
 }
 

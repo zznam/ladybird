@@ -23,8 +23,6 @@
 
 namespace Web::CSS {
 
-class CalcNodeRef;
-
 // https://drafts.csswg.org/css-values-4/#calc-context
 // Contains the context available at parse-time.
 struct CalculationContext {
@@ -34,6 +32,7 @@ struct CalculationContext {
     NumericRangesByValueType accepted_ranges_by_type {};
 
     static CalculationContext for_property(PropertyNameAndID const&);
+    static CalculationContext for_property(PropertyID);
 };
 
 class CalculatedStyleValue : public StyleValue {
@@ -41,7 +40,6 @@ public:
     // The numeric value alternatives a calculation leaf can hold.
     using NumericValue = Variant<Number, Angle, Flex, Frequency, Length, Percentage, Resolution, Time>;
 
-    static ValueComparingNonnullRefPtr<CalculatedStyleValue const> create(CalcNodeRef root, NumericType resolved_type, CalculationContext context);
     bool equals(StyleValue const& other) const;
     CalculationContext calculation_context() const;
 
@@ -55,28 +53,15 @@ public:
 
     Optional<Resolution> resolve_resolution(CalculationResolutionContext const&) const;
 
-    bool resolves_to_time() const { return resolved_type().matches_time(calculation_context().percentages_resolve_as); }
-    Optional<Time> resolve_time(CalculationResolutionContext const&) const;
-
     bool resolves_to_number() const { return resolved_type().matches_number(calculation_context().percentages_resolve_as); }
     Optional<double> resolve_number(CalculationResolutionContext const&) const;
-    Optional<i32> resolve_integer(CalculationResolutionContext const&) const;
-
     bool contains_percentage() const;
-
-    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
     friend class StyleValue;
 
     explicit CalculatedStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValue(Type::Calculated, data)
-    {
-    }
-
-    // Takes ownership of a transferred Rust calculation root.
-    explicit CalculatedStyleValue(StyleValueFFI::CalcNode const* rust_root, NumericType resolved_type, CalculationContext context)
-        : StyleValue(Type::Calculated, make_calculated_data_from_rust_root(rust_root, resolved_type, context))
     {
     }
 
@@ -89,8 +74,6 @@ private:
     //        There are still some CalculatedStyleValues which we don't call absolutized for (i.e. sub-values of other
     //        StyleValue classes which lack their own absolutized method) which will need to be fixed beforehand.
     Optional<ResolvedValue> resolve_value(CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
-
-    static StyleValueFFI::StyleValueData const* make_calculated_data_from_rust_root(StyleValueFFI::CalcNode const*, NumericType const&, CalculationContext const&);
 
     NumericType resolved_type() const;
 };

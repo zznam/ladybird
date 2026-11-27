@@ -37,17 +37,15 @@ define_native_function_class!(
 
 impl FinalizationRegistryConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<FinalizationRegistryConstructor> {
-        realm.create_object(
-            vm,
-            FinalizationRegistryConstructor {
-                base: NativeFunction::new_with_name(
-                    vm,
-                    Self::CLASS,
-                    vm.names.FinalizationRegistry.as_string().clone(),
-                    realm.function_prototype(),
-                ),
-            },
-        )
+        realm.create_object(vm, |_| FinalizationRegistryConstructor {
+            base: NativeFunction::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                Some(vm.names.FinalizationRegistry.as_string().clone()),
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -102,7 +100,9 @@ impl FinalizationRegistryConstructor {
             realm,
             new_target,
             Intrinsics::finalization_registry_prototype,
-            |prototype| FinalizationRegistry::new(vm, function_realm, cleanup_job_callback, prototype),
+            |defer_gc, prototype| {
+                FinalizationRegistry::new(defer_gc, vm, function_realm, cleanup_job_callback, prototype)
+            },
         )?;
         Ok(finalization_registry.upcast())
     }

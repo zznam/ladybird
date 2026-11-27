@@ -26,7 +26,7 @@ use crate::runtime::function_object::FunctionObject;
 use crate::runtime::iterator::{IteratorHint, IteratorRecord, get_iterator, iterator_close, iterator_step_value};
 use crate::runtime::job_callback::JobCallback;
 use crate::runtime::native_function::{NativeFunction, define_native_function_class, raw_native};
-use crate::runtime::promise::{Promise, PromiseState, RejectionOperation, promise_resolve};
+use crate::runtime::promise::{Promise, PromiseState, promise_resolve};
 use crate::runtime::promise_capability::{PromiseCapability, new_promise_capability, try_or_reject};
 use crate::runtime::promise_prototype::PromisePrototype;
 use crate::runtime::promise_resolving_element_functions::{
@@ -111,7 +111,7 @@ fn run_promise_all_resolve_element_job(
     value: Value,
 ) -> ThrowCompletionOr<Value> {
     // 5. Set values[thisIndex] to value.
-    values.set(index, value);
+    values.set(vm, index, value);
 
     // 6. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 7. If remainingElementsCount.[[Value]] = 0, then
@@ -213,16 +213,13 @@ fn invoke_promise_all_then(
 
             if promise.state() == PromiseState::Rejected {
                 let reason = promise.result();
-                if !promise.is_handled() {
-                    vm.host_promise_rejection_tracker()(vm, promise, RejectionOperation::Handle);
-                }
+                promise.mark_handled(vm);
 
                 let reject = result_capability.reject();
                 let job = create_heap_function(vm, (reject, reason), |vm, &(reject, reason)| {
                     call_function_object(vm, reject, Value::UNDEFINED, &[reason])
                 });
                 vm.host_enqueue_promise_job()(vm, job, Some(realm));
-                promise.set_is_handled();
                 return Ok(Value::UNDEFINED);
             }
 
@@ -296,7 +293,7 @@ fn perform_promise_common(
         };
 
         // c. Append undefined to values.
-        values.append(Value::UNDEFINED);
+        values.append(vm, Value::UNDEFINED);
 
         // d. Let nextPromise be ? Call(promiseResolve, constructor, « next »).
         let next_promise = call(vm, promise_resolve, constructor, &[next])?;
@@ -603,17 +600,15 @@ define_native_function_class!(
 
 impl PromiseConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<PromiseConstructor> {
-        realm.create_object(
-            vm,
-            PromiseConstructor {
-                base: NativeFunction::new_with_name(
-                    vm,
-                    Self::CLASS,
-                    vm.names.Promise.as_string().clone(),
-                    realm.function_prototype(),
-                ),
-            },
-        )
+        realm.create_object(vm, |_| PromiseConstructor {
+            base: NativeFunction::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                Some(vm.names.Promise.as_string().clone()),
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -745,7 +740,7 @@ impl PromiseConstructor {
             realm,
             new_target,
             |intrinsics, vm| intrinsics.promise_prototype(vm),
-            |prototype| Promise::new(vm, Promise::CLASS, prototype),
+            |defer_gc, prototype| Promise::new(defer_gc, vm, realm, Promise::CLASS, prototype),
         )?;
 
         // 8. Let resolvingFunctions be CreateResolvingFunctions(promise).

@@ -9,6 +9,7 @@
 //! code then exits to the interpreter, which runs the instruction itself.
 
 use ak::Utf16FlyString;
+use libjs_runtime_macros::jit_abi;
 
 use crate::bytecode::executable::{KeyedPropertyLookup, KeyedPropertyLookupCache, PropertyLookupCacheEntryType};
 use crate::gc::class::GcCell;
@@ -17,13 +18,76 @@ use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::array::Array;
+use crate::runtime::completion::Must;
+use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::module_namespace_object::ModuleNamespaceObject;
 use crate::runtime::property_key::{PropertyKey, StringMayBeNumber};
 use crate::runtime::proxy_object::ProxyObject;
 use crate::runtime::realm_watchpoints;
+use crate::runtime::shape::ShapeKey;
 use crate::runtime::string_object::StringObject;
 use crate::runtime::typed_array::{ContentType, TypedArrayBase};
 use crate::utf16::{has_fly_string_storage, to_utf16_fly_string};
+
+/// The packed-array path of Array.prototype.splice, without coercions or
+/// calls of species constructors. All checks precede its observable work.
+///
+/// # Safety
+///
+/// `items` points to `item_count` live, aligned values on the caller's native
+/// stack, outside any object's element storage, for the duration of the call.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_array_splice(
+    vm: &Vm,
+    receiver: u64,
+    start: i32,
+    delete_count: i32,
+    items: *const Value,
+    item_count: u32,
+) -> u64 {
+    let receiver = Value::from_bits(receiver);
+    if !receiver.is_object() {
+        return Value::EMPTY.0;
+    }
+    let Some(array) = receiver.as_object().downcast::<Array>() else {
+        return Value::EMPTY.0;
+    };
+    let realm = vm.current_realm().expect("JIT code runs in a realm");
+    if array.realm() != realm
+        || !array.is_simple_packed_array()
+        || !array.extensible()
+        || !array.length_is_writable()
+        || array.shape().property_count() != 0
+        || !array.default_prototype_chain_intact()
+        || !realm_watchpoints::array_species_is_unchanged(vm, realm)
+    {
+        return Value::EMPTY.0;
+    }
+    let length = array.indexed_array_like_size();
+    let start = if start < 0 {
+        (i64::from(length) + i64::from(start)).max(0) as u32
+    } else {
+        (start as u32).min(length)
+    };
+    let delete_count = (delete_count.max(0) as u32).min(length - start);
+    if u64::from(length - delete_count) + u64::from(item_count) > u64::from(u32::MAX) {
+        return Value::EMPTY.0;
+    }
+    let removed = Array::create(vm, realm, 0, None).must();
+    removed.set_indexed_property_elements_to_undefined(delete_count);
+    for index in 0..delete_count {
+        let value = array
+            .indexed_get(start + index)
+            .expect("packed arrays have every element")
+            .value;
+        removed.set_packed_indexed_element(index, value);
+    }
+    // SAFETY: The caller keeps these values on its native stack, which GC
+    // scans while allocating the result. Element storage growth does not collect.
+    let items = unsafe { ak::slice_from_raw_parts(items, item_count as usize) };
+    array.splice_packed_indexed_elements(start, delete_count, items);
+    Value::from_object(removed).0
+}
 
 /// The property key of a string or symbol, which converting runs no code for.
 fn string_or_symbol_key(vm: &Vm, key: Value) -> Option<PropertyKey> {
@@ -43,11 +107,14 @@ fn has_ordinary_lookups(object: Gc<Object>) -> bool {
         && !object.is_platform_object()
 }
 
+/// Whether the object is an ECMAScript function that has the property `key` without having made it yet.
+fn has_lazy_function_property(vm: &Vm, object: Gc<Object>, key: &PropertyKey) -> bool {
+    as_ecmascript_function_object(object).is_some_and(|function| function.has_lazy_property(vm, key))
+}
+
 /// Whether looking up the property `key` of the object creates nothing.
 fn lookup_creates_nothing(vm: &Vm, object: Gc<Object>, key: &PropertyKey) -> bool {
-    if object.is_ecmascript_function_object()
-        && (*key == vm.names.prototype || *key == vm.names.caller || *key == vm.names.arguments)
-    {
+    if has_lazy_function_property(vm, object, key) {
         return false;
     }
     if key.is_number() {
@@ -91,7 +158,7 @@ fn has_own_string_property(vm: &Vm, object: Gc<Object>, name: &Utf16FlyString) -
     let cache = vm.keyed_property_lookup_cache();
     let index = KeyedPropertyLookupCache::entry_index_for(shape, name);
     if let Some(entry) = cache.lookup(index, shape, name)
-        && (!shape.is_dictionary() || shape.dictionary_generation() == entry.shape_dictionary_generation)
+        && entry.shape_key() == Some(ShapeKey::of(shape))
     {
         // NB: Only names that are no array indices have entries, since the shape does not hold indexed properties.
         match entry.entry_type {
@@ -117,11 +184,7 @@ fn has_own_string_property(vm: &Vm, object: Gc<Object>, name: &Utf16FlyString) -
                 PropertyLookupCacheEntryType::MissingOwnProperty
             },
             property_offset: metadata.map_or(0, |metadata| metadata.offset),
-            shape_dictionary_generation: shape.dictionary_generation(),
-            shape: Some(shape),
-            prototype: None,
-            prototype_chain_validity: None,
-            new_shape: None,
+            ..KeyedPropertyLookup::for_shape(ShapeKey::of(shape))
         },
         name,
     );
@@ -131,8 +194,9 @@ fn has_own_string_property(vm: &Vm, object: Gc<Object>, name: &Utf16FlyString) -
 /// `Object.prototype.hasOwnProperty` called on `object` with `key`.
 ///
 /// JIT code calls this with its VM.
+#[jit_abi]
 pub extern "C" fn libjs_jit_has_own_property(vm: &Vm, object: u64, key: u64) -> u64 {
-    let (object, key) = (Value(object), Value(key));
+    let (object, key) = (Value::from_bits(object), Value::from_bits(key));
     if !object.is_object() || !has_ordinary_lookups(object.as_object()) {
         return Value::EMPTY.0;
     }
@@ -141,12 +205,17 @@ pub extern "C" fn libjs_jit_has_own_property(vm: &Vm, object: u64, key: u64) -> 
     {
         return Value::from_bool(result).0;
     }
-    let Some(key) = string_or_symbol_key(vm, key).filter(|key| lookup_creates_nothing(vm, object.as_object(), key))
-    else {
+    let Some(key) = string_or_symbol_key(vm, key) else {
         return Value::EMPTY.0;
     };
+    let object = object.as_object();
+    if has_lazy_function_property(vm, object, &key) {
+        return Value::TRUE.0;
+    }
+    if !lookup_creates_nothing(vm, object, &key) {
+        return Value::EMPTY.0;
+    }
     object
-        .as_object()
         .has_own_property(vm, &key)
         .map_or(Value::EMPTY, Value::from_bool)
         .0
@@ -155,8 +224,9 @@ pub extern "C" fn libjs_jit_has_own_property(vm: &Vm, object: u64, key: u64) -> 
 /// `key in object`.
 ///
 /// JIT code calls this with its VM.
+#[jit_abi]
 pub extern "C" fn libjs_jit_has_property(vm: &Vm, key: u64, object: u64) -> u64 {
-    let (key_value, object) = (Value(key), Value(object));
+    let (key_value, object) = (Value::from_bits(key), Value::from_bits(object));
     let index_key = key_value.is_int32() && key_value.as_i32() >= 0;
     if !object.is_object() || !(key_value.is_string() || key_value.is_symbol() || index_key) {
         return Value::EMPTY.0;
@@ -191,11 +261,15 @@ pub extern "C" fn libjs_jit_has_property(vm: &Vm, key: u64, object: u64) -> u64 
             Some(true) => return Value::TRUE.0,
             Some(false) => holder = current.prototype(),
             None => {
-                let Some(key) = string_or_symbol_key(vm, key_value)
-                    .filter(|key| prototype_chain_lookup_creates_nothing(vm, current, key))
-                else {
+                let Some(key) = string_or_symbol_key(vm, key_value) else {
                     return Value::EMPTY.0;
                 };
+                if has_lazy_function_property(vm, current, &key) {
+                    return Value::TRUE.0;
+                }
+                if !prototype_chain_lookup_creates_nothing(vm, current, &key) {
+                    return Value::EMPTY.0;
+                }
                 return current.has_property(vm, &key).map_or(Value::EMPTY, Value::from_bool).0;
             }
         }
@@ -209,8 +283,9 @@ pub extern "C" fn libjs_jit_has_property(vm: &Vm, key: u64, object: u64) -> u64 
 /// empty value otherwise.
 ///
 /// JIT code calls this with its VM.
+#[jit_abi]
 pub extern "C" fn libjs_jit_open_array_iteration(vm: &Vm, iterable: u64) -> u64 {
-    let iterable = Value(iterable);
+    let iterable = Value::from_bits(iterable);
     if !iterable.is_object() {
         return Value::EMPTY.0;
     }

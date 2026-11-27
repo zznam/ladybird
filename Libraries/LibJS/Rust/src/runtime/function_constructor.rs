@@ -42,17 +42,15 @@ define_native_function_class!(
 
 impl FunctionConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<FunctionConstructor> {
-        realm.create_object(
-            vm,
-            FunctionConstructor {
-                base: NativeFunction::new_with_name(
-                    vm,
-                    Self::CLASS,
-                    vm.names.Function.as_string().clone(),
-                    realm.function_prototype(),
-                ),
-            },
-        )
+        realm.create_object(vm, |_| FunctionConstructor {
+            base: NativeFunction::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                Some(vm.names.Function.as_string().clone()),
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -263,22 +261,8 @@ impl FunctionConstructor {
             );
         }
         // 32. Else if kind is normal, perform MakeConstructor(F).
-        else if kind == FunctionKind::Normal {
-            // FIXME: Implement MakeConstructor
-            prototype = Object::create_prototype(vm, realm, Some(realm.object_prototype()));
-            prototype.define_direct_property(
-                vm,
-                &names.constructor,
-                Value::from_object(function),
-                PropertyAttributes::new(Attribute::WRITABLE | Attribute::CONFIGURABLE),
-            );
-            function.define_direct_property(
-                vm,
-                &names.prototype,
-                Value::from_object(prototype),
-                PropertyAttributes::new(Attribute::WRITABLE),
-            );
-        }
+        // NB: Normal functions make their "prototype" property the first time something looks for it (see
+        //     EcmascriptFunctionObject::instantiate_lazy_prototype()).
 
         // 33. NOTE: Functions whose kind is async are not constructible and do not have a [[Construct]] internal method or a "prototype" property.
 
@@ -301,7 +285,7 @@ impl FunctionConstructor {
         for index in 0..vm.argument_count() {
             marked_arguments.push(vm.argument(index));
         }
-        let arguments = marked_arguments.to_vec();
+        let arguments = marked_arguments.values();
 
         let parameter_args = &arguments[..arguments.len().saturating_sub(1)];
 
@@ -341,11 +325,9 @@ pub fn compile_dynamic_function(
     kind: FunctionKind,
 ) -> Result<Gc<SharedFunctionInstanceData>, ParserError> {
     let source_code = SourceCode::create(Utf16String::default(), source_text.clone());
-    let mut full_source = Vec::with_capacity(source_code.length_in_code_units());
-    Utf16View::of_string(source_code.code()).append_to(&mut full_source);
-
-    let description = crate::compile::parse_dynamic_function(&full_source, parameters_string, body_parse_string, kind)
-        .and_then(crate::compile::ParsedDynamicFunction::into_description);
+    let description =
+        crate::compile::parse_dynamic_function(&source_code.code(), parameters_string, body_parse_string, kind)
+            .and_then(crate::compile::ParsedDynamicFunction::into_description);
     let description = match description {
         Ok(description) => description,
         Err(errors) => {
@@ -358,7 +340,7 @@ pub fn compile_dynamic_function(
         }
     };
 
-    let function_data = SharedFunctionInstanceData::create(vm, description, Some(&source_code));
+    let function_data = SharedFunctionInstanceData::create(vm, &description, description.strict, Some(&source_code));
     function_data.set_source_text_owner(source_text.clone());
     Ok(function_data)
 }

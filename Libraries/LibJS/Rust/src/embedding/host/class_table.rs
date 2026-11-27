@@ -13,14 +13,16 @@ use crate::embedding::abi_types::{completion_from_abi, optional_cell_from_abi};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::host_class::{
-    JS_HOST_ABI_VERSION, JS_HOST_CLASS_ARRAY, JS_HOST_CLASS_FUNCTION, JS_HOST_CLASS_HAS_CONSTRUCTOR,
-    JS_HOST_CLASS_IMMUTABLE_PROTOTYPE, JS_HOST_CLASS_IS_GLOBAL_OBJECT, JS_HOST_CLASS_IS_HTMLDDA,
-    JS_HOST_CLASS_IS_PLATFORM_OBJECT, JS_HOST_CLASS_MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS, JS_HOST_CLASS_MODULE,
-    JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE, JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
+    JS_HOST_CLASS_ARRAY, JS_HOST_CLASS_FUNCTION, JS_HOST_CLASS_HAS_CONSTRUCTOR, JS_HOST_CLASS_IMMUTABLE_PROTOTYPE,
+    JS_HOST_CLASS_IS_GLOBAL_OBJECT, JS_HOST_CLASS_IS_HTMLDDA, JS_HOST_CLASS_IS_PLATFORM_OBJECT,
+    JS_HOST_CLASS_MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS, JS_HOST_CLASS_MODULE,
+    JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS, JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE,
+    JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
     JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH, JS_HOST_CLASS_OBJECT,
     JS_HOST_CLASS_REQUIRES_SLOW_ADD_OWN_PROPERTY, JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT,
     JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY, JS_PROPERTY_LOOKUP_PHASE_PROTOTYPE_CHAIN, JSCompletion, JSGetCacheMetadata,
-    JSHostArrayHooks, JSHostClass, JSHostFunctionHooks, JSHostObjectHooks, JSObject, JSSetCacheMetadata,
+    JSHostArrayHooks, JSHostClass, JSHostFunctionHooks, JSHostModuleHooks, JSHostObjectHooks, JSObject,
+    JSSetCacheMetadata,
 };
 use crate::layout::object::Object;
 use crate::runtime::completion::ThrowCompletionOr;
@@ -36,6 +38,7 @@ const FLAGS_COPIED_INTO_OBJECTS: u32 = JS_HOST_CLASS_IS_PLATFORM_OBJECT
 const FLAGS_OF_HOST_OBJECTS_ONLY: u32 = JS_HOST_CLASS_IMMUTABLE_PROTOTYPE
     | JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE
     | JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE
+    | JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS
     | JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH;
 
 static HOST_OBJECT_HOOKS_THAT_ARE_ALL_ORDINARY: JSHostObjectHooks = JSHostObjectHooks {
@@ -54,9 +57,11 @@ static HOST_OBJECT_HOOKS_THAT_ARE_ALL_ORDINARY: JSHostObjectHooks = JSHostObject
     error_data: None,
     finalize: None,
     get_indexed_value: None,
+    preserve_identity: None,
 };
 
 static HOST_ARRAY_HOOKS_THAT_ARE_ALL_ORDINARY: JSHostArrayHooks = JSHostArrayHooks {
+    define_own_property: None,
     set: None,
     delete_property: None,
 };
@@ -74,7 +79,39 @@ pub fn host_class_into_abi(table: &'static JSHostClass) -> *const JSHostClass {
     core::ptr::from_ref(table)
 }
 
+// SAFETY: A class and its hooks are constant data that lives as long as the process, which no thread writes.
+unsafe impl Sync for JSHostClass {}
+// SAFETY: As for the class.
+unsafe impl Sync for JSHostObjectHooks {}
+// SAFETY: As for the class.
+unsafe impl Sync for JSHostFunctionHooks {}
+// SAFETY: As for the class.
+unsafe impl Sync for JSHostModuleHooks {}
+
 impl JSHostClass {
+    /// A class of the kind, for an embedder written in Rust, as JS::make_host_class() makes one for C++. `hooks` is the
+    /// hook struct of the kind, which must live as long as the process.
+    pub const fn new(
+        kind: u8,
+        name: &'static str,
+        parent: Option<&'static JSHostClass>,
+        hooks: *const core::ffi::c_void,
+        flags: u32,
+    ) -> Self {
+        Self {
+            kind,
+            flags,
+            name: name.as_ptr().cast(),
+            name_length: name.len(),
+            parent: match parent {
+                Some(parent) => parent,
+                None => core::ptr::null(),
+            },
+            hooks,
+            user_data: core::ptr::null(),
+        }
+    }
+
     /// The address that identifies the class.
     pub fn identity(&'static self) -> usize {
         core::ptr::from_ref(self).addr()
@@ -145,16 +182,10 @@ impl JSHostClass {
         unsafe { self.hooks.cast::<JSHostArrayHooks>().as_ref() }.unwrap_or(&HOST_ARRAY_HOOKS_THAT_ARE_ALL_ORDINARY)
     }
 
-    /// Checks what LibJS/HostObjectABI.h requires of a table of `kind`, which the engine then relies on: its version
-    /// and kind, flags that apply to the kind, a parent of the same kind to share an allocator with, and the hooks the
-    /// kind cannot do without.
+    /// Checks what LibJS/HostObjectABI.h requires of a table of `kind`, which the engine then relies on: its kind,
+    /// flags that apply to the kind, a parent of the same kind to share an allocator with, and the hooks the kind
+    /// cannot do without.
     pub fn validate(&'static self, kind: u8) {
-        assert!(
-            self.abi_version == JS_HOST_ABI_VERSION,
-            "the host class {} is of ABI version {}, not {JS_HOST_ABI_VERSION}",
-            self.class_name(),
-            self.abi_version
-        );
         assert!(
             self.kind == kind,
             "the host class {} is of kind {}, not {kind}",

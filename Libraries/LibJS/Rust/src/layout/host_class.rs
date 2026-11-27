@@ -12,8 +12,6 @@
 
 use core::ffi::{c_char, c_void};
 
-pub const JS_HOST_ABI_VERSION: u16 = 1;
-
 pub type JSValue = u64;
 
 /// A borrowed property key, with the bits of the runtime's own property key.
@@ -108,6 +106,14 @@ pub const JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH: u32
 pub const JS_HOST_CLASS_HAS_CONSTRUCTOR: u32 = 1 << 8;
 pub const JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT: u32 = 1 << 9;
 pub const JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE: u32 = 1 << 10;
+pub const JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS: u32 = 1 << 11;
+
+pub type DefineOwnPropertyHook = unsafe extern "C" fn(
+    object: *mut JSObject,
+    key: JSPropertyKey,
+    descriptor: *mut JSPropertyDescriptor,
+    precomputed_get_own_property: *const JSPropertyDescriptor,
+) -> JSCompletion;
 
 #[repr(C)]
 pub struct JSHostObjectHooks {
@@ -118,14 +124,7 @@ pub struct JSHostObjectHooks {
     pub get_own_property: Option<
         unsafe extern "C" fn(object: *mut JSObject, key: JSPropertyKey, out: *mut JSPropertyDescriptor) -> JSCompletion,
     >,
-    pub define_own_property: Option<
-        unsafe extern "C" fn(
-            object: *mut JSObject,
-            key: JSPropertyKey,
-            descriptor: *mut JSPropertyDescriptor,
-            precomputed_get_own_property: *const JSPropertyDescriptor,
-        ) -> JSCompletion,
-    >,
+    pub define_own_property: Option<DefineOwnPropertyHook>,
     pub has_property: Option<unsafe extern "C" fn(object: *mut JSObject, key: JSPropertyKey) -> JSCompletion>,
     pub get: Option<
         unsafe extern "C" fn(
@@ -152,6 +151,7 @@ pub struct JSHostObjectHooks {
     pub error_data: Option<unsafe extern "C" fn(object: *mut JSObject) -> *mut c_void>,
     pub finalize: Option<unsafe extern "C" fn(object: *mut JSObject)>,
     pub get_indexed_value: Option<unsafe extern "C" fn(object: *mut JSObject, index: u32) -> JSCompletion>,
+    pub preserve_identity: Option<unsafe extern "C" fn(object: *mut JSObject)>,
 }
 
 #[repr(C)]
@@ -164,6 +164,7 @@ pub struct JSHostFunctionHooks {
 
 #[repr(C)]
 pub struct JSHostArrayHooks {
+    pub define_own_property: Option<DefineOwnPropertyHook>,
     pub set: Option<
         unsafe extern "C" fn(
             object: *mut JSObject,
@@ -208,9 +209,7 @@ pub struct JSHostModuleHooks {
 
 #[repr(C)]
 pub struct JSHostClass {
-    pub abi_version: u16,
     pub kind: u8,
-    pub reserved: u8,
     pub flags: u32,
     pub name: *const c_char,
     pub name_length: usize,

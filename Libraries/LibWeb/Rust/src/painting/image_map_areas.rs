@@ -4,11 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::style::fast_hash::FastMap;
 use crate::layout::node_data::NodeSlotId;
 use libgfx_rust::path::Path;
 use libgfx_rust::{FloatPoint, WindingRule};
-use std::cell::RefCell;
 use std::sync::Arc;
 
 /// The state an `<area>`'s `shape` attribute represents, as the HTML image map processing model
@@ -73,7 +71,7 @@ pub struct PublishedImageMapArea {
 
 // https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
 /// The shape to layer onto the image, built with the same operations the DOM side built it with,
-/// so that the containment test is the one `Gfx::Path` already answered.
+/// so that the containment test gives the same answer.
 fn shape_path(shape: AreaShape, coords: &[f64]) -> Option<Path> {
     // Each area element in areas must be processed as follows to obtain a shape to layer onto the image:
 
@@ -158,15 +156,19 @@ fn shape_path(shape: AreaShape, coords: &[f64]) -> Option<Path> {
             // corner is given by the coordinate (x2, y2), those coordinates being interpreted as CSS pixels from the
             // top left corner of the image.
             let [left, top, right, bottom] = corners.map(|corner| corner as f32);
-            let mut builder = Path::new();
-            builder.move_to(FloatPoint { x: left, y: top });
-            builder.line_to(FloatPoint { x: right, y: top });
-            builder.line_to(FloatPoint { x: right, y: bottom });
-            builder.line_to(FloatPoint { x: left, y: bottom });
-            builder.close();
-            Some(builder)
+            Some(rectangle_path(left, top, right, bottom))
         }
     }
+}
+
+fn rectangle_path(left: f32, top: f32, right: f32, bottom: f32) -> Path {
+    let mut builder = Path::new();
+    builder.move_to(FloatPoint { x: left, y: top });
+    builder.line_to(FloatPoint { x: right, y: top });
+    builder.line_to(FloatPoint { x: right, y: bottom });
+    builder.line_to(FloatPoint { x: left, y: bottom });
+    builder.close();
+    builder
 }
 
 // The `<area>` elements of the image map an image is associated with, as the hit test sees them.
@@ -181,48 +183,61 @@ fn shape_path(shape: AreaShape, coords: &[f64]) -> Option<Path> {
 #[derive(Clone, Default)]
 pub struct ImageMapAreaColumn {
     /// Shared with the rows published for the host, so a write copies the maps only while those hold them.
-    maps: RefCell<Arc<ImageMaps>>,
+    maps: Arc<ImageMaps>,
+    writes: u64,
 }
 
 /// The `<area>` elements of the image map of every image that has one, by the image's paintable row.
-pub type ImageMaps = FastMap<NodeSlotId, Arc<[PublishedImageMapArea]>>;
+pub type ImageMaps = crate::cow_map::CowMap<NodeSlotId, Arc<[PublishedImageMapArea]>>;
 
 impl ImageMapAreaColumn {
     /// Publishes the `<area>` elements of the image map an image is associated with, in tree order.
-    pub fn publish(&self, slot: NodeSlotId, areas: Box<[PublishedImageMapArea]>) {
+    pub fn publish(&mut self, slot: NodeSlotId, areas: Box<[PublishedImageMapArea]>) {
         if slot.is_invalid() {
             return;
         }
-        let mut published = self.maps.borrow_mut();
         if areas.is_empty() {
-            if published.contains_key(&slot) {
-                Arc::make_mut(&mut published).remove(&slot);
-            }
+            self.forget(slot);
         } else {
-            Arc::make_mut(&mut published).insert(slot, areas.into());
+            self.writes += 1;
+            Arc::make_mut(&mut self.maps).insert(slot, areas.into());
         }
     }
 
-    pub fn forget(&self, slot: NodeSlotId) {
-        let mut published = self.maps.borrow_mut();
-        if published.contains_key(&slot) {
-            Arc::make_mut(&mut published).remove(&slot);
+    pub fn forget(&mut self, slot: NodeSlotId) {
+        if self.maps.contains_key(&slot) {
+            self.writes += 1;
+            Arc::make_mut(&mut self.maps).remove(&slot);
         }
     }
 
     /// Whether the image whose paintable row is `slot` has an image map.
     pub(crate) fn has_areas(&self, slot: NodeSlotId) -> bool {
-        self.maps.borrow().contains_key(&slot)
+        self.maps.contains_key(&slot)
     }
 
     /// The maps as they are now, for the host to read.
     pub(crate) fn snapshot(&self) -> Arc<ImageMaps> {
-        self.maps.borrow().clone()
+        self.maps.clone()
     }
 
-    /// Where the maps are, which moves when a write copies the ones a snapshot shares.
-    pub(crate) fn address(&self) -> usize {
-        Arc::as_ptr(&self.maps.borrow()).addr()
+    /// How many writes the maps took.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
+    }
+}
+
+/// The shape of the area of the map of the image whose paintable row is `slot` that its style-tree identity `area` names,
+/// in the coordinate space of the image, whose size is `width` by `height`. None when the map lists no such area, or its
+/// shape is empty.
+pub(crate) fn area_shape_path(maps: &ImageMaps, slot: NodeSlotId, area: u32, width: f32, height: f32) -> Option<Path> {
+    let area = maps.get(&slot)?.iter().find(|published| published.style_node == area)?;
+    match &area.coverage {
+        // https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
+        // The shape is a rectangle that exactly covers the entire image.
+        AreaCoverage::WholeImage => Some(rectangle_path(0.0, 0.0, width, height)),
+        AreaCoverage::Shape(path) => Some(path.clone()),
+        AreaCoverage::Nothing => None,
     }
 }
 

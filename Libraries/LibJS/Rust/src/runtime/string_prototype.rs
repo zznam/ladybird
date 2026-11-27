@@ -279,12 +279,9 @@ impl StringPrototype {
     }
 
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<StringPrototype> {
-        realm.create_object(
-            vm,
-            StringPrototype {
-                base: StringObject::new(vm, Self::CLASS, vm.empty_string(), realm.object_prototype()),
-            },
-        )
+        realm.create_object(vm, |_| StringPrototype {
+            base: StringObject::new(vm, realm, Self::CLASS, vm.empty_string(), realm.object_prototype()),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -718,6 +715,33 @@ impl StringPrototype {
     // 20.1.1 String.prototype.localeCompare ( that [ , locales [ , options ] ] ), https://tc39.es/ecma402/#sup-String.prototype.localeCompare
     fn locale_compare(vm: &Vm) -> ThrowCompletionOr<Value> {
         let realm = vm.current_realm().expect("a native function runs in a realm");
+
+        // OPTIMIZATION: Strings compared with the default options are compared as they are, without copying them into
+        //               new strings first.
+        if vm.this_value().is_string()
+            && vm.argument(0).is_string()
+            && vm.argument(1).is_undefined()
+            && vm.argument(2).is_undefined()
+        {
+            let (string, that_value) = (vm.this_value().as_string(), vm.argument(0).as_string());
+            let (view, that_view) = (string.utf16_string_view(), that_value.utf16_string_view());
+            // NB: The ASCII comparison finds identical strings equal too.
+            if let (Utf16View::Ascii(view), Utf16View::Ascii(that_view)) = (view, that_view)
+                && let Some(result) = try_fast_ascii_string_compare(view, that_view)
+            {
+                return Ok(Value::from_i32(result));
+            }
+            if view == that_view {
+                return Ok(Value::from_i32(0));
+            }
+            // NB: The views are taken again after making the collator, which may collect garbage.
+            let collator = realm.intrinsics().default_collator(vm);
+            return Ok(Value::from_i32(compare_strings(
+                &collator,
+                string.utf16_string_view(),
+                that_value.utf16_string_view(),
+            )));
+        }
 
         // 1. Let O be ? RequireObjectCoercible(this value).
         let object = require_object_coercible(vm, vm.this_value())?;
@@ -2199,13 +2223,9 @@ impl<'vm> SubstringList<'vm> {
                 Array::create_from(vm, realm, &self.first_substrings[..self.length]).upcast::<Object>(),
             );
         }
-        // NB: The array is allocated before the first substrings are copied off the stack, so the collector still
-        //     finds them there if the allocation collects.
-        let array = Array::create(vm, realm, 0, None).must();
-        let mut elements = self.first_substrings.to_vec();
-        self.other_substrings
-            .with_values(|others| elements.extend_from_slice(others));
-        array.set_indexed_property_elements(&elements);
-        Value::from_object(array.upcast::<Object>())
+        let elements = MarkedVec::with_capacity(vm, self.length);
+        elements.extend_from_slice(&self.first_substrings);
+        elements.extend_from_slice(&self.other_substrings.values());
+        Value::from_object(Array::create_from_list(vm, realm, &elements).upcast::<Object>())
     }
 }

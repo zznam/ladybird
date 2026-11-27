@@ -20,6 +20,7 @@ reused from one compile to the next:
 |---|---|---|
 | Decode and build | `decode.rs`, `builder/` | One forward pass over the validated, quickened body. Produces typed SSA with phis, folding and value numbering as it goes. |
 | Cleanup | `passes/cleanup.rs` | Removes trivial phis to a fixed point, dead pure nodes, and fuses branches with the comparisons only they use. |
+| Interrupt check elimination | `passes/interrupt_checks.rs` | Small innermost loops that count towards an end lose their `CheckInterrupt`. |
 | Loop invariant code motion | `passes/licm.rs` | Finds the nodes of call-free loops that compute the same value in every iteration. |
 | Scheduling | `passes/schedule.rs` | Rebuilds the node arena in linear order without the dead nodes, with the invariant nodes at the end of their loop's preheader. |
 | Liveness | `regalloc/liveness.rs` | One interval per value in linear order, extended over loops. |
@@ -80,6 +81,7 @@ truncations, unless their flags say they cannot), and are neither removed nor mo
 | FAdd ... FNearest, FloatCompare | Float arithmetic and comparison (`FloatCondition`). |
 | TruncS, TruncU, TruncSatS, TruncSatU, ConvertS, ConvertU, Demote, Promote, Reinterpret | Conversions to the node's type from the input's. The plain truncations trap on NaN and out of range values. |
 | Select | Input 1 where input 0 is nonzero, else input 2. |
+| SelectCompare | A select of integers on a comparison of its operands 1 and 2 (or on whether their `and` is zero): operand 3 where it holds, else operand 0. |
 | InstanceField, LoadPointer | Pointers in instance data that never change, like `globals` and `globals[i]`, and type identities. |
 | Offset | A pointer plus a constant, like the address of a segment. |
 | ReadField, WriteField | Fields of runtime data that change, like the size of a memory or table, or a segment's length. |
@@ -99,6 +101,7 @@ truncations, unless their flags say they cannot), and are neither removed nor mo
 | CheckFunction, CheckNull | The checks of `call_indirect` (null, then type identity, then the subtype check of GC types) and of references that must not be null. |
 | Call | A call through a `FunctionHeader`, direct or not; its value is the first result. |
 | Helper | A call of a function of the runtime, which takes its operands in the context and may return a trap code. |
+| CheckInterrupt | Traps if another thread interrupted the store (section on calls, "Interrupts"). |
 | CallResult | A further result of the call right before it. Never removed, since the results' places depend on them all. |
 | Jump, Branch, BranchCompare, BranchFloatCompare, BrTable, Return, Trap, TailCall | Terminators. A branch goes to its first successor where its condition holds. |
 
@@ -152,8 +155,12 @@ a large one do not pay for its capacity.
 
 `passes/cleanup.rs` forwards trivial phis to a fixed point, rewrites every use of a forwarded phi,
 counts uses, removes pure nodes without uses (transitively), and unlinks dead phis. Then a branch on
-a comparison (or `eqz`) in its own block that nothing else uses compares itself
-(`BranchCompare`, `BranchFloatCompare`).
+a comparison (or `eqz`) in its own block that nothing else uses compares itself (`BranchCompare`,
+`BranchFloatCompare`). A select of integers on a comparison, an `eqz` or an `and` that only selects
+in its block use compares or tests itself (`SelectCompare`), which x86-64 lowers to a compare or
+test and a conditional move into the register of the value where the condition fails, if that value
+dies there.
+These are the only pure variadic nodes but phis: they are made after value numbering.
 
 ## 6. Loop invariant code motion and scheduling
 
@@ -194,22 +201,30 @@ be immediates, which need fixed registers, what it clobbers and where its output
 and temps are placed first; an input of the same node in the way moves to another free register.
 When no register is free, the value used furthest in the future is evicted. Inside a loop, the
 values the rest of the iteration uses come first, then those the next iteration reads, then those
-used after the loop. Values first used by a call argument or a return value prefer that register.
+used after the loop. Values first used by a call argument or a return value prefer that register. A
+value a loop's back edge carries into a phi of its header prefers the phi's register, so that the
+edge moves nothing: it takes it where it is free, or where an input dying there is the first one, or
+either one of an integer add, and, or, xor or mul.
 
 **Spilling** happens at the definition: a value that ever needs a stack slot gets one for its whole
 life, and code generation stores it right after defining it, so a slot always holds its value once
-it has one. Parameters use their home slots and the instance its frame header slot. Every value
-live across a call gets a slot, since calls clobber every register. A phi and its inputs (its web)
-share slots wherever their intervals do not overlap, so that the moves into a spilled phi on its
-edges, a loop's back edge above all, are mostly no moves at all.
+it has one. A value evicted from its register needs a slot only if its block or a successor of its
+block still uses it: its interval may go on past a block that returns. Parameters use their home
+slots and the instance its frame header slot. Every value live across a call gets a slot, since
+calls clobber every register. A phi and its inputs (its web) share slots wherever their intervals do
+not overlap, so that the moves into a spilled phi on its edges, a loop's back edge above all, are
+mostly no moves at all.
 
 **Blocks.** A block with one predecessor starts with that predecessor's registers. A merge starts
 with those of the predecessor that keeps the most of its values in registers, so that a path that
 called a function, which leaves none in registers, does not make the others give theirs up; a loop
 header starts with those of the block entering the loop, without the values the loop only carries
-through that have a slot already. Their phis get registers free there, preferably the input's own
-from that predecessor. Every other edge moves its values into place, as parallel moves with cycles
-broken through a slot; back edges get theirs when their source block ends.
+through that have a slot already. A value the loop only carries through that gets its slot later,
+when the loop needs its register, would be reloaded by every back edge: the allocator then allocates
+the function again, with such values in their slots from the loop's header on (at most three
+passes). Their phis get registers free there, preferably the input's own from that predecessor.
+Every other edge moves its values into place, as parallel moves with cycles broken through a slot;
+back edges get theirs when their source block ends.
 
 **The verifier** (`regalloc/verify.rs`) simulates every register from the state each block starts
 with, checks that every input is where the allocation says, and that every edge's moves produce its
@@ -243,6 +258,22 @@ recomputed from fp, which also undoes whatever a callee's tail calls did to it.
 The prologue writes the instance to the frame and checks the new rsp against the stack limit of
 the store's `ExecutionContext`, which `InstanceData::context` points at, trapping with
 `TRAP_STACK_EXHAUSTED`. `RuntimeInfo` has the trap exit.
+
+**Interrupts.** Another thread stops the code of a store by making that limit
+`STACK_LIMIT_INTERRUPTED`, above every stack pointer. Calls then trap in their prologue at no cost,
+and `CheckInterrupt`, in the header of every loop, compares the limit with rsp for code that does
+not call. Each store has its own code, so x86-64 code has the limit's address as a constant: a move,
+a compare and a branch to the shared trap stub, which take no allocatable register. aarch64 reaches
+it through the frame's instance. The embedder turns the trap into whatever stopped the store;
+nothing else can observe it.
+
+Small innermost loops without calls lose their check (`passes/interrupt_checks.rs`) if an i32 counts
+by one towards a bound a step cannot go past: `<`, `>` or `!=` of an invariant bound. Everything wraps
+around here, so loops that step by more keep it. One known to run under 5000 times goes anywhere.
+Any other ends within 2^32 iterations, and goes only where a loop around it keeps its check, so that
+an interrupt takes as long as the rest of that loop at most. x86-64 aligns loop headers to 64 bytes,
+and code to the same: what lies in front of a small loop otherwise decides how it lies across what
+the CPU fetches. That is worth 6% of CoreMark's score.
 
 **Calls.** Every call goes through `FunctionHeader::native_entry`. A direct call of a function of
 the same instance passes the caller's instance and memory base; any other call (imports,
@@ -284,8 +315,9 @@ unshared memory traps, and notifying one wakes nobody, without a call.
 **GC** (`builder/gc.rs`). Objects are cells of the runtime's heap: the Rtt first, the address of the
 data, an array's length, then the data inline if it has at most 4096 bytes. A struct's fields are at
 constant offsets (8 bytes each, 16 for v128, packed and 32-bit values zero-extended in their word), so
-`struct.get` is a null check and a load at the object plus the field's offset; a large struct's data
-is reached through its address first. `array.get` and `array.set` access the element at its
+`struct.get` is a null check and a load at the object plus the field's offset; a large struct's data,
+or the data of any struct accessed through a type that is not final, is reached through its address
+first. `array.get` and `array.set` access the element at its
 `ElementAddress`. Allocation, filling, copying and initializing from segments call the runtime
 (`Helper`); the allocation traps with `TRAP_RUNTIME` where the runtime returns null. `ref.test`,
 `ref.cast`, `br_on_cast` and `br_on_cast_fail` are a `RefTest`: abstract heap types test the
@@ -306,10 +338,15 @@ There is a backend per target, with the same structure: `codegen/x86_64/` and `c
 (ARMv8.1 with LSE atomics and NEON), each with its own instruction selection for numbers, vectors,
 memory, calls, tables and GC objects. The rest of this section describes the x86-64 one.
 
-`codegen/x86_64/` lowers the blocks in linear order with x86-64-v3 instructions (VEX three-operand
-float arithmetic, BMI1/BMI2 shifts and rotates, lzcnt, tzcnt, popcnt, and AVX2 for vectors), from
-libjs_jit's encoders and the additions in its `asm/x86_64/extended.rs`, whose `vex()` encodes any
-VEX instruction from its opcode (`codegen/x86_64/vector.rs` names the SIMD ones). After each node, a value with a slot is stored
+`codegen/x86_64/` lowers the blocks in linear order for an x86-64-v2 baseline (SSE4.2 and POPCNT).
+The assembler and allocator select optional instructions independently using runtime CPU detection:
+AVX for scalar floats, AVX2 for vectors, BMI2 for shifts and rotates, and LZCNT/BMI1 for zero counts.
+Without them, `asm/x86_64/sse.rs` emits legacy SSE sequences and bit scans, and variable integer
+shifts use CL. This selection also covers entry, exit and host stubs. The shared encoders live in
+libjs_jit's `asm/x86_64/`; `codegen/x86_64/vector.rs` names the SIMD opcodes. SSE packed operations
+read spilled vectors through registers, since their memory operands require sixteen-byte alignment.
+Distributed C++ and Rust builds target the same v2 baseline (`LADYBIRD_BASELINE_CPU_TARGET`); native
+builds still target the machine building them. After each node, a value with a slot is stored
 there; a phi in a register with a slot is stored where its block starts.
 
 - **Vectors.** A vector node's output register differs from its inputs and temps, so lowerings may
@@ -323,8 +360,14 @@ there; a phi in a register with a slot is stored where its block starts.
 
 - **Edges.** A jump moves its values and jumps unless its target comes next. A two-way branch whose
   taken edge needs moves jumps to a stub that moves them; its other edge moves inline. Where the
-  taken target comes next and needs no moves, the condition is inverted. `br_table` is a jump table
-  of 32-bit offsets, with stubs for the edges that need moves.
+  taken target comes next and needs no moves, the condition is inverted. It is also inverted where
+  the taken target is a loop header the edge needs moves into: the exit jumps (to a stub if it needs
+  moves), and the back edge moves inline, so that an iteration takes one jump rather than two.
+  `br_table` is a jump table of 32-bit offsets, with stubs for the edges that need moves.
+- **Flags.** A branch on whether a value is zero right after the add, sub, and, or or xor that
+  computed it, with nothing emitted in between, uses the flags that instruction set rather than
+  testing the value again, if the two fit in one 32-byte window: they can macro-fuse, and the
+  branch's padding would go between them.
 - **Traps** jump to one stub per trap code, which puts the code in edi and jumps to
   `RuntimeInfo::trap_exit` with rbp still the trapping frame's fp. Memory accesses rely on guard
   pages: the runtime's fault handler turns faults in compiled code into the same trap exit.
@@ -381,6 +424,11 @@ the interpreter and the host. The JIT is on by default; `LIBWASM_JIT` configures
   traps with a code of its own; binding a module's instance points the engine's function headers at
   the code. With `--runtime`, the script calls go through `Store::invoke` instead, and the runtime
   compiles what `LIBWASM_JIT` says (`eager` by default).
+- To check the SSE path on an AVX-capable development machine, build `spec_check` with
+  `RUSTFLAGS='-Ctarget-cpu=x86-64-v2' cargo build -p libwasm_jit --example spec_check`, then run
+  `qemu-x86_64 -cpu Nehalem target/debug/examples/spec_check SCRIPT_DIRECTORY`. Repeat with
+  `--stress-registers` to exercise spills and with `--runtime` to exercise the runtime's tier
+  transitions and stubs. `-cpu SandyBridge` also checks AVX scalar floats alongside SSE vectors.
 - `examples/bench_check.rs` runs a module's entry in an interpreted store and a compiled one, with
   deterministic imports, and compares results, exit codes, memories, tables and globals.
 - `examples/smith_check.rs` does the same for random modules from `wasm-tools smith` in the subset

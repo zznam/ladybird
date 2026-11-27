@@ -86,25 +86,11 @@ function (generate_css_implementation)
     )
 
     invoke_py_idl_generator(
-        "GeneratedCSSNumericFactoryMethods.cpp"
         "GeneratedCSSNumericFactoryMethods.idl"
         "generate_libweb_css_numeric_factory_methods.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-        "CSS/GeneratedCSSNumericFactoryMethods.h"
-        "CSS/GeneratedCSSNumericFactoryMethods.cpp"
         "CSS/GeneratedCSSNumericFactoryMethods.idl"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-    )
-
-    invoke_py_idl_generator(
-        "GeneratedCSSStyleProperties.cpp"
-        "GeneratedCSSStyleProperties.idl"
-        "generate_libweb_css_style_properties.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
-        "CSS/GeneratedCSSStyleProperties.h"
-        "CSS/GeneratedCSSStyleProperties.cpp"
-        "CSS/GeneratedCSSStyleProperties.idl"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
     )
 
     embed_as_string(
@@ -141,8 +127,6 @@ function (generate_css_implementation)
 
     set(CSS_GENERATED_HEADERS
        "CSS/Enums.h"
-       "CSS/GeneratedCSSStyleProperties.h"
-       "CSS/GeneratedCSSNumericFactoryMethods.h"
        "CSS/Keyword.h"
        "CSS/MediaFeatureID.h"
        "CSS/PropertyID.h"
@@ -158,7 +142,6 @@ function (generate_css_implementation)
     set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 
     set(CSS_GENERATED_IDL
-        "GeneratedCSSStyleProperties.idl"
         "GeneratedCSSNumericFactoryMethods.idl"
     )
     list(APPEND LIBWEB_ALL_GENERATED_IDL ${CSS_GENERATED_IDL})
@@ -245,7 +228,6 @@ endfunction()
 
 function (generate_js_bindings target)
     set(LIBWEB_INPUT_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(generated_idl_targets ${LIBWEB_ALL_GENERATED_IDL})
     list(TRANSFORM generated_idl_targets PREPEND "generate_")
     set(LIBWEB_ALL_BINDINGS_SOURCES)
@@ -267,10 +249,8 @@ function (generate_js_bindings target)
         endif()
 
         list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${BINDINGS_HEADER})
-        set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 
         list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${BINDINGS_SOURCES})
-        set(LIBWEB_ALL_BINDINGS_SOURCES ${LIBWEB_ALL_BINDINGS_SOURCES} PARENT_SCOPE)
 
         # The module's enumerations, which LibWebCommon provides so that processes without LibWeb can use them.
         set(COMMON_BINDINGS_HEADER "${LIBWEB_COMMON_BINDINGS_DIRECTORY}/${basename}.h")
@@ -278,10 +258,9 @@ function (generate_js_bindings target)
             install(FILES ${COMMON_BINDINGS_HEADER} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWebCommon/Bindings")
         endif()
         list(APPEND LIBWEB_ALL_COMMON_BINDINGS_HEADERS ${COMMON_BINDINGS_HEADER})
-        set(LIBWEB_ALL_COMMON_BINDINGS_HEADERS ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} PARENT_SCOPE)
     endmacro()
 
-    function(libweb_js_bindings class)
+    macro(libweb_js_bindings class)
         get_filename_component(basename "${class}" NAME)
         set(idl_path "${LIBWEB_INPUT_FOLDER}/${class}.idl")
         if ("${basename}.idl" IN_LIST LIBWEB_ALL_GENERATED_IDL)
@@ -291,11 +270,9 @@ function (generate_js_bindings target)
         libweb_add_bindings_source(${class})
 
         list(APPEND LIBWEB_ALL_IDL_FILES "${idl_path}")
-        set(LIBWEB_ALL_IDL_FILES ${LIBWEB_ALL_IDL_FILES} PARENT_SCOPE)
 
         list(APPEND LIBWEB_ALL_PARSED_IDL_FILES "${idl_path}")
-        set(LIBWEB_ALL_PARSED_IDL_FILES ${LIBWEB_ALL_PARSED_IDL_FILES} PARENT_SCOPE)
-    endfunction()
+    endmacro()
 
     set(bindings_generator "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate_libweb_bindings.py")
     set(bindings_generator_dependencies
@@ -317,6 +294,7 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/interfaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/intrinsics.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/iterables.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/json_conversions.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/named_and_indexed_properties.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/namespaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/operations.py"
@@ -326,12 +304,12 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_members.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_names.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_overloads.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_js_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_types.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_usage.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/security_checks.py"
-        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_js_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/wrappers.py"
@@ -373,10 +351,6 @@ function (generate_js_bindings target)
     endif()
     list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${GLOBAL_MIXIN_HEADERS})
     list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${GLOBAL_MIXIN_HEADERS})
-
-    set(STRUCTURED_SERIALIZE_BINDINGS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/Bindings/StructuredSerializeBindings.cpp")
-    target_sources(${target} PRIVATE ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
-    list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
 
     set(LIBWEB_ALL_IDL_FILES_ARGUMENT ${LIBWEB_ALL_IDL_FILES})
     set(LIBWEB_ALL_PARSED_IDL_FILES_ARGUMENT ${LIBWEB_ALL_PARSED_IDL_FILES})

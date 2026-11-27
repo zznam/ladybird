@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/NeverDestroyed.h>
 #include <LibAudio/ClientConnection.h>
 #include <LibAudio/RemotePlaybackStream.h>
@@ -40,6 +41,26 @@ ErrorOr<NonnullRefPtr<ClientConnection>> ClientConnection::acquire()
     auto connection = adopt_ref(*new ClientConnection(move(transport)));
     *s_connection = connection;
     return connection;
+}
+
+bool ClientConnection::capture_is_pending_for_testing()
+{
+    auto const& connection = *s_connection;
+    if (!connection)
+        return false;
+    return any_of(connection->m_capture_sources, [](auto const& entry) { return !entry.value.specification.has_value(); });
+}
+
+size_t ClientConnection::capture_stream_count_for_testing()
+{
+    auto const& connection = *s_connection;
+    if (!connection)
+        return 0;
+
+    size_t stream_count = 0;
+    for (auto const& [stream_id, source] : connection->m_capture_sources)
+        stream_count += source.stream_count;
+    return stream_count;
 }
 
 ClientConnection::ClientConnection(NonnullOwnPtr<IPC::Transport> transport)
@@ -133,7 +154,7 @@ void ClientConnection::devices_changed(Vector<AudioDeviceInfo> inputs, Vector<Au
         m_on_device_list(AudioDeviceEnumeration { .inputs = move(inputs), .outputs = move(outputs) });
 }
 
-NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_stream(StringView device_id, RecordStream::RecordCallback callback)
+NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_stream(StringView device_id, PlaybackGroupId group, RecordStream::RecordCallback callback)
 {
     auto promise = RecordStream::CreatePromise::construct();
     if (m_is_dead) {
@@ -142,7 +163,7 @@ NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_strea
     }
 
     for (auto& [stream_id, source] : m_capture_sources) {
-        if (source.device_id != device_id)
+        if (source.device_id != device_id || source.group != group)
             continue;
         if (!source.specification.has_value()) {
             source.pending.append(PendingRecordStream { .promise = promise, .callback = move(callback) });
@@ -154,10 +175,10 @@ NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_strea
     }
 
     auto stream_id = m_next_stream_id++;
-    CaptureSource source { .device_id = device_id, .specification = {}, .pending = {}, .stream_count = 0 };
+    CaptureSource source { .device_id = device_id, .group = group, .specification = {}, .pending = {}, .stream_count = 0 };
     source.pending.append(PendingRecordStream { .promise = promise, .callback = move(callback) });
     m_capture_sources.set(stream_id, move(source));
-    async_create_record_stream(stream_id, device_id);
+    async_create_record_stream(stream_id, device_id, group);
     return promise;
 }
 
@@ -171,7 +192,7 @@ void ClientConnection::record_stream_created(u64 stream_id, SharedAudioFrameRing
     // FIXME: Support channel layouts beyond mono and stereo.
     if (ring.channel_count() == 0 || ring.channel_count() > 2) {
         async_destroy_record_stream(stream_id);
-        record_stream_creation_failed(stream_id);
+        record_stream_creation_failed(stream_id, RecordStreamFailure::DeviceUnavailable);
         return;
     }
     SampleSpecification specification(ring.sample_rate(), ring.channel_count() == 1 ? ChannelMap::mono() : ChannelMap::stereo());
@@ -191,13 +212,14 @@ void ClientConnection::record_stream_created(u64 stream_id, SharedAudioFrameRing
         pending_stream.promise->resolve(adopt_ref(*new RemoteRecordStream(*this, stream_id, specification, move(pending_stream.callback))));
 }
 
-void ClientConnection::record_stream_creation_failed(u64 stream_id)
+void ClientConnection::record_stream_creation_failed(u64 stream_id, RecordStreamFailure failure)
 {
     auto source = m_capture_sources.take(stream_id);
     if (!source.has_value())
         return;
+    auto error_code = failure == RecordStreamFailure::Refused ? EPERM : EIO;
     for (auto& pending_stream : source->pending)
-        pending_stream.promise->reject(Error::from_string_literal("Audio server could not open the capture device"));
+        pending_stream.promise->reject(Error::from_errno(error_code));
 }
 
 void ClientConnection::record_stream_closed(u64 stream_id)
@@ -267,17 +289,33 @@ RefPtr<RemotePlaybackStream> ClientConnection::find_live_stream(u64 stream_id)
     return nullptr;
 }
 
-NonnullRefPtr<PlaybackStream::CreatePromise> ClientConnection::create_stream(OutputState initial_state, u32 target_latency_ms, PlaybackStream::AudioDataRequestCallback callback)
+NonnullRefPtr<PlaybackStream::CreatePromise> ClientConnection::create_stream(OutputState initial_state, u32 target_latency_ms, NonnullRefPtr<OutputSession> session, PlaybackStream::AudioDataRequestCallback callback)
 {
     auto promise = PlaybackStream::CreatePromise::construct();
     if (m_is_dead) {
         promise->reject(Error::from_string_literal("Audio server connection has died"));
         return promise;
     }
+    session->declare_on({}, *this);
     auto stream_id = m_next_stream_id++;
-    m_pending_streams.set(stream_id, PendingStream { .promise = promise, .callback = move(callback), .initial_state = initial_state, .target_latency_ms = target_latency_ms });
-    async_create_stream(stream_id);
+    auto session_id = session->id();
+    m_pending_streams.set(stream_id, PendingStream { .promise = promise, .session = move(session), .callback = move(callback), .initial_state = initial_state, .target_latency_ms = target_latency_ms });
+    async_create_stream(stream_id, session_id);
     return promise;
+}
+
+void ClientConnection::session_rebound(Badge<OutputSession>, u64 session_id, PlaybackGroupId group)
+{
+    if (m_is_dead)
+        return;
+    async_rebind_session(session_id, group);
+}
+
+void ClientConnection::session_destroyed(Badge<OutputSession>, u64 session_id)
+{
+    if (m_is_dead)
+        return;
+    async_destroy_session(session_id);
 }
 
 void ClientConnection::stream_created(u64 stream_id, SampleSpecification sample_specification, u32 device_latency_ms)
@@ -299,7 +337,7 @@ void ClientConnection::stream_created(u64 stream_id, SampleSpecification sample_
         MutexLocker locker(m_pump_mutex);
         m_pump_period = min(m_pump_period, AK::Duration::from_milliseconds(max<u32>(1, ring_latency_ms / 4)));
     }
-    auto stream = adopt_ref(*new RemotePlaybackStream(*this, stream_id, sample_specification, ring_latency_ms, pending->initial_state, move(pending->callback)));
+    auto stream = adopt_ref(*new RemotePlaybackStream(*this, stream_id, move(pending->session), sample_specification, ring_latency_ms, pending->initial_state, move(pending->callback)));
     pending->promise->resolve(stream);
 }
 
@@ -382,21 +420,16 @@ void ClientConnection::pump_thread_main()
     MutexLocker locker(m_pump_mutex);
     while (!m_pump_should_exit) {
         streams.clear_with_capacity();
-        record_streams.clear_with_capacity();
         capture_rings.clear_with_capacity();
         for (auto* stream : m_streams) {
             if (stream->try_ref())
                 streams.append(adopt_ref(*stream));
         }
-        for (auto* stream : m_record_streams) {
-            if (stream->try_ref())
-                record_streams.append(adopt_ref(*stream));
-        }
         for (auto& [stream_id, ring] : m_capture_rings)
             capture_rings.append({ .stream_id = stream_id, .ring = ring });
         m_pump_woken = false;
 
-        if (streams.is_empty() && record_streams.is_empty()) {
+        if (streams.is_empty() && m_record_streams.is_empty()) {
             m_pump_condition.wait();
             continue;
         }
@@ -412,14 +445,21 @@ void ClientConnection::pump_thread_main()
             scratch.resize(frames_available * ring.channel_count());
             auto frames_popped = ring.try_pop(scratch);
             auto samples = scratch.span().trim(frames_popped * ring.channel_count());
-            for (auto& stream : record_streams) {
-                if (stream->stream_id() == stream_id)
-                    stream->deliver(samples);
+
+            // The streams are gathered after the pop, so every stream registered before these frames were captured
+            // receives them.
+            locker.lock();
+            for (auto* stream : m_record_streams) {
+                if (stream->stream_id() == stream_id && stream->try_ref())
+                    record_streams.append(adopt_ref(*stream));
             }
+            locker.unlock();
+            for (auto& stream : record_streams)
+                stream->deliver(samples);
+            record_streams.clear_with_capacity();
         }
         // Drop the references before sleeping, so a stream's last reference does not idle here.
         streams.clear_with_capacity();
-        record_streams.clear_with_capacity();
         capture_rings.clear_with_capacity();
         locker.lock();
 

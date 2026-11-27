@@ -25,7 +25,7 @@ public:
     virtual ~ConnectionFromClient() override = default;
 
 private:
-    ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RefPtr<Gfx::SkiaBackendContext>);
+    ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RefPtr<Gfx::SkiaBackendContext>, bool scrollbars_always_shown);
 
     virtual void die() override;
 
@@ -34,11 +34,8 @@ private:
     virtual void connect_render_clock(i32 web_content_connection_id, IPC::TransportHandle) override;
     virtual void connect_video_presentation(i32 web_content_connection_id, IPC::TransportHandle) override;
     virtual Messages::CompositorControlServer::CreatePresentationConnectionResponse create_presentation_connection(bool synthesizes_scroll_momentum, bool scrolls_elastically, Optional<u64> gpu_presentation_adapter_luid) override;
-    virtual void bind_presentation(Web::CompositorContextId, u64 presentation_id) override;
+    virtual ErrorOr<OwnPtr<IPC::MessageBuffer>> handle_raw(IPC::RawMessage&) override;
     virtual void create_context(Web::CompositorContextId, Optional<u64> page_id, i32 web_content_connection_id) override;
-    virtual void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress) override;
-    virtual void set_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays) override;
-    virtual void set_display_metadata(Web::CompositorContextId, Optional<u64>, double) override;
     virtual void set_context_visibility(Web::CompositorContextId, Compositing::ContextVisibility) override;
     virtual void crash() override;
 
@@ -47,7 +44,6 @@ private:
     HashMap<i32, NonnullRefPtr<ConnectionFromWebContent>> m_web_content_connections;
     NonnullRefPtr<CompositorState> m_compositor_state;
     HashMap<u64, NonnullRefPtr<ConnectionFromPresentation>> m_presentation_connections;
-    u64 m_next_presentation_id { 1 };
 };
 
 }

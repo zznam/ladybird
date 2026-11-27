@@ -9,6 +9,7 @@
 #include <AK/HashMap.h>
 #include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/ScopeGuard.h>
 #include <AK/ThreadID.h>
 #include <AK/ThreadSafeWeakable.h>
 #include <AK/Vector.h>
@@ -19,7 +20,7 @@
 #include <LibMediaCodecs/VideoDecoderClientEndpoint.h>
 #include <LibMediaCodecs/VideoDecoderServerEndpoint.h>
 #include <LibMediaCodecs/VideoFrame.h>
-#include <LibMediaCodecs/VideoFrameHandle.h>
+#include <LibMediaCodecs/VideoFrameMetadata.h>
 #include <LibMediaCodecs/VideoFramePool.h>
 #include <LibThreading/Thread.h>
 
@@ -27,7 +28,6 @@ namespace Media {
 
 static constexpr size_t MINIMUM_RING_SIZE = 4 * MiB;
 static constexpr size_t MAXIMUM_RING_SIZE = 256 * MiB;
-static constexpr AK::Duration SERVER_SILENCE_UNTIL_TREATED_AS_LOST = AK::Duration::from_seconds(10);
 
 namespace {
 
@@ -43,8 +43,7 @@ struct EventLoopThread {
 // Shared by a decoder with the connection that routes its server's answers to it.
 struct RemoteVideoDecoder::State : public AtomicRefCounted<State> {
     struct Output {
-        NonnullRefPtr<PooledVideoFrameSlot> slot;
-        VideoFrameHandle handle;
+        NonnullRefPtr<VideoFrame> frame;
     };
 
     // A coded frame the server has yet to answer, whose data occupies its range of the ring until then.
@@ -65,15 +64,15 @@ struct RemoteVideoDecoder::State : public AtomicRefCounted<State> {
         return count;
     }
 
-    // The outputs are returned to be dropped after the mutex is released, since releasing their slots takes it.
+    // The outputs are returned to be dropped after the mutex is released, since releasing their frames takes it.
     [[nodiscard]] Vector<Output> forget_server_while_locked()
     {
         connection_was_lost = true;
         connection = {};
         auto forgotten_outputs = move(outputs);
-        relay_pools.clear();
         server_is_waiting_for_storage = false;
         submissions_in_flight.clear();
+        server_decoder_has_any_decode_in_progress = false;
         failure.clear();
         server_decoder_state_changed.broadcast();
         drained = false;
@@ -90,47 +89,66 @@ struct RemoteVideoDecoder::State : public AtomicRefCounted<State> {
     bool decoder_was_destroyed { false };
 
     Vector<Output> outputs;
-    HashMap<VideoFramePoolID, NonnullRefPtr<VideoFrameRelayPool>> relay_pools;
     Vector<SubmissionInFlight> submissions_in_flight;
+    // When the server last showed that it is not stuck, by answering or by being given something new to answer.
+    MonotonicTime last_progress_time { MonotonicTime::now_coarse() };
+    bool server_decoder_has_any_decode_in_progress { false };
     Optional<DecoderError> failure;
     bool drained { false };
 
     // Called under the mutex when the server reports something the decoder's caller is not already waiting for, so
     // that destroying the decoder, which clears it, ends its calls.
-    Function<void()> output_arrived_callback;
+    Function<void(DecodeCompletion)> decode_completed_callback;
     bool caller_is_waiting_for_output { false };
 
     // Set once before any frame is submitted, and called after the mutex is released.
     Function<void()> storage_freed_callback;
-    // Set while the server waits for a slot to be released, which our caller is then answered TryAgain for. The server
+    // Set while the server waits for a frame to be released, which our caller is then answered TryAgain for. The server
     // reports nothing else while it waits, so anything it reports for the generation it waited in ends the wait too.
     bool server_is_waiting_for_storage { false };
 
     // Returns whether the server was waiting for storage, so that the storage freed callback must be called.
     [[nodiscard]] bool clear_server_wait_for_storage_while_locked()
     {
-        return exchange(server_is_waiting_for_storage, false);
+        if (!exchange(server_is_waiting_for_storage, false))
+            return false;
+        note_progress_while_locked();
+        return true;
+    }
+
+    void note_progress_while_locked()
+    {
+        last_progress_time = MonotonicTime::now_coarse();
     }
 
     // Returns whether the server was waiting for this release, so that the storage freed callback must be called.
-    [[nodiscard]] bool release_slot_to_server_while_locked(VideoFramePoolID pool_id, u32 slot_index)
+    [[nodiscard]] bool release_frame_to_server_while_locked(u64 frame_id)
     {
         connection.with_target([&](auto& connection) {
-            connection.async_release_frame(pool_id, slot_index);
+            connection.async_release_frame(frame_id);
         });
         return clear_server_wait_for_storage_while_locked();
     }
 
-    void tell_caller_of_new_state_while_locked()
+    bool has_any_decode_in_progress_while_locked() const
     {
-        if (!caller_is_waiting_for_output && output_arrived_callback)
-            output_arrived_callback();
+        if (submissions_in_flight_of_current_generation() > 0 || server_decoder_has_any_decode_in_progress)
+            return true;
+        return !outputs.is_empty() || failure.has_value();
+    }
+
+    void tell_caller_of_new_state_while_locked(DecodeCompletion completion)
+    {
+        if (!caller_is_waiting_for_output && decode_completed_callback)
+            decode_completed_callback(completion);
     }
 };
 
 namespace {
 
 NeverDestroyed<RemoteVideoDecoder::TransportRequester> s_transport_requester;
+NeverDestroyed<RemoteVideoDecoder::UnresponsiveServerReporter> s_unresponsive_server_reporter;
+Atomic<i64> s_milliseconds_without_progress_until_server_is_stuck { 10'000 };
 Core::EventLoop* s_transport_requester_event_loop { nullptr };
 AK::ThreadID s_transport_requester_thread_id;
 
@@ -261,16 +279,23 @@ public:
         s_transport_request_condition->broadcast();
     }
 
-    // Shuts the connection down on its own thread, where its death is handled, for a caller that found the server
-    // unresponsive from any other thread.
+    // Reports the server and shuts the connection down on its own thread, where its death is handled, for a caller
+    // that found the server stuck from any other thread. The report is posted before the death is handled, so that it
+    // reaches the reporter's event loop before any request for a replacement.
     static void disconnect_from_unresponsive_server(ThreadSafeWeakRef<VideoDecoderClientConnection> connection)
     {
         connection_thread().event_loop->deferred_invoke([connection = move(connection)] {
             // Shutting down revokes the weak reference, so it happens outside the reference's lock.
             RefPtr<VideoDecoderClientConnection> strong_connection;
             connection.with_target([&](auto& target) { strong_connection = target; });
-            if (strong_connection)
-                strong_connection->shutdown();
+            if (!strong_connection || strong_connection != *s_connection)
+                return;
+            if (*s_unresponsive_server_reporter) {
+                s_transport_requester_event_loop->deferred_invoke([] {
+                    (*s_unresponsive_server_reporter)();
+                });
+            }
+            strong_connection->shutdown();
         });
     }
 
@@ -348,7 +373,7 @@ private:
             if (state->decoder_id != decoder_id)
                 continue;
             forgotten_outputs = state->forget_server_while_locked();
-            state->tell_caller_of_new_state_while_locked();
+            state->tell_caller_of_new_state_while_locked(DecodeCompletion::ProducedOutput);
         }
     }
 
@@ -360,7 +385,7 @@ private:
         return nullptr;
     }
 
-    // What the decoder's caller is told of once the mutex is released: new state to take, through the output arrived
+    // What the decoder's caller is told of once the mutex is released: new state to take, through the decode completed
     // callback unless it is already waiting, and the end of a wait for storage it was answered TryAgain for, through
     // the storage freed callback.
     struct CallerWakeup {
@@ -380,10 +405,13 @@ private:
             MutexLocker locker { state->mutex };
             if (state->decoder_id != decoder_id || state->decoder_was_destroyed)
                 return false;
+            auto any_decode_was_in_progress = state->has_any_decode_in_progress_while_locked();
             wakeup = callback(*state);
             state->server_decoder_state_changed.broadcast();
             if (wakeup.has_something_to_take)
-                state->tell_caller_of_new_state_while_locked();
+                state->tell_caller_of_new_state_while_locked(DecodeCompletion::ProducedOutput);
+            else if (any_decode_was_in_progress && !state->has_any_decode_in_progress_while_locked())
+                state->tell_caller_of_new_state_while_locked(DecodeCompletion::ProducedNothing);
         }
         if (wakeup.storage_was_freed && state->storage_freed_callback)
             state->storage_freed_callback();
@@ -397,69 +425,42 @@ private:
         shutdown();
     }
 
-    virtual void video_frame_slot_announced(u64 decoder_id, VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer, RefPtr<VideoSurface> surface) override
+    virtual void frame_decoded(u64 decoder_id, u32 generation, u64 frame_id, VideoFrameMetadata metadata, VideoFramePixels pixels) override
     {
-        Optional<Error> misbehavior;
-        with_decoder(decoder_id, [&](RemoteVideoDecoder::State& state) -> CallerWakeup {
-            RefPtr<VideoFrameRelayPool> relay_pool;
-            if (auto existing_relay_pool = state.relay_pools.get(pool_id); existing_relay_pool.has_value())
-                relay_pool = *existing_relay_pool;
-            if (!relay_pool) {
-                // A pool can outlive the server it came from, whose replacement must not count its releases.
-                auto relay_pool_or_error = VideoFrameRelayPool::create([state = NonnullRefPtr { state }, decoder_id, pool_id](u32 released_slot_index) {
-                    auto server_was_waiting_for_storage = false;
-                    {
-                        MutexLocker locker { state->mutex };
-                        if (state->decoder_id != decoder_id)
-                            return;
-                        server_was_waiting_for_storage = state->release_slot_to_server_while_locked(pool_id, released_slot_index);
-                    }
-                    if (server_was_waiting_for_storage && state->storage_freed_callback)
-                        state->storage_freed_callback();
-                });
-                if (relay_pool_or_error.is_error()) {
-                    state.failure = DecoderError::with_description(DecoderErrorCategory::Memory, "Could not create a pool to relay decoded video frames"sv);
-                    return { .has_something_to_take = true };
-                }
-                relay_pool = relay_pool_or_error.release_value();
-                state.relay_pools.set(pool_id, *relay_pool);
-            }
-            if (auto result = relay_pool->set_slot_storage(slot_index, move(slot_buffer), move(surface)); result.is_error())
-                misbehavior = result.release_error();
-            return {};
-        });
-        if (misbehavior.has_value())
-            disconnect_misbehaving_server("unusable slot"sv, *misbehavior);
-    }
-
-    virtual void frame_decoded(u64 decoder_id, u32 generation, VideoFrameHandle handle) override
-    {
-        Optional<Error> misbehavior;
-        auto decoder_is_known = with_decoder(decoder_id, [&](RemoteVideoDecoder::State& state) -> CallerWakeup {
-            // A frame that nobody wants anymore is returned to the server right away.
-            if (generation != state.generation)
-                return { .storage_was_freed = state.release_slot_to_server_while_locked(handle.pool_id, handle.slot_index) };
-            auto storage_was_freed = state.clear_server_wait_for_storage_while_locked();
-            auto relay_pool = state.relay_pools.get(handle.pool_id);
-            if (!relay_pool.has_value()) {
-                misbehavior = Error::from_string_literal("The frame is in a pool that was never announced");
-                return {};
-            }
-            auto slot_or_error = (*relay_pool)->try_adopt_published_slot(handle.slot_index, handle.slot_acquisition_id);
-            if (slot_or_error.is_error()) {
-                misbehavior = slot_or_error.release_error();
-                return {};
-            }
-            state.outputs.append({ slot_or_error.release_value(), handle });
-            return { .has_something_to_take = true, .storage_was_freed = storage_was_freed };
-        });
-        if (misbehavior.has_value()) {
-            disconnect_misbehaving_server("unusable frame"sv, *misbehavior);
+        auto state = find_decoder(decoder_id);
+        if (!state) {
+            async_release_frame(frame_id);
             return;
         }
-        // A decoder that is gone has no use for the frame either.
-        if (!decoder_is_known)
-            async_release_frame(handle.pool_id, handle.slot_index);
+
+        // A frame can outlive the server it came from, whose replacement must not hear of its release.
+        auto release_to_server = [state, decoder_id, frame_id] {
+            auto server_was_waiting_for_storage = false;
+            {
+                MutexLocker locker { state->mutex };
+                if (state->decoder_id != decoder_id)
+                    return;
+                server_was_waiting_for_storage = state->release_frame_to_server_while_locked(frame_id);
+            }
+            if (server_was_waiting_for_storage && state->storage_freed_callback)
+                state->storage_freed_callback();
+        };
+        auto frame_or_error = create_received_video_frame(metadata, move(pixels), 0, move(release_to_server));
+        if (frame_or_error.is_error()) {
+            disconnect_misbehaving_server("unusable frame"sv, frame_or_error.release_error());
+            return;
+        }
+
+        // A frame nobody takes is dropped after the mutex is released, since releasing it takes the mutex.
+        RefPtr<VideoFrame> frame = frame_or_error.release_value();
+        with_decoder(decoder_id, [&](RemoteVideoDecoder::State& state) -> CallerWakeup {
+            if (generation != state.generation)
+                return {};
+            auto storage_was_freed = state.clear_server_wait_for_storage_while_locked();
+            state.note_progress_while_locked();
+            state.outputs.append({ frame.release_nonnull() });
+            return { .has_something_to_take = true, .storage_was_freed = storage_was_freed };
+        });
     }
 
     virtual void decoder_waiting_for_storage(u64 decoder_id, u32 generation) override
@@ -476,6 +477,15 @@ private:
         with_decoder(decoder_id, [&](RemoteVideoDecoder::State& state) -> CallerWakeup {
             if (!state.submissions_in_flight.is_empty())
                 state.submissions_in_flight.remove(0);
+            state.note_progress_while_locked();
+            return {};
+        });
+    }
+
+    virtual void any_decode_in_progress_changed(u64 decoder_id, bool any_decode_is_in_progress) override
+    {
+        with_decoder(decoder_id, [&](RemoteVideoDecoder::State& state) -> CallerWakeup {
+            state.server_decoder_has_any_decode_in_progress = any_decode_is_in_progress;
             return {};
         });
     }
@@ -486,6 +496,7 @@ private:
             if (generation != state.generation)
                 return {};
             auto storage_was_freed = state.clear_server_wait_for_storage_while_locked();
+            state.note_progress_while_locked();
             if (!state.failure.has_value())
                 state.failure = move(error);
             return { .has_something_to_take = true, .storage_was_freed = storage_was_freed };
@@ -498,6 +509,7 @@ private:
             if (generation != state.generation)
                 return {};
             auto storage_was_freed = state.clear_server_wait_for_storage_while_locked();
+            state.note_progress_while_locked();
             state.drained = true;
             return { .has_something_to_take = true, .storage_was_freed = storage_was_freed };
         });
@@ -513,9 +525,15 @@ NeverDestroyed<Optional<ThreadSafeWeakRef<VideoDecoderClientConnection>>> VideoD
 
 }
 
-void RemoteVideoDecoder::set_transport_requester(TransportRequester requester)
+void RemoteVideoDecoder::set_time_without_progress_until_server_is_stuck(AK::Duration duration)
+{
+    s_milliseconds_without_progress_until_server_is_stuck.store(duration.to_milliseconds(), AK::MemoryOrder::memory_order_relaxed);
+}
+
+void RemoteVideoDecoder::set_server_broker(TransportRequester requester, UnresponsiveServerReporter reporter)
 {
     *s_transport_requester = move(requester);
+    *s_unresponsive_server_reporter = move(reporter);
     s_transport_requester_event_loop = &Core::EventLoop::current();
     s_transport_requester_thread_id = AK::ThreadID::current();
 }
@@ -569,8 +587,7 @@ RemoteVideoDecoder::~RemoteVideoDecoder()
         decoder_id = m_state->decoder_id;
         outputs = move(m_state->outputs);
         m_state->decoder_was_destroyed = true;
-        m_state->relay_pools.clear();
-        m_state->output_arrived_callback = nullptr;
+        m_state->decode_completed_callback = nullptr;
     }
     connection.with_target([&](auto& connection) {
         connection.async_destroy_decoder(decoder_id);
@@ -599,6 +616,7 @@ DecoderErrorOr<void> RemoteVideoDecoder::start_server_decoder()
         m_state->connection_was_lost = false;
         m_state->connection = connection;
         m_state->decoder_id = decoder_id;
+        m_state->note_progress_while_locked();
         generation = m_state->generation;
     }
     m_ring = {};
@@ -624,10 +642,16 @@ void RemoteVideoDecoder::set_storage_freed_callback(Function<void()> callback)
     m_state->storage_freed_callback = move(callback);
 }
 
-void RemoteVideoDecoder::set_output_arrived_callback(Function<void()> callback)
+void RemoteVideoDecoder::set_decode_completed_callback(Function<void(DecodeCompletion)> callback)
 {
     MutexLocker locker { m_state->mutex };
-    m_state->output_arrived_callback = move(callback);
+    m_state->decode_completed_callback = move(callback);
+}
+
+bool RemoteVideoDecoder::has_any_decode_in_progress() const
+{
+    MutexLocker locker { m_state->mutex };
+    return m_state->has_any_decode_in_progress_while_locked();
 }
 
 DecoderError RemoteVideoDecoder::report_server_loss()
@@ -708,8 +732,9 @@ DecoderErrorOr<void> RemoteVideoDecoder::receive_coded_data(CodedFrame const& co
 
     MutexLocker locker { m_state->mutex };
     m_state->submissions_in_flight.append({ m_ring_serial, ring_offset, coded_frame.data().size(), m_state->generation });
+    m_state->note_progress_while_locked();
     m_state->connection.with_target([&](auto& connection) {
-        connection.async_submit_coded_frame(m_state->decoder_id, m_state->generation, ring_offset, coded_frame.data().size(), coded_frame.presentation_timestamp(), coded_frame.decode_timestamp(), coded_frame.duration(), coded_frame.flags(), move(new_codec_configuration), intent, m_output_target);
+        connection.async_submit_coded_frame(m_state->decoder_id, m_state->generation, ring_offset, coded_frame.data().size(), coded_frame.presentation_timestamp(), coded_frame.decode_timestamp(), coded_frame.duration(), coded_frame.flags(), coded_frame.maximum_scene_luminance(), move(new_codec_configuration), intent, m_output_target);
     });
     return {};
 }
@@ -719,15 +744,19 @@ void RemoteVideoDecoder::signal_end_of_stream()
     m_reached_end_of_stream = true;
     MutexLocker locker { m_state->mutex };
     m_state->drained = false;
+    m_state->note_progress_while_locked();
     m_state->connection.with_target([&](auto& connection) {
         connection.async_signal_end_of_stream(m_state->decoder_id, m_state->generation);
     });
 }
 
-DecoderErrorOr<NonnullRefPtr<VideoFrame>> RemoteVideoDecoder::take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> RemoteVideoDecoder::take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target)
 {
     // The server hears of the target with the next submission, which follows the flush that any new target comes after.
     m_output_target = target;
+
+    auto time_without_progress_until_stuck = AK::Duration::from_milliseconds(s_milliseconds_without_progress_until_server_is_stuck.load(AK::MemoryOrder::memory_order_relaxed));
+    auto server_was_found_stuck = false;
 
     Optional<State::Output> output;
     {
@@ -758,21 +787,29 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> RemoteVideoDecoder::take_next_output(C
             if (m_state->server_is_waiting_for_storage)
                 return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every slot of the video decoder server is held"sv);
             m_state->caller_is_waiting_for_output = true;
-            auto server_answered = m_state->server_decoder_state_changed.wait_for(SERVER_SILENCE_UNTIL_TREATED_AS_LOST);
-            m_state->caller_is_waiting_for_output = false;
-            if (!server_answered) {
-                dbgln("The video decoder server has answered nothing for {} seconds, disconnecting.", SERVER_SILENCE_UNTIL_TREATED_AS_LOST.to_seconds());
-                VideoDecoderClientConnection::disconnect_from_unresponsive_server(m_state->connection);
+            ScopeGuard stop_waiting = [&] { m_state->caller_is_waiting_for_output = false; };
+            // Once the server is found stuck, its connection's death ends the wait.
+            if (server_was_found_stuck) {
+                m_state->server_decoder_state_changed.wait();
+                continue;
             }
+            auto time_until_stuck = m_state->last_progress_time + time_without_progress_until_stuck - MonotonicTime::now_coarse();
+            if (time_until_stuck > AK::Duration::zero()) {
+                (void)m_state->server_decoder_state_changed.wait_for(time_until_stuck);
+                continue;
+            }
+            dbgln("The video decoder server has made no progress for {} ms, disconnecting.", time_without_progress_until_stuck.to_milliseconds());
+            server_was_found_stuck = true;
+            VideoDecoderClientConnection::disconnect_from_unresponsive_server(m_state->connection);
         }
     }
 
-    auto const& handle = output->handle;
-    auto cicp = container_cicp;
-    cicp.adopt_specified_values(handle.cicp);
+    auto const& frame = output->frame;
+    auto color_metadata = container_color_metadata;
+    color_metadata.adopt_specified_values(frame->color_metadata());
     return DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(
-        handle.timestamp, handle.duration, handle.size.to_type<u32>(),
-        handle.bit_depth, handle.subsampling, cicp, move(output->slot)));
+        frame->timestamp(), frame->duration(), frame->size(),
+        frame->bit_depth(), frame->subsampling(), move(color_metadata), frame->storage()));
 }
 
 void RemoteVideoDecoder::flush()
@@ -787,6 +824,7 @@ void RemoteVideoDecoder::flush()
     m_state->failure.clear();
     m_state->drained = false;
     m_state->server_is_waiting_for_storage = false;
+    m_state->note_progress_while_locked();
     m_state->connection.with_target([&](auto& connection) {
         connection.async_flush(m_state->decoder_id, m_state->generation);
     });

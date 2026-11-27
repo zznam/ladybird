@@ -139,13 +139,27 @@ impl FunctionInfo {
 const MEMORY32_MAX_PAGES: u64 = 1 << 16;
 const MEMORY64_MAX_PAGES: u64 = 1 << 48;
 
-/// The most locals a function may have, its parameters included, as the JS API's implementation limits say. Every
-/// local takes a slot of the function's machine stack frame, so this bounds the frame size a module can ask for.
+// https://webassembly.github.io/spec/js-api/#limits
+
+// The maximum depth of a defined subtype hierarchy is 63 (where a type defined with no supertype has depth 0).
+const MAX_SUBTYPING_DEPTH: u32 = 63;
+
+// The maximum number of parameters to any function or block is 1,000.
+const MAX_FUNCTION_PARAMS: usize = 1_000;
+
+// The maximum number of return values for any function or block is 1,000.
+const MAX_FUNCTION_RESULTS: usize = 1_000;
+
+// The maximum number of locals declared in a function, including implicitly declared as parameters, is 50,000.
 const MAX_FUNCTION_LOCALS: usize = 50_000;
 
-/// The most supertypes a type may have above it, as the JS API's implementation limits say. Runtime types hold all of
-/// their supertypes, and subtype checks walk them.
-const MAX_SUBTYPING_DEPTH: u32 = 63;
+// The maximum number of fields in a struct is 10,000.
+const MAX_STRUCT_FIELDS: usize = 10_000;
+
+// AD-HOC: A function's operand stack lives in its frame, 8 bytes per slot. Its height is capped so the frame size
+//         stays far from wrapping a u32 and validation memory stays bounded. A function that needs more than 8 MiB of
+//         operand stack could not be entered on a thread stack anyway.
+const MAX_FUNCTION_STACK_SLOTS: u32 = 1 << 20;
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::invalid(message))
@@ -792,6 +806,11 @@ impl FunctionValidator<'_> {
                 return Err(Error::malformed("unexpected end of section or function"));
             }
             self.validate_instruction(reader)?;
+            // NB: One instruction pushes at most a few thousand slots, so checking after each one keeps the height
+            //     far from wrapping.
+            if self.slot_height > MAX_FUNCTION_STACK_SLOTS {
+                return invalid("operand stack too deep");
+            }
         }
         if !reader.is_at_end() {
             return Err(Error::malformed("section size mismatch"));
@@ -2206,13 +2225,24 @@ fn validate_types(module: &Module, identities: &mut Vec<u32>) -> Result<()> {
             };
             match &sub_type.composite {
                 CompositeType::Func(function) => {
+                    if function.params.len() > MAX_FUNCTION_PARAMS {
+                        return invalid("too many parameters");
+                    }
+                    if function.results.len() > MAX_FUNCTION_RESULTS {
+                        return invalid("too many results");
+                    }
                     function
                         .params
                         .iter()
                         .chain(&function.results)
                         .try_for_each(|&value| check(value))?;
                 }
-                CompositeType::Struct(fields) => fields.iter().try_for_each(|field| check_storage(field.storage))?,
+                CompositeType::Struct(fields) => {
+                    if fields.len() > MAX_STRUCT_FIELDS {
+                        return invalid("too many struct fields");
+                    }
+                    fields.iter().try_for_each(|field| check_storage(field.storage))?;
+                }
                 CompositeType::Array(field) => check_storage(field.storage)?,
             }
             if sub_type.supertypes.len() > 1 {
@@ -2449,7 +2479,7 @@ pub fn validate(module: &mut Module) -> Result<()> {
             catch_clauses: validator.catch_clauses.into_boxed_slice(),
             local_count: validator.locals.len() as u32 + validator.exception_local_count,
             exception_local_count: validator.exception_local_count,
-            max_stack_slots: validator.max_slot_height,
+            max_stack_slots: validator.max_slot_height.max(slots_of(&function.results)),
         });
     }
     module.function_infos = infos;

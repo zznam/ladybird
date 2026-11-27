@@ -5,7 +5,7 @@
  */
 
 use super::executable::{Executable, append_double_formatted_like_ak, append_value_formatted_like_ak};
-use super::generator::ExceptionHandler;
+use super::executable_data::ExceptionHandler;
 use super::instruction::dump_instruction_from_bytes;
 use super::instruction::instruction_is_terminator_from_opcode;
 use super::instruction::instruction_length_from_bytes;
@@ -13,7 +13,7 @@ use super::instruction::instruction_name_from_opcode;
 use super::instruction::visit_labels_from_bytes;
 use super::native_disassembler::disassemble;
 use super::operand::Operand;
-use super::validator::read_u32;
+use super::operand::read_u32;
 use crate::bytecode::encoded_value::EncodedValue;
 use crate::bytecode::encoded_value::EncodedValueKind;
 use crate::interpreter::run::should_dump_interpreter_assembly;
@@ -157,7 +157,7 @@ impl BytecodeDumper<'_> {
         }
 
         let raw = operand.raw();
-        if raw < self.executable.number_of_registers {
+        if raw < self.executable.number_of_registers() {
             if raw == 2 {
                 self.append("\x1b[33mthis\x1b[0m");
             } else {
@@ -168,7 +168,7 @@ impl BytecodeDumper<'_> {
         } else if raw < self.executable.registers_and_locals_count() {
             let index = raw - self.executable.local_index_base();
             self.append("\x1b[34m");
-            Utf16View::of_fly_string(&self.executable.local_variable_names[index as usize])
+            Utf16View::of_fly_string(&self.executable.local_variable_names()[index as usize])
                 .append_as_wtf8_to(self.output);
             self.append("~");
             self.append(&index.to_string());
@@ -258,15 +258,15 @@ impl BytecodeDumper<'_> {
     }
 
     fn append_bigint(&mut self, encoded: u64) {
-        Utf16View::of_string(&Value(encoded).as_bigint().to_utf16_string()).append_as_wtf8_to(self.output);
+        Utf16View::of_string(&Value::from_bits(encoded).as_bigint().to_utf16_string()).append_as_wtf8_to(self.output);
     }
 
     fn append_string_value(&mut self, encoded: u64) {
-        Utf16View::of_string(&Value(encoded).as_string().utf16_string()).append_as_wtf8_to(self.output);
+        Utf16View::of_string(&Value::from_bits(encoded).as_string().utf16_string()).append_as_wtf8_to(self.output);
     }
 
     fn append_value_fallback(&mut self, encoded: u64) {
-        append_value_formatted_like_ak(self.output, Value(encoded));
+        append_value_formatted_like_ak(self.output, Value::from_bits(encoded));
     }
 
     fn append_quoted(&mut self, text: Utf16View<'_>) {
@@ -277,28 +277,27 @@ impl BytecodeDumper<'_> {
 
     pub fn append_identifier_quoted(&mut self, index: u32) {
         self.append_quoted(Utf16View::of_fly_string(
-            &self.executable.identifier_table[index as usize],
+            &self.executable.identifier_table()[index as usize],
         ));
     }
 
     pub fn append_identifier_plain(&mut self, index: u32) {
-        Utf16View::of_fly_string(&self.executable.identifier_table[index as usize]).append_as_wtf8_to(self.output);
+        Utf16View::of_fly_string(&self.executable.identifier_table()[index as usize]).append_as_wtf8_to(self.output);
     }
 
-    /// The table holds the property keys as the strings they were made from. Formatting a PropertyKey writes an array
-    /// index key as its number, which is the same text, since only canonical index strings become numbers.
+    /// A PropertyKey is the text it was made from, since only canonical index strings become numbers.
     pub fn append_property_key_quoted(&mut self, index: u32) {
-        self.append_quoted(Utf16View::of_fly_string(
-            &self.executable.property_key_table()[index as usize],
-        ));
+        let key = self.executable.property_key(index as usize).to_utf16_string();
+        self.append_quoted(Utf16View::of_string(&key));
     }
 
     pub fn append_property_key_plain(&mut self, index: u32) {
-        Utf16View::of_fly_string(&self.executable.property_key_table()[index as usize]).append_as_wtf8_to(self.output);
+        let key = self.executable.property_key(index as usize).to_utf16_string();
+        Utf16View::of_string(&key).append_as_wtf8_to(self.output);
     }
 
     pub fn append_string(&mut self, index: u32) {
-        Utf16View::of_fly_string(&self.executable.string_table[index as usize]).append_as_wtf8_to(self.output);
+        Utf16View::of_fly_string(&self.executable.string_table()[index as usize]).append_as_wtf8_to(self.output);
     }
 
     pub fn append_bool(&mut self, name: &str, value: bool) {
@@ -313,7 +312,7 @@ impl BytecodeDumper<'_> {
         self.append(&value.to_string());
     }
 
-    pub fn append_put_kind(&mut self, name: &str, value: u32) {
+    pub fn append_put_kind(&mut self, name: &str, value: u8) {
         let kind = match value {
             0 => "Normal",
             1 => "Getter",
@@ -335,7 +334,7 @@ impl BytecodeDumper<'_> {
             if i != 0 {
                 self.append(", ");
             }
-            self.append_operand("", Operand::from_raw(read_u32(bytes, offset + i * 4)));
+            self.append_operand("", Operand::from_raw(u32::from(bytes[offset + i])));
         }
         self.append("]");
     }
@@ -345,10 +344,11 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let raw = read_u32(bytes, offset + i * 4);
-            let Some(operand) = Operand::optional_from_raw(raw) else {
+            let raw = bytes[offset + i];
+            if raw == u8::MAX {
                 continue;
-            };
+            }
+            let operand = Operand::from_raw(u32::from(raw));
             if !first_elem {
                 self.append(", ");
             }
@@ -375,7 +375,7 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let element_offset = offset + i * 8;
+            let element_offset = offset + i * 5;
             if bytes[element_offset + 4] == 0 {
                 continue;
             }
@@ -440,7 +440,7 @@ fn collect_basic_block_start_offsets(bytecode: &[u8], exception_handlers: &[Exce
     while at < bytecode.len() {
         let opcode = bytecode[at];
         let length = instruction_length_from_bytes(opcode, bytecode, at)
-            .expect("validated bytecode should have valid instruction lengths");
+            .expect("generated bytecode has valid instruction lengths");
         let next_offset = at + length;
 
         visit_labels_from_bytes(opcode, bytecode, at, &mut |address| {
@@ -464,16 +464,16 @@ fn collect_basic_block_start_offsets(bytecode: &[u8], exception_handlers: &[Exce
     offsets
 }
 
-/// Count basic blocks in a validated bytecode instruction stream.
+/// Count basic blocks in a bytecode instruction stream.
 pub fn count_basic_blocks(executable: &Executable) -> usize {
-    collect_basic_block_start_offsets(executable.bytecode(), &executable.exception_handlers).len()
+    collect_basic_block_start_offsets(executable.bytecode(), executable.exception_handlers()).len()
 }
 
-/// Dump the validated bytecode of an executable, and with LADYBIRD_JS_INTERPRETER_DUMP set, the native code of the
+/// Dump the bytecode of an executable, and with LADYBIRD_JS_INTERPRETER_DUMP set, the native code of the
 /// interpreter handler of each instruction.
 pub fn dump_bytecode(output: &mut Vec<u8>, executable: &Executable) {
     let bytecode = executable.bytecode();
-    let exception_handlers = &executable.exception_handlers;
+    let exception_handlers = executable.exception_handlers();
     let dump_interpreter = should_dump_interpreter_assembly();
     let basic_block_start_offsets = collect_basic_block_start_offsets(bytecode, exception_handlers);
     let mut dumper = BytecodeDumper {
@@ -516,7 +516,7 @@ pub fn dump_bytecode(output: &mut Vec<u8>, executable: &Executable) {
         }
 
         at += instruction_length_from_bytes(bytecode[at], bytecode, at)
-            .expect("validated bytecode should have valid instruction lengths");
+            .expect("generated bytecode has valid instruction lengths");
     }
 
     dumper.append_exception_handlers(exception_handlers);

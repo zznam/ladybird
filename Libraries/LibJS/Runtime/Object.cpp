@@ -77,22 +77,6 @@ ThrowCompletionOr<bool> Object::create_data_property_or_throw(PropertyKey const&
     return completion_from_abi<bool>(js_object_create_data_property_or_throw(vm_of(*this), object_to_abi(*this), property_key_to_abi(property_key), value_to_abi(value)));
 }
 
-// 7.3.8 CreateNonEnumerableDataPropertyOrThrow ( O, P, V ), https://tc39.es/ecma262/#sec-createnonenumerabledatapropertyorthrow
-void Object::create_non_enumerable_data_property_or_throw(PropertyKey const& property_key, Value value)
-{
-    VERIFY(!value.is_special_empty_value());
-
-    // 1. Assert: O is an ordinary, extensible object with no non-configurable properties.
-
-    // 2. Let newDesc be the PropertyDescriptor { [[Value]]: V, [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }.
-    auto new_description = PropertyDescriptor { .value = value, .writable = true, .enumerable = false, .configurable = true };
-
-    // 3. Perform ! DefinePropertyOrThrow(O, P, newDesc).
-    MUST(define_property_or_throw(property_key, new_description));
-
-    // 4. Return unused.
-}
-
 // 7.3.9 DefinePropertyOrThrow ( O, P, desc ), https://tc39.es/ecma262/#sec-definepropertyorthrow
 ThrowCompletionOr<void> Object::define_property_or_throw(PropertyKey const& property_key, PropertyDescriptor& property_descriptor)
 {
@@ -334,9 +318,9 @@ void Object::define_native_function(Realm& realm, PropertyKey const& property_ke
     js_object_define_native_function(vm_of(*this), object_to_abi(*this), cell_to_abi<JSRealm>(realm), property_key_to_abi(property_key), native_function_to_abi(native_function), length, attributes.bits());
 }
 
-void Object::define_native_function(Realm& realm, PropertyKey const& property_key, Function<ThrowCompletionOr<Value>(VM&)> native_function, i32 length, PropertyAttributes attributes)
+void Object::define_native_function(Realm& realm, PropertyKey const& property_key, GC::Ref<GC::Function<ThrowCompletionOr<Value>(VM&)>> native_function, i32 length, PropertyAttributes attributes)
 {
-    auto function = NativeFunction::create(realm, move(native_function), length, property_key, &realm);
+    auto function = NativeFunction::create(realm, native_function, length, property_key, &realm);
     define_direct_property(property_key, function, attributes);
 }
 
@@ -345,20 +329,40 @@ void Object::define_native_accessor(Realm& realm, PropertyKey const& property_ke
     js_object_define_native_accessor(vm_of(*this), object_to_abi(*this), cell_to_abi<JSRealm>(realm), property_key_to_abi(property_key), getter ? native_function_to_abi(getter) : nullptr, setter ? native_function_to_abi(setter) : nullptr, attributes.bits());
 }
 
-void Object::define_native_accessor(Realm& realm, PropertyKey const& property_key, Function<ThrowCompletionOr<Value>(VM&)> getter, Function<ThrowCompletionOr<Value>(VM&)> setter, PropertyAttributes attributes)
+void Object::define_native_accessor(Realm& realm, PropertyKey const& property_key, GC::Ptr<GC::Function<ThrowCompletionOr<Value>(VM&)>> getter, GC::Ptr<GC::Function<ThrowCompletionOr<Value>(VM&)>> setter, PropertyAttributes attributes)
 {
     GC::Ptr<FunctionObject> getter_function;
     if (getter)
-        getter_function = NativeFunction::create(realm, move(getter), 0, property_key, &realm, "get"sv);
+        getter_function = NativeFunction::create(realm, *getter, 0, property_key, &realm, "get"sv);
     GC::Ptr<FunctionObject> setter_function;
     if (setter)
-        setter_function = NativeFunction::create(realm, move(setter), 1, property_key, &realm, "set"sv);
+        setter_function = NativeFunction::create(realm, *setter, 1, property_key, &realm, "set"sv);
     define_direct_accessor(property_key, getter_function, setter_function, attributes);
 }
 
-bool Object::is_date() const
+bool Object::is_weak_map() const
 {
-    return is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_DATE);
+    return engine_class_id() == JS_LAYOUT_CLASS_ID_WEAK_MAP;
+}
+
+bool Object::is_weak_set() const
+{
+    return engine_class_id() == JS_LAYOUT_CLASS_ID_WEAK_SET;
+}
+
+bool Object::is_generator() const
+{
+    return engine_class_id() == JS_LAYOUT_CLASS_ID_GENERATOR_OBJECT || engine_class_id() == JS_LAYOUT_CLASS_ID_ASYNC_GENERATOR;
+}
+
+bool Object::is_proxy() const
+{
+    return engine_class_id() == JS_LAYOUT_CLASS_ID_PROXY_OBJECT;
+}
+
+bool Object::is_array_buffer() const
+{
+    return is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_ARRAY_BUFFER);
 }
 
 ErrorData* Object::error_data()
@@ -392,9 +396,9 @@ void Object::indexed_append(Value value, PropertyAttributes attributes)
     js_array_indexed_append(object_to_abi(*this), value_to_abi(value));
 }
 
-ValueAndAttributes Object::indexed_take_first()
+void Object::indexed_take_first()
 {
-    return ValueAndAttributes { .value = value_from_abi(js_array_indexed_take_first(object_to_abi(*this))) };
+    js_array_indexed_take_first(object_to_abi(*this));
 }
 
 void Object::convert_to_prototype_if_needed()

@@ -4,20 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <AK/String.h>
-#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibIPC/Transport.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
@@ -32,12 +28,12 @@
 
 namespace {
 
-class TestApplication : public WebView::Application {
+class TestApplication : public Test::HeadlessApplication {
     WEB_VIEW_APPLICATION(TestApplication)
 
 public:
     explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
+        : Test::HeadlessApplication(move(ladybird_binary_path))
     {
     }
 
@@ -56,9 +52,7 @@ public:
         web_content_options.file_scheme_urls_have_tuple_origins = WebView::FileSchemeUrlsHaveTupleOrigins::Yes;
     }
 
-    virtual bool should_coordinate_browser_process() const override { return false; }
-
-    virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override
+    virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab, WebView::ViewImplementation const*) const override
     {
         ++m_new_tab_requests;
         return {};
@@ -103,23 +97,15 @@ void press_history_traversal_button(WebView::ViewImplementation& view, Web::UIEv
 // The browser's back and forward keys are matched in the UI process once WebContent reports them unhandled, so a
 // page's keydown handler must be able to consume them, and an unconsumed press must traverse the session history.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(browser_history_traversal)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestBrowserHistoryTraversal-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    VERIFY(setenv("XDG_CONFIG_HOME", test_config_directory.characters(), 1) == 0);
+    Test::HeadlessTestEnvironment environment { "TestBrowserHistoryTraversal"sv };
+    auto const& test_config_directory = environment.directory();
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     auto view = WebView::HeadlessWebView::create(theme, { 800, 600 });
 
@@ -150,7 +136,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     size_t spare_view_loads_finished = 0;
     spare_view->on_load_finish = [&](auto const&) { ++spare_view_loads_finished; };
     auto spare_view_url = URL::Parser::basic_parse("data:text/html,spare-process-navigation"sv).release_value();
-    spare_view->load(spare_view_url);
+    spare_view->load_from_browser_ui(spare_view_url);
     Core::EventLoop::current().spin_until([&]() { return spare_view_loads_finished == 1; });
     VERIFY(spare_view->url() == spare_view_url);
     // The page a spare process was started with is one its client may act for, and a page ID the client
@@ -170,16 +156,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Core::EventLoop::current().spin_until([&]() { return loads_finished >= expected_loads && view_is_at(url); });
     };
 
-    view->load(url_a);
+    view->load_from_browser_ui(url_a);
     wait_until_at(url_a);
-    view->load(url_b);
+    view->load_from_browser_ui(url_b);
     wait_until_at(url_b);
-    view->load(url_c);
+    view->load_from_browser_ui(url_c);
     wait_until_at(url_c);
-    view->load(url_d);
+    view->load_from_browser_ui(url_d);
     wait_until_at(url_d);
 
-    auto back_menu_items = view->session_history_traversal_menu_items(-1);
+    auto back_menu_items = view->session_history_traversal_items(-1);
     VERIFY(back_menu_items.size() == 3);
     VERIFY(back_menu_items[0].step == 2);
     VERIFY(back_menu_items[1].step == 1);
@@ -242,7 +228,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto javascript_url = URL::Parser::basic_parse("javascript:void(0)"sv).release_value();
     auto loads_started_before_javascript_url = loads_started;
     auto loads_finished_before_javascript_url = loads_finished;
-    view->load(javascript_url);
+    view->load_from_browser_ui(javascript_url);
     Core::EventLoop::current().spin_until([&] { return loads_finished > loads_finished_before_javascript_url; });
     VERIFY(loads_started == loads_started_before_javascript_url + 1);
     VERIFY(view_is_at(url_c));
@@ -280,7 +266,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     // Take the spare, so the restored view launches a process of its own the way a private window's tab does. A
     // spare is relaunched from a deferred task, so none is available until the event loop next runs.
-    auto restored_theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto restored_theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
     auto spare_consumer = WebView::HeadlessWebView::create(restored_theme, { 800, 600 });
     VERIFY(!app->has_spare_web_content_process());
 
@@ -320,7 +306,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto cookie_url = URL::Parser::basic_parse("https://example.com/"sv).release_value();
     HTTP::Cookie::ParsedCookie cookie { .name = "page-lifecycle"_string, .value = "preserved"_string };
     auto& cookie_jar = *client.session().cookie_jar;
-    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {});
+    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
     VERIFY(cookie_jar.get_named_cookie(cookie_url, cookie.name).has_value());
     auto& stub = static_cast<WebContentClientStub&>(client);
     auto new_tab_requests = app->new_tab_requests();
@@ -329,7 +315,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(stub.did_request_cookie(popup_page_id, {}, cookie_url, HTTP::Cookie::Source::Http).cookie().cookie == "page-lifecycle=preserved"sv);
     stub.did_request_delete_all_cookies(popup_page_id, 0, cookie_url);
     VERIFY(!cookie_jar.get_named_cookie(cookie_url, cookie.name).has_value());
-    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {});
+    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
     client.page(popup_page_id)->set_detached_close_pending(true);
     popup.clear();
     VERIFY(!client.page(popup_page_id));
@@ -357,7 +343,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         rejected_page_id = traversable.display_page()->id();
         return String {};
     };
-    auto rejected_popup = stub.did_request_new_web_view(restored_view->page().id(), Web::HTML::ActivateTab::No, {}, {}, {}, {}, {});
+    auto rejected_popup = stub.did_request_new_web_view(restored_view->page().id(), Web::HTML::ActivateTab::No, {}, restored_view->traversable().id(), {}, true, {});
     VERIFY(!rejected_popup.new_page_id().has_value());
     VERIFY(rejected_page_id != 0);
     VERIFY(!client.may_act_for_page(rejected_page_id));
@@ -365,9 +351,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     // An initial page can read cookies before the UI adopts it into a view.
     {
-        auto transport = TRY(IPC::Transport::create_paired());
+        auto transport = TRY_OR_FAIL(IPC::Transport::create_paired());
         auto initial_page_id = app->allocate_page_id();
-        auto initial_client = adopt_ref(*new WebView::WebContentClient(move(transport.local), client.is_private(), initial_page_id, app->allocate_ui_process_cross_process_id()));
+        auto initial_client = adopt_ref(*new WebView::WebContentClient(move(transport.local), client.session(), initial_page_id, app->allocate_ui_process_cross_process_id()));
         VERIFY(!initial_client->page(initial_page_id));
         auto& initial_stub = static_cast<WebContentClientStub&>(*initial_client);
         VERIFY(initial_stub.did_request_cookie(initial_page_id, {}, cookie_url, HTTP::Cookie::Source::Http).cookie().cookie == "page-lifecycle=preserved"sv);
@@ -377,8 +363,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     {
         auto reload_view = WebView::HeadlessWebView::create(restored_theme, { 800, 600 });
         auto reload_page_path = ByteString::formatted("{}/reload.html", test_config_directory);
-        auto reload_page = TRY(Core::File::open(reload_page_path, Core::File::OpenMode::Write));
-        TRY(reload_page->write_until_depleted("<script>navigation.onnavigate=()=>alert('navigate')</script>reload"sv.bytes()));
+        auto reload_page = TRY_OR_FAIL(Core::File::open(reload_page_path, Core::File::OpenMode::Write));
+        TRY_OR_FAIL(reload_page->write_until_depleted("<script>navigation.onnavigate=()=>alert('navigate')</script>reload"sv.bytes()));
         reload_page->close();
         auto reload_url = URL::create_with_file_scheme(reload_page_path).release_value();
         size_t reload_url_loads_finished = 0;
@@ -391,7 +377,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             ++navigate_events;
             reload_view->alert_closed();
         };
-        reload_view->load(reload_url);
+        reload_view->load_from_browser_ui(reload_url);
         Core::EventLoop::current().spin_until([&] { return reload_url_loads_finished == 1; });
         reload_view->reload();
         Core::EventLoop::current().spin_until([&] { return reload_url_loads_finished == 2; });
@@ -413,21 +399,21 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             TRY(file->write_until_depleted(contents.bytes()));
             return URL::create_with_file_scheme(path).release_value();
         };
-        auto slow_unload_url = TRY(write_page("slow-unload.html"sv, "<script>addEventListener('unload', () => { const end = performance.now() + 1000; while (performance.now() < end) {} });</script>"sv));
-        auto activated_url = TRY(write_page("activated.html"sv, "activated"sv));
-        auto newer_url = TRY(write_page("newer.html"sv, "newer"sv));
+        auto slow_unload_url = TRY_OR_FAIL(write_page("slow-unload.html"sv, "<script>addEventListener('unload', () => { const end = performance.now() + 1000; while (performance.now() < end) {} });</script>"sv));
+        auto activated_url = TRY_OR_FAIL(write_page("activated.html"sv, "activated"sv));
+        auto newer_url = TRY_OR_FAIL(write_page("newer.html"sv, "newer"sv));
         Vector<URL::URL> loads_finished;
         view->on_load_finish = [&](URL::URL const& url) { loads_finished.append(url); };
-        view->load(slow_unload_url);
+        view->load_from_browser_ui(slow_unload_url);
         Core::EventLoop::current().spin_until([&] { return loads_finished.contains_slow(slow_unload_url); });
 
         // The displayed document is still unloading, after its successor's history job was found ready.
-        view->load(activated_url);
+        view->load_from_browser_ui(activated_url);
         bool unloading = false;
         auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(300), [&] { unloading = true; });
         timer->start();
         Core::EventLoop::current().spin_until([&] { return unloading; });
-        view->load(newer_url);
+        view->load_from_browser_ui(newer_url);
         Core::EventLoop::current().spin_until([&] { return loads_finished.contains_slow(newer_url); });
         VERIFY(view->url() == newer_url);
     }
@@ -439,5 +425,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(!client.is_open());
 
     outln("PASS: browser history traversal");
-    return 0;
 }

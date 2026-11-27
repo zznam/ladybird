@@ -19,8 +19,8 @@
 #include <LibCore/MappedFile.h>
 #include <LibGfx/Font/FaceDescription.h>
 #include <LibGfx/Font/FontVariationSettings.h>
-#include <LibGfx/Font/RasterizerData.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/RasterizerData.h>
 #include <LibGfx/ShapeFeature.h>
 #include <LibIPC/Forward.h>
 
@@ -34,6 +34,7 @@ struct hb_font_t;
 namespace Gfx {
 
 class Font;
+struct TypefaceRasterizerData;
 
 struct SystemFontIdentifier {
     u64 generation { 0 };
@@ -57,15 +58,40 @@ struct SystemUIFontStyle {
     u8 slope;
 };
 
+// https://drafts.csswg.org/css-fonts-4/#font-synthesis-intro
+// How a font is drawn bolder or slanted than its face, where the face lacks the weight or style asked for.
+struct FontSynthesis {
+    bool bold { false };
+    // The angle of a synthetic oblique, in degrees; positive slants the glyphs' tops toward the end of the line.
+    float oblique_angle { 0 };
+
+    bool operator==(FontSynthesis const&) const = default;
+};
+
+// https://drafts.csswg.org/css-fonts-4/#font-synthesis-weight
+// https://drafts.csswg.org/css-fonts-4/#font-synthesis-style
+// What a request for text at this weight and slope (0 normal, 1 italic, 2 oblique) asks to be synthesized of a font
+// made of the typeface with these variations, where the request allows synthesis of weight and of style.
+struct FontSynthesisRequest {
+    int weight { 400 };
+    int slope { 0 };
+    // The angle of the oblique style the request asks for, in degrees.
+    float oblique_angle { 14 };
+    bool allows_weight { true };
+    bool allows_style { true };
+};
+
 struct FontCacheKey {
     float point_size;
     Vector<FontVariationAxis> axes;
     Gfx::ShapeFeatures shape_features;
+    FontSynthesis synthesis;
 
     // Sizes and values compare by their bits, as the hash reads them, so that a key with NaN finds itself.
     bool operator==(FontCacheKey const& other) const
     {
-        if (bit_cast<u32>(point_size) != bit_cast<u32>(other.point_size) || axes.size() != other.axes.size() || shape_features != other.shape_features)
+        if (bit_cast<u32>(point_size) != bit_cast<u32>(other.point_size) || axes.size() != other.axes.size() || shape_features != other.shape_features
+            || synthesis.bold != other.synthesis.bold || bit_cast<u32>(synthesis.oblique_angle) != bit_cast<u32>(other.synthesis.oblique_angle))
             return false;
         for (size_t index = 0; index < axes.size(); ++index) {
             if (axes[index].tag != other.axes[index].tag || bit_cast<u32>(axes[index].value) != bit_cast<u32>(other.axes[index].value))
@@ -80,6 +106,7 @@ struct FontCacheKey {
         for (auto const& axis : axes)
             h = pair_int_hash(h, pair_int_hash(axis.tag.to_u32(), bit_cast<u32>(axis.value)));
         h = pair_int_hash(h, Traits<Gfx::ShapeFeatures>::hash(shape_features));
+        h = pair_int_hash(h, pair_int_hash(synthesis.bold, bit_cast<u32>(synthesis.oblique_angle)));
         return h;
     }
 };
@@ -108,6 +135,11 @@ public:
 
     virtual ~Typeface();
 
+    u64 id() const { return m_id; }
+
+    using DestructionObserver = void (*)(u64 typeface_id);
+    static void set_destruction_observer(DestructionObserver);
+
     u32 glyph_count() const;
     u16 units_per_em() const;
     u32 glyph_id_for_code_point(u32 code_point) const;
@@ -121,9 +153,9 @@ public:
     RefPtr<FontDataBacking> font_data_backing() const { return m_font_data; }
     u32 collection_index() const { return m_ttc_index; }
 
-    [[nodiscard]] NonnullRefPtr<Font> font(float point_size, FontVariationSettings const& variations = {}, Gfx::ShapeFeatures const& shape_features = {}) const;
+    [[nodiscard]] NonnullRefPtr<Font> font(float point_size, FontVariationSettings const& variations = {}, Gfx::ShapeFeatures const& shape_features = {}, FontSynthesis synthesis = {}) const;
     // A font that measures and shapes text like font() but draws nothing. Each call makes a new font.
-    [[nodiscard]] NonnullRefPtr<Font> invisible_font(float point_size, FontVariationSettings const& variations = {}, Gfx::ShapeFeatures const& shape_features = {}) const;
+    [[nodiscard]] NonnullRefPtr<Font> invisible_font(float point_size, FontVariationSettings const& variations = {}, Gfx::ShapeFeatures const& shape_features = {}, FontSynthesis synthesis = {}) const;
 
     void set_system_font_identifier(SystemFontIdentifier identifier) { m_system_font_identifier = identifier; }
     Optional<SystemFontIdentifier> system_font_identifier() const { return m_system_font_identifier; }
@@ -133,14 +165,18 @@ public:
     hb_face_t* harfbuzz_typeface() const;
     FaceDescription const& description() const;
 
+    // How a font of this typeface, with these variations, has to be synthesized to show the weight and the slope that
+    // the request asks for.
+    FontSynthesis synthesis_for(FontSynthesisRequest const&, FontVariationSettings const&) const;
+
     // The style of a font of this typeface with these variations.
     FaceStyle style_for_variations(ReadonlySpan<FontVariationAxis>) const;
     ErrorOr<Vector<String>> local_font_names() const;
     Optional<String> postscript_name() const;
 
     // What a rasterizer keeps with this typeface. The first call makes it.
-    template<typename T, typename Callback>
-    T& rasterizer_data(Callback make) const { return m_rasterizer_data.get<T>(make); }
+    template<typename Callback>
+    TypefaceRasterizerData& rasterizer_data(Callback make) const { return m_rasterizer_data.get(make); }
 
     // Union of all glyph bounding boxes as recorded in the `head` table, in font units with y pointing up.
     // is_empty() when the face has no usable `head` table (e.g. bitmap-only fonts).
@@ -212,8 +248,9 @@ private:
     void populate_glyph_page(GlyphPage&, size_t page_index) const;
     hb_font_t* cmap_font() const;
 
-    // Addresses can be reused after destruction, so per-thread caches use a monotonic identity.
-    u64 m_glyph_cache_id { 0 };
+    // Addresses can be reused after destruction, so per-thread caches and other processes name a typeface by a
+    // monotonic identity.
+    u64 m_id { 0 };
 
     mutable Mutex m_fonts_mutex;
     // The fonts that are alive. A font does not keep itself here, so it holds its typeface without a reference cycle.
@@ -227,7 +264,7 @@ private:
     mutable Optional<FaceDescription> m_description;
     mutable OnceFlag m_bounding_box_once;
     mutable BoundingBoxInFontUnits m_bounding_box_in_font_units;
-    RasterizerDataSlot m_rasterizer_data;
+    RasterizerDataSlot<TypefaceRasterizerData> m_rasterizer_data;
 };
 
 }

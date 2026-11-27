@@ -42,11 +42,12 @@ class WEBVIEW_API CanonicalDocumentState final : public RefCounted<CanonicalDocu
 public:
     static NonnullRefPtr<CanonicalDocumentState> create(Web::HTML::CrossProcessId);
     static NonnullRefPtr<CanonicalDocumentState> create(Web::HTML::CrossProcessId, NonnullRefPtr<CanonicalDocument>);
+    static NonnullRefPtr<CanonicalDocumentState> create_from_descriptor(Web::HTML::SessionHistoryDocumentStateDescriptor const&);
 
     ~CanonicalDocumentState();
 
     Web::HTML::SessionHistoryDocumentStateDescriptor descriptor() const;
-    void save_the_origin_of_the_populated_document();
+    void save_the_state_of_the_populated_document();
 
     // NB: The identity the processes hosting the document state's documents give it.
     Web::HTML::CrossProcessId id;
@@ -66,6 +67,7 @@ public:
     Optional<URL::Origin> origin;
     Optional<URL::URL> about_base_url;
     Web::HTML::DocumentResource resource;
+    HTTP::Cookie::SameSiteStatus navigation_same_site_status { HTTP::Cookie::SameSiteStatus::CrossSite };
     bool reload_pending { false };
     bool reload_bypasses_cache { false };
     bool ever_populated { false };
@@ -73,8 +75,7 @@ public:
     Utf16String navigable_target_name;
     Vector<CanonicalNestedHistory> nested_histories;
 
-    // Whether the UI process populated local file content for this document state. Only then may the process populating
-    // it again read the file its entry names: a process reports an entry's URL, but not this.
+    // Whether the UI process populated local file content for this document state.
     bool held_local_file_content { false };
 
 private:

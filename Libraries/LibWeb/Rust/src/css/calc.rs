@@ -13,7 +13,11 @@
 //! Nothing constructs these yet; the FFI construction surface follows with
 //! the C++ staging.
 
-use crate::css::ffi_support::{OwnedArc, OwnedBox};
+use crate::css::style_value::{
+    AnchorPayload, AnchorSizePayload, CalculatedPayload, RandomValueSharingPayload, StyleValueBox,
+};
+use crate::css::style_value_arc::StyleValueArc;
+use ak::math;
 use std::sync::Arc;
 
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
@@ -140,7 +144,7 @@ impl CalcNumericType {
     }
 
     /// https://drafts.css-houdini.org/css-typed-om-1/#cssnumericvalue-add-two-types
-    pub(crate) fn added_to(&self, other: &CalcNumericType) -> Option<CalcNumericType> {
+    pub fn added_to(&self, other: &CalcNumericType) -> Option<CalcNumericType> {
         // To add two types type1 and type2, perform the following steps:
 
         // 1. Replace type1 with a fresh copy of type1, and type2 with a fresh copy of type2.
@@ -222,7 +226,7 @@ impl CalcNumericType {
     }
 
     /// https://drafts.css-houdini.org/css-typed-om-1/#cssnumericvalue-multiply-two-types
-    pub(crate) fn multiplied_by(&self, other: &CalcNumericType) -> Option<CalcNumericType> {
+    pub fn multiplied_by(&self, other: &CalcNumericType) -> Option<CalcNumericType> {
         // To multiply two types type1 and type2, perform the following steps:
 
         // 1. Replace type1 with a fresh copy of type1, and type2 with a fresh copy of type2.
@@ -264,7 +268,7 @@ impl CalcNumericType {
     }
 
     /// https://drafts.css-houdini.org/css-typed-om-1/#cssnumericvalue-invert-a-type
-    pub(crate) fn inverted(&self) -> CalcNumericType {
+    pub fn inverted(&self) -> CalcNumericType {
         // To invert a type type, perform the following steps:
 
         // 1. Let result be a new type with an initially empty ordered map and a percent hint matching that of type.
@@ -303,7 +307,7 @@ impl CalcNumericType {
     }
 }
 
-fn base_type_from_value_type(value_type: u8) -> Option<u8> {
+pub(crate) fn base_type_from_value_type(value_type: u8) -> Option<u8> {
     match value_type {
         value_type::ANGLE => Some(1),
         value_type::FLEX => Some(5),
@@ -332,6 +336,7 @@ pub(crate) fn simplify_parsed_calculation(
         percentage_basis: None,
         length_resolution: LengthResolution::default(),
         random_base_value: None,
+        evaluates_arithmetic: false,
     };
     let callbacks = CalcSimplifyCallbacks {
         resolve_non_math_function: &|_| None,
@@ -354,6 +359,7 @@ pub(crate) fn serialize_context_free_calculation(
         values,
         crate::css::parser::calc_parser::CalcParserContext {
             percentages_resolve_as: None,
+            allow_percentages: false,
             property: 0,
             random_function_index: None,
             allowed_color_channels: 0,
@@ -367,7 +373,7 @@ pub(crate) fn serialize_context_free_calculation(
     if !numeric_type.matches_dimension(expected_base_type, None) {
         return None;
     }
-    let calculated = crate::css::style_value::StyleValueData::Calculated {
+    let calculated = crate::css::style_value::StyleValueData::Calculated(StyleValueBox::new(CalculatedPayload {
         rust_calculation: CalcNodeHandle::from_arc(root),
         resolve_as_is_number: false,
         resolve_as_base: 0,
@@ -376,7 +382,7 @@ pub(crate) fn serialize_context_free_calculation(
         percentages_resolve_as: 0,
         resolve_numbers_as_integers: false,
         accepted_ranges: crate::css::style_value::RetainedNumericRangeList::empty(),
-    };
+    }));
     Some(crate::css::serialize::serialize_style_value_to_utf16(&calculated))
 }
 
@@ -468,7 +474,7 @@ pub struct FfiNumericType {
 }
 
 impl FfiNumericType {
-    pub(crate) fn from_calc(value: Option<CalcNumericType>) -> Self {
+    pub fn from_calc(value: Option<CalcNumericType>) -> Self {
         let mut result = FfiNumericType {
             has_exponent_bits: 0,
             exponents: [0; BASE_TYPE_COUNT],
@@ -491,7 +497,7 @@ impl FfiNumericType {
         result
     }
 
-    pub(crate) fn to_calc(self) -> CalcNumericType {
+    pub fn to_calc(self) -> CalcNumericType {
         let mut result = CalcNumericType::default();
         for i in 0..BASE_TYPE_COUNT {
             if self.has_exponent_bits & (1 << i) != 0 {
@@ -508,37 +514,11 @@ impl FfiNumericType {
 #[derive(Clone, Copy)]
 #[repr(u8)]
 #[expect(dead_code, reason = "C++ constructs the variants")]
-pub enum FfiNumericTypeOperation {
-    Add,
-    Multiply,
-    Invert,
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiNumericTypeMatch {
     Dimension,
     Percentage,
     DimensionPercentage,
     Number,
-}
-
-/// Applies one numeric type algebra operation for C++ callers.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_numeric_type_operate(
-    operation: FfiNumericTypeOperation,
-    first: &FfiNumericType,
-    second: Option<&FfiNumericType>,
-) -> FfiNumericType {
-    let first = first.to_calc();
-    let second = || second.expect("the operation has a second operand").to_calc();
-    let result = match operation {
-        FfiNumericTypeOperation::Add => first.added_to(&second()),
-        FfiNumericTypeOperation::Multiply => first.multiplied_by(&second()),
-        FfiNumericTypeOperation::Invert => Some(first.inverted()),
-    };
-    FfiNumericType::from_calc(result)
 }
 
 /// Tests a numeric type against one of the CSS numeric matching categories.
@@ -593,9 +573,9 @@ pub enum CalcNode {
     Min(Vec<Arc<CalcNode>>),
     Max(Vec<Arc<CalcNode>>),
     Clamp {
-        min: Arc<CalcNode>,
+        min: Option<Arc<CalcNode>>,
         center: Arc<CalcNode>,
-        max: Arc<CalcNode>,
+        max: Option<Arc<CalcNode>>,
     },
     /// https://drafts.csswg.org/css-values-5/#progress-func
     Progress {
@@ -684,9 +664,13 @@ impl CalcNode {
             | CalcNode::Sqrt(child)
             | CalcNode::Exp(child) => f(child),
             CalcNode::Clamp { min, center, max } => {
-                f(min);
+                if let Some(min) = min {
+                    f(min);
+                }
                 f(center);
-                f(max);
+                if let Some(max) = max {
+                    f(max);
+                }
             }
             CalcNode::Progress { progress, from, to, .. } => {
                 f(progress);
@@ -782,7 +766,13 @@ impl CalcNode {
             // NOTE: `- foo` doesn't change the type, and neither does abs().
             CalcNode::Negate(child) | CalcNode::Abs(child) => child.numeric_type(percentage_leaf_type),
             CalcNode::Invert(child) => Some(child.numeric_type(percentage_leaf_type)?.inverted()),
-            CalcNode::Clamp { min, center, max } => add_children(&[min, center, max]),
+            CalcNode::Clamp { min, center, max } => {
+                let mut numeric_type = center.numeric_type(percentage_leaf_type)?;
+                for bound in min.iter().chain(max.iter()) {
+                    numeric_type = numeric_type.added_to(&bound.numeric_type(percentage_leaf_type)?)?;
+                }
+                Some(numeric_type)
+            }
             CalcNode::Progress { progress, from, to, .. } => {
                 let sum = add_children(&[progress, from, to])?;
                 CalcNumericType::default().made_consistent_with(&sum)
@@ -849,12 +839,47 @@ impl CalcNode {
         });
         found
     }
+
+    /// Whether the node resolves to a length plus a percentage of whatever its percentages are of, as `calc(1% + 1px)`
+    /// does and `min(50%, 10px)` does not.
+    pub(crate) fn is_linear_in_percentages(&self) -> bool {
+        if !self.contains_percentage() {
+            return true;
+        }
+        match self {
+            CalcNode::Numeric(_) => true,
+            CalcNode::Negate(child) => child.is_linear_in_percentages(),
+            CalcNode::Sum(children) => children.iter().all(|child| child.is_linear_in_percentages()),
+            CalcNode::Product(children) => {
+                children.iter().filter(|child| child.contains_percentage()).count() == 1
+                    && children.iter().all(|child| child.is_linear_in_percentages())
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_linear_in_percentages_looks_at_what_holds_a_percentage() {
+        let percent = Arc::new(CalcNode::Numeric(CalcNumericValue::Percentage(50.0)));
+        let number = Arc::new(CalcNode::Numeric(CalcNumericValue::Number {
+            value: 2.0,
+            number_type: 0,
+        }));
+        let sum = Arc::new(CalcNode::Sum(vec![number.clone(), percent.clone()]));
+        assert!(sum.is_linear_in_percentages());
+        assert!(CalcNode::Negate(sum.clone()).is_linear_in_percentages());
+        assert!(CalcNode::Product(vec![number.clone(), sum.clone()]).is_linear_in_percentages());
+        assert!(!CalcNode::Product(vec![percent.clone(), sum]).is_linear_in_percentages());
+        assert!(!CalcNode::Min(vec![number.clone(), percent.clone()]).is_linear_in_percentages());
+        assert!(!CalcNode::Sum(vec![number.clone(), Arc::new(CalcNode::Invert(percent))]).is_linear_in_percentages());
+        assert!(CalcNode::Min(vec![number.clone(), number]).is_linear_in_percentages());
+    }
 
     #[test]
     fn contains_percentage_walks_the_tree() {
@@ -915,12 +940,6 @@ unsafe impl Send for CalcNodeHandle where CalcNode: Send + Sync {}
 unsafe impl Sync for CalcNodeHandle where CalcNode: Send + Sync {}
 
 impl CalcNodeHandle {
-    /// # Safety
-    /// `raw` must be a handle from one of the construction functions below.
-    pub(crate) unsafe fn from_raw(raw: *const CalcNode) -> Self {
-        Self { node: raw }
-    }
-
     pub(crate) fn from_arc(node: Arc<CalcNode>) -> Self {
         Self {
             node: Arc::into_raw(node),
@@ -957,9 +976,9 @@ impl Clone for CalcNodeHandle {
 pub(crate) fn interpolate_length_percentage_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
 ) -> Option<(Arc<CalcNode>, FfiNumericType)> {
-    combine_calculations(from, to, 1.0 - delta as f64, delta as f64, Some(ResolveAs::Base(0)))
+    combine_calculations(from, to, 1.0 - delta, delta, Some(ResolveAs::Base(0)))
 }
 
 /// Interpolates two calc-size() calculations as calc((1 - p) * A + p * B).
@@ -967,9 +986,22 @@ pub(crate) fn interpolate_length_percentage_calculations(
 pub(crate) fn interpolate_calc_size_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
 ) -> Option<(Arc<CalcNode>, FfiNumericType)> {
-    combine_calculations_keeping_zero_lengths(from, to, 1.0 - delta as f64, delta as f64, Some(ResolveAs::Base(0)))
+    combine_calculations_keeping_zero_lengths(from, to, 1.0 - delta, delta, Some(ResolveAs::Base(0)))
+}
+
+/// https://drafts.csswg.org/css-values-4/#combine-math
+/// Addition of math functions, with each other or with numeric values and other numeric-valued functions, is
+/// defined as Vresult = calc(VA + VB).
+pub(crate) fn add_calc_size_calculations(
+    underlying: Arc<CalcNode>,
+    animated: Arc<CalcNode>,
+) -> Option<(Arc<CalcNode>, FfiNumericType)> {
+    simplify_combined_calculation(
+        shared(CalcNode::Sum(vec![underlying, animated])),
+        Some(ResolveAs::Base(0)),
+    )
 }
 
 /// The calculation with each calc-size() size keyword in it replaced by `replacement`, or None where the
@@ -1016,7 +1048,7 @@ pub(crate) fn de_percentify_calc_size_calculation(node: &Arc<CalcNode>) -> Optio
 
 /// Rebuilds a calculation with each leaf `replace` gives a replacement for replaced, or returns None where that
 /// would need to rebuild a kind of node other than the calc operators, min(), max() and clamp().
-fn map_calc_size_leaves(
+pub(crate) fn map_calc_size_leaves(
     node: &Arc<CalcNode>,
     replace: &dyn Fn(&CalcNode) -> Option<Arc<CalcNode>>,
 ) -> Option<Arc<CalcNode>> {
@@ -1038,9 +1070,13 @@ fn map_calc_size_leaves(
         CalcNode::Negate(child) => shared(CalcNode::Negate(map_calc_size_leaves(child, replace)?)),
         CalcNode::Invert(child) => shared(CalcNode::Invert(map_calc_size_leaves(child, replace)?)),
         CalcNode::Clamp { min, center, max } => shared(CalcNode::Clamp {
-            min: map_calc_size_leaves(min, replace)?,
+            min: min
+                .as_ref()
+                .map_or(Some(None), |min| map_calc_size_leaves(min, replace).map(Some))?,
             center: map_calc_size_leaves(center, replace)?,
-            max: map_calc_size_leaves(max, replace)?,
+            max: max
+                .as_ref()
+                .map_or(Some(None), |max| map_calc_size_leaves(max, replace).map(Some))?,
         }),
         _ => {
             let mut needs_replacement = false;
@@ -1075,7 +1111,7 @@ pub(crate) fn add_length_percentage_calculations(
 pub(crate) fn interpolate_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
     has_percentages_resolve_as: bool,
     resolve_as_is_number: bool,
     resolve_as_base: u8,
@@ -1083,8 +1119,8 @@ pub(crate) fn interpolate_calculations(
     combine_calculations(
         from,
         to,
-        1.0 - delta as f64,
-        delta as f64,
+        1.0 - delta,
+        delta,
         resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base),
     )
 }
@@ -1128,6 +1164,13 @@ fn combine_calculations_keeping_zero_lengths(
     let to_contribution = shared(CalcNode::Product(vec![to, number(to_multiplier)]));
     let root = shared(CalcNode::Sum(vec![from_contribution, to_contribution]));
 
+    simplify_combined_calculation(root, resolve_as)
+}
+
+fn simplify_combined_calculation(
+    root: Arc<CalcNode>,
+    resolve_as: Option<ResolveAs>,
+) -> Option<(Arc<CalcNode>, FfiNumericType)> {
     let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
     let evaluation_context = CalcEvaluationContext {
         percentage_leaf_type: &percentage_leaf_type,
@@ -1135,6 +1178,7 @@ fn combine_calculations_keeping_zero_lengths(
         percentage_basis: None,
         length_resolution: LengthResolution::default(),
         random_base_value: None,
+        evaluates_arithmetic: false,
     };
     let callbacks = CalcSimplifyCallbacks {
         resolve_non_math_function: &|_| None,
@@ -1195,18 +1239,9 @@ fn shared(node: CalcNode) -> Arc<CalcNode> {
     Arc::new(node)
 }
 
-/// Reconstructs the child Arcs from an array of transferred handles.
-///
-/// # Safety
-/// `children` must point at `count` valid transferred handles.
-unsafe fn children_from_raw(children: *const *const CalcNode, count: usize) -> Vec<Arc<CalcNode>> {
-    (0..count).map(|i| unsafe { Arc::from_raw(*children.add(i)) }).collect()
-}
-
 /// Creates a numeric leaf for a dimension: kind selects the dimension in the
 /// order number, angle, flex, frequency, length, percentage, resolution, time.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, unit: u8) -> *const CalcNode {
+pub(crate) fn calc_node_create_numeric_dimension(kind: u8, value: f64, unit: u8) -> *const CalcNode {
     let numeric = match kind {
         0 => CalcNumericValue::Number {
             value,
@@ -1224,74 +1259,6 @@ pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, 
     handle(CalcNode::Numeric(numeric))
 }
 
-/// Creates a variadic node: kind selects sum (0), product (1), min (2) or
-/// max (3).
-///
-/// # Safety
-/// `children` must point at `count` valid transferred handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_variadic(
-    kind: u8,
-    children: *const *const CalcNode,
-    count: usize,
-) -> *const CalcNode {
-    let children = unsafe { children_from_raw(children, count) };
-    let node = match kind {
-        0 => CalcNode::Sum(children),
-        1 => CalcNode::Product(children),
-        2 => CalcNode::Min(children),
-        3 => CalcNode::Max(children),
-        _ => unreachable!("invalid variadic calc node kind {kind}"),
-    };
-    handle(node)
-}
-
-/// Creates a single-child node: kind selects negate (0) or invert (1).
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_create_unary(kind: u8, child: OwnedArc<CalcNode>) -> *const CalcNode {
-    let child = child.into_arc();
-    let node = match kind {
-        0 => CalcNode::Negate(child),
-        1 => CalcNode::Invert(child),
-        _ => unreachable!("invalid unary calc node kind {kind}"),
-    };
-    handle(node)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_create_clamp(
-    min: OwnedArc<CalcNode>,
-    center: OwnedArc<CalcNode>,
-    max: OwnedArc<CalcNode>,
-) -> *const CalcNode {
-    handle(CalcNode::Clamp {
-        min: min.into_arc(),
-        center: center.into_arc(),
-        max: max.into_arc(),
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_release(node: OwnedArc<CalcNode>) {
-    drop(node);
-}
-
-/// https://drafts.csswg.org/css-values-4/#determine-the-type-of-a-calculation
-/// Determines the type of the calculation rooted at `node` under the given
-/// resolve-as target. The result's valid flag is false when the tree does not
-/// type-check.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_determine_type(
-    node: &CalcNode,
-    has_percentages_resolve_as: bool,
-    resolve_as_is_number: bool,
-    resolve_as_base: u8,
-) -> FfiNumericType {
-    let resolve_as = resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base);
-    let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
-    FfiNumericType::from_calc(node.numeric_type(&percentage_leaf_type))
-}
-
 /// Whether any leaf of the calculation is a percentage.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_calc_node_contains_percentage(node: &CalcNode) -> bool {
@@ -1300,7 +1267,7 @@ pub extern "C" fn rust_calc_node_contains_percentage(node: &CalcNode) -> bool {
 
 /// What percentages resolve against in the surrounding context.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolveAs {
+pub enum ResolveAs {
     Number,
     /// A base type index, in the numeric type order.
     Base(u8),
@@ -1319,6 +1286,9 @@ pub(crate) struct CalcEvaluationContext<'a> {
     /// Produces the random base value for a random() node's sharing options,
     /// when the resolution context can (it needs per-element state).
     pub random_base_value: Option<RandomBaseValueResolver<'a>>,
+    /// Whether a product that simplification can't reduce, but whose value is fully determined, becomes that value.
+    /// Set when computing or resolving a value; a specified value keeps the form its author wrote.
+    pub evaluates_arithmetic: bool,
 }
 
 /// Produces the random base value for a random() node's sharing options.
@@ -1376,6 +1346,53 @@ impl CalcNode {
         })
     }
 
+    /// The value of a tree that combines canonical numeric leaves with sums, negations, products and inversions only.
+    /// Simplification leaves some of those trees unreduced although their value is fully determined: It never
+    /// distributes an Invert node over a product, so 64px / (300px / 1s) stays a product holding an inverted product,
+    /// rather than becoming the time it is.
+    fn try_evaluate_arithmetic(&self, context: &CalcEvaluationContext) -> Option<CalcResult> {
+        match self {
+            CalcNode::Numeric(..) => self.try_canonical_result(context),
+            CalcNode::Negate(child) => {
+                let mut result = child.try_evaluate_arithmetic(context)?;
+                result.value = -result.value;
+                Some(result)
+            }
+            CalcNode::Invert(child) => {
+                let mut result = child.try_evaluate_arithmetic(context)?;
+                result.invert();
+                Some(result)
+            }
+            CalcNode::Product(children) => {
+                let mut result: Option<CalcResult> = None;
+                for child in children {
+                    let child_result = child.try_evaluate_arithmetic(context)?;
+                    match &mut result {
+                        Some(result) => result.multiply_by(&child_result),
+                        None => result = Some(child_result),
+                    }
+                    result.as_ref()?.numeric_type?;
+                }
+                result
+            }
+            CalcNode::Sum(children) => {
+                let mut result: Option<CalcResult> = None;
+                for child in children {
+                    let child_result = child.try_evaluate_arithmetic(context)?;
+                    result = Some(match result {
+                        None => child_result,
+                        Some(previous) => CalcResult {
+                            value: previous.value + child_result.value,
+                            numeric_type: Some(previous.numeric_type?.added_to(&child_result.numeric_type?)?),
+                        },
+                    });
+                }
+                result
+            }
+            _ => None,
+        }
+    }
+
     /// Mirrors try_get_number: a plain number leaf.
     fn try_number(&self) -> Option<f64> {
         match self {
@@ -1400,11 +1417,12 @@ impl CalcNode {
                     None => result = Some(child_value),
                     Some(previous) => {
                         let consistent_type = previous.numeric_type?.added_to(&child_value.numeric_type?)?;
-                        // Strict comparisons, so ties (including 0 vs -0) keep the earlier child.
+                        // https://drafts.csswg.org/css-values-4/#calc-ieee
+                        // When comparing 0⁺ and 0⁻, 0⁻ is less than 0⁺.
                         let replace = if is_min {
-                            child_value.value < previous.value
+                            child_value.value.total_cmp(&previous.value).is_lt()
                         } else {
-                            child_value.value > previous.value
+                            child_value.value.total_cmp(&previous.value).is_gt()
                         };
                         let value = if child_value.value.is_nan() || previous.value.is_nan() {
                             f64::NAN
@@ -1430,9 +1448,21 @@ impl CalcNode {
             CalcNode::Max(children) => fold_min_or_max(children, false),
             // https://drafts.csswg.org/css-values-4/#funcdef-clamp
             CalcNode::Clamp { min, center, max } => {
-                let min_result = min.try_canonical_result(context)?;
                 let center_result = center.try_canonical_result(context)?;
-                let max_result = max.try_canonical_result(context)?;
+                let min_result = match min {
+                    Some(min) => min.try_canonical_result(context)?,
+                    None => CalcResult {
+                        value: f64::NEG_INFINITY,
+                        numeric_type: center_result.numeric_type,
+                    },
+                };
+                let max_result = match max {
+                    Some(max) => max.try_canonical_result(context)?,
+                    None => CalcResult {
+                        value: f64::INFINITY,
+                        numeric_type: center_result.numeric_type,
+                    },
+                };
                 // The first consistency must hold; the second stays part of the
                 // result, exactly as in the C++ implementation.
                 let first = min_result.numeric_type?.added_to(&center_result.numeric_type?)?;
@@ -1440,14 +1470,12 @@ impl CalcNode {
                 let value = if min_result.value.is_nan() || center_result.value.is_nan() || max_result.value.is_nan() {
                     f64::NAN
                 } else {
-                    // Branch-based min/max, so ties (including 0 vs -0) keep the first
-                    // operand; f64::min and f64::max may lose the zero sign on ties.
-                    let inner = if max_result.value < center_result.value {
+                    let inner = if max_result.value.total_cmp(&center_result.value).is_lt() {
                         max_result.value
                     } else {
                         center_result.value
                     };
-                    if min_result.value < inner {
+                    if min_result.value.total_cmp(&inner).is_lt() {
                         inner
                     } else {
                         min_result.value
@@ -1509,9 +1537,9 @@ impl CalcNode {
                     _ => unreachable!("trigonometric argument must be a number or an angle"),
                 };
                 let result = match self {
-                    CalcNode::Sin(..) => radians.sin(),
-                    CalcNode::Cos(..) => radians.cos(),
-                    _ => radians.tan(),
+                    CalcNode::Sin(..) => math::sin(radians),
+                    CalcNode::Cos(..) => math::cos(radians),
+                    _ => math::tan(radians),
                 };
                 Some(CalcResult {
                     value: result,
@@ -1532,9 +1560,9 @@ impl CalcNode {
                     degrees
                 };
                 let result = match self {
-                    CalcNode::Asin(..) => normalize_angle(number.asin(), -90.0, 90.0),
-                    CalcNode::Acos(..) => normalize_angle(number.acos(), 0.0, 180.0),
-                    _ => normalize_angle(number.atan(), -90.0, 90.0),
+                    CalcNode::Asin(..) => normalize_angle(math::asin(number), -90.0, 90.0),
+                    CalcNode::Acos(..) => normalize_angle(math::acos(number), 0.0, 180.0),
+                    _ => normalize_angle(math::atan(number), -90.0, 90.0),
                 };
                 let mut angle_type = CalcNumericType::default();
                 angle_type.exponents[1] = Some(1);
@@ -1548,7 +1576,7 @@ impl CalcNode {
                 let y_value = y.try_canonical_result(context)?;
                 let x_value = x.try_canonical_result(context)?;
                 let input_consistent_type = y_value.numeric_type?.added_to(&x_value.numeric_type?)?;
-                let mut degrees = y_value.value.atan2(x_value.value).to_degrees();
+                let mut degrees = math::atan2(y_value.value, x_value.value).to_degrees();
                 while degrees <= -180.0 {
                     degrees += 360.0;
                 }
@@ -1570,7 +1598,7 @@ impl CalcNode {
                     .numeric_type(leaf_type)?
                     .added_to(&exponent.numeric_type(leaf_type)?)?;
                 Some(CalcResult {
-                    value: a.powf(b),
+                    value: math::pow(a, b),
                     numeric_type: Some(consistent_type),
                 })
             }
@@ -1587,7 +1615,7 @@ impl CalcNode {
                 let number = value.try_number()?;
                 let base_number = base.try_number()?;
                 Some(CalcResult {
-                    value: number.ln() / base_number.ln(),
+                    value: math::log(number) / math::log(base_number),
                     numeric_type: CalcNumericType::default().made_consistent_with(&value.numeric_type(leaf_type)?),
                 })
             }
@@ -1595,7 +1623,7 @@ impl CalcNode {
             CalcNode::Exp(child) => {
                 let number = child.try_number()?;
                 Some(CalcResult {
-                    value: number.exp(),
+                    value: math::exp(number),
                     numeric_type: CalcNumericType::default().made_consistent_with(&child.numeric_type(leaf_type)?),
                 })
             }
@@ -1716,10 +1744,9 @@ impl CalcNode {
             } => {
                 let numerator = value.try_canonical_result(context)?;
                 let denominator = modulus.try_canonical_result(context)?;
-                // The arguments must have the same type, not merely consistent ones.
-                if numerator.numeric_type != denominator.numeric_type {
-                    return None;
-                }
+                // https://drafts.csswg.org/css-values-4/#calc-type-checking
+                // The result of adding the types of its comma-separated calculations.
+                let numeric_type = numerator.numeric_type?.added_to(&denominator.numeric_type?)?;
                 let result = if matches!(self, CalcNode::Mod { .. }) {
                     numerator.value - denominator.value * (numerator.value / denominator.value).floor()
                 } else {
@@ -1727,7 +1754,7 @@ impl CalcNode {
                 };
                 Some(CalcResult {
                     value: result,
-                    numeric_type: numerator.numeric_type,
+                    numeric_type: Some(numeric_type),
                 })
             }
             // https://drafts.csswg.org/css-values-5/#calculate-a-progress-function
@@ -1872,7 +1899,7 @@ impl CalcNumericType {
 
     /// A type matches a dimension if its only non-zero entry is that base type
     /// with value 1, and the percent hint is compatible with the context.
-    pub(crate) fn matches_dimension(&self, base: usize, resolve_as: Option<ResolveAs>) -> bool {
+    pub fn matches_dimension(&self, base: usize, resolve_as: Option<ResolveAs>) -> bool {
         if self.entry_with_value_1_while_all_others_are_0() != Some(base) {
             return false;
         }
@@ -1884,20 +1911,20 @@ impl CalcNumericType {
 
     /// A type matches <percentage> if its only non-zero entry is percent with
     /// value 1, and its percent hint is null or percent.
-    pub(crate) fn matches_percentage(&self) -> bool {
+    pub fn matches_percentage(&self) -> bool {
         if self.percent_hint.is_some() && self.percent_hint != Some(BASE_TYPE_PERCENT as u8) {
             return false;
         }
         self.entry_with_value_1_while_all_others_are_0() == Some(BASE_TYPE_PERCENT)
     }
 
-    pub(crate) fn matches_dimension_percentage(&self, base: usize, resolve_as: Option<ResolveAs>) -> bool {
+    pub fn matches_dimension_percentage(&self, base: usize, resolve_as: Option<ResolveAs>) -> bool {
         self.matches_percentage() || self.matches_dimension(base, resolve_as)
     }
 
     /// A type matches <number> if it has no non-zero entries, with the hint
     /// compatible when percentages resolve against a non-number type.
-    pub(crate) fn matches_number(&self, resolve_as: Option<ResolveAs>) -> bool {
+    pub fn matches_number(&self, resolve_as: Option<ResolveAs>) -> bool {
         for i in 0..BASE_TYPE_COUNT {
             if self.exponents[i].is_some() && self.exponents[i] != Some(0) {
                 return false;
@@ -2095,6 +2122,22 @@ impl CalcNode {
                 return self.clone();
             }
 
+            // https://drafts.csswg.org/css-viewport/#zoom-property
+            // NB: An absolute length computes zoomed by the effective zoom of the element, as it does outside a
+            //     calculation.
+            if let CalcNumericValue::Length { value, unit } = *value
+                && let Some(length_context) = context.length_resolution.context
+                && length_context.zoom != 1.0
+            {
+                let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[unit as usize];
+                if ratio.is_finite() {
+                    return shared(CalcNode::Numeric(CalcNumericValue::Length {
+                        value: value * ratio * length_context.zoom,
+                        unit: canonical_unit_code(&crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS),
+                    }));
+                }
+            }
+
             // 2. If root is a dimension that is not expressed in its canonical unit, and there is enough
             //    information available to convert it to the canonical unit, do so, and return the value.
             if !is_canonical_unit(*value)
@@ -2177,11 +2220,13 @@ impl CalcNode {
                                     let CalcNode::Numeric(existing_value) = &**existing else {
                                         unreachable!();
                                     };
-                                    let replace = if is_min {
-                                        child_value.raw() < existing_value.raw()
-                                    } else {
-                                        child_value.raw() > existing_value.raw()
-                                    };
+                                    let replace = !existing_value.raw().is_nan()
+                                        && (child_value.raw().is_nan()
+                                            || if is_min {
+                                                child_value.raw().total_cmp(&existing_value.raw()).is_lt()
+                                            } else {
+                                                child_value.raw().total_cmp(&existing_value.raw()).is_gt()
+                                            });
                                     if replace {
                                         *existing = child.clone();
                                     }
@@ -2349,6 +2394,23 @@ impl CalcNode {
                                     shared(CalcNode::Numeric(value.with_raw(value.raw() * multiplier)))
                                 })
                                 .collect();
+                            if let Some(length_context) = context.length_resolution.context {
+                                // NB: The product's children already resolved their lengths before distribution.
+                                let mut neutral_length = *length_context;
+                                neutral_length.zoom = 1.0;
+                                let neutral_context = CalcEvaluationContext {
+                                    percentage_leaf_type: context.percentage_leaf_type,
+                                    resolve_as: context.resolve_as,
+                                    percentage_basis: context.percentage_basis,
+                                    length_resolution: LengthResolution {
+                                        context: Some(&neutral_length),
+                                        ..context.length_resolution
+                                    },
+                                    random_base_value: context.random_base_value,
+                                    evaluates_arithmetic: context.evaluates_arithmetic,
+                                };
+                                return shared(CalcNode::Sum(multiplied)).simplify(&neutral_context, callbacks);
+                            }
                             return shared(CalcNode::Sum(multiplied)).simplify(context, callbacks);
                         }
                     }
@@ -2408,7 +2470,19 @@ impl CalcNode {
                 {
                     return shared(node);
                 }
-                shared(CalcNode::Product(flattened))
+                let product = shared(CalcNode::Product(flattened));
+                // NB: The steps above never look into an Invert node holding a product, so 64px / (300px / 1s) stays a
+                //     product here although its value is the time 0.213333s. Where the value is computed or resolved,
+                //     take that value, so that the math functions around the product can fold it like any other leaf.
+                if context.evaluates_arithmetic
+                    && !product.contains_percentage()
+                    && let Some(node) = product
+                        .try_evaluate_arithmetic(context)
+                        .and_then(|result| make_calc_result_node(&result, context.resolve_as))
+                {
+                    return shared(node);
+                }
+                product
             }
             _ => root,
         }
@@ -2453,9 +2527,9 @@ impl CalcNode {
             CalcNode::Sqrt(child) => CalcNode::Sqrt(simplify_child(child, &mut changed)),
             CalcNode::Exp(child) => CalcNode::Exp(simplify_child(child, &mut changed)),
             CalcNode::Clamp { min, center, max } => CalcNode::Clamp {
-                min: simplify_child(min, &mut changed),
+                min: min.as_ref().map(|min| simplify_child(min, &mut changed)),
                 center: simplify_child(center, &mut changed),
-                max: simplify_child(max, &mut changed),
+                max: max.as_ref().map(|max| simplify_child(max, &mut changed)),
             },
             CalcNode::Progress {
                 no_clamp,
@@ -2551,7 +2625,7 @@ pub(crate) fn length_percentage_calculated_style_value(
 ) -> crate::css::style_value::StyleValueData {
     use crate::css::style_value::{RetainedNumericRangeList, StyleValueData};
 
-    StyleValueData::Calculated {
+    StyleValueData::Calculated(StyleValueBox::new(CalculatedPayload {
         rust_calculation: CalcNodeHandle::from_arc(calculation),
         resolve_as_is_number: false,
         resolve_as_base: BASE_TYPE_LENGTH as u8,
@@ -2560,7 +2634,7 @@ pub(crate) fn length_percentage_calculated_style_value(
         percentages_resolve_as: value_type::LENGTH,
         resolve_numbers_as_integers: false,
         accepted_ranges: RetainedNumericRangeList::empty(),
-    }
+    }))
 }
 
 /// Wraps a computed anchor() or anchor-size() value into the calculated style
@@ -2578,7 +2652,7 @@ pub(crate) fn length_percentage_calculated_style_value(
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) unsafe fn create_anchor_function_calculated(
     anchor: *const crate::css::style_value::StyleValueData,
-) -> Arc<crate::css::style_value::StyleValueData> {
+) -> StyleValueArc {
     use crate::css::style_value::StyleValueData;
 
     assert!(
@@ -2588,11 +2662,11 @@ pub(crate) unsafe fn create_anchor_function_calculated(
         ),
         "anchor function handle holds a non-anchor style value"
     );
-    unsafe { Arc::increment_strong_count(anchor) };
+    unsafe { StyleValueArc::increment_strong_count(anchor) };
     let anchor_value = unsafe { RetainedStyleValueData::from_retained_pointer(anchor) };
     let mut length_type = CalcNumericType::default();
     length_type.exponents[BASE_TYPE_LENGTH] = Some(1);
-    Arc::new(length_percentage_calculated_style_value(
+    StyleValueArc::new(length_percentage_calculated_style_value(
         shared(CalcNode::NonMathFunction {
             value: anchor_value,
             numeric_type: length_type,
@@ -2739,9 +2813,10 @@ fn prepare_external_resolutions(root: &CalcNode, context: &FfiCalcResolutionCont
                 } else {
                     continue;
                 };
-                let StyleValueData::RandomValueSharing { fixed_value, .. } = sharing.data() else {
+                let StyleValueData::RandomValueSharing(random_value_sharing_payload) = sharing.data() else {
                     continue;
                 };
+                let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
                 let number = match fixed_value.optional_data() {
                     Some(StyleValueData::Number { value }) => Some(*value),
                     Some(calculated @ StyleValueData::Calculated { .. }) => {
@@ -2786,8 +2861,9 @@ fn prepare_external_resolutions(root: &CalcNode, context: &FfiCalcResolutionCont
 
 pub(crate) fn collect_unfixed_random_sharings(node: &CalcNode, sharings: &mut Vec<*const StyleValueData>) {
     if let CalcNode::Random { sharing, .. } = node
-        && let StyleValueData::RandomValueSharing { fixed_value, .. } = sharing.data()
+        && let StyleValueData::RandomValueSharing(random_value_sharing_payload) = sharing.data()
     {
+        let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
         if let Some(fixed_value) = fixed_value.optional_data() {
             crate::css::style_compute::collect_unfixed_random_sharings_in_value(fixed_value, sharings);
         } else {
@@ -2802,9 +2878,10 @@ pub(crate) fn collect_unfixed_random_sharings(node: &CalcNode, sharings: &mut Ve
 
 /// Returns the borrowed calculation-tree root stored in calculated style value data.
 pub(crate) fn calc_root(calculated: &crate::css::style_value::StyleValueData) -> &CalcNode {
-    let crate::css::style_value::StyleValueData::Calculated { rust_calculation, .. } = calculated else {
+    let crate::css::style_value::StyleValueData::Calculated(calculated_payload) = calculated else {
         unreachable!("calc_root requires calculated value data");
     };
+    let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
     rust_calculation.node()
 }
 
@@ -2912,6 +2989,7 @@ fn with_ffi_evaluation<R>(
             fallback: Some(&resolve_length_fallback),
         },
         random_base_value: Some(&random_base_value),
+        evaluates_arithmetic: true,
     };
     let absolutize_random_sharing = |sharing: &RetainedStyleValueData| -> Option<RetainedStyleValueData> {
         external_resolutions
@@ -3043,7 +3121,10 @@ fn resolve_calculated_with_channels_options(
     apply_censoring_and_clamping: bool,
 ) -> Option<(f64, CalcNumericType, Option<ResolveAs>)> {
     use crate::css::style_value::StyleValueData;
-    let StyleValueData::Calculated {
+    let StyleValueData::Calculated(calculated_payload) = calculated else {
+        return None;
+    };
+    let CalculatedPayload {
         rust_calculation,
         has_percentages_resolve_as,
         resolve_as_is_number,
@@ -3051,17 +3132,15 @@ fn resolve_calculated_with_channels_options(
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = calculated
-    else {
-        return None;
-    };
+    } = &**calculated_payload;
     let root = rust_calculation.node_arc();
     let resolve_as = resolve_as_from_fields(*has_percentages_resolve_as, *resolve_as_is_number, *resolve_as_base);
     let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
     let fixed_random_base_value = |sharing: &RetainedStyleValueData| {
-        let StyleValueData::RandomValueSharing { fixed_value, .. } = sharing.data() else {
+        let StyleValueData::RandomValueSharing(random_value_sharing_payload) = sharing.data() else {
             return None;
         };
+        let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
         match fixed_value.optional_data() {
             Some(StyleValueData::Number { value }) => Some(*value),
             _ => None,
@@ -3073,6 +3152,7 @@ fn resolve_calculated_with_channels_options(
         percentage_basis,
         length_resolution,
         random_base_value: Some(&fixed_random_base_value),
+        evaluates_arithmetic: true,
     };
     let callbacks = CalcSimplifyCallbacks {
         absolutize_random_sharing: &|_| None,
@@ -3546,7 +3626,10 @@ pub(crate) fn resolve_calculated(
     apply_censoring_and_clamping: bool,
 ) -> FfiResolvedCalc {
     use crate::css::style_value::StyleValueData;
-    let StyleValueData::Calculated {
+    let StyleValueData::Calculated(calculated_payload) = calculated else {
+        unreachable!("resolve_calculated requires calculated value data");
+    };
+    let CalculatedPayload {
         rust_calculation,
         has_percentages_resolve_as,
         resolve_as_is_number,
@@ -3554,10 +3637,7 @@ pub(crate) fn resolve_calculated(
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = calculated
-    else {
-        unreachable!("resolve_calculated requires calculated value data");
-    };
+    } = &**calculated_payload;
     let root = rust_calculation.node_arc();
 
     // The percentage leaf type and resolve-as target from the creation-time fields.
@@ -3592,8 +3672,7 @@ pub(crate) fn resolve_calculated(
     )
 }
 
-#[repr(C)]
-pub struct FfiCalcSerializationPiece {
+pub struct CalcSerializationPiece {
     /// 0 = literal, 1 = numeric leaf, 2 = style value, 3 = channel keyword,
     /// 4 = literal conditioned on the preceding piece producing output.
     pub kind: u8,
@@ -3634,15 +3713,15 @@ impl CalcNumericValue {
 }
 
 struct CalcSerializer<'a> {
-    pieces: Vec<FfiCalcSerializationPiece>,
+    pieces: Vec<CalcSerializationPiece>,
     resolved_mode: bool,
     resolve_numbers_as_integers: bool,
     accepted_ranges: &'a [crate::css::style_value::RetainedNumericRangeByType],
 }
 
 impl CalcSerializer<'_> {
-    fn piece(kind: u8) -> FfiCalcSerializationPiece {
-        FfiCalcSerializationPiece {
+    fn piece(kind: u8) -> CalcSerializationPiece {
+        CalcSerializationPiece {
             kind,
             numeric_kind: 0,
             unit_or_channel: 0,
@@ -3654,7 +3733,7 @@ impl CalcSerializer<'_> {
     }
 
     fn literal(&mut self, text: &'static str) {
-        self.pieces.push(FfiCalcSerializationPiece {
+        self.pieces.push(CalcSerializationPiece {
             bytes: text.as_ptr(),
             length: text.len(),
             ..Self::piece(0)
@@ -3662,7 +3741,7 @@ impl CalcSerializer<'_> {
     }
 
     fn conditional_literal(&mut self, text: &'static str) {
-        self.pieces.push(FfiCalcSerializationPiece {
+        self.pieces.push(CalcSerializationPiece {
             bytes: text.as_ptr(),
             length: text.len(),
             ..Self::piece(4)
@@ -3671,7 +3750,7 @@ impl CalcSerializer<'_> {
 
     fn leaf(&mut self, value: CalcNumericValue) {
         let (kind, raw, unit) = value.leaf_parts();
-        self.pieces.push(FfiCalcSerializationPiece {
+        self.pieces.push(CalcSerializationPiece {
             numeric_kind: kind,
             unit_or_channel: unit,
             value: raw,
@@ -3680,14 +3759,14 @@ impl CalcSerializer<'_> {
     }
 
     fn style_value(&mut self, value: &RetainedStyleValueData) {
-        self.pieces.push(FfiCalcSerializationPiece {
+        self.pieces.push(CalcSerializationPiece {
             style_value: value.data() as *const _ as *const _,
             ..Self::piece(2)
         });
     }
 
     fn channel(&mut self, channel: u8) {
-        self.pieces.push(FfiCalcSerializationPiece {
+        self.pieces.push(CalcSerializationPiece {
             unit_or_channel: channel,
             ..Self::piece(3)
         });
@@ -3836,6 +3915,21 @@ impl CalcSerializer<'_> {
             if let Some(step) = step {
                 self.literal(", ");
                 self.serialize_tree(step, true);
+            }
+            self.literal(")");
+            return;
+        }
+
+        if let CalcNode::Clamp { min, center, max } = &**node {
+            self.literal("clamp(");
+            for (index, child) in [min.as_ref(), Some(center), max.as_ref()].into_iter().enumerate() {
+                if index != 0 {
+                    self.literal(", ");
+                }
+                match child {
+                    Some(child) => self.serialize_tree(child, false),
+                    None => self.literal("none"),
+                }
             }
             self.literal(")");
             return;
@@ -4193,10 +4287,7 @@ pub(crate) fn absolutize_anchor_function(
     random_base_values: &[crate::css::style_compute::FfiRandomBaseValue],
 ) -> Option<Option<crate::css::style_value::StyleValueData>> {
     use crate::css::style_value::StyleValueData;
-    let (StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. }) = value
-    else {
-        return None;
-    };
+    let (_, _, fallback_value) = value.anchor_name_and_fallback()?;
     let absolutized_fallback = match fallback_value.optional_data() {
         None => return Some(None),
         Some(StyleValueData::Length { value, unit }) => {
@@ -4227,32 +4318,38 @@ pub(crate) fn absolutize_anchor_function(
         }
         Some(_) => return Some(None),
     };
-    let fallback_value = RetainedStyleValueData::from_arc(Arc::new(absolutized_fallback));
+    let fallback_value = RetainedStyleValueData::from_arc(StyleValueArc::new(absolutized_fallback));
     Some(Some(match value {
-        StyleValueData::Anchor {
-            has_anchor_name,
-            anchor_name,
-            anchor_side,
-            ..
-        } => StyleValueData::Anchor {
-            has_anchor_name: *has_anchor_name,
-            anchor_name: anchor_name.clone(),
-            anchor_side: anchor_side.clone_retained(),
-            fallback_value,
-        },
-        StyleValueData::AnchorSize {
-            has_anchor_name,
-            anchor_name,
-            has_anchor_size,
-            anchor_size,
-            ..
-        } => StyleValueData::AnchorSize {
-            has_anchor_name: *has_anchor_name,
-            anchor_name: anchor_name.clone(),
-            has_anchor_size: *has_anchor_size,
-            anchor_size: *anchor_size,
-            fallback_value,
-        },
+        StyleValueData::Anchor(anchor_payload) => {
+            let AnchorPayload {
+                has_anchor_name,
+                anchor_name,
+                anchor_side,
+                ..
+            } = &**anchor_payload;
+            StyleValueData::Anchor(StyleValueBox::new(AnchorPayload {
+                has_anchor_name: *has_anchor_name,
+                anchor_name: anchor_name.clone(),
+                anchor_side: anchor_side.clone_retained(),
+                fallback_value,
+            }))
+        }
+        StyleValueData::AnchorSize(anchor_size_payload) => {
+            let AnchorSizePayload {
+                has_anchor_name,
+                anchor_name,
+                has_anchor_size,
+                anchor_size,
+                ..
+            } = &**anchor_size_payload;
+            StyleValueData::AnchorSize(StyleValueBox::new(AnchorSizePayload {
+                has_anchor_name: *has_anchor_name,
+                anchor_name: anchor_name.clone(),
+                has_anchor_size: *has_anchor_size,
+                anchor_size: *anchor_size,
+                fallback_value,
+            }))
+        }
         _ => unreachable!("the value was matched as an anchor function above"),
     }))
 }
@@ -4270,16 +4367,16 @@ pub(crate) fn absolutize_calculation_value(
     random_base_values: &[crate::css::style_compute::FfiRandomBaseValue],
 ) -> Option<AbsolutizedCalculation> {
     use crate::css::style_value::StyleValueData;
-    let StyleValueData::Calculated {
+    let StyleValueData::Calculated(calculated_payload) = value else {
+        return None;
+    };
+    let CalculatedPayload {
         rust_calculation,
         resolve_as_is_number,
         resolve_as_base,
         has_percentages_resolve_as,
         ..
-    } = value
-    else {
-        return None;
-    };
+    } = &**calculated_payload;
     let root = rust_calculation.node_arc();
     let mut externals = Vec::new();
     collect_external_resolutions(&root, &mut externals);
@@ -4298,9 +4395,10 @@ pub(crate) fn absolutize_calculation_value(
             continue;
         }
         if matches!(external.kind, CalcExternalResolutionKind::RandomSharing) {
-            let StyleValueData::RandomValueSharing { fixed_value, .. } = external.source.data() else {
+            let StyleValueData::RandomValueSharing(random_value_sharing_payload) = external.source.data() else {
                 return None;
             };
+            let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
             let number = match fixed_value.optional_data() {
                 Some(StyleValueData::Number { value }) => *value,
                 Some(fixed_value @ StyleValueData::Calculated { .. }) => {
@@ -4322,14 +4420,17 @@ pub(crate) fn absolutize_calculation_value(
                     .find(|resolution| resolution.source == external.source.pointer().cast())
                     .map(|resolution| resolution.value)?,
             };
-            let fixed_number = RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Number { value: number }));
-            let resolved = RetainedStyleValueData::from_arc(Arc::new(StyleValueData::RandomValueSharing {
-                fixed_value: fixed_number,
-                is_auto: false,
-                has_name: false,
-                name: crate::css::style_value::CssString::none(),
-                element_shared: false,
-            }));
+            let fixed_number =
+                RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::Number { value: number }));
+            let resolved = RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::RandomValueSharing(
+                StyleValueBox::new(RandomValueSharingPayload {
+                    fixed_value: fixed_number,
+                    is_auto: false,
+                    has_name: false,
+                    name: crate::css::style_value::CssString::none(),
+                    element_shared: false,
+                }),
+            )));
             external.has_number = true;
             external.number = number;
             external.resolved_style_value = Some(resolved);
@@ -4352,7 +4453,7 @@ pub(crate) fn absolutize_calculation_value(
                     let mut length_type = CalcNumericType::default();
                     length_type.exponents[BASE_TYPE_LENGTH] = Some(1);
                     external.resolved_node = Some(Arc::new(CalcNode::NonMathFunction {
-                        value: RetainedStyleValueData::from_arc(Arc::new(absolutized)),
+                        value: RetainedStyleValueData::from_arc(StyleValueArc::new(absolutized)),
                         numeric_type: length_type,
                     }));
                 }
@@ -4402,7 +4503,10 @@ fn computed_calculation_from_simplified(
     evaluation_context: &CalcEvaluationContext,
 ) -> AbsolutizedCalculation {
     use crate::css::style_value::StyleValueData;
-    let StyleValueData::Calculated {
+    let StyleValueData::Calculated(calculated_payload) = value else {
+        unreachable!("computed_calculation_from_simplified requires calculated value data");
+    };
+    let CalculatedPayload {
         resolve_as_is_number,
         resolve_as_base,
         resolved_type,
@@ -4411,10 +4515,7 @@ fn computed_calculation_from_simplified(
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = value
-    else {
-        unreachable!("computed_calculation_from_simplified requires calculated value data");
-    };
+    } = &**calculated_payload;
     if let Some(percentage) = percentage_dimension_mix(&simplified, evaluation_context) {
         return AbsolutizedCalculation::Percentage(percentage);
     }
@@ -4446,7 +4547,7 @@ fn computed_calculation_from_simplified(
     if Arc::ptr_eq(&simplified, root) {
         return AbsolutizedCalculation::Unchanged;
     }
-    AbsolutizedCalculation::Value(StyleValueData::Calculated {
+    AbsolutizedCalculation::Value(StyleValueData::Calculated(StyleValueBox::new(CalculatedPayload {
         rust_calculation: CalcNodeHandle::from_arc(simplified),
         resolve_as_is_number: *resolve_as_is_number,
         resolve_as_base: *resolve_as_base,
@@ -4455,7 +4556,7 @@ fn computed_calculation_from_simplified(
         percentages_resolve_as: *percentages_resolve_as,
         resolve_numbers_as_integers: *resolve_numbers_as_integers,
         accepted_ranges: accepted_ranges.clone(),
-    })
+    })))
 }
 
 /// Replaces the anchor() and anchor-size() functions of a computed `<length-percentage>` with their fallback values,
@@ -4469,19 +4570,21 @@ pub(crate) fn substitute_unresolvable_anchor_functions(
 ) -> Option<Option<RetainedStyleValueData>> {
     use crate::css::style_value::StyleValueData;
     match value {
-        StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => {
+        StyleValueData::Anchor(_) | StyleValueData::AnchorSize(_) => {
+            let (_, _, fallback_value) = value.anchor_name_and_fallback().unwrap();
             let fallback = fallback_value.optional_data()?;
             Some(Some(
                 substitute_unresolvable_anchor_functions(fallback)?.unwrap_or_else(|| fallback_value.clone()),
             ))
         }
-        StyleValueData::Calculated {
-            rust_calculation,
-            resolve_as_is_number,
-            resolve_as_base,
-            has_percentages_resolve_as,
-            ..
-        } if rust_calculation.node().contains_anchor_function() => {
+        StyleValueData::Calculated(calculated) if calculated.rust_calculation.node().contains_anchor_function() => {
+            let CalculatedPayload {
+                rust_calculation,
+                resolve_as_is_number,
+                resolve_as_base,
+                has_percentages_resolve_as,
+                ..
+            } = &**calculated;
             let root = rust_calculation.node_arc();
             let mut externals = Vec::new();
             collect_external_resolutions(&root, &mut externals);
@@ -4518,9 +4621,9 @@ pub(crate) fn substitute_unresolvable_anchor_functions(
             Some(Some(match computed {
                 AbsolutizedCalculation::Unchanged => unreachable!("substituting an anchor function changes the tree"),
                 AbsolutizedCalculation::Percentage(value) => {
-                    RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Percentage { value }))
+                    RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::Percentage { value }))
                 }
-                AbsolutizedCalculation::Value(value) => RetainedStyleValueData::from_arc(Arc::new(value)),
+                AbsolutizedCalculation::Value(value) => RetainedStyleValueData::from_arc(StyleValueArc::new(value)),
             }))
         }
         _ => Some(None),
@@ -4533,7 +4636,10 @@ pub extern "C" fn rust_style_value_contains_anchor_function(value: &crate::css::
     use crate::css::style_value::StyleValueData;
     match value {
         StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. } => true,
-        StyleValueData::Calculated { rust_calculation, .. } => rust_calculation.node().contains_anchor_function(),
+        StyleValueData::Calculated(calculated_payload) => {
+            let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
+            rust_calculation.node().contains_anchor_function()
+        }
         _ => false,
     }
 }
@@ -4541,8 +4647,7 @@ pub extern "C" fn rust_style_value_contains_anchor_function(value: &crate::css::
 /// The value of a computed `<length-percentage>` whose anchor() and anchor-size() functions are unresolvable: one
 /// strong reference to it with the functions replaced by their fallback values, or null when it holds no anchor
 /// functions or when one of them has no fallback value, which `is_invalid` tells apart.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_with_unresolvable_anchor_functions(
+pub(crate) fn style_value_with_unresolvable_anchor_functions(
     value: &crate::css::style_value::StyleValueData,
     is_invalid: &mut bool,
 ) -> *const crate::css::style_value::StyleValueData {
@@ -4563,7 +4668,10 @@ fn length_percentage_calc_node(value: &crate::css::style_value::StyleValueData) 
             unit: *unit,
         }))),
         StyleValueData::Percentage { value } => Some(Arc::new(CalcNode::Numeric(CalcNumericValue::Percentage(*value)))),
-        StyleValueData::Calculated { rust_calculation, .. } => Some(rust_calculation.node_arc()),
+        StyleValueData::Calculated(calculated_payload) => {
+            let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
+            Some(rust_calculation.node_arc())
+        }
         _ => None,
     }
 }
@@ -4624,16 +4732,16 @@ pub(crate) fn flipped_edge_offset(
 pub(crate) fn serialize_math_function_pieces(
     calculated: &crate::css::style_value::StyleValueData,
     resolved_mode: bool,
-) -> Vec<FfiCalcSerializationPiece> {
-    let crate::css::style_value::StyleValueData::Calculated {
+) -> Vec<CalcSerializationPiece> {
+    let crate::css::style_value::StyleValueData::Calculated(calculated_payload) = calculated else {
+        unreachable!("calc serialization requires calculated value data");
+    };
+    let CalculatedPayload {
         rust_calculation,
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = calculated
-    else {
-        unreachable!("calc serialization requires calculated value data");
-    };
+    } = &**calculated_payload;
     let root = rust_calculation.node_arc();
     let mut serializer = CalcSerializer {
         pieces: Vec::new(),
@@ -4650,16 +4758,16 @@ pub(crate) fn serialize_math_function_pieces(
 pub(crate) fn serialize_bare_calculation_pieces(
     calculated: &crate::css::style_value::StyleValueData,
     resolved_mode: bool,
-) -> Vec<FfiCalcSerializationPiece> {
-    let crate::css::style_value::StyleValueData::Calculated {
+) -> Vec<CalcSerializationPiece> {
+    let crate::css::style_value::StyleValueData::Calculated(calculated_payload) = calculated else {
+        unreachable!("calc serialization requires calculated value data");
+    };
+    let CalculatedPayload {
         rust_calculation,
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = calculated
-    else {
-        unreachable!("calc serialization requires calculated value data");
-    };
+    } = &**calculated_payload;
     let root = rust_calculation.node_arc();
     let mut serializer = CalcSerializer {
         pieces: Vec::new(),
@@ -4711,9 +4819,12 @@ impl CalcNode {
                     max: b_max,
                 },
             ) => {
-                a_min.structurally_equals(b_min)
-                    && a_center.structurally_equals(b_center)
-                    && a_max.structurally_equals(b_max)
+                let bounds_equal = |a: &Option<Arc<CalcNode>>, b: &Option<Arc<CalcNode>>| match (a, b) {
+                    (Some(a), Some(b)) => a.structurally_equals(b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                bounds_equal(a_min, b_min) && a_center.structurally_equals(b_center) && bounds_equal(a_max, b_max)
             }
             (
                 CalcNode::Progress {
@@ -4848,9 +4959,10 @@ pub extern "C" fn rust_calc_equals(
 ) -> bool {
     use crate::css::style_value::StyleValueData;
     let tree_of = |data: &StyleValueData| {
-        let StyleValueData::Calculated { rust_calculation, .. } = data else {
+        let StyleValueData::Calculated(calculated_payload) = data else {
             unreachable!("rust_calc_equals requires calculated value data");
         };
+        let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
         rust_calculation.node_arc()
     };
     let first_tree = tree_of(first);
@@ -4895,7 +5007,7 @@ fn node_kind_code(node: &CalcNode) -> u8 {
 }
 
 #[repr(C)]
-pub struct FfiCalcReificationNode {
+pub struct CalcReificationNode {
     pub kind: u8,
     pub numeric_kind: u8,
     pub unit: u8,
@@ -4905,24 +5017,10 @@ pub struct FfiCalcReificationNode {
     pub child_count: usize,
 }
 
-#[repr(C)]
-pub struct FfiCalcReification {
-    pub nodes: *const FfiCalcReificationNode,
-    pub node_count: usize,
-    pub children: *const usize,
-    pub child_count: usize,
-    pub storage: *mut std::ffi::c_void,
-}
-
-pub struct CalcReificationStorage {
-    nodes: Box<[FfiCalcReificationNode]>,
-    children: Box<[usize]>,
-}
-
 fn append_reification_node(
     node: &CalcNode,
     percentage_leaf_type: &CalcNumericType,
-    nodes: &mut Vec<FfiCalcReificationNode>,
+    nodes: &mut Vec<CalcReificationNode>,
     children: &mut Vec<usize>,
 ) -> Option<usize> {
     if !matches!(
@@ -4934,7 +5032,11 @@ fn append_reification_node(
             | CalcNode::Invert(..)
             | CalcNode::Min(..)
             | CalcNode::Max(..)
-            | CalcNode::Clamp { .. }
+            | CalcNode::Clamp {
+                min: Some(_),
+                max: Some(_),
+                ..
+            }
     ) {
         return None;
     }
@@ -4959,7 +5061,7 @@ fn append_reification_node(
         _ => (0, 0.0, 0),
     };
     let index = nodes.len();
-    nodes.push(FfiCalcReificationNode {
+    nodes.push(CalcReificationNode {
         kind: node_kind_code(node),
         numeric_kind,
         unit,
@@ -4972,22 +5074,21 @@ fn append_reification_node(
 }
 
 /// https://drafts.css-houdini.org/css-typed-om-1/#reify-a-math-expression
-/// Describe a calculation tree in postorder so C++ can create its GC-owned Typed OM objects.
-/// Unsupported math functions return an empty description.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_describe_for_typed_om(
+/// Describes a calculation tree in postorder, for the objects of the Typed OM. Unsupported math functions result in
+/// nothing.
+pub(crate) fn reification_nodes(
     calculated: &crate::css::style_value::StyleValueData,
-) -> FfiCalcReification {
-    let crate::css::style_value::StyleValueData::Calculated {
+) -> Option<(Vec<CalcReificationNode>, Vec<usize>)> {
+    let crate::css::style_value::StyleValueData::Calculated(calculated_payload) = calculated else {
+        unreachable!("reification_nodes requires calculated value data");
+    };
+    let CalculatedPayload {
         rust_calculation,
         has_percentages_resolve_as,
         resolve_as_is_number,
         resolve_as_base,
         ..
-    } = calculated
-    else {
-        unreachable!("rust_calc_describe_for_typed_om requires calculated value data");
-    };
+    } = &**calculated_payload;
     let percentage_leaf_type = percentage_leaf_type_for(resolve_as_from_fields(
         *has_percentages_resolve_as,
         *resolve_as_is_number,
@@ -4995,41 +5096,11 @@ pub extern "C" fn rust_calc_describe_for_typed_om(
     ));
     let mut nodes = Vec::new();
     let mut children = Vec::new();
-    if append_reification_node(
+    append_reification_node(
         rust_calculation.node(),
         &percentage_leaf_type,
         &mut nodes,
         &mut children,
-    )
-    .is_none()
-    {
-        return FfiCalcReification {
-            nodes: std::ptr::null(),
-            node_count: 0,
-            children: std::ptr::null(),
-            child_count: 0,
-            storage: std::ptr::null_mut(),
-        };
-    }
-    let storage = Box::new(CalcReificationStorage {
-        nodes: nodes.into_boxed_slice(),
-        children: children.into_boxed_slice(),
-    });
-    let result = FfiCalcReification {
-        nodes: storage.nodes.as_ptr(),
-        node_count: storage.nodes.len(),
-        children: storage.children.as_ptr(),
-        child_count: storage.children.len(),
-        storage: std::ptr::null_mut(),
-    };
-    let storage = Box::into_raw(storage);
-    FfiCalcReification {
-        storage: storage.cast(),
-        ..result
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_reification_release(storage: OwnedBox<CalcReificationStorage>) {
-    drop(storage);
+    )?;
+    Some((nodes, children))
 }

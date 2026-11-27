@@ -11,19 +11,22 @@ use core::ptr::NonNull;
 
 use libjs_abi::register;
 use libjs_jit::ir::Float64Function;
+use libjs_runtime_macros::{jit_abi, jit_function_address};
 
 use super::code::EntryStatus;
 use super::entry_exit::{can_enter_jit_code, enter_jit_code};
 use super::{frame_of, frames_above};
 use crate::bytecode::encoding::Operand;
-use crate::bytecode::executable::Executable;
+use crate::bytecode::executable::{Executable, PropertyLookupCache};
 use crate::bytecode::instruction::OpCode;
 use crate::bytecode::instruction_at;
 use crate::bytecode::op;
+use crate::bytecode::property_access::remember_vm_cache_get;
 use crate::gc::root::MarkedVec;
 use crate::interpreter::runtime_functions::{Runtime, RuntimeFunctions, SlowPathControl, handle_asm_exception};
+use crate::interpreter::slow_paths;
 use crate::interpreter::slow_paths::calls::{
-    CallType, execute_asm_call, record_callback, throw_error, throw_if_needed_for_asm_call,
+    ArgumentStorage, CallType, execute_asm_call, record_callback, throw_error, throw_if_needed_for_asm_call,
 };
 use crate::interpreter::slow_paths::feedback::record_forwarded_call;
 use crate::interpreter::slow_paths::property_access::{CachedAccessors, try_get_by_id_cache_with};
@@ -31,11 +34,12 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::feedback::CallFeedbackForwarding;
-use crate::layout::function_object::{EcmascriptFunctionObject, RawNativeFunction};
+use crate::layout::function_object::{EcmascriptFunctionObject, FunctionObject, NativeFunction, RawNativeFunction};
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
-    create_unmapped_arguments_object, get_prototype_from_constructor, length_of_array_like,
+    call_function_object, create_unmapped_arguments_object, function_object_as_object, length_of_array_like,
+    throw_if_too_many_arguments,
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
@@ -44,7 +48,6 @@ use crate::runtime::ecmascript_function_object::{as_ecmascript_function_object, 
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_prototype::FunctionPrototype;
-use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::iterator::get_iterator_values;
 use crate::runtime::math_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
@@ -107,7 +110,7 @@ fn run_callee_frame_from_jit(vm: &Vm, site: &JitCallSite, callee_frame: NonNull<
         let result = enter_jit_code(vm, callee_frame);
         match result.status {
             EntryStatus::Returned => {
-                vm.return_from_running_frame(Value(result.value));
+                vm.return_from_running_frame(Value::from_bits(result.value));
                 return finish_call_from_jit(vm, site.frame, site.pc, site.return_pc);
             }
             EntryStatus::ExitInterpreter => return finish_call_from_jit(vm, site.frame, site.pc, site.return_pc),
@@ -160,6 +163,9 @@ fn call_builtin_from_jit(
     this_value: Value,
     arguments: &[Value],
 ) -> Option<SlowPathControl> {
+    if !vm.is_in_current_realm(builtin.as_function_object_gc()) {
+        return None;
+    }
     let executable = builtin.inline_call_executable(vm)?;
     record_callback(vm, frame_of(site.frame), site.pc, builtin, arguments);
     if vm.did_reach_stack_space_limit() {
@@ -180,17 +186,37 @@ fn call_builtin_from_jit(
     Some(run_callee_frame_from_jit(vm, site, callee_frame))
 }
 
+/// Whether constructs from JIT code with `function` as the constructor run its bytecode in an inline frame.
+fn constructs_in_inline_frame(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
+    function.kind() == FunctionKind::Normal
+        && function.has_constructor()
+        && vm.is_in_current_realm(function.as_function_object_gc())
+        && function.bytecode_executable().is_some()
+}
+
+/// The frame of a construct from JIT code, pushed by push_construct_frame() and running next.
+struct PushedConstruct {
+    callee_frame: NonNull<ExecutionContext>,
+    /// The this value of a base constructor.
+    this_argument: Option<Gc<Object>>,
+    /// Whether the this value of a derived constructor is in its frame (see
+    /// ExecutionContext::caller_is_derived_construct).
+    this_is_in_frame: bool,
+    constructor_environment: Gc<crate::layout::environment::Environment>,
+}
+
 // 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
-/// Constructs with an ECMAScript function as the new target, in an inline frame linked to the call site's frame like a
-/// call.
-fn construct_ecmascript_function_from_jit(
+/// Steps 2 to 7 of a construct with an ECMAScript function from JIT code: pushes its frame, an inline frame linked to
+/// the call site's frame like a call, which runs next.
+fn push_construct_frame(
     vm: &Vm,
     site: &JitCallSite,
     function: Gc<EcmascriptFunctionObject>,
+    new_target: Gc<FunctionObject>,
     arguments: &[Value],
-) -> SlowPathControl {
+) -> Result<PushedConstruct, SlowPathControl> {
     if vm.did_reach_stack_space_limit() {
-        return throw_call_stack_size_exceeded(vm, site.pc);
+        return Err(throw_call_stack_size_exceeded(vm, site.pc));
     }
 
     // 2. Let kind be F.[[ConstructorKind]].
@@ -201,16 +227,21 @@ fn construct_ecmascript_function_from_jit(
     if kind == ConstructorKind::Base {
         // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
         // NB: With room for the properties the constructor is known to add.
-        match get_prototype_from_constructor(vm, function.as_function_object_gc(), Intrinsics::object_prototype) {
-            Ok(prototype) => this_argument = Some(Object::create_for_construct(vm, prototype, function.shared_data())),
-            Err(throw) => return handle_asm_exception(vm, site.pc, throw.value()),
+        match Object::create_from_constructor_for_construct(vm, new_target, function.shared_data()) {
+            Ok(object) => this_argument = Some(object),
+            Err(throw) => return Err(handle_asm_exception(vm, site.pc, throw.value())),
         }
     }
 
     // 4. Let calleeContext be PrepareForOrdinaryCall(F, newTarget).
-    // NB: The frame does not use the construct return rule of Return, which knows nothing of derived constructors;
-    //     steps 10 to 17 are below.
-    let executable = function.bytecode_executable().expect("a constructor has an executable");
+    // NB: The frame of a base constructor does not use the construct return rule of Return; steps 10 to 17 are in
+    //     finish_construct().
+    // NB: The prototype lookup above may have run code and collected garbage, which may have flushed the
+    //     constructor's code (see `bytecode::flushing`).
+    let executable = match function.compiled_executable(vm) {
+        Ok(executable) => executable,
+        Err(throw) => return Err(handle_asm_exception(vm, site.pc, throw.value())),
+    };
     let argument_count = u32::try_from(arguments.len()).expect("the argument count fits in u32");
     let Some(callee_frame) = vm.push_inline_frame_without_this(
         function,
@@ -219,12 +250,19 @@ fn construct_ecmascript_function_from_jit(
         argument_count,
         site.return_pc,
         site.dst,
-        Some(function.upcast()),
+        Some(function_object_as_object(new_target)),
         false,
     ) else {
-        return throw_call_stack_size_exceeded(vm, site.pc);
+        return Err(throw_call_stack_size_exceeded(vm, site.pc));
     };
     let callee_frame_ref = frame_of(callee_frame);
+    // NB: The frame of a derived constructor without an environment for `this` has the this value, which step 15
+    //     needs after the frame is gone. Returning undefined from the frame returns it instead (see
+    //     ExecutionContext::caller_is_derived_construct).
+    let this_is_in_frame =
+        kind == ConstructorKind::Derived && !function.shared_data().function_environment_has_this_binding();
+    callee_frame_ref.caller_is_construct.set(this_is_in_frame);
+    callee_frame_ref.caller_is_derived_construct.set(this_is_in_frame);
 
     // 6. If kind is base, then
     if let Some(this_argument) = this_argument {
@@ -240,7 +278,7 @@ fn construct_ecmascript_function_from_jit(
             vm.unwind_inline_frame_for_exception();
 
             // ii. Return ? initializeResult.
-            return handle_asm_exception(vm, site.pc, throw.value());
+            return Err(handle_asm_exception(vm, site.pc, throw.value()));
         }
     }
 
@@ -250,15 +288,24 @@ fn construct_ecmascript_function_from_jit(
         .get()
         .expect("a constructor runs in an environment");
 
-    // 8. Let result be Completion(OrdinaryCallEvaluateBody(F, argumentsList)).
-    // 9. Remove calleeContext from the execution context stack and restore callerContext as the running execution context.
-    // 10. If result is a throw completion, then
-    //     a. Return ? result.
-    let control = run_callee_frame_from_jit(vm, site, callee_frame);
-    if !control.continues_in_frame() {
-        return control;
-    }
+    Ok(PushedConstruct {
+        callee_frame,
+        this_argument,
+        this_is_in_frame,
+        constructor_environment,
+    })
+}
 
+/// Steps 11 to 17 of a construct from JIT code (see push_construct_frame()), once its frame returned the value now in
+/// the call site's destination slot.
+fn finish_construct(
+    vm: &Vm,
+    site: &JitCallSite,
+    this_argument: Option<Gc<Object>>,
+    this_is_in_frame: bool,
+    constructor_environment: Option<Gc<crate::layout::environment::Environment>>,
+    control: SlowPathControl,
+) -> SlowPathControl {
     // 11. Assert: result is a return completion.
     let result_slot = &frame_of(site.frame).slots()[site.dst as usize];
     let result = result_slot.get();
@@ -274,6 +321,18 @@ fn construct_ecmascript_function_from_jit(
         return control;
     }
 
+    // OPTIMIZATION: The frame returned its this value for undefined, which is empty if it is not initialized.
+    if this_is_in_frame && result.is_empty() {
+        result_slot.set(Value::UNDEFINED);
+        return throw_error(
+            vm,
+            site.pc,
+            ErrorKind::ReferenceError,
+            ErrorType::ThisHasNotBeenInitialized,
+            &[],
+        );
+    }
+
     // 14. If result.[[Value]] is not undefined, throw a TypeError exception.
     if !result.is_undefined() {
         return throw_error(
@@ -286,6 +345,8 @@ fn construct_ecmascript_function_from_jit(
     }
 
     // 15. Let thisBinding be ? constructorEnv.GetThisBinding().
+    let constructor_environment =
+        constructor_environment.expect("a frame without the this value has an environment for it");
     let this_binding = match constructor_environment.get_this_binding(vm) {
         Ok(this_binding) => this_binding,
         Err(throw) => return handle_asm_exception(vm, site.pc, throw.value()),
@@ -297,6 +358,39 @@ fn construct_ecmascript_function_from_jit(
     // 17. Return thisBinding.
     result_slot.set(this_binding);
     control
+}
+
+// 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
+/// Constructs with an ECMAScript function as the new target, in an inline frame linked to the call site's frame like a
+/// call.
+fn construct_ecmascript_function_from_jit(
+    vm: &Vm,
+    site: &JitCallSite,
+    function: Gc<EcmascriptFunctionObject>,
+    new_target: Gc<FunctionObject>,
+    arguments: &[Value],
+) -> SlowPathControl {
+    let pushed = match push_construct_frame(vm, site, function, new_target, arguments) {
+        Ok(pushed) => pushed,
+        Err(control) => return control,
+    };
+
+    // 8. Let result be Completion(OrdinaryCallEvaluateBody(F, argumentsList)).
+    // 9. Remove calleeContext from the execution context stack and restore callerContext as the running execution context.
+    // 10. If result is a throw completion, then
+    //     a. Return ? result.
+    let control = run_callee_frame_from_jit(vm, site, pushed.callee_frame);
+    if !control.continues_in_frame() {
+        return control;
+    }
+    finish_construct(
+        vm,
+        site,
+        pushed.this_argument,
+        pushed.this_is_in_frame,
+        Some(pushed.constructor_environment),
+        control,
+    )
 }
 
 /// Calls `callee` from JIT code. Calls of ECMAScript functions avoid the generic call machinery, and calls through
@@ -314,7 +408,7 @@ fn call_from_jit(
         return None;
     }
     if let Some(function) = value_as_ecmascript_function_object(callee) {
-        if function.can_inline_call() {
+        if function.can_inline_call() && vm.is_in_current_realm(function.as_function_object_gc()) {
             return Some(call_ecmascript_function_from_jit(
                 vm, site, function, this_value, arguments,
             ));
@@ -384,6 +478,9 @@ fn call_other_function_from_jit(
                 Ok(length) => length,
                 Err(throw) => return Some(handle_asm_exception(vm, site.pc, throw.value())),
             };
+            if let Err(throw) = throw_if_too_many_arguments(vm, length) {
+                return Some(handle_asm_exception(vm, site.pc, throw.value()));
+            }
             if unwrap_depth == 0 {
                 record_forwarded_call(
                     vm,
@@ -399,7 +496,8 @@ fn call_other_function_from_jit(
                 && array_like.indexed_storage_kind() == IndexedStorageKind::Packed
                 && u64::from(array_like.indexed_packed_elements_span_size()) >= length
             {
-                let mut arguments = ArgumentStorage::filled(vm, length as usize, |slots| {
+                let mut arguments = ArgumentStorage::empty();
+                arguments.fill(vm, length as usize, |slots| {
                     array_like.copy_indexed_packed_elements(slots);
                 });
                 return Some(call_from_jit_or_generic(
@@ -407,7 +505,7 @@ fn call_other_function_from_jit(
                     site,
                     this_value,
                     target_this,
-                    arguments.values(),
+                    &arguments.values(),
                     unwrap_depth + 1,
                 ));
             }
@@ -418,12 +516,15 @@ fn call_other_function_from_jit(
                     Err(throw) => return Some(handle_asm_exception(vm, site.pc, throw.value())),
                 }
             }
-            return Some(argument_list.with_values(|arguments| {
-                call_from_jit_or_generic(vm, site, this_value, target_this, arguments, unwrap_depth + 1)
-            }));
+            return Some(call_from_jit_or_generic(
+                vm,
+                site,
+                this_value,
+                target_this,
+                &argument_list.values(),
+                unwrap_depth + 1,
+            ));
         }
-
-        return None;
     }
 
     if let Some(bound_function) = callee_object.downcast::<BoundFunction>() {
@@ -451,7 +552,8 @@ fn call_other_function_from_jit(
                 unwrap_depth + 1,
             );
         }
-        let mut argument_list = ArgumentStorage::filled(vm, bound_argument_count + arguments.len(), |slots| {
+        let mut argument_list = ArgumentStorage::empty();
+        argument_list.fill(vm, bound_argument_count + arguments.len(), |slots| {
             let (bound_slots, argument_slots) = slots.split_at_mut(bound_argument_count);
             for (index, slot) in bound_slots.iter_mut().enumerate() {
                 *slot = bound_function.bound_argument(index);
@@ -463,8 +565,17 @@ fn call_other_function_from_jit(
             site,
             target,
             bound_function.bound_this(),
-            argument_list.values(),
+            &argument_list.values(),
             unwrap_depth + 1,
+        );
+    }
+
+    if let Some(function) = callee_object.downcast::<NativeFunction>() {
+        return Some(
+            match call_function_object(vm, function.upcast(), this_value, arguments) {
+                Ok(value) => site.store_result(value),
+                Err(throw) => handle_asm_exception(vm, site.pc, throw.value()),
+            },
         );
     }
 
@@ -491,66 +602,11 @@ fn call_from_jit_or_generic(
         this_value,
         arguments,
         &mut result,
-        None,
         crate::bytecode::property_access::Strict::No,
     ) {
         return handle_asm_exception(vm, site.pc, throw.value());
     }
     site.store_result(result)
-}
-
-/// The argument values of a call from JIT code, which it keeps alive: few enough on the stack, which the garbage
-/// collector scans, and others in a rooted list as well.
-///
-/// NB: The argument values cannot stay alive in the slots of the calling frame: frames of inlined calls that compiled
-///     code pushes for a call are not initialized, and the garbage collector does not visit their registers and locals.
-struct ArgumentStorage<'vm> {
-    inline: [Value; ArgumentStorage::INLINE_CAPACITY],
-    count: usize,
-    heap: Vec<Value>,
-    _rooted: Option<MarkedVec<'vm, Value>>,
-}
-
-impl<'vm> ArgumentStorage<'vm> {
-    const INLINE_CAPACITY: usize = 16;
-
-    fn new(vm: &'vm Vm, values: impl ExactSizeIterator<Item = Value>) -> Self {
-        Self::filled(vm, values.len(), |slots| {
-            for (slot, value) in slots.iter_mut().zip(values) {
-                *slot = value;
-            }
-        })
-    }
-
-    /// `count` values, which `fill` writes into the slots it gets. Nothing may collect garbage while it does.
-    fn filled(vm: &'vm Vm, count: usize, fill: impl FnOnce(&mut [Value])) -> Self {
-        let mut storage = Self {
-            inline: [Value::UNDEFINED; Self::INLINE_CAPACITY],
-            count,
-            heap: Vec::new(),
-            _rooted: None,
-        };
-        if count <= Self::INLINE_CAPACITY {
-            fill(&mut storage.inline[..count]);
-        } else {
-            storage.heap = vec![Value::UNDEFINED; count];
-            fill(&mut storage.heap);
-            let rooted = MarkedVec::with_capacity(vm, count);
-            for value in &storage.heap {
-                rooted.push(*value);
-            }
-            storage._rooted = Some(rooted);
-        }
-        storage
-    }
-
-    fn values(&mut self) -> &mut [Value] {
-        if self.count <= Self::INLINE_CAPACITY {
-            &mut self.inline[..self.count]
-        } else {
-            &mut self.heap
-        }
-    }
 }
 
 /// Runs the generic slow path of a call instruction, and stores its result in the frame if the call returned normally.
@@ -578,6 +634,7 @@ fn finish_generic_call(vm: &Vm, site: &JitCallSite, control: SlowPathControl, re
 /// # Safety
 ///
 /// JIT code calls this with its VM, its frame and the pc of one of its executable's call instructions.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionContext, pc: u32) -> i64 {
     // SAFETY: JIT code passes live pointers.
     let vm = unsafe { &*vm };
@@ -599,7 +656,7 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
         frame,
         pc,
         return_pc: pc + length,
-        dst: dst.0,
+        dst: dst.0.into(),
     };
 
     let control = match opcode {
@@ -607,11 +664,12 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
             let call = instruction!(Call);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
             let this_value = load(call.this_value);
-            if let Some(control) = call_from_jit(vm, &site, callee, this_value, arguments, 0) {
+            if let Some(control) = call_from_jit(vm, &site, callee, this_value, &arguments, 0) {
                 return control.0;
             }
             let mut values = op::CallValues {
@@ -620,36 +678,79 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
                 this_value,
                 arguments: [],
             };
-            let control = Runtime::call(vm, pc, call, &mut values, arguments);
+            let control = slow_paths::call_slow_path(vm, pc, call, &mut values, &arguments);
             finish_generic_call(vm, &site, control, values.dst)
         }
         _ if opcode == OpCode::CallConstruct as u8 => {
             let call = instruction!(CallConstruct);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
             if let Some(function) = value_as_ecmascript_function_object(callee)
-                && function.kind() == FunctionKind::Normal
-                && function.has_constructor()
-                && function.bytecode_executable().is_some()
+                && constructs_in_inline_frame(vm, function)
             {
-                return construct_ecmascript_function_from_jit(vm, &site, function, arguments).0;
+                return construct_ecmascript_function_from_jit(
+                    vm,
+                    &site,
+                    function,
+                    function.as_function_object_gc(),
+                    &arguments,
+                )
+                .0;
             }
             let mut values = op::CallConstructValues {
                 dst: Value::EMPTY,
                 callee,
                 arguments: [],
             };
-            let control = Runtime::call_construct(vm, pc, call, &mut values, arguments);
+            let control = slow_paths::call_construct_slow_path(vm, pc, call, &mut values, &arguments);
+            finish_generic_call(vm, &site, control, values.dst)
+        }
+        _ if opcode == OpCode::SuperCall as u8 => {
+            let call = instruction!(SuperCall);
+            let site = site(call.dst, call.length());
+            let operands = call.arguments();
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
+            let arguments = storage.values();
+            let super_constructor = load(call.super_constructor);
+            if let Some(control) = super_call_from_jit(vm, &site, call.call_feedback, super_constructor, &arguments) {
+                return control.0;
+            }
+            let mut values = op::SuperCallValues {
+                dst: Value::EMPTY,
+                super_constructor,
+                arguments: [],
+            };
+            let control = slow_paths::super_call_slow_path(vm, pc, call, &mut values, &arguments);
+            finish_generic_call(vm, &site, control, values.dst)
+        }
+        _ if opcode == OpCode::SuperCallWithForwardedArguments as u8 => {
+            let call = instruction!(SuperCallWithForwardedArguments);
+            let site = site(call.dst, op::SuperCallWithForwardedArguments::LENGTH);
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from_passed_arguments(vm, frame_ref);
+            let arguments = storage.values();
+            let super_constructor = load(call.super_constructor);
+            if let Some(control) = super_call_from_jit(vm, &site, call.call_feedback, super_constructor, &arguments) {
+                return control.0;
+            }
+            let mut values = op::SuperCallWithForwardedArgumentsValues {
+                dst: Value::EMPTY,
+                super_constructor,
+            };
+            let control = Runtime::super_call_with_forwarded_arguments(vm, pc, call, &mut values);
             finish_generic_call(vm, &site, control, values.dst)
         }
         _ if opcode == OpCode::CallDirectEval as u8 => {
             let call = instruction!(CallDirectEval);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let mut values = op::CallDirectEvalValues {
                 dst: Value::EMPTY,
@@ -657,7 +758,7 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
                 this_value: load(call.this_value),
                 arguments: [],
             };
-            let control = Runtime::call_direct_eval(vm, pc, call, &mut values, arguments);
+            let control = slow_paths::call_direct_eval_slow_path(vm, pc, call, &mut values, &arguments);
             finish_generic_call(vm, &site, control, values.dst)
         }
         _ if opcode == OpCode::CallWithArgumentArray as u8 => {
@@ -712,6 +813,38 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
     control.0
 }
 
+/// Steps 1, 2, 5 and 6 of the evaluation of `super(...)` from JIT code, for a super constructor that is an ECMAScript
+/// function: it constructs in an inline frame linked to the call site's frame, like a construct. BindThisFromSuperCall
+/// does steps 7 and later. Returns nothing for other super constructors.
+fn super_call_from_jit(
+    vm: &Vm,
+    site: &JitCallSite,
+    call_feedback: u16,
+    super_constructor: Value,
+    arguments: &[Value],
+) -> Option<SlowPathControl> {
+    if let Some(function) = value_as_ecmascript_function_object(super_constructor)
+        && constructs_in_inline_frame(vm, function)
+    {
+        let new_target = vm.get_new_target();
+        assert!(new_target.is_object());
+        slow_paths::feedback::record_call(
+            vm,
+            call_feedback,
+            super_constructor,
+            crate::bytecode::feedback::call_feedback_flags::SAW_CONSTRUCT,
+        );
+        return Some(construct_ecmascript_function_from_jit(
+            vm,
+            site,
+            function,
+            new_target.as_function(),
+            arguments,
+        ));
+    }
+    None
+}
+
 /// `g(...arguments)`, built as NewArray, ArrayAppend of the arguments object the code never created and
 /// CallWithArgumentArray at pc.
 fn call_spreading_arguments_from_jit(
@@ -726,7 +859,7 @@ fn call_spreading_arguments_from_jit(
         frame,
         pc,
         return_pc: pc + op::CallWithArgumentArray::LENGTH,
-        dst: call.dst.0,
+        dst: call.dst.0.into(),
     };
     // NB: Iterate an arguments object (whose iterator is the original one, since nothing saw it) like the spread does,
     //     which is observable if %ArrayIteratorPrototype%.next is not the original.
@@ -741,11 +874,11 @@ fn call_spreading_arguments_from_jit(
         return handle_asm_exception(vm, pc, completion.value());
     }
     let callee = slots[call.callee.0 as usize].get();
-    if let Err(throw) = throw_if_needed_for_asm_call(vm, callee, CallType::Call, call.expression_string.get()) {
+    if let Err(throw) = throw_if_needed_for_asm_call(vm, callee, CallType::Call) {
         return handle_asm_exception(vm, pc, throw.value());
     }
     let this_value = slots[call.this_value.0 as usize].get();
-    spread_arguments.with_values(|arguments| call_from_jit_or_generic(vm, &site, callee, this_value, arguments, 0))
+    call_from_jit_or_generic(vm, &site, callee, this_value, &spread_arguments.values(), 0)
 }
 
 /// `i64 libjs_jit_call_forwarding_arguments(VM*, ExecutionContext* frame, u32 pc)`: runs the Call instruction at `pc`
@@ -757,6 +890,7 @@ fn call_spreading_arguments_from_jit(
 /// # Safety
 ///
 /// JIT code calls this with its VM, its frame and the pc of such an instruction.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -774,13 +908,14 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
         return call_spreading_arguments_from_jit(vm, frame, pc, call).0;
     }
     let call = instruction_at::<op::Call>(&executable, pc);
-    assert_eq!(call.argument_count, 2);
+    let argument_count = call.argument_count;
+    assert_eq!(argument_count, 2);
     let slots = frame_ref.slots();
     let site = JitCallSite {
         frame,
         pc,
         return_pc: pc + call.length(),
-        dst: call.dst.0,
+        dst: call.dst.0.into(),
     };
 
     // 20.2.3.1 Function.prototype.apply ( thisArg, argArray ), https://tc39.es/ecma262/#sec-function.prototype.apply
@@ -806,12 +941,14 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
             passed_argument_count,
         );
     }
-    // NB: The passed arguments stay alive in the frame while the call runs.
-    let arguments: Vec<Value> = frame_ref.arguments()[..passed_argument_count]
-        .iter()
-        .map(core::cell::Cell::get)
-        .collect();
-    call_from_jit_or_generic(vm, &site, function, this_argument, &arguments, 1).0
+    let mut arguments = ArgumentStorage::empty();
+    arguments.fill_from(
+        vm,
+        frame_ref.arguments()[..passed_argument_count]
+            .iter()
+            .map(core::cell::Cell::get),
+    );
+    call_from_jit_or_generic(vm, &site, function, this_argument, &arguments.values(), 1).0
 }
 
 /// `i64 libjs_jit_finish_direct_call(VM*, ExecutionContext* frame, u32 pc, u64 status)`: finishes a direct call made
@@ -823,6 +960,7 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
 /// # Safety
 ///
 /// JIT code calls this with its VM and frame, and the pc of the Call instruction.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_finish_direct_call(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -835,7 +973,23 @@ pub unsafe extern "C" fn libjs_jit_finish_direct_call(
     let frame_ref = frame_of(frame);
     let executable = Executable::from_head(frame_ref.executable.get().expect("the frame runs an executable"));
     let call = instruction_at::<op::Call>(&executable, pc);
+    let site = JitCallSite {
+        frame,
+        pc,
+        return_pc: pc + call.length(),
+        dst: call.dst.0.into(),
+    };
+    finish_direct_call_frames(vm, frame, &site, status).0
+}
 
+/// Runs the callee frame of a direct call or construct from JIT code that did not return to it to completion (see
+/// `libjs_jit_finish_direct_call()`), and finishes the call.
+fn finish_direct_call_frames(
+    vm: &Vm,
+    frame: NonNull<ExecutionContext>,
+    site: &JitCallSite,
+    status: u64,
+) -> SlowPathControl {
     // NB: The callee's frame, and the frames of the calls it inlined that its exit materialized, run in the
     //     interpreter from now on.
     for callee_frame in frames_above(vm, frame).expect("the calling frame is on the running frame's chain") {
@@ -848,7 +1002,299 @@ pub unsafe extern "C" fn libjs_jit_finish_direct_call(
         }
         vm.run_running_frame_in_interpreter();
     }
-    finish_call_from_jit(vm, frame, pc, pc + call.length()).0
+    finish_call_from_jit(vm, frame, site.pc, site.return_pc)
+}
+
+/// The call site of the CallConstruct, SuperCall or SuperCallWithForwardedArguments instruction at `pc` of `frame`.
+fn construct_site(frame: NonNull<ExecutionContext>, pc: u32) -> JitCallSite {
+    let executable = super::executable_of(frame_of(frame));
+    let opcode = executable.bytecode()[pc as usize];
+    let (dst, length) = if opcode == OpCode::CallConstruct as u8 {
+        let call = instruction_at::<op::CallConstruct>(&executable, pc);
+        (call.dst, call.length())
+    } else if opcode == OpCode::SuperCall as u8 {
+        let call = instruction_at::<op::SuperCall>(&executable, pc);
+        (call.dst, call.length())
+    } else {
+        assert_eq!(opcode, OpCode::SuperCallWithForwardedArguments as u8);
+        let call = instruction_at::<op::SuperCallWithForwardedArguments>(&executable, pc);
+        (call.dst, op::SuperCallWithForwardedArguments::LENGTH)
+    };
+    JitCallSite {
+        frame,
+        pc,
+        return_pc: pc + length,
+        dst: dst.0.into(),
+    }
+}
+
+/// What `libjs_jit_prepare_construct()` returns, in two registers.
+#[repr(C)]
+pub struct PreparedConstruct {
+    /// The frame of the construct, or null if the construct is done.
+    pub callee_frame: u64,
+    /// With a frame, the value of the construct if the frame returns something other than an object: the this value
+    /// of a base constructor, or the empty value. Without one, the slow path control word of the construct.
+    pub value: u64,
+}
+
+/// `PreparedConstruct libjs_jit_prepare_construct(VM*, ExecutionContext* frame, u32 pc)`: starts the CallConstruct,
+/// SuperCall or SuperCallWithForwardedArguments instruction at `pc` of the frame, the running execution context. A
+/// construct with an ECMAScript function whose this value is not in an environment gets its frame pushed, linked to
+/// the frame and running next, which JIT code enters and pops, and whose result it finishes with the value returned
+/// here (see `finish_construct()`) or `libjs_jit_construct_result_error()`. Every other construct runs to completion
+/// like `libjs_jit_call()`.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM, its frame and the pc of such an instruction.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_prepare_construct(
+    vm: *const Vm,
+    frame: *mut ExecutionContext,
+    pc: u32,
+) -> PreparedConstruct {
+    // SAFETY: JIT code passes live pointers.
+    let vm_ref = unsafe { &*vm };
+    let frame_pointer = NonNull::new(frame).expect("JIT code passes its frame");
+    assert_eq!(vm_ref.running_execution_context(), Some(frame_pointer));
+    let frame_ref = frame_of(frame_pointer);
+    frame_ref.program_counter.set(pc);
+    let executable = super::executable_of(frame_ref);
+    let slots = frame_ref.slots();
+    let load = |operand: Operand| slots[operand.0 as usize].get();
+    let opcode = executable.bytecode()[pc as usize];
+    let site = construct_site(frame_pointer, pc);
+    let takes_frame = |function: Gc<EcmascriptFunctionObject>| {
+        constructs_in_inline_frame(vm_ref, function)
+            && (function.constructor_kind() == ConstructorKind::Base
+                || !function.shared_data().function_environment_has_this_binding())
+    };
+
+    let mut storage = ArgumentStorage::empty();
+    let construct = if opcode == OpCode::CallConstruct as u8 {
+        let call = instruction_at::<op::CallConstruct>(&executable, pc);
+        match value_as_ecmascript_function_object(load(call.callee)) {
+            Some(function) if takes_frame(function) => {
+                storage.fill_from(vm_ref, call.arguments().iter().map(|operand| load(*operand)));
+                Some((function, function.as_function_object_gc()))
+            }
+            _ => None,
+        }
+    } else {
+        // NB: The arguments of a SuperCallWithForwardedArguments are the passed arguments of the frame.
+        let (super_constructor, call_feedback, argument_operands) = if opcode == OpCode::SuperCall as u8 {
+            let call = instruction_at::<op::SuperCall>(&executable, pc);
+            (load(call.super_constructor), call.call_feedback, Some(call.arguments()))
+        } else {
+            let call = instruction_at::<op::SuperCallWithForwardedArguments>(&executable, pc);
+            (load(call.super_constructor), call.call_feedback, None)
+        };
+        match value_as_ecmascript_function_object(super_constructor) {
+            Some(function) if takes_frame(function) => {
+                match argument_operands {
+                    Some(operands) => storage.fill_from(vm_ref, operands.iter().map(|operand| load(*operand))),
+                    None => storage.fill_from_passed_arguments(vm_ref, frame_ref),
+                }
+                let new_target = vm_ref.get_new_target();
+                assert!(new_target.is_object());
+                slow_paths::feedback::record_call(
+                    vm_ref,
+                    call_feedback,
+                    super_constructor,
+                    crate::bytecode::feedback::call_feedback_flags::SAW_CONSTRUCT,
+                );
+                Some((function, new_target.as_function()))
+            }
+            _ => None,
+        }
+    };
+    let done = |control: SlowPathControl| PreparedConstruct {
+        callee_frame: 0,
+        value: control.0 as u64,
+    };
+    let Some((function, new_target)) = construct else {
+        // SAFETY: The caller's pointers are live.
+        return done(SlowPathControl(unsafe { libjs_jit_call(vm, frame, pc) }));
+    };
+    match push_construct_frame(vm_ref, &site, function, new_target, &storage.values()) {
+        Ok(pushed) => {
+            let callee_frame = frame_of(pushed.callee_frame);
+            callee_frame.returns_to_native_caller.set(true);
+            callee_frame.runs_jit_code.set(true);
+            PreparedConstruct {
+                callee_frame: pushed.callee_frame.as_ptr() as u64,
+                value: pushed.this_argument.map_or(Value::EMPTY, Value::from_object).0,
+            }
+        }
+        Err(control) => done(control),
+    }
+}
+
+/// What `libjs_jit_construct_this()` returns, in two registers.
+#[repr(C)]
+pub struct ConstructThis {
+    pub this_value: u64,
+    pub new_target: u64,
+}
+
+// 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
+/// `ConstructThis libjs_jit_construct_this(VM*, ECMAScriptFunctionObject*, u64 new_target, u32 pc)`: step 3 of a
+/// construct from JIT code with the function as the constructor and `new_target` (or the empty value for the
+/// new.target of the running execution context, JIT code's frame), whose frame the construct stub builds like the
+/// frame of a call: the this value (the empty value for a derived constructor) and the new target. Returns 0 for
+/// constructs whose frame the stub must not build, before doing anything observable, or 1 and the slow path control
+/// word of the exception if step 3 threw.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM, an ECMAScript function and the pc of the construct instruction in its frame.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_construct_this(
+    vm: *const Vm,
+    function: *const EcmascriptFunctionObject,
+    new_target: u64,
+    pc: u32,
+) -> ConstructThis {
+    // SAFETY: JIT code passes live pointers.
+    let (vm, function) = unsafe {
+        (
+            &*vm,
+            Gc::from_non_null(NonNull::new(function.cast_mut()).expect("a function")),
+        )
+    };
+    let declined = ConstructThis {
+        this_value: 0,
+        new_target: 0,
+    };
+    if !constructs_in_inline_frame(vm, function) || vm.did_reach_stack_space_limit() {
+        return declined;
+    }
+    let shared_data = function.shared_data();
+    let new_target = match Value::from_bits(new_target) {
+        new_target if new_target.is_empty() => {
+            let new_target = vm.get_new_target();
+            assert!(new_target.is_object());
+            new_target
+        }
+        new_target => new_target,
+    };
+
+    // 2. Let kind be F.[[ConstructorKind]].
+    // 3. If kind is base, then
+    if function.constructor_kind() == ConstructorKind::Base {
+        // NB: InitializeInstanceElements runs in the constructor's frame, which the runtime pushes.
+        if function.has_class_data() && (function.private_methods_count() != 0 || function.fields_count() != 0) {
+            return declined;
+        }
+        // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
+        // NB: With room for the properties the constructor is known to add.
+        let this_argument =
+            match Object::create_from_constructor_for_construct(vm, new_target.as_function(), shared_data) {
+                Ok(object) => object,
+                Err(throw) => {
+                    return ConstructThis {
+                        this_value: 1,
+                        new_target: handle_asm_exception(vm, pc, throw.value()).0 as u64,
+                    };
+                }
+            };
+        // NB: The prototype lookup above may have run code and collected garbage, which may have flushed the
+        //     constructor's code (see `bytecode::flushing`).
+        if let Err(throw) = function.compiled_executable(vm) {
+            return ConstructThis {
+                this_value: 1,
+                new_target: handle_asm_exception(vm, pc, throw.value()).0 as u64,
+            };
+        }
+        return ConstructThis {
+            this_value: Value::from_object(this_argument).0,
+            new_target: new_target.0,
+        };
+    }
+    if shared_data.function_environment_has_this_binding() {
+        return declined;
+    }
+    ConstructThis {
+        this_value: Value::EMPTY.0,
+        new_target: new_target.0,
+    }
+}
+
+/// `i64 libjs_jit_throw_call_stack_size_exceeded(VM*, ExecutionContext* frame, u32 pc)`: throws the error of a call
+/// at `pc` of the frame, the running execution context, with too little stack left.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM, its frame and the pc of the call instruction.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_throw_call_stack_size_exceeded(
+    vm: *const Vm,
+    frame: *mut ExecutionContext,
+    pc: u32,
+) -> i64 {
+    // SAFETY: JIT code passes live pointers.
+    let vm = unsafe { &*vm };
+    assert_eq!(vm.running_execution_context(), NonNull::new(frame));
+    throw_call_stack_size_exceeded(vm, pc).0
+}
+
+/// `i64 libjs_jit_construct_result_error(VM*, ExecutionContext* frame, u32 pc, u64 result)`: throws the error of a
+/// construct prepared by `libjs_jit_prepare_construct()` (for the instruction at `pc` of the frame, which runs again)
+/// whose derived constructor's frame returned `result`, which is not an object, and returns its slow path control word.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM, its frame and the pc of the construct instruction.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_construct_result_error(
+    vm: *const Vm,
+    frame: *mut ExecutionContext,
+    pc: u32,
+    result: u64,
+) -> i64 {
+    // SAFETY: JIT code passes live pointers.
+    let vm = unsafe { &*vm };
+    let frame = NonNull::new(frame).expect("JIT code passes its frame");
+    let site = construct_site(frame, pc);
+    frame_of(frame).slots()[site.dst as usize].set(Value::from_bits(result));
+    finish_construct(
+        vm,
+        &site,
+        None,
+        true,
+        None,
+        SlowPathControl::continue_at(site.return_pc),
+    )
+    .0
+}
+
+/// `i64 libjs_jit_finish_direct_construct(VM*, ExecutionContext* frame, u32 pc, u64 status, u64 value)`: like
+/// `libjs_jit_finish_direct_call()` for a construct prepared by `libjs_jit_prepare_construct()` whose frame did not
+/// return to JIT code, which finishes the construct with the `value` that returned.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM and frame, the pc of the construct instruction, the callee's status and the value.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_finish_direct_construct(
+    vm: *const Vm,
+    frame: *mut ExecutionContext,
+    pc: u32,
+    status: u64,
+    value: u64,
+) -> i64 {
+    // SAFETY: JIT code passes live pointers.
+    let vm = unsafe { &*vm };
+    let frame = NonNull::new(frame).expect("JIT code passes its frame");
+    let site = construct_site(frame, pc);
+    let control = finish_direct_call_frames(vm, frame, &site, status);
+    if !control.continues_in_frame() {
+        return control.0;
+    }
+    let value = Value::from_bits(value);
+    let this_argument = value.is_object().then(|| value.as_object());
+    finish_construct(vm, &site, this_argument, this_argument.is_none(), None, control).0
 }
 
 /// What `libjs_jit_prepare_call_environment()` returns, in two registers.
@@ -865,6 +1311,7 @@ pub struct CallEnvironment {
 /// # Safety
 ///
 /// JIT code calls this with its VM and an ECMAScript function that can be called inline.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
     vm: *const Vm,
     function: *const EcmascriptFunctionObject,
@@ -877,7 +1324,7 @@ pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
             Gc::from_non_null(NonNull::new(function.cast_mut()).expect("a function")),
         )
     };
-    let argument = Value(this_argument);
+    let argument = Value::from_bits(this_argument);
     // NB: ToObject would make a wrapper of the caller's realm.
     if function.uses_this()
         && function.this_mode() == ThisMode::Global
@@ -902,6 +1349,14 @@ pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
     {
         super::allocation::make_call_environment_template(vm, function, environment);
     }
+    // NB: The allocations may have collected garbage and flushed the function's code (see `bytecode::flushing`),
+    //     which the calling stub loads again from the function. The call takes the generic path if it cannot compile.
+    if function.compiled_executable(vm).is_err() {
+        return CallEnvironment {
+            environment: 0,
+            this_value: 0,
+        };
+    }
     CallEnvironment {
         environment: environment.map_or(0, |environment| environment.as_ptr() as u64),
         this_value: this_value.0,
@@ -912,12 +1367,13 @@ pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
 /// append it to without any observable step, and returns the new length as a value.
 ///
 /// JIT code calls this with a live array whose elements are packed.
+#[jit_abi]
 pub extern "C" fn libjs_jit_array_push(array: &Array, value: u64) -> u64 {
     assert!(matches!(
         array.indexed_storage_kind(),
         IndexedStorageKind::None | IndexedStorageKind::Packed
     ));
-    array.indexed_append(Value(value), DEFAULT_ATTRIBUTES);
+    array.indexed_append(Value::from_bits(value), DEFAULT_ATTRIBUTES);
     Value::from_f64(f64::from(array.indexed_array_like_size())).0
 }
 
@@ -927,6 +1383,7 @@ pub extern "C" fn libjs_jit_array_push(array: &Array, value: u64) -> u64 {
 ///
 /// JIT code calls this with a live array whose prototype chain is the realm's default one without indexed properties,
 /// so that the store runs no code.
+#[jit_abi]
 pub extern "C" fn libjs_jit_store_holey_element(object: &Object, index: u32, value: u64) {
     // NB: Branches on holey elements take packed ones too.
     assert!(matches!(
@@ -934,15 +1391,16 @@ pub extern "C" fn libjs_jit_store_holey_element(object: &Object, index: u32, val
         IndexedStorageKind::Holey | IndexedStorageKind::Packed
     ));
     assert!(index < object.indexed_array_like_size());
-    object.indexed_put(index, Value(value), DEFAULT_ATTRIBUTES);
+    object.indexed_put(index, Value::from_bits(value), DEFAULT_ATTRIBUTES);
 }
 
 /// `u64 libjs_jit_primitive_to_string(VM*, u64 primitive)`: `String(primitive)`, which is ToString of the primitive,
 /// but the descriptive string of a symbol.
 ///
 /// JIT code calls this with its VM and a primitive.
+#[jit_abi]
 pub extern "C" fn libjs_jit_primitive_to_string(vm: &Vm, primitive: u64) -> u64 {
-    let primitive = Value(primitive);
+    let primitive = Value::from_bits(primitive);
     assert!(!primitive.is_object());
     // 22.1.1.1 String ( value ), https://tc39.es/ecma262/#sec-string-constructor-string-value
     if primitive.is_symbol() {
@@ -955,37 +1413,42 @@ pub extern "C" fn libjs_jit_primitive_to_string(vm: &Vm, primitive: u64) -> u64 
 /// The address of the runtime's `double (double...)` function that computes `function`, which JIT code calls with
 /// numbers (see `Op::CallFloat64Function`).
 pub fn float64_function_address(function: Float64Function) -> u64 {
-    let function: *const () = match function {
-        Float64Function::Exp => libjs_jit_math_exp as *const (),
-        Float64Function::Log => libjs_jit_math_log as *const (),
-        Float64Function::Sin => libjs_jit_math_sin as *const (),
-        Float64Function::Cos => libjs_jit_math_cos as *const (),
-        Float64Function::Tan => libjs_jit_math_tan as *const (),
-        Float64Function::Pow => libjs_jit_math_pow as *const (),
-    };
-    function as u64
+    match function {
+        Float64Function::Exp => jit_function_address!(libjs_jit_math_exp),
+        Float64Function::Log => jit_function_address!(libjs_jit_math_log),
+        Float64Function::Sin => jit_function_address!(libjs_jit_math_sin),
+        Float64Function::Cos => jit_function_address!(libjs_jit_math_cos),
+        Float64Function::Tan => jit_function_address!(libjs_jit_math_tan),
+        Float64Function::Pow => jit_function_address!(libjs_jit_math_pow),
+    }
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_exp(number: f64) -> f64 {
     math_object::exp_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_log(number: f64) -> f64 {
     math_object::log_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_sin(number: f64) -> f64 {
     math_object::sin_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_cos(number: f64) -> f64 {
     math_object::cos_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_tan(number: f64) -> f64 {
     math_object::tan_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_pow(base: f64, exponent: f64) -> f64 {
     value_conversions::exp_double(base, exponent)
 }
@@ -994,8 +1457,9 @@ extern "C" fn libjs_jit_math_pow(base: f64, exponent: f64) -> f64 {
 /// null, as the builtin function `function` makes it, or the empty value if that function is of another realm.
 ///
 /// JIT code calls this with its VM, a function object and such a primitive.
+#[jit_abi]
 pub extern "C" fn libjs_jit_to_object(vm: &Vm, primitive: u64, function: u64) -> u64 {
-    let (function, primitive) = (Value(function).as_object(), Value(primitive));
+    let (function, primitive) = (Value::from_bits(function).as_object(), Value::from_bits(primitive));
     assert!(!primitive.is_object() && !primitive.is_nullish());
     if vm.current_realm() != Some(function.shape().realm()) {
         return Value::EMPTY.0;
@@ -1004,12 +1468,37 @@ pub extern "C" fn libjs_jit_to_object(vm: &Vm, primitive: u64, function: u64) ->
     Value::from_object(primitive.to_object(vm).must()).0
 }
 
+/// `void libjs_jit_remember_vm_cache_get(VM*, u64 base, PropertyLookupCache*, u64 name)`: copies the entry of the VM's
+/// keyed property lookup cache that a megamorphic named get of `base` found after missing the tables of its cache into
+/// those tables (see `remember_vm_cache_get()`), if `base` is an object. Runs no code.
+///
+/// # Safety
+///
+/// JIT code calls this with its VM, a value, the property lookup cache of the get and the identity of its name.
+#[jit_abi]
+pub unsafe extern "C" fn libjs_jit_remember_vm_cache_get(
+    vm: &Vm,
+    base: u64,
+    cache: *const PropertyLookupCache,
+    name: u64,
+) {
+    // NB: Gets of the properties of primitives find them on their prototypes, and their caches do not learn them.
+    let base = Value::from_bits(base);
+    if !base.is_object() {
+        return;
+    }
+    // SAFETY: JIT code passes the address of a live property lookup cache.
+    let cache = unsafe { &*cache };
+    remember_vm_cache_get(vm, base.as_object(), cache, name as usize);
+}
+
 /// `u64 libjs_jit_array_create(VM*, u32 length, u64 function)`: ArrayCreate(length) as the builtin function `function`
 /// (the Array constructor) makes it, or the empty value if that function is of another realm.
 ///
 /// JIT code calls this with its VM, a length below 2^31 and a function object.
+#[jit_abi]
 pub extern "C" fn libjs_jit_array_create(vm: &Vm, length: u32, function: u64) -> u64 {
-    let realm = Value(function).as_object().shape().realm();
+    let realm = Value::from_bits(function).as_object().shape().realm();
     if vm.current_realm() != Some(realm) {
         return Value::EMPTY.0;
     }
@@ -1021,6 +1510,7 @@ pub extern "C" fn libjs_jit_array_create(vm: &Vm, length: u32, function: u64) ->
 /// start)` with the arguments object of the frame, which the code never created, as an array value.
 ///
 /// JIT code calls this with its VM and its frame.
+#[jit_abi]
 pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, start: i32) -> u64 {
     // 23.1.3.28 Array.prototype.slice ( start, end ), https://tc39.es/ecma262/#sec-array.prototype.slice
     // NB: The arguments object has every passed argument, and its length is their count.
@@ -1031,14 +1521,15 @@ pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, s
     } else {
         start.min(length)
     };
-    let mut arguments = ArgumentStorage::new(
+    let mut arguments = ArgumentStorage::empty();
+    arguments.fill_from(
         vm,
         frame.arguments()[first as usize..length as usize]
             .iter()
             .map(core::cell::Cell::get),
     );
     let realm = vm.current_realm().expect("JIT code runs in a realm");
-    Value::from_object(Array::create_from(vm, realm, arguments.values())).0
+    Value::from_object(Array::create_from(vm, realm, &arguments.values())).0
 }
 
 /// The GetById slow path of JIT code, before the full one. Generic GetById nodes have no inline cache check, so this
@@ -1064,13 +1555,13 @@ pub fn get_by_id_from_jit(
         .as_accessor()
         .getter()
         .and_then(as_ecmascript_function_object)
-        .filter(|function| function.can_inline_call())?;
+        .filter(|function| function.can_inline_call() && vm.is_in_current_realm(function.as_function_object_gc()))?;
     let frame = vm.running_execution_context().expect("a frame is running");
     let site = JitCallSite {
         frame,
         pc,
         return_pc: pc + op::GetById::LENGTH,
-        dst: instruction.dst.0,
+        dst: instruction.dst.0.into(),
     };
     let control = call_ecmascript_function_from_jit(vm, &site, function, values.base, &[]);
     if control.continues_in_frame() {

@@ -10,6 +10,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <LibWebCommon/Page/SpellingError.h>
+#include <LibWebCommon/Page/WritingSuggestion.h>
 #include <LibWebView/Export.h>
 
 namespace WebView {
@@ -30,12 +31,24 @@ public:
     // Asynchronous; on_complete runs on the main thread.
     virtual void check(DocumentTag, Utf16String const& text, Function<void(Vector<Web::SpellingError>)> on_complete) = 0;
 
-    virtual Vector<Utf16String> guesses(DocumentTag, Utf16String const& word) = 0;
+    // Asynchronous; on_complete runs on the main thread.
+    virtual void guesses(DocumentTag, Utf16String const& word, Function<void(Vector<Utf16String>)> on_complete) = 0;
+
     virtual void ignore(DocumentTag, Utf16String const& word) = 0;
     virtual void learn(DocumentTag, Utf16String const& word) = 0;
 
     // Whether a learned word holds for every document tag, as it does in a user dictionary that every app shares.
     virtual bool learns_for_every_tag() const { return true; }
+
+    // Whether suggest() can ever answer, i.e. the platform predicts text as the user types.
+    virtual bool can_suggest() const { return false; }
+
+    // Predicts how the text could continue at caret_offset (in UTF-16 code units). Asynchronous; on_complete runs on
+    // the main thread, with nothing if there's no prediction.
+    virtual void suggest(DocumentTag, [[maybe_unused]] Utf16String const& text, [[maybe_unused]] u32 caret_offset, Function<void(Optional<Web::WritingSuggestion>)> on_complete)
+    {
+        on_complete({});
+    }
 };
 
 }

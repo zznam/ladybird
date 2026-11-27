@@ -4,18 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The tape of a 2D canvas: the records that a recorder writes for the commands of the canvas, and the entry points
-//! through which the compositor checks and reads a tape that it received.
+//! The tape of a 2D canvas: the records that a recorder writes for the commands of the canvas, and how the compositor
+//! reads a tape that it received.
 
 use super::builder::{append_record, for_each_command};
 use super::commands::*;
 use super::ffi_bytes::FfiBytes;
-use super::validate::validate_canvas_2d_tape;
 use libgfx_rust::{
     AffineTransform, CapStyle, Color, CompositingAndBlendingOperator, FloatPoint, FloatRect, IntPoint, JoinStyle,
     ScalingMode, WindingRule,
 };
-use std::ffi::c_void;
 
 /// The stops of a gradient, as parallel arrays of colors and positions.
 #[derive(Clone, Copy, Debug, Default)]
@@ -225,7 +223,7 @@ impl TapeWriter {
         append_record(&mut self.bytes, command, &[]);
     }
 
-    /// `path` is a serialized Gfx::Path.
+    /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn fill_path(&mut self, path: &[u8], paint: &Paint, winding_rule: WindingRule, compositing: &Compositing) {
         let mut inline_data = InlineData::new::<Canvas2DFillPath>();
         let command = Canvas2DFillPath {
@@ -237,7 +235,7 @@ impl TapeWriter {
         self.append(&command, &inline_data);
     }
 
-    /// `path` is a serialized Gfx::Path.
+    /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn stroke_path(&mut self, path: &[u8], paint: &Paint, stroke: &Stroke, compositing: &Compositing) {
         let mut inline_data = InlineData::new::<Canvas2DStrokePath>();
         let command = Canvas2DStrokePath {
@@ -254,19 +252,21 @@ impl TapeWriter {
         self.append(&command, &inline_data);
     }
 
-    pub fn draw_glyph_run(
+    pub fn draw_glyph_runs(
         &mut self,
-        font_id: FontResourceId,
+        runs: &[Canvas2DGlyphRun],
         glyphs: &[DisplayListGlyph],
         translation: FloatPoint,
+        horizontal_scale: f32,
         paint: &Paint,
         compositing: &Compositing,
     ) {
-        let mut inline_data = InlineData::new::<Canvas2DDrawGlyphRun>();
-        let command = Canvas2DDrawGlyphRun {
-            font_id,
+        let mut inline_data = InlineData::new::<Canvas2DDrawGlyphRuns>();
+        let command = Canvas2DDrawGlyphRuns {
+            runs: inline_data.append_objects(runs),
             glyphs: inline_data.append_objects(glyphs),
             translation,
+            horizontal_scale,
             paint: inline_data.append_paint(paint),
             compositing: inline_data.append_compositing(compositing),
         };
@@ -348,7 +348,7 @@ impl TapeWriter {
         self.append_plain(&Canvas2DRestore::default());
     }
 
-    /// `path` is a serialized Gfx::Path.
+    /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn clip_path(&mut self, path: &[u8], winding_rule: WindingRule) {
         let mut inline_data = InlineData::new::<Canvas2DClipPath>();
         let command = Canvas2DClipPath {
@@ -371,39 +371,11 @@ impl TapeWriter {
     }
 }
 
-/// Checks the tape of a segment of the canvas 2D stream that came from another process. Returns false with a static
-/// error message, whose address and size it writes, if the tape does not pass.
-#[unsafe(no_mangle)]
-pub extern "C" fn canvas_2d_tape_validate(
-    tape: ak::Span<'_, u8>,
-    error: &mut *const u8,
-    error_size: &mut usize,
-) -> bool {
-    match validate_canvas_2d_tape(tape.as_slice()) {
-        Ok(()) => true,
-        Err(message) => {
-            *error = message.as_ptr();
-            *error_size = message.len();
-            false
-        }
-    }
-}
-
-/// Calls `visit` with the type and the payload of each record of a tape that passed `canvas_2d_tape_validate`, in
-/// order.
-///
-/// # Safety
-/// `visit` runs synchronously and reads the payload only while it runs.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn canvas_2d_tape_for_each_command(
-    tape: ak::Span<'_, u8>,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, DisplayListCommandType, ak::Span<'_, u8>),
-) {
-    for_each_command(tape.as_slice(), |header, _, payload| {
+/// Calls `play` with the type and the payload of each record of a tape that passed `validate_canvas_2d_tape`, in order.
+pub fn for_each_canvas_2d_command<'a>(tape: &'a [u8], mut play: impl FnMut(DisplayListCommandType, &'a [u8])) {
+    for_each_command(tape, |header, _, payload| {
         debug_assert!(header.command_type.is_canvas_2d());
-        // SAFETY: The caller reads the payload synchronously.
-        unsafe { visit(context, header.command_type, ak::Span::new(payload)) };
+        play(header.command_type, payload);
     });
 }
 
@@ -412,9 +384,11 @@ mod tests {
     use super::*;
     use crate::display_list::builder::{HEADER_SIZE, read_command, read_header};
     use crate::display_list::nested_records::span_bytes;
-    use crate::display_list::storage::write_run;
+    use crate::display_list::storage::write_run_with_zeroed_padding;
+    use crate::display_list::validate::validate_canvas_2d_tape;
     use crate::display_list::validate::validate_tape;
     use libgfx_rust::IntRect;
+    use libgfx_rust::filter::Filter;
 
     fn records(tape: &[u8]) -> Vec<(DisplayListCommandType, Vec<u8>)> {
         let mut records = Vec::new();
@@ -437,7 +411,7 @@ mod tests {
         let colors = [Color(0xff00_00ff), Color(0xffff_0000)];
         let positions = [0.0, 1.0];
         let path = [1u8, 2, 3, 4, 5];
-        let filter = [9u8, 8, 7];
+        let filter = Filter::hue_rotate(90.0, None).serialize();
         let mut writer = TapeWriter::default();
         writer.fill_path(
             &path,
@@ -452,7 +426,6 @@ mod tests {
         );
         assert_eq!(validate_canvas_2d_tape(writer.bytes()), Ok(()));
         let header = read_header(writer.bytes());
-        assert!(!header.has_bounding_rect);
         assert_eq!(header.inline_clip_count, 0);
         let records = records(writer.bytes());
         assert_eq!(records.len(), 1);
@@ -490,13 +463,17 @@ mod tests {
         });
         writer.clear_rect(FloatRect::new(0.0, 0.0, 10.0, 10.0), Color(0));
         writer.clip_path(&[4, 4, 4, 4], WindingRule::Nonzero);
-        writer.draw_glyph_run(
-            FontResourceId(7),
+        writer.draw_glyph_runs(
+            &[Canvas2DGlyphRun {
+                font_id: FontResourceId(7),
+                glyph_count: 1,
+            }],
             &[DisplayListGlyph {
                 position: FloatPoint { x: 1.0, y: 0.0 },
                 glyph_id: 42,
             }],
             FloatPoint { x: 10.0, y: 20.0 },
+            1.0,
             &Paint::Color(Color(0xff00_ff00)),
             &Compositing::default(),
         );
@@ -515,13 +492,49 @@ mod tests {
                 DisplayListCommandType::Canvas2DSetTransform,
                 DisplayListCommandType::Canvas2DClearRect,
                 DisplayListCommandType::Canvas2DClipPath,
-                DisplayListCommandType::Canvas2DDrawGlyphRun,
+                DisplayListCommandType::Canvas2DDrawGlyphRuns,
                 DisplayListCommandType::Canvas2DRestore,
                 DisplayListCommandType::Canvas2DReset,
                 DisplayListCommandType::Canvas2DClearCanvas,
             ]
         );
         assert_eq!(writer.bytes().len() % 8, 0);
+    }
+
+    #[test]
+    fn a_filter_that_the_player_cannot_build_is_rejected() {
+        let validate = |filter: &[u8]| {
+            let mut writer = TapeWriter::default();
+            writer.fill_path(
+                &[1],
+                &Paint::Color(Color(0xff00_0000)),
+                WindingRule::Nonzero,
+                &Compositing {
+                    filter: Some(filter),
+                    ..Compositing::default()
+                },
+            );
+            validate_canvas_2d_tape(writer.bytes())
+        };
+        let blur = Filter::blur(2.0, 2.0, None).serialize();
+        assert_eq!(validate(&blur), Ok(()));
+
+        let malformed = Err("Display list command has a malformed filter");
+        assert_eq!(validate(&[]), malformed);
+        assert_eq!(validate(&blur[..blur.len() - 1]), malformed);
+        assert_eq!(validate(&[blur.as_slice(), &[0]].concat()), malformed);
+        assert_eq!(validate(&[0xff]), malformed);
+
+        let image = Filter::Image {
+            frame_id: 1,
+            src_rect: IntRect::new(0, 0, 1, 1),
+            dest_rect: IntRect::new(0, 0, 1, 1).to_float(),
+            scaling_mode: libgfx_rust::ScalingMode::NearestNeighbor,
+        };
+        assert_eq!(
+            validate(&Filter::compose(Filter::blur(2.0, 2.0, None), image).serialize()),
+            Err("Canvas 2D stream command has a filter that draws an image")
+        );
     }
 
     #[test]
@@ -581,7 +594,7 @@ mod tests {
         let mut writer = TapeWriter::default();
         writer.save();
         let mut run_bytes = vec![0u8; size_of::<DisplayListCommandRun>()];
-        write_run(
+        write_run_with_zeroed_padding(
             &DisplayListCommandRun {
                 offset: 0,
                 size: u32::try_from(writer.bytes().len()).unwrap(),
@@ -640,17 +653,46 @@ mod tests {
     }
 
     #[test]
-    fn a_command_with_a_bounding_rect_is_rejected() {
-        let mut writer = TapeWriter::default();
-        writer.save();
-        writer.clear_rect(FloatRect::new(0.0, 0.0, 1.0, 1.0), Color(0));
-        let mut tape = writer.bytes().to_vec();
-        let second_record = read_header(&tape).payload_size as usize + HEADER_SIZE;
-        tape[second_record + std::mem::offset_of!(DisplayListCommandHeader, has_bounding_rect)] = 1;
-        assert_eq!(
-            validate_canvas_2d_tape(&tape),
-            Err("Canvas 2D stream command has a bounding rect")
-        );
+    fn glyph_runs_that_do_not_split_their_glyphs_exactly_are_rejected() {
+        let glyph = DisplayListGlyph {
+            position: FloatPoint { x: 0.0, y: 0.0 },
+            glyph_id: 1,
+        };
+        let run = |glyph_count| Canvas2DGlyphRun {
+            font_id: FontResourceId(1),
+            glyph_count,
+        };
+        for (runs, scale, expected) in [
+            (vec![run(1), run(1)], 1.0, Ok(())),
+            (vec![run(2), run(0)], 0.5, Ok(())),
+            (vec![run(1)], 1.0, Err("Canvas glyph runs do not cover their glyphs")),
+            (
+                vec![run(2), run(1)],
+                1.0,
+                Err("Canvas glyph runs do not cover their glyphs"),
+            ),
+            (
+                vec![run(u64::MAX), run(3)],
+                1.0,
+                Err("Canvas glyph runs do not cover their glyphs"),
+            ),
+            (
+                vec![run(2)],
+                f32::NAN,
+                Err("Canvas glyph runs have a horizontal scale that is not finite"),
+            ),
+        ] {
+            let mut writer = TapeWriter::default();
+            writer.draw_glyph_runs(
+                &runs,
+                &[glyph, glyph],
+                FloatPoint { x: 0.0, y: 0.0 },
+                scale,
+                &Paint::Color(Color(0xff00_0000)),
+                &Compositing::default(),
+            );
+            assert_eq!(validate_canvas_2d_tape(writer.bytes()), expected);
+        }
     }
 
     #[test]

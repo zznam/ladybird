@@ -28,12 +28,15 @@ CanonicalDocumentState::CanonicalDocumentState(Web::HTML::CrossProcessId id)
 CanonicalDocumentState::~CanonicalDocumentState() = default;
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
-void CanonicalDocumentState::save_the_origin_of_the_populated_document()
+void CanonicalDocumentState::save_the_state_of_the_populated_document()
 {
     // 7. If entry's document state's document is not null, then:
     if (!populated_document.has_value())
         return;
     auto const& document = *populated_document->document;
+
+    // 1. Set entry's document state's ever populated to true.
+    ever_populated = true;
 
     // 2. If saveExtraDocumentState is true:
     // NB: It is false for a document created for inline content in place of the response.
@@ -65,6 +68,7 @@ Web::HTML::SessionHistoryDocumentStateDescriptor CanonicalDocumentState::descrip
         .origin = origin,
         .about_base_url = about_base_url,
         .resource = resource,
+        .navigation_same_site_status = navigation_same_site_status,
         .reload_pending = reload_pending,
         .reload_bypasses_cache = reload_bypasses_cache,
         .ever_populated = ever_populated,
@@ -94,6 +98,7 @@ static NonnullRefPtr<CanonicalDocumentState> document_state_from_descriptor(Web:
     }
     document_state->about_base_url = descriptor.about_base_url;
     document_state->resource = descriptor.resource;
+    document_state->navigation_same_site_status = descriptor.navigation_same_site_status;
     document_state->reload_pending = descriptor.reload_pending;
     document_state->reload_bypasses_cache = descriptor.reload_bypasses_cache;
     document_state->ever_populated = descriptor.ever_populated;
@@ -107,6 +112,12 @@ static NonnullRefPtr<CanonicalDocumentState> document_state_from_descriptor(Web:
         document_state->nested_histories.append(move(canonical_nested_history));
     }
     return document_state;
+}
+
+NonnullRefPtr<CanonicalDocumentState> CanonicalDocumentState::create_from_descriptor(Web::HTML::SessionHistoryDocumentStateDescriptor const& descriptor)
+{
+    CanonicalSessionHistoryEntry::DocumentStates document_states;
+    return document_state_from_descriptor(descriptor, document_states, CanonicalSessionHistoryEntry::UpdateDocumentState::Yes);
 }
 
 static void set_entry_fields_from_descriptor(CanonicalSessionHistoryEntry& entry, Web::HTML::SessionHistoryEntryDescriptor const& descriptor)

@@ -137,7 +137,11 @@ public:
     bool autocorrect() const;
     void set_autocorrect(bool);
 
-    bool fire_a_synthetic_pointer_event(Utf16FlyString const& type, DOM::Element& target, bool not_trusted);
+    enum class NotTrusted {
+        No,
+        Yes,
+    };
+    static bool fire_a_synthetic_pointer_event(Utf16FlyString const& type, DOM::Element& target, NotTrusted not_trusted, u32 modifiers = 0);
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const { return is_form_associated_custom_element(); }
@@ -194,6 +198,11 @@ public:
     // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
     virtual bool uses_button_layout() const { return false; }
 
+    // https://drafts.csswg.org/css-ui/#devolvable
+    // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
+    // When an element uses button layout, it is a devolvable widget [...]
+    virtual bool is_devolvable_widget() const { return uses_button_layout(); }
+
     WebIDL::UnsignedLong computed_heading_level() const;
     WebIDL::UnsignedLong computed_heading_offset() const;
 
@@ -210,6 +219,11 @@ protected:
     void set_subtree_inertness(bool is_inert);
 
     [[nodiscard]] Utf16String get_the_text_steps();
+
+    static void set_own_inline_style(DOM::Element&, CSS::CSSStyleProperties const& defaults);
+
+    // Gives the slider track of a progress or meter element the style of the element's appearance.
+    void update_slider_track_style(DOM::Element& slider_track) const;
 
 private:
     struct RareData;

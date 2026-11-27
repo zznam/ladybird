@@ -22,7 +22,6 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Variant.h>
 #include <LibCore/Forward.h>
-#include <LibCore/SharedCircularQueue.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Concepts.h>
 #include <LibIPC/File.h>
@@ -234,13 +233,6 @@ ErrorOr<T> decode(Decoder& decoder)
     return hashmap;
 }
 
-template<Concepts::SharedSingleProducerCircularQueue T>
-ErrorOr<T> decode(Decoder& decoder)
-{
-    auto anon_file = TRY(decoder.decode<IPC::File>());
-    return T::create(anon_file.take_fd());
-}
-
 template<Concepts::Optional T>
 ErrorOr<T> decode(Decoder& decoder)
 {
@@ -278,6 +270,12 @@ ErrorOr<T> decode(Decoder& decoder)
     if (index >= TypeList<T>::size)
         return Error::from_string_literal("IPC decode: Invalid variant index");
     return Detail::decode_variant<T>(decoder, index);
+}
+
+template<Concepts::Encoded T>
+ErrorOr<T> decode(Decoder& decoder)
+{
+    return T::from_bytes(TRY(decoder.decode<ByteBuffer>()));
 }
 
 // This must be last so that it knows about the above specializations.

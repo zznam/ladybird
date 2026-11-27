@@ -84,6 +84,18 @@ ErrorOr<void> FontService::build_catalog()
     Optional<Error> callback_error;
     u64 next_face_id = 1;
 
+    struct CollectedFace {
+        FlyString family;
+        u64 face_id { 0 };
+        u32 ttc_index { 0 };
+        u16 weight { 0 };
+        u16 width { 0 };
+        u8 slope { 0 };
+        Gfx::FontFileFormat format { Gfx::FontFileFormat::OpenType };
+        bool is_symbol_font { false };
+    };
+    Vector<CollectedFace> collected_faces;
+
     auto directories = TRY(Gfx::FontDatabase::font_directories());
     directories.extend(m_additional_font_directories);
     for (auto const& directory : directories) {
@@ -114,19 +126,16 @@ ErrorOr<void> FontService::build_catalog()
                 }
                 m_local_font_names.set(folded_name.release_value(), face_id, AK::HashSetExistingEntryBehavior::Keep);
             }
-            auto result = builder->add_face({
-                .family = typeface->family().bytes_as_string_view(),
+            collected_faces.append({
+                .family = typeface->family(),
                 .face_id = face_id,
                 .ttc_index = ttc_index,
                 .weight = typeface->weight(),
                 .width = typeface->width(),
                 .slope = typeface->slope(),
                 .format = format,
+                .is_symbol_font = typeface->description().is_symbol_font(),
             });
-            if (result.is_error()) {
-                callback_error = result.release_error();
-                return;
-            }
             FontSource source { .path = path, .ttc_index = ttc_index, .format = format };
             m_face_id_by_source.set(source, face_id);
             m_font_sources.set(face_id, move(source));
@@ -134,6 +143,24 @@ ErrorOr<void> FontService::build_catalog()
         Gfx::PathFontProvider::for_each_typeface_in_uri(uri, loaded_paths, move(collect_typeface));
         if (callback_error.has_value())
             return callback_error.release_value();
+    }
+
+    // The catalog matches the faces of a family in the order they're added. So, the faces of symbol fonts go last, and a
+    // face of ornaments in a family of text is never matched in place of the text face of the same style.
+    for (auto symbol_fonts : { false, true }) {
+        for (auto const& face : collected_faces) {
+            if (face.is_symbol_font != symbol_fonts)
+                continue;
+            TRY(builder->add_face({
+                .family = face.family.bytes_as_string_view(),
+                .face_id = face.face_id,
+                .ttc_index = face.ttc_index,
+                .weight = face.weight,
+                .width = face.width,
+                .slope = face.slope,
+                .format = face.format,
+            }));
+        }
     }
 
     auto serialized = TRY(builder->serialize());
@@ -163,7 +190,7 @@ ErrorOr<IPC::File> FontService::create_immutable_font_data(ReadonlyBytes bytes)
         return Error::from_errno(errno);
     return file;
 #elif defined(AK_OS_WINDOWS)
-    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(bytes.size(), Core::AnonymousBuffer::Sealability::Sealable));
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(bytes.size()));
     bytes.copy_to({ buffer.data<u8>(), buffer.size() });
     return IPC::File::clone_fd(buffer.fd());
 #else
@@ -241,6 +268,8 @@ Gfx::BrokeredFont FontService::materialize_file(Gfx::SystemFontFile file, String
 {
     // Every code point that a fallback font covers matches it under a key of its own, but the face is one face for all
     // of them. A face of the catalog keeps its catalog id.
+    // NB: A match names the face, which the renderer opens only where it does not hold it yet: most matches are of
+    //     faces it matched before, for another code point or style.
     FontSource source { .path = move(file.path), .ttc_index = file.ttc_index, .format = file.format };
     auto face_id = m_face_id_by_source.ensure(source, [&] {
         auto new_face_id = m_next_dynamic_face_id++;
@@ -248,7 +277,7 @@ Gfx::BrokeredFont FontService::materialize_file(Gfx::SystemFontFile file, String
         return new_face_id;
     });
     m_dynamic_match_cache.set(move(cache_key), face_id);
-    return open_font_without_lock(m_generation, face_id);
+    return { .face_id = face_id, .source = Empty {} };
 }
 
 Gfx::BrokeredFont FontService::materialize_platform_font(Gfx::PlatformFontName name, String cache_key)
@@ -259,7 +288,7 @@ Gfx::BrokeredFont FontService::materialize_platform_font(Gfx::PlatformFontName n
         return new_face_id;
     });
     m_dynamic_match_cache.set(move(cache_key), face_id);
-    return open_font_without_lock(m_generation, face_id);
+    return { .face_id = face_id, .source = Empty {} };
 }
 
 Gfx::BrokeredFont FontService::match_local_font(String const& name)
@@ -275,7 +304,7 @@ Gfx::BrokeredFont FontService::match_local_font(String const& name)
         return {};
     // https://drafts.csswg.org/css-fonts-4/#local-font-fallback
     // Platform substitutions for a given font name must not be used.
-    return open_font_without_lock(m_generation, *face_id);
+    return { .face_id = *face_id, .source = Empty {} };
 }
 
 Gfx::BrokeredFont FontService::match_font(String const& family, u16 weight, u16 width, u8 slope)
@@ -285,7 +314,7 @@ Gfx::BrokeredFont FontService::match_font(String const& family, u16 weight, u16 
         return {};
     auto cache_key = MUST(String::formatted("family:{}:{}:{}:{}", family, weight, width, slope));
     if (auto face_id = m_dynamic_match_cache.get(cache_key); face_id.has_value())
-        return open_font_without_lock(m_generation, *face_id);
+        return { .face_id = *face_id, .source = Empty {} };
 
     auto match = Gfx::SystemFontMatcher::match_family_style(family, weight, width, slope);
     if (!match.has_value())
@@ -300,7 +329,7 @@ Gfx::BrokeredFont FontService::match_font_for_code_point(u32 code_point, u16 wei
         return {};
     auto cache_key = MUST(String::formatted("character:{}:{}:{}:{}:{}", code_point, weight, width, slope, prefer_color_emoji));
     if (auto face_id = m_dynamic_match_cache.get(cache_key); face_id.has_value())
-        return open_font_without_lock(m_generation, *face_id);
+        return { .face_id = *face_id, .source = Empty {} };
 
     auto match = Gfx::SystemFontMatcher::match_code_point(code_point, weight, width, slope, prefer_color_emoji);
     if (!match.has_value())

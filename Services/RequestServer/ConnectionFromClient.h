@@ -59,6 +59,8 @@ public:
     struct RequestTransferLease {
         NonnullRefPtr<ConnectionFromClient> owner;
         u64 request_id { 0 };
+        // The bound client that may adopt the request, until it does or disconnects.
+        Optional<int> adopter_client_id {};
     };
 
     using RequestTransferLeaseMap = HashMap<Requests::RequestTransferLeaseKey, RequestTransferLease>;
@@ -75,7 +77,7 @@ public:
     // frame site of nothing stands for documents with opaque origins.
     void bind_to_site(Badge<ControlConnectionFromClient>, Utf16String const& top_level_site, Optional<Utf16String> const& frame_site);
 
-    void start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey, ByteString method, URL::URL, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials);
+    void start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey, ByteString method, URL::URL, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials, HTTP::Cookie::SameSiteContext);
     void request_complete(Badge<Request>, Request const&);
     void fetch_aia_intermediate(Badge<Request>, ByteString const& url, u64 for_request_id);
 
@@ -86,18 +88,16 @@ private:
 
     virtual Messages::RequestServer::IsSupportedProtocolResponse is_supported_protocol(ByteString) override;
     virtual Messages::RequestServer::GetClientIdResponse get_client_id() override;
-    virtual void start_request(u64 request_id, ByteString, URL::URL, Vector<HTTP::Header>, ByteBuffer, HTTP::CacheMode, Optional<HTTP::NetworkIsolationKey>, HTTP::Cookie::IncludeCredentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id) override;
-    virtual void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease) override;
+    virtual void start_request(u64 request_id, ByteString, URL::URL, Vector<HTTP::Header>, ByteBuffer, HTTP::CacheMode, Optional<HTTP::NetworkIsolationKey>, HTTP::Cookie::IncludeCredentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, u64 originating_page_id, HTTP::Cookie::SameSiteContext) override;
+    virtual void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease, Optional<int> owner_client_id) override;
     virtual void release_request_transfer_lease(int source_client_id, u64 source_request_id) override;
     virtual Messages::RequestServer::StopRequestResponse stop_request(u64 request_id) override;
     virtual Messages::RequestServer::ExportRequestResponse export_request(u64 request_id) override;
     virtual void import_request(u64 request_id, Requests::ExportedRequest, bool create_transfer_lease) override;
     virtual void ensure_connection(u64 request_id, URL::URL url, ::RequestServer::CacheLevel cache_level) override;
+    virtual void resolve_host(u64 lookup_id, ByteString host) override;
 
-    virtual Messages::RequestServer::StoreCacheAssociatedDataResponse store_cache_associated_data(Optional<HTTP::NetworkIsolationKey>, URL::URL, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData, Core::AnonymousBuffer) override;
-    virtual Messages::RequestServer::RetrieveCacheAssociatedDataResponse retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey>, URL::URL, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData) override;
-
-    virtual void websocket_connect(u64 websocket_id, URL::URL, Optional<HTTP::NetworkIsolationKey>, ByteString, Vector<ByteString>, Vector<ByteString>, Vector<HTTP::Header>) override;
+    virtual void websocket_connect(u64 websocket_id, URL::URL, Optional<HTTP::NetworkIsolationKey>, ByteString, Vector<ByteString>, Vector<ByteString>, Vector<HTTP::Header>, u64 originating_page_id, HTTP::Cookie::SameSiteContext) override;
     virtual void websocket_send(u64 websocket_id, bool, ByteBuffer) override;
     virtual void websocket_send_shared(u64 websocket_id, bool, Core::AnonymousBuffer) override;
     virtual void websocket_close(u64 websocket_id, u16, ByteString) override;
@@ -111,8 +111,9 @@ private:
     void fail_websocket(u64 websocket_id, Requests::WebSocket::Error);
     size_t websocket_count() const;
     size_t total_websocket_count() const;
-    void connect_websocket(u64 websocket_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> request_headers);
-    void open_websocket(u64 websocket_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy>, RefPtr<DNS::LookupResult const>);
+    void connect_websocket(u64 websocket_id, u64 originating_page_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> request_headers);
+    void look_up_websocket_host(u64 websocket_id, u64 originating_page_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy>);
+    void open_websocket(u64 websocket_id, u64 originating_page_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy>, RefPtr<DNS::LookupResult const>);
 
     IsPrivate m_is_private { IsPrivate::No };
 
@@ -135,10 +136,20 @@ private:
     RequestTransferLeaseMap& m_request_transfer_leases;
     Optional<HTTP::DiskCache&> m_disk_cache;
 
-    void* m_curl_multi { nullptr };
+    struct CurlMulti {
+        ConnectionFromClient* client { nullptr };
+        void* handle { nullptr };
+        RefPtr<Core::Timer> timer;
+        Optional<MonotonicTime> timer_due_at;
+    };
+    void set_up_curl_multi(CurlMulti&);
+
+    CurlMulti m_fetch_curl;
+    CurlMulti m_websocket_curl;
 
     HashMap<u64, NonnullOwnPtr<Request>> m_active_requests;
     HashMap<u64, NonnullOwnPtr<Request>> m_active_revalidation_requests;
+    void look_up_aia_host(ByteString const& url, ByteString const& fetch_url, ByteString const& host, u16 port, Optional<HTTP::Proxy>);
     void start_aia_fetch(ByteString const& url, ByteString const& fetch_url, Optional<HTTP::Proxy>, Optional<ByteString> resolve_entry);
     void abandon_aia_lookup(ByteString const& url);
 
@@ -155,8 +166,6 @@ private:
     HashMap<u64, WebSocketCookieRequest> m_websocket_cookie_requests;
     HashMap<u64, RefPtr<WebSocket::WebSocket>> m_websockets;
 
-    RefPtr<Core::Timer> m_timer;
-    Optional<MonotonicTime> m_curl_timer_due_at;
     HashMap<int, NonnullRefPtr<Core::Notifier>> m_read_notifiers;
     HashMap<int, NonnullRefPtr<Core::Notifier>> m_write_notifiers;
 

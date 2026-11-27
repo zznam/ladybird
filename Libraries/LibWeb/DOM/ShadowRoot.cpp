@@ -6,6 +6,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Iterator.h>
+#include <LibWeb/Bindings/Sanitizer.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/CSS/StyleSheetState.h>
@@ -19,6 +20,7 @@
 #include <LibWeb/DOM/Utils.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
+#include <LibWeb/HTML/HTMLInsertion.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -83,9 +85,6 @@ void ShadowRoot::set_style_node_id(CSS::StyleNodeID style_node_id)
     // the node that held it before left behind.
     if (auto* arena = document().layout_node_arena_if_created(); arena && style_node_id != 0)
         Layout::RustFFI::render_state_clear_layout_tree_update_marks(arena->host(), style_node_id.value());
-    // The style engine keeps the mark of the children that explicitly inherit by identity too.
-    if (style_node_id != 0)
-        publish_children_explicitly_inherit_mark();
 }
 
 // https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
@@ -162,7 +161,7 @@ WebIDL::ExceptionOr<Utf16String> ShadowRoot::inner_html() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html)
+WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
 {
     // 2. Let context be this's host.
     auto context = this->host();
@@ -172,18 +171,10 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html)
     // Keep the shadow root as the fragment parsing target so custom element
     // creation uses this shadow tree's registry. The host is still used as
     // the parser context by the fragment parsing algorithm.
-    auto fragment = TRY(Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, html));
+    auto fragment = TRY(Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, html, HTML::ParserScriptingMode::Inert, HTML::FragmentFastPath::Allow, trusted_options));
 
     // 4. Replace all with fragment within this.
     this->replace_all(fragment);
-
-    // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
-    if (!is<HTML::HTMLTemplateElement>(*this)) {
-        if (this->is_connected()) {
-            // NOTE: Since the DOM has changed, we have to rebuild this shadow root's layout subtree.
-            this->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML);
-        }
-    }
 
     return {};
 }
@@ -200,19 +191,42 @@ WebIDL::ExceptionOr<Utf16String> ShadowRoot::get_html(HTMLSerializationOptions c
         options.shadow_roots);
 }
 
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-sethtmlunsafe
-WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(StringView html)
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-sethtml
+WebIDL::ExceptionOr<void> ShadowRoot::set_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
 {
-    // 2. Unsafely set HTML given this, this's shadow host, and compliantHTML.
-    auto markup = Utf16String::from_utf8(html);
-    TRY(unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, markup.utf16_view()));
+    // ShadowRoot's setHTML(html, options) method steps are to filter and set HTML given this, html, options, and Safe.
+    return HTML::filter_and_set_html(GC::Ref<DocumentFragment> { *this }, html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
+}
 
-    return {};
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-appendhtml
+WebIDL::ExceptionOr<void> ShadowRoot::append_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
+{
+    // ShadowRoot's appendHTML(html, options) method steps are to filter and pre-insert HTML given this, null, html,
+    // options, and Safe.
+    return HTML::filter_and_pre_insert_html(GC::Ref<DocumentFragment> { *this }, nullptr, html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-prependhtml
+WebIDL::ExceptionOr<void> ShadowRoot::prepend_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
+{
+    // ShadowRoot's prependHTML(html, options) method steps are to filter and pre-insert HTML given this, this's first
+    // child, html, options, and Safe.
+    return HTML::filter_and_pre_insert_html(GC::Ref<DocumentFragment> { *this }, first_child(), html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
 }
 
 GC::Ptr<Element> ShadowRoot::active_element()
 {
     return calculate_active_element(*this);
+}
+
+Element const* ShadowRoot::element_from_point(double x, double y)
+{
+    return calculate_element_from_point(*this, x, y);
+}
+
+GC::RootVector<GC::Ref<Element>> ShadowRoot::elements_from_point(double x, double y)
+{
+    return calculate_elements_from_point(*this, x, y);
 }
 
 CSS::StyleSheetList& ShadowRoot::style_sheets()
@@ -282,12 +296,6 @@ void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetSt
                 callback(style_sheet);
         });
     }
-}
-
-WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> ShadowRoot::get_animations()
-{
-    document().update_style();
-    return calculate_get_animations(*this);
 }
 
 ElementByIdMap& ShadowRoot::element_by_id() const
@@ -412,30 +420,57 @@ WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> inner_html(DOM::ShadowRoo
 
 WebIDL::ExceptionOr<void> set_inner_html(DOM::ShadowRoot& shadow_root, TrustedTypes::TrustedHTMLOrString const& value)
 {
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(shadow_root),
-        value,
-        TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
-        "script"_utf16));
+    // 1. Let (compliantString, compliantOptions) be the result of invoking the get trusted type compliant input
+    //    algorithm with this's relevant global object, the given value, a new SetHTMLUnsafeOptions dictionary,
+    //    "ShadowRoot innerHTML", this's node document's type, and false.
+    auto const [compliant_string, trusted_options] = TRY(HTML::get_trusted_type_compliant_input_for_legacy_sink(shadow_root, value, TrustedTypes::InjectionSink::ShadowRoot_innerHTML));
 
-    return shadow_root.set_inner_html(compliant_string);
+    return shadow_root.set_inner_html(compliant_string, trusted_options);
 }
 
-WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html)
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-sethtmlunsafe
+WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
 {
-    // 1. Let compliantHTML be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
-    auto const compliant_html = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "ShadowRoot setHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
         HTML::relevant_global_object(shadow_root),
         html,
-        TrustedTypes::InjectionSink::ShadowRoot_setHTMLUnsafe,
-        "script"_utf16));
+        options,
+        TrustedTypes::InjectionSink::ShadowRoot_setHTMLUnsafe));
 
-    return shadow_root.set_html_unsafe(compliant_html.to_utf8_but_should_be_ported_to_utf16());
+    // 2. Filter and set HTML given this, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_set_html(GC::Ref<DOM::DocumentFragment> { shadow_root }, compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-appendhtmlunsafe
+WebIDL::ExceptionOr<void> append_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
+{
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "ShadowRoot appendHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
+        HTML::relevant_global_object(shadow_root),
+        html,
+        options,
+        TrustedTypes::InjectionSink::ShadowRoot_appendHTMLUnsafe));
+
+    // 2. Filter and pre-insert HTML given this, null, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_pre_insert_html(GC::Ref<DOM::DocumentFragment> { shadow_root }, nullptr, compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-prependhtmlunsafe
+WebIDL::ExceptionOr<void> prepend_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
+{
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "ShadowRoot prependHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
+        HTML::relevant_global_object(shadow_root),
+        html,
+        options,
+        TrustedTypes::InjectionSink::ShadowRoot_prependHTMLUnsafe));
+
+    // 2. Filter and pre-insert HTML given this, this's first child, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_pre_insert_html(GC::Ref<DOM::DocumentFragment> { shadow_root }, shadow_root.first_child(), compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
 }
 
 GC::Ref<CSS::StyleSheetList> style_sheets(DOM::ShadowRoot& shadow_root)

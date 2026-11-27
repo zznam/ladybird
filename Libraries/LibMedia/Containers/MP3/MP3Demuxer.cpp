@@ -15,34 +15,28 @@ namespace {
 
 class FrameScanSource final : public Media::FrameScanSource {
 public:
-    virtual Optional<Frame> next_frame(MediaStreamCursor& cursor, size_t position) const override
+    virtual DecoderErrorOr<Optional<Frame>> next_frame(MediaStreamCursor& cursor, size_t position) const override
     {
         FrameIterator iterator { NonnullRefPtr { cursor }, position, FrameIterator::Resynchronize::Yes };
-        auto frame = iterator.next();
-        if (frame.is_error() || !frame.value().has_value())
-            return {};
+        auto frame = TRY(absorb_data_errors(iterator.next()));
+        if (!frame.has_value())
+            return Optional<Frame> {};
 
         return Frame {
-            .position = frame.value()->position,
-            .byte_size = frame.value()->header.frame_byte_size,
-            .duration = { frame.value()->header.sample_count, frame.value()->header.sample_rate },
+            .position = frame->position,
+            .byte_size = frame->header.frame_byte_size,
+            .duration = { frame->header.sample_count, frame->header.sample_rate },
         };
     }
 
-    virtual Optional<size_t> find_boundary_at_or_after(MediaStreamCursor& cursor, size_t start_byte, size_t upper_bound) const override
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_after(MediaStreamCursor& cursor, size_t start_byte, size_t upper_bound) const override
     {
-        auto boundary = Reader::find_frame_boundary_at_or_after(NonnullRefPtr { cursor }, start_byte, upper_bound);
-        if (boundary.is_error())
-            return {};
-        return boundary.release_value();
+        return absorb_data_errors(Reader::find_frame_boundary_at_or_after(NonnullRefPtr { cursor }, start_byte, upper_bound));
     }
 
-    virtual Optional<size_t> find_boundary_at_or_before(MediaStreamCursor& cursor, size_t target_byte, size_t lower_bound, size_t upper_bound) const override
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_before(MediaStreamCursor& cursor, size_t target_byte, size_t lower_bound, size_t upper_bound) const override
     {
-        auto boundary = Reader::find_frame_boundary_at_or_before(NonnullRefPtr { cursor }, target_byte, lower_bound, upper_bound);
-        if (boundary.is_error())
-            return {};
-        return boundary.release_value();
+        return absorb_data_errors(Reader::find_frame_boundary_at_or_before(NonnullRefPtr { cursor }, target_byte, lower_bound, upper_bound));
     }
 };
 
@@ -83,10 +77,8 @@ MP3Demuxer::MP3Demuxer(NonnullRefPtr<MediaStream> const& stream, Reader reader, 
     , m_reader(reader)
     , m_track(move(track))
     , m_seek_scanning_cursor(stream->create_cursor())
-    , m_seek_cursor(stream->create_cursor())
 {
     m_seek_scanning_cursor->set_is_blocking(false);
-    m_seek_cursor->set_is_blocking(true);
 }
 
 MP3Demuxer::~MP3Demuxer()
@@ -188,16 +180,12 @@ DecoderErrorOr<DemuxerSeekResult> MP3Demuxer::seek_to_most_recent_keyframe(Track
     VERIFY(track == m_track);
     auto& status = track_status();
 
+    auto seeked = TRY(m_buffered_scan_thread->payload().timeline->seek_to_timestamp(m_seek_scanning_cursor, NonnullRefPtr { status.iterator.cursor() }, *m_stream, timestamp));
     if (has_flag(options, DemuxerSeekOptions::NeedCodecConfiguration))
         status.needs_codec_configuration = true;
 
-    auto seek_result = TRY(m_buffered_scan_thread->payload().timeline->seek_to_timestamp(m_seek_scanning_cursor, m_seek_cursor, *m_stream, timestamp));
-    auto const* seeked = seek_result.get_pointer<SeekedPosition>();
-    if (seeked == nullptr)
-        return DemuxerSeekResult::KeptCurrentPosition;
-
-    status.iterator = FrameIterator { NonnullRefPtr { status.iterator.cursor() }, static_cast<size_t>(seeked->byte_position), FrameIterator::Resynchronize::Yes };
-    status.next_timestamp = seeked->timestamp;
+    status.iterator = FrameIterator { NonnullRefPtr { status.iterator.cursor() }, static_cast<size_t>(seeked.byte_position), FrameIterator::Resynchronize::Yes };
+    status.next_timestamp = seeked.timestamp;
     return DemuxerSeekResult::MovedPosition;
 }
 

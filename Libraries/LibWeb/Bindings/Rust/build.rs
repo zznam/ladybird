@@ -10,9 +10,9 @@
 //! clippy do, leaves the bindings out and compiles the implementations without them. rustc tracks the file itself, as
 //! the crate includes it.
 //!
-//! Also generates what the WebGL implementation shares with the rest of the tree: the vocabulary of the command
-//! stream, the methods of its recorder and the GL constants. Those do not need the bindings, so every build of the
-//! crate has them.
+//! Also generates what the WebGL implementation needs from the rest of the tree: the methods of its recorder, from the
+//! model of the command stream that libcompositing_rust has, and the GL constants. Those do not need the bindings, so
+//! every build of the crate has them.
 
 use std::env;
 use std::fs;
@@ -24,10 +24,8 @@ mod webgl_constants;
 #[path = "generate/webgl_proxy.rs"]
 mod webgl_proxy;
 
-#[path = "generate/webgl_wire.rs"]
-mod webgl_wire;
-
-#[path = "generate/webgl_wire_model.rs"]
+#[allow(dead_code, reason = "the model is for the generators of the other crates as well")]
+#[path = "../../../LibCompositing/Rust/generate/webgl_wire_model.rs"]
 mod webgl_wire_model;
 
 fn read_tracked(path: &Path) -> String {
@@ -36,18 +34,17 @@ fn read_tracked(path: &Path) -> String {
 }
 
 fn generate_webgl_command_recording(libraries: &Path, out_dir: &Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        libraries.join("LibCompositing/Rust/generate").display()
+    );
     let functions_path = libraries.join("LibCompositing/WebGL/GLFunctions.json");
-    let generate = |json: &str| -> Result<(String, String), String> {
+    let generate = |json: &str| -> Result<String, String> {
         let functions = webgl_wire_model::parse_functions(json)?;
-        let vocabulary = webgl_wire_model::vocabulary(&functions)?;
-        Ok((
-            webgl_wire::write_wire_vocabulary(&vocabulary),
-            webgl_proxy::write_proxy(&functions)?,
-        ))
+        webgl_proxy::write_proxy(&functions)
     };
-    let (wire_vocabulary, proxy) = generate(&read_tracked(&functions_path))
+    let proxy = generate(&read_tracked(&functions_path))
         .unwrap_or_else(|error| panic!("{}: {error}", functions_path.display()));
-    fs::write(out_dir.join("webgl_wire.rs"), wire_vocabulary).expect("write webgl_wire.rs");
     fs::write(out_dir.join("webgl_proxy.rs"), proxy).expect("write webgl_proxy.rs");
 }
 
@@ -93,6 +90,7 @@ fn main() {
         .expect("the crate is in Libraries/LibWeb/Bindings/Rust");
     generate_webgl_command_recording(libraries, &out_dir);
     generate_webgl_constants(libraries, &out_dir);
+    generate_css_numeric_factories(libraries, &out_dir);
 
     println!("cargo:rustc-check-cfg=cfg(web_idl_bindings)");
     println!("cargo:rerun-if-env-changed=LIBWEB_RUST_BINDINGS");
@@ -108,4 +106,29 @@ fn main() {
     );
     println!("cargo:rustc-cfg=web_idl_bindings");
     println!("cargo:rustc-env=LIBWEB_RUST_BINDINGS={}", bindings.display());
+}
+
+/// The functions of the CSS namespace that make a CSSUnitValue of a unit, one for each unit of CSS/Units.json,
+/// https://drafts.css-houdini.org/css-typed-om-1/#numeric-factory
+fn generate_css_numeric_factories(libraries: &Path, out_dir: &Path) {
+    let units_path = libraries.join("LibWeb/CSS/Units.json");
+    println!("cargo:rerun-if-changed={}", units_path.display());
+    let units = fs::read_to_string(&units_path).expect("CSS/Units.json is readable");
+    let dimensions: serde_json::Value = serde_json::from_str(&units).expect("CSS/Units.json is JSON");
+
+    let mut names = vec!["number".to_string(), "percent".to_string()];
+    for units in dimensions.as_object().expect("CSS/Units.json is an object").values() {
+        names.extend(units.as_object().expect("a dimension is an object").keys().cloned());
+    }
+
+    let mut output = String::from("impl CSS {\n");
+    for name in names {
+        let function = name.to_lowercase();
+        let identifier = if function == "in" { "r#in".to_string() } else { function };
+        output.push_str(&format!(
+            "    pub(crate) fn {identifier}(cx: &mut CallContext, value: f64) -> WebIdlResult<Ref<CSSUnitValue>> {{\n        Self::numeric_factory(cx, value, \"{name}\")\n    }}\n\n"
+        ));
+    }
+    output.push_str("}\n");
+    fs::write(out_dir.join("css_numeric_factories.rs"), output).expect("the output directory is writable");
 }

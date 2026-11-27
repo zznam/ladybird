@@ -12,11 +12,12 @@
 
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_enums::{overflow, overscroll_behavior};
-use crate::css::style::StyleEngine;
+use crate::css::style::RetainedState;
 use crate::css::style::bridge::{element_adjustment_fact, element_construction_fact};
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
+use crate::painting::record::change_ticks::RowPaintChange;
 
 /// What the propagation reads of the document element and its first HTML body child element.
 #[derive(Clone, Copy)]
@@ -45,19 +46,25 @@ pub(crate) struct ViewportPropagationFacts {
 }
 
 /// The published style record the style engine holds for an element.
-fn published_style(engine: &StyleEngine, node: StyleNodeID) -> Option<ComputedValuesView<'_>> {
-    engine
-        .element_published_style_payloads(node)
-        .map(ComputedValuesView::new)
+fn published_style(engine: &RetainedState, node: StyleNodeID) -> Option<ComputedValuesView<'_>> {
+    engine.element_published_style(node)
 }
 
 fn has_any_containment(style: ComputedValuesView<'_>) -> bool {
     let values = style.box_values();
+    // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
+    // Applies style containment and size containment to the principal box, and establishes an independent formatting
+    // context.
+    // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-inline-size
+    // Applies style containment and inline-size containment to the principal box, and establishes an independent
+    // formatting context.
     values.size_containment
         || values.inline_size_containment
         || values.layout_containment
         || values.style_containment
         || values.paint_containment
+        || values.is_size_container
+        || values.is_inline_size_container
 }
 
 /// The document element, which is the first DOM child of the style node the viewport box was
@@ -67,11 +74,23 @@ fn document_element(arena: &LayoutNodeArena) -> Option<StyleNodeID> {
 }
 
 /// The first child of the document element that is an HTML body element.
-fn first_html_body_child(engine: &StyleEngine, root_element: StyleNodeID) -> Option<StyleNodeID> {
+fn first_html_body_child(engine: &RetainedState, root_element: StyleNodeID) -> Option<StyleNodeID> {
     engine
-        .tree()
         .dom_children(root_element)
         .find(|&child| engine.element_adjustment_facts(child) & element_adjustment_fact::IS_HTML_BODY_ELEMENT != 0)
+}
+
+pub(crate) fn element_is_viewport_propagation_source(arena: &LayoutNodeArena, element: StyleNodeID) -> bool {
+    let Some(root_element) = document_element(arena) else {
+        return false;
+    };
+    root_element == element
+        || arena.with_style_store(|engine| {
+            engine.element_adjustment_facts(element) & element_adjustment_fact::IS_HTML_BODY_ELEMENT != 0
+                && engine.element_construction_facts(root_element) & element_construction_fact::IS_HTML_HTML_ELEMENT
+                    != 0
+                && first_html_body_child(engine, root_element) == Some(element)
+        })
 }
 
 /// The inputs of the propagation: the document element and its first HTML body child element, as
@@ -111,8 +130,8 @@ pub(crate) fn viewport_propagation_facts(arena: &LayoutNodeArena) -> ViewportPro
             engine.element_construction_facts(root_element) & element_construction_fact::IS_HTML_HTML_ELEMENT != 0;
         facts.root_overflow_x = root_style.overflow_x();
         facts.root_overflow_y = root_style.overflow_y();
-        facts.root_overscroll_behavior_x = root_style.misc_reset().overscroll_behavior_x;
-        facts.root_overscroll_behavior_y = root_style.misc_reset().overscroll_behavior_y;
+        facts.root_overscroll_behavior_x = root_style.misc_interaction().overscroll_behavior_x;
+        facts.root_overscroll_behavior_y = root_style.misc_interaction().overscroll_behavior_y;
         facts.root_writing_mode = root_style.writing_mode();
         facts.root_direction = root_style.direction();
         facts.root_has_containment = has_any_containment(root_style);
@@ -153,7 +172,6 @@ pub(crate) fn root_background_source(arena: &LayoutNodeArena) -> crate::painting
             element_adjustment_fact::IS_HTML_BODY_ELEMENT | element_adjustment_fact::IS_HTML_FRAMESET_ELEMENT;
         if root_is_html_html_element
             && let Some(body) = engine
-                .tree()
                 .dom_children(root_element)
                 .find(|&child| engine.element_adjustment_facts(child) & body_or_frameset != 0)
         {
@@ -183,7 +201,7 @@ pub(crate) fn root_background_source(arena: &LayoutNodeArena) -> crate::painting
         }
         source.use_body_background_properties =
             !crate::painting::style_queries::background_layers_have_image(root_style)
-                && root_style.background().background_color == 0;
+                && root_style.background_color() == 0;
     });
     source
 }
@@ -303,49 +321,55 @@ pub(crate) fn decide_viewport_propagation(facts: &ViewportPropagationFacts) -> O
 /// layout pass's style borrows.
 pub(crate) fn propagate_root_styles_to_viewport(
     host_calls: crate::layout::tree_mutation::HostCalls<'_>,
-    arena: &LayoutNodeArena,
+    arena: &mut LayoutNodeArena,
     viewport: NodeSlotId,
     facts: &ViewportPropagationFacts,
 ) {
     assert!(!viewport.is_invalid());
-    let apply_overflow = |node: NodeSlotId, (x, y): (u8, u8)| {
-        arena.update_layout_style(host_calls, node, |style| style.set_overflow(x, y));
+    let apply_overflow = |arena: &mut LayoutNodeArena, node: NodeSlotId, (x, y): (u8, u8)| {
+        let (x, y) = if node == viewport && arena.suppresses_viewport_scrolling {
+            (overflow::HIDDEN, overflow::HIDDEN)
+        } else {
+            (x, y)
+        };
+        arena.update_layout_style(host_calls, node, |style, _| style.set_overflow(x, y));
     };
-    let apply_writing_mode_and_direction = |node: NodeSlotId, writing_mode: u8, direction: u8| {
-        arena.update_layout_style(host_calls, node, |style| {
-            style.set_writing_mode_and_direction(writing_mode, direction);
-        });
-    };
-    let apply_viewport_overscroll_behavior = |(x, y): (u8, u8)| {
+    let apply_writing_mode_and_direction =
+        |arena: &mut LayoutNodeArena, node: NodeSlotId, writing_mode: u8, direction: u8| {
+            arena.update_layout_style(host_calls, node, |style, _| {
+                style.set_writing_mode_and_direction(writing_mode, direction);
+            });
+        };
+    let apply_viewport_overscroll_behavior = |arena: &mut LayoutNodeArena, (x, y): (u8, u8)| {
         let mut changed = false;
-        arena.update_layout_style(host_calls, viewport, |style| {
+        arena.update_layout_style(host_calls, viewport, |style, _| {
             style.set_overscroll_behavior(x, y);
             changed = !style.is_unchanged();
         });
         // The viewport's scroll node records what the viewport does at its boundary, and a new style for the
         // viewport box does not get it recorded again by itself.
         if changed {
-            arena.push_paint_damage(viewport, crate::painting::record::damage::PaintDamage::SCROLL_METADATA);
+            arena.note_paint_change(viewport, RowPaintChange::SCROLL_METADATA);
         }
     };
 
     let Some(styles) = decide_viewport_propagation(facts) else {
-        apply_overflow(viewport, (overflow::AUTO, overflow::AUTO));
-        apply_viewport_overscroll_behavior((overscroll_behavior::AUTO, overscroll_behavior::AUTO));
+        apply_overflow(arena, viewport, (overflow::AUTO, overflow::AUTO));
+        apply_viewport_overscroll_behavior(arena, (overscroll_behavior::AUTO, overscroll_behavior::AUTO));
         return;
     };
     let root = facts.root_layout_node;
-    apply_writing_mode_and_direction(root, styles.writing_mode, styles.direction);
+    apply_writing_mode_and_direction(arena, root, styles.writing_mode, styles.direction);
     // https://drafts.csswg.org/css-writing-modes-4/#icb
     // The principal writing mode is propagated to the initial containing block and to the
     // viewport, thereby affecting the layout of the root element and the scrolling direction of
     // the viewport.
-    apply_writing_mode_and_direction(viewport, styles.writing_mode, styles.direction);
-    apply_overflow(viewport, styles.viewport_overflow);
-    apply_viewport_overscroll_behavior(styles.viewport_overscroll_behavior);
-    apply_overflow(root, styles.root_overflow);
+    apply_writing_mode_and_direction(arena, viewport, styles.writing_mode, styles.direction);
+    apply_overflow(arena, viewport, styles.viewport_overflow);
+    apply_viewport_overscroll_behavior(arena, styles.viewport_overscroll_behavior);
+    apply_overflow(arena, root, styles.root_overflow);
     if let Some(body_overflow) = styles.body_overflow {
-        apply_overflow(facts.body_layout_node, body_overflow);
+        apply_overflow(arena, facts.body_layout_node, body_overflow);
     }
 }
 

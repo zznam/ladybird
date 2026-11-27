@@ -41,8 +41,8 @@ use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::host_class::{
-    JS_HOST_CLASS_IMMUTABLE_PROTOTYPE, JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE,
-    JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
+    JS_HOST_CLASS_IMMUTABLE_PROTOTYPE, JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS,
+    JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE, JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
     JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH, JS_HOST_CLASS_OBJECT, JS_PD_CONFIGURABLE,
     JS_PD_ENUMERABLE, JS_PD_HAS_CONFIGURABLE, JS_PD_HAS_ENUMERABLE, JS_PD_HAS_VALUE, JS_PD_HAS_WRITABLE, JS_PD_PRESENT,
     JS_PD_WRITABLE, JSHostClass, JSHostObjectHooks, JSObject, JSPropertyDescriptor, JSVM, JSValue, JSValueSink,
@@ -58,6 +58,7 @@ use crate::runtime::object::{
 use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
+use crate::runtime::shape::Shape;
 
 // The class that the class of every host class table of this kind extends. Its own internal methods are ordinary,
 // and no object has it as its class.
@@ -132,13 +133,19 @@ fn host_object_methods(table: &'static JSHostClass) -> ObjectMethods {
     if hooks.own_property_keys.is_some() {
         methods.internal_own_property_keys = own_property_keys_through_hook;
     }
+    if hooks.preserve_identity.is_some() {
+        methods.preserve_identity = Some(preserve_identity_through_hook);
+    }
     if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE) {
-        methods.is_cacheable_for_property_absence = |_| false;
+        methods.is_cacheable_for_property_absence = false;
     } else if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE) {
         methods.is_cacheable_for_absence_of = |_, _, property_key| !property_key.is_number();
     }
     if hooks.is_cacheable_for_inherited_property.is_some() {
         methods.is_cacheable_for_inherited_property = is_cacheable_for_inherited_property_through_hook;
+    }
+    if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS) {
+        methods.is_cacheable_across_realms = |_| false;
     }
     // The fast paths read keys, attributes and values straight from the shape and storage and follow the shape's
     // prototype, so they would bypass these hooks.
@@ -253,7 +260,7 @@ unsafe fn property_descriptor_from_hook(descriptor: &JSPropertyDescriptor) -> Op
     const ATTRIBUTE_FLAGS: u16 = JS_PD_WRITABLE | JS_PD_ENUMERABLE | JS_PD_CONFIGURABLE;
     if descriptor.flags & !ATTRIBUTE_FLAGS == COMPLETE_DATA_DESCRIPTOR_FLAGS {
         return Some(PropertyDescriptor {
-            value: Some(Value(descriptor.value)),
+            value: Some(Value::from_bits(descriptor.value)),
             writable: Some(descriptor.flags & JS_PD_WRITABLE != 0),
             enumerable: Some(descriptor.flags & JS_PD_ENUMERABLE != 0),
             configurable: Some(descriptor.flags & JS_PD_CONFIGURABLE != 0),
@@ -274,6 +281,16 @@ fn define_own_property_through_hook(
     let hook = hooks_of(object)
         .define_own_property
         .expect("the class has a [[DefineOwnProperty]] hook");
+    call_define_own_property_hook(hook, object, key, descriptor, precomputed_get_own_property)
+}
+
+pub(super) fn call_define_own_property_hook(
+    hook: crate::layout::host_class::DefineOwnPropertyHook,
+    object: &Object,
+    key: &PropertyKey,
+    descriptor: &mut PropertyDescriptor,
+    precomputed_get_own_property: Option<&Option<PropertyDescriptor>>,
+) -> ThrowCompletionOr<bool> {
     let mut abi_descriptor = property_descriptor_to_abi(Some(descriptor));
     let abi_precomputed_get_own_property =
         precomputed_get_own_property.map(|precomputed| property_descriptor_to_abi(precomputed.as_ref()));
@@ -384,7 +401,7 @@ fn delete_through_hook(object: &Object, _vm: &Vm, key: &PropertyKey) -> ThrowCom
 unsafe extern "C" fn append_key_to_list(keys: *mut c_void, key: JSValue) {
     // SAFETY: The sink's context is the rooted list of keys of the [[OwnPropertyKeys]] call that made the sink.
     let keys = unsafe { &*keys.cast::<MarkedVec<'_, Value>>() };
-    keys.push(Value(key));
+    keys.push(Value::from_bits(key));
 }
 
 fn own_property_keys_through_hook<'vm>(object: &Object, vm: &'vm Vm) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
@@ -409,6 +426,14 @@ fn is_cacheable_for_inherited_property_through_hook(object: &Object) -> bool {
     unsafe { hook(lend_object_to_hook(object)) }
 }
 
+fn preserve_identity_through_hook(object: &Object) {
+    let hook = hooks_of(object)
+        .preserve_identity
+        .expect("the class has a preserve_identity hook");
+    // SAFETY: The hook takes an object of its class.
+    unsafe { hook(lend_object_to_hook(object)) }
+}
+
 fn error_data_through_hook(object: &Object) -> Option<&ErrorData> {
     let hook = hooks_of(object).error_data.expect("the class has an error_data hook");
     // SAFETY: The hook takes an object of its class, and returns null or error data that lives as long as the object,
@@ -417,8 +442,8 @@ fn error_data_through_hook(object: &Object) -> Option<&ErrorData> {
 }
 
 impl HostObject {
-    /// HostObject::create(): a host object of the class `table` describes, with the realm's empty object shape
-    /// transitioned to `prototype`, holding the embedder's `wrappable` and `host_data` cells.
+    /// HostObject::create(): a host object of the class `table` describes, with `prototype` as its [[Prototype]],
+    /// holding the embedder's `wrappable` and `host_data` cells.
     ///
     /// # Safety
     ///
@@ -433,13 +458,15 @@ impl HostObject {
         host_data: Option<NonNull<c_void>>,
     ) -> Gc<HostObject> {
         let (class, allocator) = runtime_class_and_allocator_of_host_class(vm, table, JS_HOST_CLASS_OBJECT);
-        let base = Object::new_with_realm_and_prototype(
-            vm,
-            class,
-            realm,
-            prototype,
-            MayInterfereWithIndexedPropertyAccess::No,
-        );
+        let base = if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS) {
+            let shape = Shape::create(vm, realm);
+            if let Some(prototype) = prototype {
+                shape.set_prototype_without_transition(vm, prototype);
+            }
+            Object::new_with_shape(class, shape, MayInterfereWithIndexedPropertyAccess::No)
+        } else {
+            Object::new_with_prototype(vm, class, realm, prototype, MayInterfereWithIndexedPropertyAccess::No)
+        };
         copy_host_class_flags_into_object(vm, table, &base);
         let host_object = HostObject {
             base,
@@ -452,7 +479,7 @@ impl HostObject {
             host_object.wrappable.set(wrappable);
             host_object.host_data.set(host_data);
         }
-        let host_object = allocate_object_in(vm, allocator, host_object);
+        let host_object = allocate_object_in(vm, allocator, |_| host_object);
         host_object.initialize(vm, realm);
         host_object
     }
@@ -461,6 +488,16 @@ impl HostObject {
 /// The host object an internal method of a host object class was called on.
 pub(crate) fn as_host_object(object: &Object) -> &HostObject {
     cast_ref(object)
+}
+
+/// HostObjectHasImpureLookupInternalMethods(object): whether a hook of the object's host class looks its properties or
+/// its prototype up, which may run script.
+pub(crate) fn host_object_has_impure_lookup_internal_methods(object: &Object) -> bool {
+    if object.class().id != ClassId::HostObject {
+        return false;
+    }
+    let hooks = hooks_of(object);
+    hooks.get_prototype_of.is_some() || hooks.get_own_property.is_some() || hooks.get.is_some()
 }
 
 /// host_class_of(): the host class of an object of any host kind, or none for any other object.
@@ -506,8 +543,8 @@ pub unsafe fn set_host_data(object: &Object, host_data: Option<NonNull<c_void>>)
 
 // The embedding ABI of host objects, and of what every kind of host object shares
 
-/// HostObject::create(): a host object of `host_class`, a table of kind JS_HOST_CLASS_OBJECT, made from the realm's
-/// empty object shape with `prototype_or_null` as its [[Prototype]]. `wrappable_or_null` is the embedder's
+/// HostObject::create(): a host object of `host_class`, a table of kind JS_HOST_CLASS_OBJECT, with
+/// `prototype_or_null` as its [[Prototype]]. `wrappable_or_null` is the embedder's
 /// implementation object, which direct getter functions read at JS_HOST_OBJECT_WRAPPABLE_OFFSET, and
 /// `host_data_or_null` a cell with the rest of its per-object state; the object keeps both alive. Returns an unrooted
 /// object. Main thread only.

@@ -7,10 +7,13 @@
 #include <AK/Vector.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
+#include <LibWebView/Settings.h>
+#include <UI/Qt/Theme.h>
 #include <UI/Qt/WebCompatReportReview.h>
 
 #include <QAbstractButton>
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -50,9 +53,9 @@ TEST_CASE(the_review_shows_the_website_and_the_selected_screenshot)
     WebCompatReportReview review { test_page(), test_screenshot(), nullptr };
     review.show();
 
-    EXPECT_EQ(child<QLabel>(review, "WebCompatReportWebsite").text(), "https://example.com/broken");
+    EXPECT_EQ(child<QLabel>(review, "WebCompatReportWebsite").text(), "example.com/broken");
     EXPECT(child<QWidget>(review, "WebCompatReportScreenshot").isVisible());
-    EXPECT_EQ(child<QPushButton>(review, "WebCompatReportSelectScreenshotButton").text(), "Retake screenshot");
+    EXPECT_EQ(child<QPushButton>(review, "WebCompatReportSelectScreenshotButton").text(), "Retake");
     EXPECT(child<QPushButton>(review, "WebCompatReportRemoveScreenshotButton").isVisible());
 }
 
@@ -98,7 +101,7 @@ TEST_CASE(a_report_without_a_screenshot_offers_to_take_one)
 
     review.set_screenshot(test_screenshot());
     EXPECT(child<QWidget>(review, "WebCompatReportScreenshot").isVisible());
-    EXPECT_EQ(select_button.text(), "Retake screenshot");
+    EXPECT_EQ(select_button.text(), "Retake");
 }
 
 TEST_CASE(page_dumps_can_be_included_once_they_have_arrived)
@@ -161,15 +164,25 @@ TEST_CASE(leaving_the_review_closes_its_tab)
     review.show();
 
     auto& review_close = child<QPushButton>(review, "WebCompatReportReviewCloseButton");
-    EXPECT_EQ(review_close.text(), "Close tab");
+    EXPECT_EQ(review_close.text(), "Cancel");
     review_close.click();
     EXPECT_EQ(exits, 1);
 
     review.show_sent();
+    auto& back_to_site = child<QPushButton>(review, "WebCompatReportBackToSiteButton");
+    EXPECT_EQ(back_to_site.text(), "Back to the site");
+    EXPECT(back_to_site.isVisible());
+    back_to_site.click();
+    EXPECT_EQ(exits, 2);
+
+    // Closing the tab once the report is sent does not have to return to the site.
+    auto closes = 0;
+    review.on_close_tab = [&] { ++closes; };
     auto& close = child<QPushButton>(review, "WebCompatReportCloseButton");
     EXPECT_EQ(close.text(), "Close tab");
     close.click();
     EXPECT_EQ(exits, 2);
+    EXPECT_EQ(closes, 1);
 }
 
 TEST_CASE(sending_can_be_canceled_until_the_report_is_sent)
@@ -206,7 +219,8 @@ TEST_CASE(sending_can_be_canceled_until_the_report_is_sent)
     EXPECT(!retry.isVisible());
     EXPECT(!cancel.isVisible());
     EXPECT(close.isVisible());
-    EXPECT(close.isDefault());
+    EXPECT(!close.isDefault());
+    EXPECT(child<QPushButton>(review, "WebCompatReportBackToSiteButton").isVisible());
 }
 
 TEST_CASE(a_screenshot_is_shrunk_to_fit_a_report)
@@ -226,4 +240,40 @@ TEST_CASE(a_screenshot_is_shrunk_to_fit_a_report)
     auto decoded = QImage::fromData(encoded->bytes().data(), encoded->size(), "PNG");
     EXPECT(static_cast<size_t>(decoded.width()) * decoded.height() <= WebCompatReport::maximum_screenshot_pixels);
     EXPECT(decoded.width() > 3000);
+}
+
+// The offscreen platform keeps Qt's light palette whatever color scheme is asked for, as some platform themes do.
+TEST_CASE(the_review_takes_the_dark_interface_theme_even_where_qt_keeps_a_light_palette)
+{
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Dark);
+    WebCompatReportReview review { test_page(), test_screenshot(), nullptr };
+    review.show();
+
+    auto const& website = child<QLabel>(review, "WebCompatReportWebsite");
+    EXPECT(review.palette().color(QPalette::Window).lightness() < 128);
+    EXPECT(website.palette().color(website.foregroundRole()).lightness() > 128);
+
+    // A switch of the interface theme restyles every widget, which takes the review back to Qt's palette.
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Light);
+    QEvent palette_change(QEvent::PaletteChange);
+    QCoreApplication::sendEvent(&review, &palette_change);
+    EXPECT(review.palette().color(QPalette::Window).lightness() > 128);
+    EXPECT(website.palette().color(website.foregroundRole()).lightness() < 128);
+
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::System);
+}
+
+// A review is shown over the page in an overlay that has the interface theme's colors already.
+TEST_CASE(a_review_inside_a_dark_overlay_keeps_its_labels_light_where_qt_keeps_a_light_palette)
+{
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::Dark);
+    QWidget overlay;
+    overlay.setPalette(Ladybird::Theme::interface_palette(overlay.palette()));
+    auto* review = new WebCompatReportReview { test_page(), test_screenshot(), &overlay };
+    overlay.show();
+
+    auto const& website = child<QLabel>(*review, "WebCompatReportWebsite");
+    EXPECT(website.palette().color(website.foregroundRole()).lightness() > 128);
+
+    Ladybird::Theme::set_interface_theme(WebView::ThemePreference::System);
 }

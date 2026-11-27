@@ -8,6 +8,8 @@
 
 mod extended;
 mod macro_assembler;
+mod sse;
+mod stack_probes;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +24,9 @@ pub use extended::VexOpcode;
 pub use extended::VexOperand;
 pub use extended::VexPrefix;
 pub use macro_assembler::MacroAssembler;
+pub use sse::CpuFeatures;
+pub use stack_probes::PROBES_STACK;
+pub use stack_probes::needs_stack_probes;
 
 use super::Address;
 use super::Fpr;
@@ -31,6 +36,8 @@ use super::buffer::AsmError;
 use super::buffer::CodeBuffer;
 use super::buffer::FixupKind;
 use super::buffer::Label;
+use ak::Column;
+use ak::Zone;
 
 pub const RAX: Gpr = Gpr(0);
 pub const RCX: Gpr = Gpr(1);
@@ -161,9 +168,11 @@ enum Prefix {
 }
 
 /// x86-64 machine code assembler.
-#[derive(Debug, Default)]
-pub struct Assembler {
-    buffer: CodeBuffer,
+#[derive(Debug)]
+pub struct Assembler<'a> {
+    buffer: CodeBuffer<'a>,
+    /// None for a raw instruction encoder; host code generation selects the CPU's optional instructions.
+    cpu_features: Option<CpuFeatures>,
     /// Whether a group of instructions that ends in a branch is being emitted (see `BranchGroups::branch_group()`), whose
     /// branches leave keeping it within a branch window to the group.
     in_branch_group: bool,
@@ -173,8 +182,8 @@ pub struct Assembler {
 const BRANCH_WINDOW: usize = 32;
 
 /// Emitters of code with branches, which keep the branches within 32-byte windows.
-pub trait BranchGroups: Sized {
-    fn branch_assembler(&mut self) -> &mut Assembler;
+pub trait BranchGroups<'a>: Sized {
+    fn branch_assembler(&mut self) -> &mut Assembler<'a>;
 
     /// Emits a branch with `emit`, or the instructions that macro-fuse with a branch and the branch, so that they
     /// neither cross nor end at the end of a 32-byte window, padding with NOPs to the next one where they would.
@@ -205,22 +214,43 @@ pub trait BranchGroups: Sized {
     }
 }
 
-impl BranchGroups for Assembler {
-    fn branch_assembler(&mut self) -> &mut Assembler {
+impl<'a> BranchGroups<'a> for Assembler<'a> {
+    fn branch_assembler(&mut self) -> &mut Assembler<'a> {
         self
     }
 }
 
-impl Assembler {
-    pub fn new() -> Self {
-        Self::default()
+impl<'a> Assembler<'a> {
+    /// An assembler that writes its code into `code`, in place of what it holds, and keeps its labels in `work`.
+    pub fn new(code: &'a mut Column<u8>, work: &'a Zone) -> Self {
+        Self {
+            buffer: CodeBuffer::new(code, work),
+            cpu_features: None,
+            in_branch_group: false,
+        }
+    }
+
+    /// Selects AVX, AVX2, BMI and LZCNT only where the executing CPU supports them.
+    pub fn for_host(code: &'a mut Column<u8>, work: &'a Zone) -> Self {
+        Self::with_cpu_features(CpuFeatures::host(), code, work)
+    }
+
+    pub fn with_cpu_features(cpu_features: CpuFeatures, code: &'a mut Column<u8>, work: &'a Zone) -> Self {
+        Self {
+            cpu_features: Some(cpu_features),
+            ..Self::new(code, work)
+        }
+    }
+
+    pub fn cpu_features(&self) -> CpuFeatures {
+        self.cpu_features.unwrap_or(CpuFeatures::X86_64_V3)
     }
 
     pub fn offset(&self) -> usize {
         self.buffer.offset()
     }
 
-    pub fn buffer(&self) -> &CodeBuffer {
+    pub fn buffer(&self) -> &CodeBuffer<'a> {
         &self.buffer
     }
 
@@ -236,16 +266,8 @@ impl Assembler {
         self.buffer.label_offset(label)
     }
 
-    pub fn finish(self) -> Result<Vec<u8>, AsmError> {
+    pub fn finish(self) -> Result<&'a [u8], AsmError> {
         self.buffer.finish()
-    }
-
-    /// `finish()`, with the end of the code as the data offset: the
-    /// assembler itself emits no constant pool.
-    pub fn finish_with_data_offset(self) -> Result<(Vec<u8>, usize), AsmError> {
-        let code = self.finish()?;
-        let length = code.len();
-        Ok((code, length))
     }
 
     // Data emission.
